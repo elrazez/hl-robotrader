@@ -36,3 +36,6 @@ liqfade/panel/frontend/dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Vite/tsc build metadata
+*.tsbuildinfo

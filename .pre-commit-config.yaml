@@ -1,9 +1,9 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.6
+    rev: v0.16.5
     hooks:
       - id: ruff-format
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
 
   # Secrets scanner. CLAUDE.md rule 6: no key may ever reach the repo.
