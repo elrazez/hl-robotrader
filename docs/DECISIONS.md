@@ -79,3 +79,25 @@ need an explicit `systemctl restart`, which the script prints.
 **Tailscale installed but not brought up by the bootstrap.** `tailscale up` needs an
 interactive auth URL, and a bootstrap script should not decide to open a tunnel unattended.
 The script prints the command.
+
+## 2026-08-30 (cross-exchange liquidation history survey)
+
+**No purchase of Binance/Bybit/OKX liquidation history for v0.** Surveyed Tardis
+(https://docs.tardis.dev/faq/billing-and-subscriptions, https://tardis.dev/,
+https://docs.tardis.dev/historical-data-details/binance-futures,
+https://docs.tardis.dev/historical-data-details/bybit), CryptoStruct
+(https://cryptostruct.com/pricing, https://cryptostruct.com/exchanges,
+https://cryptostruct.com/download), Hyblock (https://docs.hyblockcapital.com/liquidation),
+Velo (https://docs.velo.xyz/api, https://docs.velo.xyz/api/data), Coinglass
+(https://www.coinglass.com/pricing), Amberdata
+(https://blog.amberdata.io/accessing-crypto-liquidations-data-for-research-and-visualization),
+Binance's public archive (https://data.binance.vision/, S3 listing under
+data/futures/um/daily/ and data/futures/cm/daily/liquidationSnapshot/), and the
+Binance developer forum (https://dev.binance.vision/t/is-there-historical-data-for-forceorder-endpoint/8362).
+Finding: Binance and OKX have only ever published throttled streams, so no vendor holds
+anything more complete than what the recorder captures; Bybit is complete only since
+2025-02-25. Tardis has no one-off purchases and starts at $700/month; CryptoStruct sells
+per instrument-day at EUR 1 but only carries liquidation events in 2026+ files. Summary
+table in docs/DATA_SOURCES.md. Reverse if research question 4 shows cross-venue signals
+matter; Hyblock 1-minute aggregates or a small CryptoStruct order are the affordable
+paths then.

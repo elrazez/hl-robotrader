@@ -187,6 +187,41 @@ turned into the smaller Parquet tables and deleted.
 **Pull in order, newest first.** If the money or the disk runs out, you still have the
 most recent and most relevant months.
 
+### Third-party sellers of cross-exchange liquidation history (surveyed 2026-08-30)
+
+The question was whether anyone sells a more complete Binance/Bybit/OKX liquidation
+history than the free first-of-month Tardis days. The answer has two parts.
+
+**There is nothing more complete to buy for Binance and OKX.** Both exchanges have only
+ever published a throttled public stream (one event per symbol per second, largest
+order only). Every vendor's "historical liquidations" for those venues is a recording
+of that same throttled stream; Tardis says so explicitly for Binance (`forceOrder`,
+"only the latest liquidation per symbol in each 1000ms window", since 2020-01-07).
+Bybit is complete only since 2025-02-25 (`allLiquidation`); before that it was
+throttled too. The only complete liquidation records that exist anywhere are
+Hyperliquid's own fills (our S3 pull) and Bybit since Feb 2025 (whoever recorded it).
+
+**Continuous history of the throttled streams does exist, at these prices:**
+
+| Vendor | What | Coverage | Price | Verdict |
+|---|---|---|---|---|
+| Tardis.dev | Per-event CSVs, all venues | Binance from 2020, Bybit from 2020-12 | Solo $700+/mo, no one-off purchases; quarterly billing unlocks 12 months back | Over budget |
+| CryptoStruct | Per instrument-day files: tick trades, full L2, liquidations | Binance USDT-M from 2021-02, Bybit from 2023-07, OKX from 2021-10, Hyperliquid from 2024-04; liquidation events only in 2026+ files | EUR 1 per instrument-day, one-off, Parquet export; EUR 20/mo for 50 credits | Affordable for samples; full coverage of 10 coins x 3 venues x 8 months is ~EUR 7,000 |
+| Hyblock Capital | 1-minute aggregated liquidation count and volume per side, 14 exchanges incl. Binance, Bybit, OKX, Hyperliquid | No documented lookback limit | Pricing not published on a fetchable page; API on paid tiers | Cheapest route to 1m cross-venue aggregates if Q4 ever needs them |
+| Velo Data | 1-minute candles with exchange breakdown; Binance and Bybit only, no OKX | Yearly plan for full history | $199/mo | Over budget, missing OKX |
+| Coinglass | Aggregated | 1-minute interval keeps only days of history on every tier under $699 | $29 to $699/mo | Rejected (see DECISIONS) |
+| Amberdata / Kaiko, CoinAPI | Per-event (Amberdata) or aggregated metrics (CoinAPI) | Deep | Enterprise, not published | Out of scope |
+| Binance data.binance.vision | Daily `liquidationSnapshot` zips | COIN-margined futures only, from 2023-06-25; USDT-M has none | Free | Marginal: a different, smaller market |
+| Exchange REST | OKX `liquidation-orders` keeps 7 days; Binance `allForceOrders` removed; Bybit has none | n/a | Free | Useless for history |
+
+**Decision:** do not buy cross-exchange liquidation history for v0. Hyperliquid's exact
+fills carry the research; Coinalyze aggregates carry regime context; the recorder
+carries cross-venue data forward from the day it starts. Revisit only if research
+question 4 says cross-venue signals matter, and then Hyblock (aggregated) or a small
+CryptoStruct order (per-event, 2026 only) are the affordable options. A CryptoStruct
+order is also the cheapest way to get full-tick Hyperliquid L2 for a few coin-days if
+the hourly S3 snapshots turn out too coarse for the fill model.
+
 ### Pay once, keep everything
 
 Standing policy, decided 2026-08-30: the S3 download is bought exactly once. The
