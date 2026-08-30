@@ -1,0 +1,88 @@
+"""The canonical Parquet schemas are the project contract, so they get a guard test."""
+
+from __future__ import annotations
+
+import pyarrow as pa
+import pytest
+
+from liqfade.data.schemas import (
+    SCHEMAS,
+    SchemaError,
+    rows_to_table,
+    schema_for,
+    validate_table,
+)
+
+GOOD_BBO = {
+    "coin": "BTC",
+    "ts_ms": 1_700_000_000_000,
+    "rx_ms": 1_700_000_000_005,
+    "bid_px": 60000.0,
+    "bid_sz": 1.5,
+    "ask_px": 60001.0,
+    "ask_sz": 2.0,
+}
+
+
+def test_every_table_documented_in_data_sources_exists() -> None:
+    assert set(SCHEMAS) == {
+        "liquidations",
+        "trades",
+        "bbo",
+        "l2",
+        "asset_ctx",
+        "candles_1m",
+        "xchg_ctx",
+    }
+
+
+def test_column_order_matches_the_schema_doc() -> None:
+    assert SCHEMAS["liquidations"].names == [
+        "venue",
+        "coin",
+        "venue_symbol",
+        "ts_ms",
+        "rx_ms",
+        "side",
+        "px",
+        "sz",
+        "notional_usd",
+        "method",
+        "complete",
+    ]
+    assert SCHEMAS["candles_1m"].names == ["coin", "ts_ms", "o", "h", "l", "c", "v", "n"]
+
+
+def test_a_good_table_validates() -> None:
+    validate_table("bbo", rows_to_table("bbo", [GOOD_BBO]))
+
+
+def test_a_wrong_typed_column_is_rejected() -> None:
+    wrong = pa.Table.from_pylist(
+        [GOOD_BBO],
+        schema=pa.schema(
+            [(f.name, pa.float32() if f.name == "bid_px" else f.type) for f in SCHEMAS["bbo"]]
+        ),
+    )
+    with pytest.raises(SchemaError, match="bid_px"):
+        validate_table("bbo", wrong)
+
+
+def test_a_reordered_or_extra_column_is_rejected() -> None:
+    fields = list(SCHEMAS["bbo"])
+    reordered = pa.Table.from_pylist(
+        [GOOD_BBO], schema=pa.schema([fields[1], fields[0], *fields[2:]])
+    )
+    with pytest.raises(SchemaError, match="do not match canonical"):
+        validate_table("bbo", reordered)
+
+
+def test_missing_keys_become_null_rather_than_failing() -> None:
+    table = rows_to_table("liquidations", [{"venue": "bybit", "venue_symbol": "BTCUSDT"}])
+    validate_table("liquidations", table)
+    assert table.column("coin").to_pylist() == [None]
+
+
+def test_an_unknown_table_name_is_an_error() -> None:
+    with pytest.raises(SchemaError, match="unknown table"):
+        schema_for("nope")
