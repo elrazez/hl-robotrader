@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Data lake and run artifacts
+data/
+reports/
+logs/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Panel overrides written at runtime by the panel
+config/overrides.yaml
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Node (the built bundle under liqfade/panel/static/ IS committed on purpose)
+node_modules/
+liqfade/panel/frontend/dist/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

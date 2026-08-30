@@ -1,0 +1,98 @@
+[project]
+name = "liqfade"
+version = "0.1.0"
+description = "Autonomous Hyperliquid perps bot that fades liquidation cascades"
+requires-python = ">=3.12"
+dependencies = [
+    # Core runtime: recorder, control plane, CLI, live loop.
+    "hyperliquid-python-sdk>=0.19,<1",
+    "websockets>=15,<16",
+    "uvloop>=0.21,<1",
+    "orjson>=3.10,<4",
+    "polars>=1.20,<2",
+    "duckdb>=1.2,<2",
+    "pyarrow>=19,<22",
+    "numpy>=2.1,<3",
+    "pydantic>=2.10,<3",
+    "structlog>=25.1,<26",
+    "httpx>=0.28,<1",
+    "aiosqlite>=0.21,<1",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+panel = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.34,<1",
+    "bcrypt>=4.2,<6",
+    "itsdangerous>=2.2,<3",
+]
+
+[project.scripts]
+liqfade = "liqfade.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<2",
+    "ruff>=0.9,<1",
+    "mypy>=1.14,<2",
+    "pre-commit>=4.1,<5",
+    "types-pyyaml>=6.0,<7",
+    "httpx>=0.28,<1",
+]
+research = [
+    "jupyterlab>=4.3,<5",
+    "pandas>=2.2,<3",
+    "matplotlib>=3.10,<4",
+    "scipy>=1.15,<2",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["liqfade"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["liqfade/panel/frontend", "liqfade/panel/static"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "ASYNC", "S"]
+ignore = [
+    "S101",  # asserts are how tests assert
+    "S104",  # binding 0.0.0.0 is guarded by panel.allow_non_loopback, not by lint
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "N806"]
+"scripts/probe/**" = ["S", "T201"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["liqfade"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "liqfade.config.*",
+    "liqfade.control.*",
+    "liqfade.strategy.*",
+    "liqfade.sizing.*",
+    "liqfade.risk.*",
+    "liqfade.execution.*",
+]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers -m 'not integration'"
+markers = ["integration: needs testnet keys and network; deselected by default"]
