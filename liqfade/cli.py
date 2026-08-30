@@ -24,7 +24,6 @@ from liqfade.config.models import Settings
 
 # Subcommands that later phases fill in. Value is the phase number in docs/ROADMAP.md.
 NOT_YET: dict[str, int] = {
-    "record": 1,
     "backfill": 2,
     "backtest": 4,
     "paper": 5,
@@ -38,7 +37,12 @@ EXIT_ERROR = 1
 
 def _settings(args: argparse.Namespace) -> Settings:
     extra = [Path(args.config)] if getattr(args, "config", None) else None
-    return load_settings(getattr(args, "env", None), extra_files=extra)
+    environ = dict(os.environ)
+    # --data-dir is spelled as the env override so it goes through the same layering and
+    # the same validation as everything else, rather than mutating the model afterwards.
+    if getattr(args, "data_dir", None):
+        environ["LIQFADE_DATA_DIR"] = str(args.data_dir)
+    return load_settings(getattr(args, "env", None), extra_files=extra, environ=environ)
 
 
 # --- config ------------------------------------------------------------------
@@ -73,6 +77,36 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     for key in sorted(flat):
         print(f"{key:<{width}}  {flat[key]!r:<30}  [{sources.get(key, 'default.yaml')}]")
+    return 0
+
+
+# --- record -------------------------------------------------------------------
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    """Run the recorder, or compact one past day and exit."""
+    from datetime import UTC, datetime, timedelta
+
+    from liqfade.log import setup_logging
+    from liqfade.recorder.main import Recorder
+    from liqfade.recorder.writer import compact_day
+    from liqfade.runtime import run_main, shutdown_event
+
+    settings = _settings(args)
+    setup_logging(proc="recorder", env=settings.env, level=settings.logging.level)
+    root = settings.paths.data_dir / "parquet"
+
+    if args.compact_only:
+        date = args.date or (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+        written = compact_day(root, date)
+        for table, rows in sorted(written.items()):
+            print(f"{table}: {rows} rows compacted for {date}")
+        if not written:
+            print(f"nothing to compact for {date} under {root}")
+        return 0
+
+    recorder = Recorder(settings, minutes=args.minutes)
+    run_main(lambda: recorder.run(shutdown_event()))
     return 0
 
 
@@ -267,7 +301,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
 
-    sub.add_parser("record", parents=[common], help="run the market data recorder (Phase 1)")
+    record = sub.add_parser("record", parents=[common], help="run the market data recorder")
+    record.add_argument(
+        "--minutes",
+        type=float,
+        default=None,
+        help="stop after N minutes; used for fixture capture and smoke tests",
+    )
+    record.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+    record.add_argument(
+        "--compact-only",
+        action="store_true",
+        help="compact one day's hourly Parquet files into one file per table and exit",
+    )
+    record.add_argument(
+        "--date", default=None, help="YYYY-MM-DD for --compact-only (default: yesterday)"
+    )
     sub.add_parser("backfill", parents=[common], help="pull historical data (Phase 2)")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
     sub.add_parser("paper", parents=[common], help="live feeds, simulated fills (Phase 5)")
@@ -304,6 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 HANDLERS = {
     "config": cmd_config,
+    "record": cmd_record,
     "status": cmd_status,
     "sync": cmd_sync,
     "panel": cmd_panel,

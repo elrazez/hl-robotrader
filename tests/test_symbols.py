@@ -41,3 +41,10 @@ def test_an_unknown_venue_is_a_programming_error() -> None:
         to_venue_symbol("BTC", "kraken")
     with pytest.raises(ValueError, match="unknown venue"):
         to_coin("BTCUSD", "kraken")
+
+
+def test_okx_inverse_and_dated_contracts_do_not_map_to_a_coin() -> None:
+    """Their size is in USD contracts, so folding them into the coin would skew notional."""
+    assert to_coin("BTC-USD-SWAP", "okx") is None
+    assert to_coin("BTC-USDT-240628", "okx") is None
+    assert to_coin("BTC-USDC-SWAP", "okx") == "BTC"

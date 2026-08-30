@@ -90,7 +90,18 @@ All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for his
 - `candles_1m`: `coin, ts_ms, o, h, l, c, v, n`
 - `xchg_ctx` (Coinalyze): `venue, coin, ts_ms, rx_ms, open_interest, funding, predicted_funding`
 
-Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day.
+Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day. A buffer that fills before the hour is out writes `{venue}_{hour}_{n}.parquet` alongside it rather than rewriting the hour file; readers glob the partition and compaction folds the day into one file, so nothing downstream needs to know.
+
+## What the wire actually sends
+
+Captured live on 2026-08-30 with `scripts/probe/ws_payloads.py`. Where this differs from the endpoint notes above, the wire wins and the parsers follow it.
+
+- **HL `activeAssetCtx` carries no timestamp.** The payload is `{"channel":"activeAssetCtx","data":{"coin":..,"ctx":{..}}}` with no `time` field, so the `asset_ctx` table sets `ts_ms = rx_ms`. It is a slowly moving context snapshot rather than an event, so receive time is the honest answer, but any research that joins `asset_ctx` to trades on exchange time must know this.
+- **HL `candle` sends one object, not a list**, and names the coin `s`: `{"t":..,"T":..,"s":"BTC","i":"1m","o":..,"c":..,"h":..,"l":..,"v":..,"n":..}`. The snapshot on subscribe is a list, so the parser accepts both.
+- **HL `trades` `side` is the aggressor**, `B` buy and `A` sell, confirmed by the shared counterparty address across a burst of `A` trades. The first `trades` and `l2Book` messages after subscribing are snapshots of recent activity, so their `rx_ms - ts_ms` is tens of seconds; only the first message per subscription, but do not read it as latency.
+- **OKX swap sizes are in contracts, not coin units.** `sz` on `liquidation-orders` counts contracts of `ctVal` each, so the `notional_usd` we record for OKX is `bkPx * contracts` and is not USD. Both raw fields are preserved, so multiplying by `ctVal` from the instruments endpoint fixes it later; until then treat OKX notional as an index, not a currency amount, and lean on `venues.okx.liq_weight`. OKX inverse (coin margined) swaps such as `BTC-USD-SWAP` are recorded with `coin = null` for the same reason: their size is in USD contracts and folding them into the coin would corrupt every cross-venue total.
+- **Bybit `allLiquidation` `S` is confirmed**: `Sell` means a long was liquidated, `Buy` means a short was. Verified against live BTCUSDT and SOLUSDT events.
+- **Binance `!forceOrder@arr` delivered nothing from a geo-blocked network.** The connection is accepted and stays open, but no message ever arrives, and neither does `btcusdt@aggTrade`, so this is a silent block rather than a quiet market or a parser bug. The parser is tested against the documented payload. **Confirm Binance liquidations actually flow once the recorder runs in Tokyo**; `liqfade status` showing `binance.liquidations` with `msgs/min = 0` for a busy hour means the block follows the VPS too, and then Binance is worth dropping from `venues` rather than pretending it is a feed.
 
 Symbol mapping lives in `data/symbols.py` (`BTC` <-> `BTCUSDT` on Binance/Bybit, `BTC-USDT-SWAP` on OKX, Coinalyze suffix codes). Unknown symbols are recorded under their venue symbol with `coin = null` rather than dropped.
 
