@@ -1,0 +1,10 @@
+# Paper: real feeds, simulated fills, no keys required. This is the default environment.
+env: paper
+
+execution:
+  # Paper never talks to /exchange, but the fill simulator uses the same latency and
+  # cost model as the backtester so paper and backtest numbers are comparable.
+  action_budget_per_hour: 600
+
+logging:
+  level: INFO

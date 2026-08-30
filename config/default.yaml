@@ -1,0 +1,200 @@
+# Base configuration. Layered: default.yaml -> {env}.yaml -> overrides.yaml -> LIQFADE_ env vars.
+# Every value here is a Phase 3 research starting point, not a tuned parameter.
+# Units and rationale are on every key. See docs/STRATEGY_AND_RISK.md.
+
+env: paper  # paper | testnet | mainnet. Env file and LIQFADE_ENV normally set this.
+
+paths:
+  data_dir: data  # root of the data lake, the KILL flag, state.json and the sqlite order store
+  reports_dir: reports  # backtest and research reports
+
+universe:
+  # Dynamic selection by liquidity, plus a fixed core that is always subscribed.
+  core_coins: [BTC, ETH, SOL, HYPE]  # always in the universe regardless of rank
+  top_n_by_volume: 20  # count: top N HL perps by dayNtlVlm from metaAndAssetCtxs
+  min_day_ntl_vlm_usd: 20000000.0  # USD: below this a coin is too thin to fade a cascade in
+  min_open_interest_usd: 5000000.0  # USD: OI floor, cascades need positions to liquidate
+  min_listing_days: 14  # days: new listings have no stable vol baseline (STRATEGY_AND_RISK 3)
+  refresh_min: 60  # minutes between metaAndAssetCtxs universe refreshes (DATA_SOURCES)
+  exclude: []  # HL coin symbols never traded regardless of rank
+
+venues:
+  hyperliquid:
+    enabled: true
+    api_url: https://api.hyperliquid.xyz
+    ws_url: wss://api.hyperliquid.xyz/ws
+    ws_ping_s: 20  # seconds: server closes idle connections after 60s
+    liq_weight: 1.0  # weight in aggregated liquidation notional; HL-exact is complete
+    complete: false  # the free public feed does not flag liquidations, only the S3 pull does
+  binance:
+    enabled: true
+    ws_url: wss://fstream.binance.com/ws/!forceOrder@arr
+    liq_weight: 1.0  # throttled to one event/symbol/second, so a lower bound. Revisit in Phase 3
+    complete: false
+  bybit:
+    enabled: true
+    ws_url: wss://stream.bybit.com/v5/public/linear
+    subscribe_batch: 10  # symbols per subscribe frame
+    liq_weight: 1.0  # complete since 2025-02-25, this is the reference feed
+    complete: true
+  okx:
+    enabled: true
+    ws_url: wss://ws.okx.com:8443/ws/v5/public
+    liq_weight: 1.0  # at most one update per contract per second, a lower bound
+    complete: false
+  coinalyze:
+    enabled: true
+    base_url: https://api.coinalyze.net/v1/
+    poll_s: 60  # seconds between OI and funding polls; free tier allows 40 calls/min
+    rate_limit_per_min: 40
+
+recorder:
+  flush_min: 60  # minutes: Parquet flush cadence, one file per table per venue per hour
+  compaction_hour_utc: 3  # UTC hour for nightly compaction into one file per table per day
+  ring_buffer_rows: 200000  # rows per coin per stream held in memory between flushes
+  gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap (Phase 1 DoD)
+  silence_alert_s: 60.0  # seconds of silence that raises a Telegram alert
+  reconnect_backoff_min_s: 0.5  # seconds: initial reconnect delay
+  reconnect_backoff_max_s: 30.0  # seconds: capped reconnect delay
+  reconnect_jitter_frac: 0.3  # fraction of the delay added as uniform jitter
+  disk_alert_pct: 80.0  # percent used on the data volume that raises an alert
+
+features:
+  decision_cadence_ms: 250  # milliseconds between feature ticks, identical live and in backtest
+  windows_s: [15, 60, 300]  # seconds: trailing windows for liquidation intensity and returns
+  z_lookback_h: 24  # hours of history for the liquidation z-score distribution
+  z_grid_s: 60  # seconds: grid the z-score distribution is sampled on
+  z_robust: true  # use median and MAD rather than mean and stdev, cascades are fat tailed
+  rv_windows_s: [60, 300]  # seconds: realized volatility windows from 1s mid changes
+  cvd_slope_window_s: 15  # seconds over which the CVD slope is measured
+  depth_bps: 10.0  # basis points from the touch used for the depth features
+  vwap_anchor_s: 300  # seconds: pre-cascade VWAP anchor for the displacement feature
+  proxy:
+    # HL-native forced flow proxy, since the free feed does not flag liquidations.
+    vol_median_lookback_s: 3600  # seconds of trailing aggressive volume used as the denominator
+    oi_delta_window_s: 60  # seconds: OI must be falling over this window for forced flow
+    mark_mid_pct_threshold: 95.0  # percentile of trailing abs(mark-mid)/mid that must be exceeded
+
+cascade:
+  # Cascade start, per coin per side. All conditions must hold.
+  liq_z_min: 3.0  # z-score of aggregated liquidation notional over 60s
+  proxy_min: 4.0  # alternative trigger: hl_forced_proxy_60s multiple of median volume
+  ret_over_rv_min: 2.0  # abs(ret_60s) / rv_5m, in the direction implied by the liquidated side
+  imbalance_min: 0.6  # liq_imbalance_60s must favour the cascading side by at least this
+  window_s: 60  # seconds: the window the three conditions above are evaluated over
+
+exhaustion:
+  # All conditions must hold for consecutive_ticks in a row before an intent is emitted.
+  consecutive_ticks: 3  # ticks at the 250ms cadence, so 750ms of confirmation
+  liq_decay_frac: 0.25  # liq_15s must fall to this fraction of peak_liq_15s
+  require_flow_flip: true  # cvd_slope_15s or book_imbalance must flip against the cascade
+  mark_mid_pct_threshold: 80.0  # abs(mark-mid)/mid back under this trailing percentile
+  no_new_extreme_s: 10.0  # seconds since the last new extreme mid
+  min_age_s: 20.0  # seconds: younger cascades are still running
+  max_age_s: 900.0  # seconds: older cascades are a different regime, drop them
+
+intent:
+  k_target: 0.5  # fraction of (anchor_px - extreme_px) retraced; target = extreme + k*(anchor-extreme)
+  k_stop: 1.5  # stop distance beyond the extreme in units of rv_5m * mid, vol scaled
+  time_stop_s: 900  # seconds: flatten if neither target nor stop hit. Horizon is 1 to 60 minutes
+  urgency_liq_z: 5.0  # liq_z_60s at or above this marks the intent high urgency
+  allow_taker_entry_high_urgency: true  # only high urgency intents may fall back to a taker entry
+
+filters:
+  max_spread_bps:
+    # Basis points. Per liquidity tier; a wide spread eats the whole reversion.
+    core: 3.0  # BTC, ETH, SOL, HYPE
+    major: 6.0
+    minor: 12.0
+  min_edge_multiple: 4.0  # expected edge must exceed this multiple of the round trip fee
+  skip_when_btc_cascading: true  # market-wide sweeps behave differently; research question 4
+  funding_extreme_bps_8h: 30.0  # bps per 8h: skip when funding this far against the trade
+  min_notional_usd: 10.0  # USD: the Hyperliquid exchange minimum order value
+
+sizing:
+  risk_frac: 0.005  # fraction of equity risked at the stop, 0.5%
+  vol_participation: 0.02  # fraction of the coin's trailing 5 minute HL notional volume
+  vol_window_s: 300  # seconds: the volume window the cap above is measured over
+  depth_participation: 0.25  # fraction of resting depth within depth_bps on the side we hit
+  coin_exposure_frac: 0.25  # max notional in one coin as a fraction of equity
+  total_exposure_frac: 1.0  # max gross notional as a fraction of equity
+  respect_venue_max_leverage: true  # also clamp to maxLeverage * equity from meta.universe
+
+risk:
+  max_daily_loss_frac: 0.03  # 3% of day start equity: halt entries until the next UTC day
+  max_dd_frac: 0.10  # 10% below peak equity: halt and flatten, manual /resume required
+  max_consecutive_losses: 6  # losing trades in a row before a cooldown
+  cooldown_after_streak_min: 120  # minutes of no entries after a losing streak
+  coin_cooldown_after_loss_min: 30  # minutes before re-entering a coin that lost
+  coin_cooldown_after_exit_min: 5  # minutes before re-entering a coin after any exit
+  max_concurrent_positions: 4  # count
+  max_positions_per_direction: 3  # count
+  stale_coin_s: 5.0  # seconds without an HL trade or bbo for a coin: no new entries in it
+  stale_global_cancel_s: 15.0  # seconds of global feed silence: cancel all resting entries
+  stale_global_flatten_s: 60.0  # seconds of global feed silence: flatten everything and halt
+  max_reconnects_10min: 5  # reconnects on any critical feed before entries halt
+  max_rejects_10min: 5  # exchange rejects before entries halt
+  heartbeat_s: 1.0  # seconds between touches of data/heartbeat by the live loop
+  watchdog_stale_s: 10.0  # seconds of heartbeat staleness before the watchdog cancels all
+  kill_deadline_s: 5.0  # seconds within which /kill must have cancelled and flattened
+
+execution:
+  entry_tif: Alo  # post only at the touch; taker entries are the exception, not the rule
+  entry_ttl_s: 3.0  # seconds a resting entry lives before it is repriced
+  max_reprices: 3  # reprices per intent, capped because every action burns address rate limit
+  taker_slippage_bps: 15.0  # bps bound on Ioc "market" orders; never the SDK 5% default
+  reconcile_s: 60.0  # seconds between reconciliations against clearinghouseState and openOrders
+  action_budget_per_hour: 600  # orders plus cancels plus modifies per hour, see HYPERLIQUID.md
+  max_intents_per_coin_per_min: 2  # count, throttles the same cascade re-triggering
+  transient_retries: 3  # retries with jitter on transport errors. Rejects are never retried
+  use_isolated_margin: false  # cross margin by default, see docs/DECISIONS.md
+  order_db: orders.sqlite  # filename under data_dir
+
+backtest:
+  latency_ms: 1000  # milliseconds from intent to an order visible to the market (docs/DECISIONS)
+  taker_fee_frac: 0.00045  # 0.045% of notional per side, base tier 2026-08
+  maker_fee_frac: 0.00015  # 0.015% of notional per side, base tier 2026-08
+  apply_funding: true  # accrue funding hourly while a position is open
+  maker_queue_pessimism: 1.0  # multiplier on the assumed queue ahead at the resting price
+  maker_requires_trade_through: true  # an Alo fills only on trade through or queue exhaustion
+  slip_stale_bps: 5.0  # bps added when the L2 snapshot used for a taker fill is over 1s old
+  stale_book_s: 1.0  # seconds after which an L2 snapshot counts as stale
+  holdout_frac: 0.25  # fraction of the chronological tail held out of any fitting
+  walk_forward_refit_days: 30  # days between refits in the walk forward split
+  bootstrap_samples: 1000  # trade level bootstrap draws for confidence intervals
+
+control:
+  socket_path: control.sock  # under data_dir, created with mode 0600
+  state_file: state.json  # under data_dir, atomically rewritten every state_interval_s
+  state_interval_s: 1.0  # seconds between state snapshots
+  connect_timeout_s: 2.0  # seconds a client waits for the socket
+  request_timeout_s: 5.0  # seconds a client waits for a response
+
+panel:
+  host: 127.0.0.1  # loopback only; reached over Tailscale or an SSH tunnel
+  port: 8787
+  allow_non_loopback: false  # must be set true explicitly to bind anything but loopback
+  session_ttl_s: 43200  # seconds a login cookie stays valid, 12 hours
+  login_max_attempts: 5  # failed logins per window before the client is locked out
+  login_window_s: 300  # seconds the failed login window covers
+  state_stale_s: 5.0  # seconds after which /api/state returns 503 rather than stale numbers
+
+telegram:
+  enabled: true
+  alert_on_intent: true  # every intent is posted with its explain() values
+  parse_mode: HTML
+  send_timeout_s: 10.0  # seconds before an alert send is abandoned; alerts never block trading
+
+sync:
+  host: ""  # ssh target for `liqfade sync`, e.g. liqfade@vps. Usually from LIQFADE_SYNC_HOST
+  remote_root: /srv/liqfade  # remote path holding data/ and reports/
+  paths:  # relative to remote_root, pulled into the local project root
+    - data/parquet/
+    - data/orders.sqlite
+    - data/state.json
+    - reports/
+  rsync_flags: [-az, --info=progress2, --partial]
+
+logging:
+  level: INFO  # DEBUG | INFO | WARNING | ERROR
+  proc: unknown  # overwritten per process by runtime.setup_logging

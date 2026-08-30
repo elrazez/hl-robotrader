@@ -1,0 +1,17 @@
+# Mainnet: real money. Phase 6 starts here at minimum size.
+# Loading this file never by itself enables trading. settings.live_trading_enabled is
+# true only when LIQFADE_ENV=mainnet AND LIQFADE_LIVE_TRADING=1 AND data/KILL is absent.
+env: mainnet
+
+sizing:
+  risk_frac: 0.0025  # 0.25% of equity per trade, half the research default (ROADMAP Phase 6)
+  coin_exposure_frac: 0.15  # tighter than default while the live fill model is unproven
+  total_exposure_frac: 0.5
+
+risk:
+  max_daily_loss_frac: 0.02  # 2% of day start equity (ROADMAP Phase 6)
+  max_concurrent_positions: 2  # count (ROADMAP Phase 6)
+  max_positions_per_direction: 1
+
+logging:
+  level: INFO

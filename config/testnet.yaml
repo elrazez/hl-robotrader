@@ -1,0 +1,16 @@
+# Testnet: real orders against api.hyperliquid-testnet.xyz with faucet USDC.
+# Sizing is unchanged so that rounding, minimums and rejects are exercised for real.
+env: testnet
+
+venues:
+  hyperliquid:
+    api_url: https://api.hyperliquid-testnet.xyz
+    ws_url: wss://api.hyperliquid-testnet.xyz/ws
+
+risk:
+  # Looser than mainnet on purpose: we want to hit the gates and see them fire.
+  max_daily_loss_frac: 0.10
+  max_dd_frac: 0.25
+
+logging:
+  level: DEBUG

@@ -1,0 +1,7 @@
+# Backtest run config for strategy v0. Layered on top of config/default.yaml by
+# `liqfade backtest --config config/backtest/v0.yaml`. Phase 4 fills in the run window.
+env: paper
+
+backtest:
+  latency_ms: 1000
+  holdout_frac: 0.25

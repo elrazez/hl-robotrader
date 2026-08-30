@@ -1,0 +1,144 @@
+"""Config layering, validation and the live trading gate."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from liqfade.config import ConfigError, flatten, load_settings, resolve
+
+
+def test_every_environment_loads() -> None:
+    for env in ("paper", "testnet", "mainnet"):
+        settings = load_settings(env, environ={})
+        assert settings.env == env
+
+
+def test_unknown_environment_is_an_error() -> None:
+    with pytest.raises(ConfigError, match="unknown environment"):
+        load_settings("staging", environ={})
+
+
+def test_env_file_overrides_default() -> None:
+    default_risk = load_settings("paper", environ={}).sizing.risk_frac
+    mainnet = load_settings("mainnet", environ={})
+    assert mainnet.sizing.risk_frac < default_risk
+    assert mainnet.risk.max_concurrent_positions == 2
+
+
+def test_envvar_overrides_files_and_is_reported_as_the_source() -> None:
+    environ = {"LIQFADE_SIZING__RISK_FRAC": "0.001", "LIQFADE_PANEL__PORT": "9999"}
+    settings = load_settings("paper", environ=environ)
+    assert settings.sizing.risk_frac == 0.001
+    assert settings.panel.port == 9999
+
+    _, sources = resolve("paper", environ=environ)
+    assert sources["sizing.risk_frac"] == "envvar"
+    assert sources["panel.port"] == "envvar"
+    assert sources["cascade.liq_z_min"] == "default.yaml"
+    assert sources["risk.max_concurrent_positions"] == "default.yaml"
+
+
+def test_env_file_is_reported_as_the_source_when_it_wins() -> None:
+    _, sources = resolve("mainnet", environ={})
+    assert sources["sizing.risk_frac"] == "mainnet.yaml"
+    assert sources["cascade.liq_z_min"] == "default.yaml"
+
+
+def test_liqfade_env_selects_the_environment_file() -> None:
+    assert load_settings(environ={"LIQFADE_ENV": "testnet"}).env == "testnet"
+
+
+def test_extra_config_file_layers_between_env_and_overrides(tmp_path: Path) -> None:
+    extra = tmp_path / "run.yaml"
+    extra.write_text("backtest:\n  latency_ms: 3000\n")
+    settings = load_settings("paper", extra_files=[extra], environ={})
+    assert settings.backtest.latency_ms == 3000
+    _, sources = resolve("paper", extra_files=[extra], environ={})
+    assert sources["backtest.latency_ms"] == "run.yaml"
+
+
+def test_unknown_key_is_rejected(tmp_path: Path) -> None:
+    extra = tmp_path / "typo.yaml"
+    extra.write_text("sizing:\n  risk_fraq: 0.01\n")
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_settings("paper", extra_files=[extra], environ={})
+
+
+def test_out_of_range_value_is_rejected(tmp_path: Path) -> None:
+    extra = tmp_path / "bad.yaml"
+    extra.write_text("sizing:\n  risk_frac: 2.0\n")
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_settings("paper", extra_files=[extra], environ={})
+
+
+def test_cross_field_validators_reject_inconsistent_risk(tmp_path: Path) -> None:
+    extra = tmp_path / "stale.yaml"
+    extra.write_text("risk:\n  stale_coin_s: 90.0\n")
+    with pytest.raises(ConfigError, match="stale thresholds"):
+        load_settings("paper", extra_files=[extra], environ={})
+
+
+def test_flatten_produces_dotted_keys() -> None:
+    merged, _ = resolve("paper", environ={})
+    flat = flatten(merged)
+    assert flat["sizing.risk_frac"] == 0.005
+    assert flat["panel.host"] == "127.0.0.1"
+
+
+# --- The live trading gate: CLAUDE.md rule 3. All three conditions must hold. ---
+
+
+def _mainnet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live: str | None):
+    monkeypatch.delenv("LIQFADE_LIVE_TRADING", raising=False)
+    if live is not None:
+        monkeypatch.setenv("LIQFADE_LIVE_TRADING", live)
+    return load_settings(
+        "mainnet",
+        environ={"LIQFADE_PATHS__DATA_DIR": str(tmp_path)},
+    )
+
+
+def test_live_trading_blocked_when_env_is_not_mainnet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LIQFADE_LIVE_TRADING", "1")
+    settings = load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(tmp_path)})
+    assert settings.live_trading_enabled is False
+    assert settings.live_trading_block_reason() == "env is paper, not mainnet"
+
+
+def test_live_trading_blocked_when_flag_is_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _mainnet(tmp_path, monkeypatch, live=None)
+    assert settings.live_trading_enabled is False
+    assert settings.live_trading_block_reason() == "LIQFADE_LIVE_TRADING is not set to 1"
+
+
+def test_live_trading_blocked_when_flag_is_not_exactly_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for value in ("0", "true", "yes", "", "01"):
+        settings = _mainnet(tmp_path, monkeypatch, live=value)
+        assert settings.live_trading_enabled is False
+
+
+def test_live_trading_blocked_when_kill_file_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _mainnet(tmp_path, monkeypatch, live="1")
+    assert settings.live_trading_enabled is True  # all three conditions hold
+
+    settings.kill_file.parent.mkdir(parents=True, exist_ok=True)
+    settings.kill_file.write_text("halt")
+    assert settings.live_trading_enabled is False
+    assert "kill switch file present" in (settings.live_trading_block_reason() or "")
+
+    settings.kill_file.unlink()
+    assert settings.live_trading_enabled is True  # and it recovers when the file goes
+
+
+def test_default_environment_is_paper() -> None:
+    assert load_settings(environ={}).env == "paper"
