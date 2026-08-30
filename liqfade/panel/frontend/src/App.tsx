@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchState, hasSession, logout } from "./api";
+import { fetchDisk, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import LiquidationChart from "./LiquidationChart";
 import Login from "./Login";
-import type { FeedState, StateSnapshot } from "./types";
+import type { DiskStats, FeedState, Liquidations, StateSnapshot } from "./types";
 
 const POLL_MS = 1000;
+// The lake does not move fast and duckdb has to read files for it, so poll it slowly.
+const RECORDER_POLL_MS = 30_000;
+const LIQ_HOURS = 24;
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -27,6 +31,10 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: stri
 
 function ms(value: number | null) {
   return value === null ? "-" : `${value.toFixed(0)} ms`;
+}
+
+function gb(bytes: number) {
+  return `${(bytes / 1e9).toFixed(1)} GB`;
 }
 
 function Feeds({ feeds }: { feeds: FeedState[] }) {
@@ -62,6 +70,8 @@ export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  const [disk, setDisk] = useState<DiskStats | null>(null);
+  const [liquidations, setLiquidations] = useState<Liquidations | null>(null);
 
   useEffect(() => {
     hasSession().then(setAuthed);
@@ -77,12 +87,24 @@ export default function App() {
     setProblem(result.error);
   }, []);
 
+  const pollRecorder = useCallback(async () => {
+    setDisk(await fetchDisk());
+    setLiquidations(await fetchLiquidations(LIQ_HOURS));
+  }, []);
+
   useEffect(() => {
     if (!authed) return;
     poll();
     const timer = setInterval(poll, POLL_MS);
     return () => clearInterval(timer);
   }, [authed, poll]);
+
+  useEffect(() => {
+    if (!authed) return;
+    pollRecorder();
+    const timer = setInterval(pollRecorder, RECORDER_POLL_MS);
+    return () => clearInterval(timer);
+  }, [authed, pollRecorder]);
 
   if (authed === null) return <div className="min-h-screen bg-neutral-950" />;
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
@@ -129,6 +151,13 @@ export default function App() {
           <Row label="halt reason" value={risk?.halt_reason ?? "-"} />
           <Row label="snapshot age" value={`${(state?.age_s ?? 0).toFixed(1)} s`} />
           <Row label="uptime" value={`${Math.round(state?.uptime_s ?? 0)} s`} />
+          <Row
+            label="disk"
+            value={
+              disk ? `${disk.used_pct.toFixed(0)}% used, ${gb(disk.free_bytes)} free` : "-"
+            }
+            tone={disk && disk.used_pct >= 80 ? "text-amber-300" : undefined}
+          />
         </Section>
 
         <Section title="risk">
@@ -152,6 +181,16 @@ export default function App() {
         <div className="md:col-span-3">
           <Section title="feeds">
             <Feeds feeds={state?.feeds ?? []} />
+          </Section>
+        </div>
+
+        <div className="md:col-span-3">
+          <Section title={`liquidations, last ${LIQ_HOURS}h`}>
+            {liquidations ? (
+              <LiquidationChart data={liquidations} />
+            ) : (
+              <p className="text-sm text-neutral-500">loading</p>
+            )}
           </Section>
         </div>
 

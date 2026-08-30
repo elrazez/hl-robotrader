@@ -76,3 +76,20 @@ export interface StateSnapshot {
   universe: string[];
   age_s?: number;
 }
+
+export interface DiskStats {
+  path: string;
+  total_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  used_pct: number;
+}
+
+/** GET /api/recorder/liquidations: hourly notional per venue, aligned on hour_ms. */
+export interface Liquidations {
+  hours: number;
+  hour_ms: number[];
+  venues: Record<string, (number | null)[]>;
+  totals: Record<string, number>;
+  events?: Record<string, number>;
+}

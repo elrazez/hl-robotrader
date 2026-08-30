@@ -44,6 +44,68 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+HOUR_MS = 3_600_000
+
+
+def liquidations_by_venue(parquet_root: Path, hours: int) -> dict[str, Any]:
+    """Aggregate the `liquidations` table into hourly notional per venue.
+
+    Returns uplot shaped data: the complete hour grid for the window and one aligned list
+    of values per venue, with quiet hours as nulls. The grid is always complete so the
+    chart's x axis spans the window the caller asked for, rather than collapsing onto
+    whichever two hours happened to have a liquidation in them.
+    """
+    import duckdb
+
+    end_hour = (now_ms() // HOUR_MS) * HOUR_MS
+    since_ms = end_hour - (hours - 1) * HOUR_MS
+    hour_list = [since_ms + step * HOUR_MS for step in range(hours)]
+    empty: dict[str, Any] = {
+        "hours": hours,
+        "hour_ms": hour_list,
+        "venues": {},
+        "totals": {},
+        "events": {},
+    }
+    partitions = sorted((parquet_root / "liquidations").glob("date=*/*.parquet"))
+    if not partitions:
+        return empty
+
+    rows = (
+        duckdb.connect()
+        .execute(
+            """
+            select venue, (ts_ms // ?) * ? as hour_ms,
+                   sum(notional_usd) as notional, count(*) as events
+            from read_parquet(?, union_by_name = true)
+            where ts_ms >= ?
+            group by 1, 2
+            """,
+            [HOUR_MS, HOUR_MS, [str(path) for path in partitions], since_ms],
+        )
+        .fetchall()
+    )
+    if not rows:
+        return empty
+
+    index = {hour: position for position, hour in enumerate(hour_list)}
+    venues: dict[str, list[float | None]] = {}
+    totals: dict[str, float] = {}
+    events: dict[str, int] = {}
+    for venue, hour_ms, notional, count in rows:
+        series = venues.setdefault(venue, [None] * len(hour_list))
+        series[index[int(hour_ms)]] = float(notional or 0.0)
+        totals[venue] = totals.get(venue, 0.0) + float(notional or 0.0)
+        events[venue] = events.get(venue, 0) + int(count)
+    return {
+        "hours": hours,
+        "hour_ms": hour_list,
+        "venues": dict(sorted(venues.items())),
+        "totals": dict(sorted(totals.items())),
+        "events": dict(sorted(events.items())),
+    }
+
+
 def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
     app = FastAPI(title="liqfade panel", docs_url=None, redoc_url=None, openapi_url=None)
     limiter = LoginLimiter(
@@ -130,6 +192,26 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
                 },
             )
         return JSONResponse(payload)
+
+    @api.get("/recorder/disk", dependencies=[Depends(require_session)])
+    def recorder_disk() -> dict[str, Any]:
+        """How full the data volume is. Same numbers the recorder alerts on."""
+        # Imported here so the panel process does not pull the recorder's websocket
+        # stack in just to call shutil.disk_usage.
+        from liqfade.recorder.health import disk_stats
+
+        return disk_stats(settings.paths.data_dir)
+
+    @api.get("/recorder/liquidations", dependencies=[Depends(require_session)])
+    def recorder_liquidations(hours: int = 24) -> dict[str, Any]:
+        """Hourly liquidation notional per venue, straight off the Parquet lake.
+
+        duckdb reads the partition files directly, so this needs no running recorder and
+        no database: the lake is the database. Bounded to a week because the panel is a
+        monitor, not a research tool; research reads the same files from a notebook.
+        """
+        hours = max(1, min(hours, 168))
+        return liquidations_by_venue(settings.paths.data_dir / "parquet", hours)
 
     @api.get("/config", dependencies=[Depends(require_session)])
     def config() -> dict[str, Any]:

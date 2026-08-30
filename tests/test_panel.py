@@ -219,3 +219,100 @@ def test_serve_refuses_a_non_loopback_bind(tmp_path: Path) -> None:
     )
     with pytest.raises(SystemExit, match="not loopback"):
         serve(settings)
+
+
+# --- recorder page (Panel v1) ---------------------------------------------------
+
+
+def _write_liquidations(root: Path, rows: list[dict[str, object]]) -> None:
+    """Write rows through the real writer, so the test reads what the recorder writes."""
+    from liqfade.recorder.buffer import partition_of
+    from liqfade.recorder.writer import write_rows
+
+    for row in rows:
+        date, hour = partition_of(int(row["ts_ms"]))  # type: ignore[arg-type]
+        write_rows(root, ("liquidations", str(row["venue"]), date, hour), [row])
+
+
+def _liq(venue: str, ts_ms: int, notional: float) -> dict[str, object]:
+    return {
+        "venue": venue,
+        "coin": "BTC",
+        "venue_symbol": "BTCUSDT",
+        "ts_ms": ts_ms,
+        "rx_ms": ts_ms,
+        "side": "long",
+        "px": 79000.0,
+        "sz": notional / 79000.0,
+        "notional_usd": notional,
+        "method": "unknown",
+        "complete": venue == "bybit",
+    }
+
+
+def test_recorder_endpoints_need_a_session(client: TestClient) -> None:
+    assert client.get("/api/recorder/disk").status_code == 401
+    assert client.get("/api/recorder/liquidations").status_code == 401
+
+
+def test_disk_endpoint_reports_the_data_volume(client: TestClient) -> None:
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/recorder/disk").json()
+    assert body["total_bytes"] > 0
+    assert body["free_bytes"] <= body["total_bytes"]
+    assert 0.0 <= body["used_pct"] <= 100.0
+
+
+def test_liquidations_with_no_lake_yet_is_an_empty_chart_rather_than_an_error(
+    client: TestClient,
+) -> None:
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/recorder/liquidations").json()
+    assert body["venues"] == body["totals"] == {}
+    # The hour grid is still complete, so the chart spans 24h instead of nothing.
+    assert len(body["hour_ms"]) == 24
+
+
+def test_liquidations_are_bucketed_by_hour_and_venue(
+    client: TestClient, settings: Settings
+) -> None:
+    hour = (now_ms() // 3_600_000) * 3_600_000
+    _write_liquidations(
+        settings.paths.data_dir / "parquet",
+        [
+            _liq("bybit", hour + 1000, 30_000.0),
+            _liq("bybit", hour + 2000, 20_000.0),
+            _liq("okx", hour - 3_600_000, 5_000.0),
+        ],
+    )
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/recorder/liquidations?hours=24").json()
+
+    assert body["hour_ms"][-1] == hour
+    assert len(body["hour_ms"]) == 24
+    assert body["venues"]["bybit"][-2:] == [None, 50_000.0]
+    assert body["venues"]["okx"][-2:] == [5_000.0, None]
+    assert set(body["venues"]["bybit"][:-1]) == {None}
+    assert body["totals"] == {"bybit": 50_000.0, "okx": 5_000.0}
+    assert body["events"] == {"bybit": 2, "okx": 1}
+
+
+def test_liquidations_older_than_the_window_are_left_out(
+    client: TestClient, settings: Settings
+) -> None:
+    hour = (now_ms() // 3_600_000) * 3_600_000
+    _write_liquidations(
+        settings.paths.data_dir / "parquet",
+        [_liq("bybit", hour - 48 * 3_600_000, 1.0), _liq("bybit", hour, 2.0)],
+    )
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/recorder/liquidations?hours=24").json()
+    assert body["totals"] == {"bybit": 2.0}
+
+
+def test_the_window_is_capped_so_the_panel_cannot_scan_the_whole_lake(
+    client: TestClient,
+) -> None:
+    client.post("/api/login", json={"password": PASSWORD})
+    assert client.get("/api/recorder/liquidations?hours=100000").json()["hours"] == 168
+    assert client.get("/api/recorder/liquidations?hours=0").json()["hours"] == 1

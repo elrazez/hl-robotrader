@@ -39,3 +39,6 @@ liqfade/panel/frontend/dist/
 
 # Vite/tsc build metadata
 *.tsbuildinfo
+
+# Playwright MCP scratch output
+.playwright-mcp/

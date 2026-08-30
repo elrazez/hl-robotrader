@@ -1,4 +1,4 @@
-import type { StateSnapshot } from "./types";
+import type { DiskStats, Liquidations, StateSnapshot } from "./types";
 
 export interface StateResult {
   state: StateSnapshot | null;
@@ -52,4 +52,17 @@ export async function hasSession(): Promise<boolean> {
   const res = await fetch("/api/session", { credentials: "same-origin" });
   if (!res.ok) return false;
   return (await res.json()).authenticated === true;
+}
+
+/** Recorder page data. Both are cheap but not free, so the page polls them slowly. */
+export async function fetchDisk(): Promise<DiskStats | null> {
+  const res = await fetch("/api/recorder/disk", { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as DiskStats) : null;
+}
+
+export async function fetchLiquidations(hours = 24): Promise<Liquidations | null> {
+  const res = await fetch(`/api/recorder/liquidations?hours=${hours}`, {
+    credentials: "same-origin",
+  });
+  return res.ok ? ((await res.json()) as Liquidations) : null;
 }
