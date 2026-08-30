@@ -3,6 +3,9 @@
 Operational procedures for the VPS. Written in Phase 0 and filled in as each phase lands;
 sections marked "Phase N" describe something that does not exist yet.
 
+First time setting the server up? Start at [docs/DEPLOY_VPS.md](DEPLOY_VPS.md). This file
+is for a server that already runs.
+
 Conventions: `<vps>` is the Tailscale host name, `<port>` the SSH port chosen during
 bootstrap (default 2222). Everything runs as the `liqfade` user under `/srv/liqfade`.
 

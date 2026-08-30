@@ -93,3 +93,120 @@ All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for his
 Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day.
 
 Symbol mapping lives in `data/symbols.py` (`BTC` <-> `BTCUSDT` on Binance/Bybit, `BTC-USDT-SWAP` on OKX, Coinalyze suffix codes). Unknown symbols are recorded under their venue symbol with `coin = null` rather than dropped.
+
+## Getting 6 to 12 months of history
+
+Written 2026-08-30, so "12 months back" means roughly September 2025. This is the
+shopping list for a backtest that covers that window. Phase 2 of `docs/ROADMAP.md` writes
+the code that does the pulling; this section is what it will pull and what it will cost.
+
+### The short version
+
+| What | Where | 6 months | 12 months | Notes |
+|---|---|---|---|---|
+| Hyperliquid exact liquidations and trades | `s3://hl-mainnet-node-data/node_fills_by_block` | about $16 | about $33 | Requester pays. This is the important one |
+| Hyperliquid liquidations, pre-parsed | Hydromancer Reservoir S3 | egress only, likely far less | same | Covers Aug 2025 onward. Check this first |
+| Hyperliquid 1 minute candles | `candleSnapshot` on the public API | free | free | Rate limited, not egress billed |
+| Hyperliquid order book snapshots | `s3://hyperliquid-archive` | varies | varies | Only pull a few coins, hourly. Whole-market is expensive |
+| Cross-exchange liquidations | Nowhere affordable | see below | see below | This is the real gap |
+| Cross-exchange open interest and funding | Coinalyze free tier | free | free | Daily granularity keeps long history, intraday does not |
+
+Everything downloads to your laptop. None of it needs the server.
+
+### The one thing you cannot buy
+
+Binance, Bybit and OKX broadcast liquidations live and then throw them away. There is no
+free historical archive, and the paid ones (Coinglass at $299 a month for minute-level,
+and even then only 6 days) are out of budget and out of scope. See `docs/DECISIONS.md`.
+
+What exists instead:
+
+- **Tardis free days.** The 1st of each month, every exchange, no signup:
+  `https://datasets.tardis.dev/v1/{exchange}/liquidations/{year}/{month}/01/{symbol}.csv.gz`.
+  That is 12 days a year per exchange. Enough to check that your recorded data looks like
+  earlier months. Not enough to fit anything on.
+- **Your own recorder,** from the day you start it. This is the only way to get a
+  continuous cross-exchange liquidation feed.
+
+**What this means for your plan.** A 6 to 12 month backtest is possible right now, but it
+can only use Hyperliquid's own liquidations, which come from the S3 fills. That is the
+right place to start anyway: `docs/STRATEGY_AND_RISK.md` research question 1 is entirely
+about Hyperliquid-native cascades, and question 4 (does a Bybit spike predict a
+Hyperliquid bounce) is explicitly a later question. The plan already assumes Hyperliquid
+carries v0 and cross-exchange features are an addition.
+
+It also means the recorder is worth starting sooner than it feels. Every week it is not
+running is a week of cross-exchange data that cannot be recovered at any price.
+
+### Hyperliquid fills from S3, step by step
+
+This is the main pull. Every fill on the exchange, and liquidations carry a `liquidation`
+object naming the liquidated account, the mark price and whether it was a normal or
+backstop liquidation.
+
+**You need first:**
+
+1. An AWS account.
+2. An IAM user with `s3:GetObject` and `s3:ListBucket` on `arn:aws:s3:::hl-mainnet-node-data`
+   and `arn:aws:s3:::hl-mainnet-node-data/*`, plus the same for `hyperliquid-archive` if
+   you want order book snapshots.
+3. **A billing alarm at $10.** Set this before the first byte moves. Requester-pays means
+   every GB is on your card.
+4. Those keys in `.env` as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+
+**Estimate before pulling.** The `hyperliquid-data` package on PyPI has a cost command:
+
+```bash
+uvx --from hyperliquid-data hl-data cost --start 2026-02-01 --end 2026-08-01
+```
+
+Sanity check on the numbers: fills run 0.8 to 1.0 GiB a day compressed for the whole
+market, and S3 egress is about $0.09 a GB. So roughly $0.08 a day, $16 for 6 months, $33
+for 12. The roadmap's $15 target fits 6 months, not 12.
+
+**You cannot filter by coin server-side.** The files are laid out by block, not by symbol,
+so you pay for every coin's bytes and throw away what you do not want after the download.
+Filtering to the universe happens locally.
+
+**Disk.** Budget 200 GB free for a 6 month pull, 400 GB for 12, before the raw files are
+turned into the smaller Parquet tables and deleted.
+
+**Pull in order, newest first.** If the money or the disk runs out, you still have the
+most recent and most relevant months.
+
+### Check Hydromancer first
+
+Hydromancer's Reservoir S3 bucket carries Hyperliquid perps from August 2025 with fills,
+liquidations and auto-deleveraging already separated out. The vendor says free forever,
+egress only. If their liquidation table is correct, it is a much smaller download than
+parsing every fill yourself, and it happens to cover exactly the 12 month window you want.
+
+Verify it before relying on it: pull one day from both sources and confirm the liquidation
+count and total notional match. If they do, use Hydromancer and save most of the $33.
+
+### Candles and order book
+
+1 minute candles come from the public API for free, 5000 candles per call, no AWS
+involved. Good for the slower context features and for sanity-checking prices.
+
+Order book snapshots live in `s3://hyperliquid-archive` as one compressed file per coin
+per hour, going back to 2023. Do not pull the whole market. Pick the handful of coins the
+backtest actually trades and pull hourly snapshots. The backtester needs the book to
+model what a taker order would really have paid.
+
+### Counting a liquidation once
+
+Fills arrive in maker and taker pairs, so the same liquidation shows up twice. Key on
+`(block_time, coin, tid)` and count once. Getting this wrong doubles every liquidation
+number and makes the strategy look far better than it is.
+
+### Order to do it in
+
+1. Set the AWS billing alarm.
+2. Pull one day. Confirm the file layout matches this document.
+3. Compare that day against Hydromancer. Pick the cheaper source.
+4. Pull 6 months, newest first, and check the daily counts for holes.
+5. Pull 1 minute candles for the same window.
+6. Pull hourly order book snapshots for the coins you will actually trade.
+7. Cross-check against the Tardis free 1st-of-month days.
+8. Only then start Phase 3 research.
