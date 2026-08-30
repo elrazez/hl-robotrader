@@ -142,3 +142,19 @@ def test_live_trading_blocked_when_kill_file_exists(
 
 def test_default_environment_is_paper() -> None:
     assert load_settings(environ={}).env == "paper"
+
+
+def test_secret_env_vars_are_never_merged_into_the_config() -> None:
+    """A secret must not end up in the config tree, where `config show` would print it."""
+    merged, _ = resolve(
+        "paper",
+        environ={
+            "LIQFADE_PANEL_PASSWORD_HASH": "$2b$12$deadbeef",
+            "LIQFADE_PANEL_SESSION_SECRET": "super-secret",
+            "LIQFADE_LIVE_TRADING": "1",
+        },
+    )
+    rendered = repr(flatten(merged))
+    assert "deadbeef" not in rendered
+    assert "super-secret" not in rendered
+    assert "live_trading" not in merged

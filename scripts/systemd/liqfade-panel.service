@@ -1,0 +1,37 @@
+[Unit]
+Description=liqfade web panel
+Documentation=file:/srv/liqfade/app/docs/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Binds 127.0.0.1 only. Reached over Tailscale or an SSH tunnel, never exposed.
+ExecStart=/home/liqfade/.local/bin/uv run --frozen --extra panel liqfade panel
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening. The code directory stays read only; only data and logs are writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

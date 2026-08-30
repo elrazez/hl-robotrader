@@ -35,6 +35,7 @@ ENV_NOT_CONFIG = frozenset(
     {
         "LIQFADE_LIVE_TRADING",  # a hard gate checked in Settings.live_trading_enabled
         "LIQFADE_PANEL_PASSWORD_HASH",  # secret, read by liqfade.panel.auth
+        "LIQFADE_PANEL_SESSION_SECRET",  # secret, read by liqfade.panel.auth
         "LIQFADE_CONFIG_DIR",  # points at this loader's own search path
     }
 )

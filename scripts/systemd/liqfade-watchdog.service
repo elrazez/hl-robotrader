@@ -1,0 +1,38 @@
+[Unit]
+Description=liqfade watchdog: cancels everything if the trading loop stops breathing
+Documentation=file:/srv/liqfade/app/docs/STRATEGY_AND_RISK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Deliberately independent of liqfade-live.service: a watchdog that dies with the process
+# it watches is not a watchdog. Built in Phase 5.
+ExecStart=/home/liqfade/.local/bin/uv run --frozen python -m liqfade.execution.watchdog
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening. The code directory stays read only; only data and logs are writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

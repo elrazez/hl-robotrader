@@ -1,0 +1,40 @@
+[Unit]
+Description=liqfade trading loop
+Documentation=file:/srv/liqfade/app/CLAUDE.md
+After=network-online.target chrony.service liqfade-recorder.service
+Wants=network-online.target
+Requires=liqfade-recorder.service
+
+[Service]
+Type=simple
+# The kill switch wins over systemd too: the unit refuses to start while the flag exists,
+# so a restart loop cannot walk past a kill the owner triggered.
+ExecStartPre=/usr/bin/test ! -e /srv/liqfade/data/KILL
+ExecStart=/home/liqfade/.local/bin/uv run --frozen liqfade live
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening. The code directory stays read only; only data and logs are writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

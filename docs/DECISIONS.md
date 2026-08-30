@@ -21,3 +21,61 @@ Append-only. One entry per decision that a future reader would otherwise questio
 **Sizing driven by equity fraction and liquidity caps, leverage as an output.** Owner instruction: capital scales and leverage does not matter, volume and size do.
 
 **Backtest latency default 1.0s.** Independent Tokyo measurement in March 2026 showed about 0.9s median order-to-fill despite official 0.2s docs. Reverse when live measurements say otherwise.
+
+## 2026-08-30 (Phase 0 scaffold)
+
+**argparse over typer or click for the CLI.** The whole surface is ten subcommands with a
+handful of flags. argparse is in the standard library, so the trading process carries one
+fewer dependency and one fewer thing to audit. Reverse if the CLI grows nested command
+groups or needs shell completion badly enough to pay for a dependency.
+
+**Hand-rolled config layering over pydantic-settings.** `liqfade config show` and the
+panel settings page both have to tell the owner where a value came from (default file,
+environment file, overrides.yaml, env var). pydantic-settings resolves its sources
+internally and does not expose that provenance. So the loader deep-merges the layers
+itself, recording the source of every leaf, and hands one dict to a plain pydantic model.
+Reverse if pydantic-settings ever exposes per-field source information.
+
+**Config YAML at the repo root, models in the package.** `config/default.yaml` sits beside
+`data/` and `reports/`, matching how CLAUDE.md refers to `config/overrides.yaml` and
+`config/mainnet.yaml` as root-relative paths, and keeping the file the panel writes out of
+the installed package. The pydantic models live in `liqfade/config/`.
+
+**Newline-delimited JSON framing on the control socket.** Messages are a command name and
+a few arguments, so framing efficiency is irrelevant, and `nc -U /srv/liqfade/data/
+control.sock` stays usable when the loop is misbehaving. Length-prefixed framing would buy
+nothing here. Reverse if the control plane ever carries bulk data such as full order books.
+
+**No authentication on the control socket.** Access control is the file: mode 0600, owned
+by the service user. Anything that can open it already runs as the user that holds the
+agent key, so a token on the wire would protect nothing. Reverse if a lower privileged
+process ever needs read-only access.
+
+**bcrypt for the panel password, not argon2.** Named in CLAUDE.md, one small wheel with no
+build step on the VPS, and the real boundary is the network: the panel binds loopback and
+is reached over Tailscale or an SSH tunnel. Against a single high-entropy password behind a
+private network, argon2's better memory hardness does not change the outcome. Reverse if
+the panel is ever exposed more widely, which it should not be.
+
+**Panel sessions signed with itsdangerous, secret generated per process by default.** A
+restart invalidating sessions is the safe default; `LIQFADE_PANEL_SESSION_SECRET` opts into
+persistence. Reverse never for v0.
+
+**/api/state reads data/state.json, never the control socket.** A slow HTTP client must not
+be able to make the trading loop wait. A snapshot older than `panel.state_stale_s` returns
+503 rather than a warning field, because every number on that page is a trading number and
+quietly showing stale positions is worse than an obvious outage.
+
+**Python pinned to 3.12 via .python-version.** pyarrow ships no 3.14 wheels yet and uv
+otherwise tries to build it from source. Reverse once pyarrow publishes 3.14 wheels.
+
+**Integration tests deselected, not skipped.** `-m "not integration"` in addopts, so a
+clean `make test` reports zero skipped tests, which is the Phase 0 definition of done.
+
+**deploy.sh restarts only services whose unit file changed.** Restarting the trading loop
+because the panel's unit was edited is a surprise nobody wants at 3am. Code-only changes
+need an explicit `systemctl restart`, which the script prints.
+
+**Tailscale installed but not brought up by the bootstrap.** `tailscale up` needs an
+interactive auth URL, and a bootstrap script should not decide to open a tunnel unattended.
+The script prints the command.

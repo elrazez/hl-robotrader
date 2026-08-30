@@ -1,0 +1,36 @@
+[Unit]
+Description=liqfade market data recorder
+Documentation=file:/srv/liqfade/app/docs/DATA_SOURCES.md
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/liqfade/.local/bin/uv run --frozen liqfade record
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening. The code directory stays read only; only data and logs are writable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
