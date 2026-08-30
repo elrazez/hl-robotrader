@@ -3,8 +3,10 @@
 Owner notes: this is the phase that spends money. Before running it you need an AWS
 account, an IAM user with read access to the two Hyperliquid buckets (CLAUDE.md section
 7 item 7), a billing alarm at $10, and the keys in `.env`. Budget: about $16 for 6
-months of fills, $33 for 12. Also 200 to 400 GB of free disk during the pull. Read
-"Getting 6 to 12 months of history" in `docs/DATA_SOURCES.md` first.
+months of fills, $33 for 12. Also 250 to 500 GB of free disk during the pull. Read
+"Getting 6 to 12 months of history" in `docs/DATA_SOURCES.md` first. Standing policy:
+we pay for this download exactly once, so nothing in it gets thrown away; see the
+pay-once rules inside.
 
 ---
 
@@ -54,14 +56,39 @@ them separately first, and note that Phase 1 must reuse them.
   record the correction in `docs/DATA_SOURCES.md`.
 - The same fills also populate the `trades` table (deduped by tid, aggressor side from
   `crossed` and `side`), so one pull fills two tables.
+- **Pay-once rule, the most important decision in this phase.** The S3 bytes are billed
+  once and must never need re-buying. Therefore:
+  - A third output table `fills_full` preserves EVERY field of every fill record for
+    EVERY coin, no universe filtering: coin, px, sz, side, time, user_address,
+    startPosition, dir, closedPnl, hash, oid, crossed, fee, feeToken, tid, cloid,
+    builder, builderFee, twapId, and the liquidation object flattened to
+    liq_user, liq_mark_px, liq_method (nulls when absent), plus block_time,
+    block_number, local_time from the envelope. Partitioned like the other tables,
+    zstd, schema added to `data/schemas.py`. This is the archive: whale tracking,
+    position-size studies, ADL analysis, anything creative later, all come from here
+    without touching S3 again.
+  - The canonical `liquidations` and `trades` tables become DERIVED views of
+    `fills_full`: a job `liqfade backfill rederive --start --end` rebuilds them from
+    the local archive at zero cost. If a parsing rule turns out wrong (the side rule,
+    the dedup), fix it and rederive; never re-download.
+  - Raw lz4 files are still deleted after parsing (default): `fills_full` is lossless
+    relative to them, and queryable. `--keep-raw` remains for paranoia.
+  - Disk: `fills_full` for the whole market runs roughly the same as the compressed
+    raw, budget 1 GB per day of history.
 - `hl_archive_l2.py`: `s3://hyperliquid-archive/market_data/{YYYYMMDD}/{H}/l2Book/
   {COIN}.lz4`, only for coins passed via `--coins` (no default; requiring an explicit
   list prevents an accidental whole-market pull), top 20 levels into the `l2` table.
 - `hl_candles.py`: public `candleSnapshot`, interval `1m`, paginated 5000 per call,
   walking backwards until the API returns nothing older. Sleep 250ms between calls to
-  stay far inside the rate weight. No AWS involved. Free.
+  stay far inside the rate weight. No AWS involved. Free. Default coin set: EVERY live
+  perp from `metaAndAssetCtxs`, not just the universe (it is free; the whole market is
+  a few hours of polite polling and feeds the zone and regime features later).
+  `--coins` restricts it when the owner wants a quick partial run.
 - `tardis_free.py`: day-01 CSVs for `binance-futures`, `bybit`, `okex-swap`,
-  `hyperliquid`; data types `liquidations` and `trades`; map to canonical schemas via
+  `hyperliquid`; data types `liquidations`, `trades`, `book_snapshot_5` and
+  `derivative_ticker` (all four are free; book snapshots and tickers land in
+  venue-prefixed side tables with their native columns preserved, not forced into the
+  canonical book schema); liquidations and trades map to canonical schemas via
   `symbols.py`; `rx_ms=0`, `complete` per venue as in the recorder. Skip months where
   the URL 404s (the file legitimately may not exist) and report which.
 - `hydromancer.py`: verification job, not a default source. `--check-day YYYY-MM-DD`
@@ -82,8 +109,9 @@ them separately first, and note that Phase 1 must reuse them.
 ## Deliverables
 
 1. `liqfade/data/ingest/` with `common.py` (manifest, S3 client factory, estimate
-   logic, disk guard), `hl_s3.py`, `hl_archive_l2.py`, `hl_candles.py`,
-   `tardis_free.py`, `hydromancer.py`.
+   logic, disk guard), `hl_s3.py` (including the `rederive` job), `hl_archive_l2.py`,
+   `hl_candles.py`, `tardis_free.py`, `hydromancer.py`. `data/schemas.py` gains the
+   `fills_full` schema.
 2. `liqfade backfill` CLI wired as above; the old placeholder removed.
 3. `scripts/research/data_quality.py`.
 4. Tests, all offline, no boto3 network calls (inject a fake client): estimate math
@@ -92,7 +120,9 @@ them separately first, and note that Phase 1 must reuse them.
    liquidation dedup counts a maker+taker pair once; the side rule; trades dedup;
    candle pagination walks backwards and stops; Tardis CSV mapping for each of the
    four exchanges from embedded sample rows; disk guard stops the loop; l2 file path
-   construction.
+   construction; `fills_full` preserves every input field byte-for-byte on the fixture
+   (round-trip test: parse, write, read, compare); `rederive` from a `fills_full`
+   fixture reproduces the canonical tables exactly.
 5. `.env.example` already lists the AWS variables; verify, do not duplicate.
 6. Append to `docs/DECISIONS.md`: boto3 and lz4 added and why; the liquidation side
    rule and how it was verified.

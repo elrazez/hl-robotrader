@@ -174,6 +174,17 @@ turned into the smaller Parquet tables and deleted.
 **Pull in order, newest first.** If the money or the disk runs out, you still have the
 most recent and most relevant months.
 
+### Pay once, keep everything
+
+Standing policy, decided 2026-08-30: the S3 download is bought exactly once. The
+ingestion jobs therefore write a lossless `fills_full` table preserving every field of
+every fill for every coin (user addresses, position sizes, closed PnL, fees, builder
+and TWAP tags, the full liquidation object), with no universe filtering. The canonical
+`liquidations` and `trades` tables are derived from it locally and can be rebuilt at
+any time with `liqfade backfill rederive` at zero cost. This is what makes later ideas
+(whale tracking, liquidation-cluster levels, ADL studies, anything not thought of yet)
+free instead of a second egress bill. Budget roughly 1 GB per day of history for it.
+
 ### Check Hydromancer first
 
 Hydromancer's Reservoir S3 bucket carries Hyperliquid perps from August 2025 with fills,

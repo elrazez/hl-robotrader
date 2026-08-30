@@ -22,7 +22,9 @@ skippable, including for "obviously good" ideas.
    ideas should die here.
 2. **Config-flagged implementation.** The change lands behind a config value that
    defaults to the CURRENT behavior. New params go in models.py + default.yaml with
-   unit and rationale comments like every other.
+   unit and rationale comments like every other. New entry conditions land as
+   `ConfluenceRule` classes in `strategy/rules.py` (one class, one config section,
+   one test), not as edits to the engine.
 3. **Backtest.** Full-history run plus holdout plus the lagged rerun, config hash
    recorded, `reports/.n_trials` increments (deflated Sharpe stays honest about how
    many things have been tried). The change must improve net metrics on the holdout,
@@ -51,6 +53,9 @@ Each entry is a candidate research question, not a promise. Pick ONE per iterati
    is draining improve the net tail? (Extends Q6.)
 3. Book-imbalance exhaustion timing: does adding depth imbalance to the exhaustion
    conditions improve entry price versus the current definition?
+3b. Zone library extensions (only if Q7 was a yes): volume-profile nodes, liquidation
+   cluster levels from `fills_full` (where past cascades died is itself a level),
+   higher-timeframe zones. Each as its own ConfluenceRule through the full ladder.
 4. Coin-tier parameter sets: do minor-tier coins want different k_target/k_stop, or
    should they be dropped entirely?
 5. Trailing exits: replace the fixed target with a trail after 50% reversion is

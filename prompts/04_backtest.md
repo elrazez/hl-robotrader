@@ -34,6 +34,25 @@ in `strategy/` or `features/`, stop and put it in `live/`'s future scope instead
   value that crossed a threshold.
 - `filters.py`: the skip conditions from spec section 3, each returning a reason
   string; the engine logs which filter killed an intent.
+- `rules.py`: the confluence rule layer, the owner's mechanism for trying different
+  entry conditions without touching engine code. A `ConfluenceRule` protocol:
+  `evaluate(features, cascade: CascadeState) -> RuleVerdict(passed: bool,
+  values: dict[str, float])`. The engine runs every ENABLED rule after cascade and
+  exhaustion fire; all enabled rules must pass or the intent is dropped with the rule
+  name as the reason; every rule's values merge into `explain()` either way. Rules
+  are pure and registered in one dict `RULES: dict[str, type[ConfluenceRule]]`.
+  Config: a `strategy.rules.<name>` section per rule with `enabled: bool` plus its
+  params (models.py + default.yaml as usual). Ship two rules in this phase:
+  - `zone_proximity`: passes when the cascade extreme is within
+    `zone_width_bps` of a pre-existing level from `features/levels.py`
+    (enable it by default ONLY if Q7's DECISION was yes; otherwise ship disabled).
+  - `min_cascade_notional`: passes when episode notional exceeds a config floor.
+    Trivial on purpose: it proves the mechanism with something easy to reason about.
+  With every rule disabled the engine is bit-identical to the bare spec behavior;
+  the golden test runs in that configuration. The backtest report gets a per-rule
+  table: evaluated / passed / intents killed, so the owner sees what each rule cost
+  and saved. New rule ideas later mean: write one class, one config section, one
+  test, rerun; no engine changes.
 - `mypy` strict already covers strategy/, sizing/, risk/, execution/.
 
 **sizing/**
@@ -135,6 +154,10 @@ in `strategy/` or `features/`, stop and put it in `live/`'s future scope instead
      fixture, assert intents up to T are identical.
    - consistency: the online cascade detector vs `features/episodes.py` on the same
      synthetic stream: same episode count, start/end within one decision tick.
+   - rules: a rule that fails kills the intent and names itself; rule values appear
+     in explain(); all-rules-disabled equals the golden baseline byte-for-byte;
+     zone_proximity passes and fails correctly against a constructed level set;
+     an unknown rule name in config fails validation loudly.
    - sizing: one test per binding cap.
    - risk: one test per gate, plus persistence across a simulated restart.
    - rounding property test as above.
@@ -149,7 +172,7 @@ in `strategy/` or `features/`, stop and put it in `live/`'s future scope instead
 ## How to work
 
 - Print a short plan and wait for OK.
-- Commit order: rounding; strategy types+cascade+filters+engine; sizing; risk;
+- Commit order: rounding; strategy types+cascade+filters+rules+engine; sizing; risk;
   backtest data+clock; fills+costs+portfolio; engine+metrics+report; validate+CLI;
   panel v2; golden test last. `make lint test` green before each.
 - Floats in features/backtest, Decimal only inside rounding.py outputs. Time is int

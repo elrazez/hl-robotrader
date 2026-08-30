@@ -1,7 +1,8 @@
 # Prompt 03: Phase 3 research, the go/no-go gate
 
-Owner notes: this phase decides whether the project continues. Its deliverable is six
-written yes/no/inconclusive decisions with sample sizes, not code that trades. Needs the
+Owner notes: this phase decides whether the project continues. Its deliverable is seven
+written yes/no/inconclusive decisions with sample sizes (the spec's six plus the
+supply/demand zone question), not code that trades. Needs the
 Phase 2 data on disk. Question 4 also wants a few weeks of recorder data; if the
 recorder has not run that long, Q4 is answered "inconclusive" and that is fine. Expect
 to run the scripts yourself and read the reports; the agent builds them.
@@ -44,8 +45,28 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
   rv_5m, cvd_w and slope, disp_w vs the 5 minute pre-window VWAP anchor), `book.py`
   (spread_bps, depth within 10bps per side, book_imbalance; returns NaN columns when
   no l2 data exists for the window and callers must handle NaN), `context.py`
-  (oi_delta_w, funding, premium, btc_ret_5m, btc_liq_z_60s, session hour bucket).
+  (oi_delta_w, funding, premium, btc_ret_5m, btc_liq_z_60s, session hour bucket),
+  `levels.py` (supply/demand zones, below).
   Every docstring states window, units, inputs, and NaN behavior.
+- `levels.py`, the zone feature set. Built from 1m candles, per coin, and usable at
+  any decision time with only completed bars (a bar at time t is usable from its
+  close, never mid-bar; the no-lookahead property test applies here too):
+  - swing highs and lows: fractal points where a bar's high (low) exceeds the N bars
+    on each side, N from config (`features.levels.fractal_n`, default 12).
+  - untested levels: a swing level is "fresh" until price trades through it; track
+    freshness and touch count.
+  - range edges: rolling highest high and lowest low over `features.levels.range_d`
+    days (default 5), plus prior UTC day and prior week high/low.
+  - derived features at decision time: `dist_to_support_bps`, `dist_to_resistance_bps`
+    (nearest level on each side, NaN when none within
+    `features.levels.max_dist_bps`, default 200), the same distances normalized by
+    rv_5m, the nearest level's freshness and touch count, and
+    `extreme_in_zone` (bool: is the current cascade extreme within
+    `features.levels.zone_width_bps`, default 15, of a level).
+  Config keys go into models.py and default.yaml with unit and rationale comments
+  like everything else. Keep the detector dumb and transparent: fractals and rolling
+  extremes only. No ML, no volume profile in this phase; those are Phase 7
+  candidates if Q7 says zones matter at all.
 - Episode (cascade) detection for research lives in `liqfade/features/episodes.py`,
   NOT in strategy/. Definition: per coin per side, take exact liquidation events
   (from S3 data), join consecutive events with gaps under 60s into an episode, keep
@@ -57,7 +78,7 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
 - Coin tiers for bucketing: tier by 30 day median daily notional volume: core =
   universe.core_coins, major = top 20 excluding core, minor = rest.
 - Each research question is a script `scripts/research/q1_reversion.py` ...
-  `q6_filters.py`, runnable as `uv run python scripts/research/qN_*.py --start ...
+  `q7_zones.py`, runnable as `uv run python scripts/research/qN_*.py --start ...
   --end ...`, reading only the Parquet lake, writing
   `reports/research/qN_<slug>.md` plus PNGs beside it. Scripts are the canonical
   deliverable; notebooks are optional scratch and never required.
@@ -90,7 +111,17 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
     cascading, funding extreme, listing age, session bucket), split Q1's episode
     outcomes by filter pass/fail. DECISION per filter: keep if it removes at least
     2x more loss-tail (worst decile) episodes than it removes sample overall.
-- Final deliverable `reports/research/SUMMARY.md`: one table, six rows, DECISION and
+  - **Q7 zone confluence** (owner addition, `scripts/research/q7_zones.py`): split
+    Q1's episodes by whether the cascade extreme landed in a pre-existing
+    supply/demand zone (`extreme_in_zone` from `levels.py`, using only levels that
+    existed before the cascade started). Compare net reversion, hit rate and the
+    loss tail for in-zone vs out-of-zone episodes, by tier, at zone widths 10, 15
+    and 25 bps. Also test the reverse use: does distance-to-zone at cascade start
+    predict how far the cascade extends (a stop-placement input)? DECISION yes if
+    in-zone episodes beat out-of-zone net reversion with the 95% CI separated on at
+    least 100 in-zone episodes. A yes wires the zone rule into Phase 4 as an
+    optional confluence gate; a no leaves it built but off.
+- Final deliverable `reports/research/SUMMARY.md`: one table, seven rows, DECISION and
   key number each, plus a paragraph saying whether Phase 4 should proceed and with
   which parameter values. If the answer is stop, say stop.
 - Parameter writeback: where results support different defaults than
@@ -107,7 +138,7 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
 2. `liqfade/features/episodes.py` plus tests on synthetic liquidation streams
    (constructed episodes with known answers: gap joining, notional threshold, extreme
    tracking).
-3. `scripts/research/_lib.py` and the six question scripts.
+3. `scripts/research/_lib.py` and the seven question scripts.
 4. Fixture-based smoke test: each script runs end-to-end against
    `tests/fixtures/parquet/` (tiny synthetic lake committed in this phase if the
    Phase 1 fixture lacks liquidations: build one through `data/schemas.py` with ~50
@@ -119,9 +150,9 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
 ## How to work
 
 - Print a short plan and wait for OK.
-- Commit order: grid+flow+book+context; intensity+zscore+proxy; episodes; _lib +
-  q1+q3 (the two that gate everything); q2+q5+q6; q4; summary template + config
-  writeback placeholder. `make lint test` green before each.
+- Commit order: grid+flow+book+context; levels; intensity+zscore+proxy; episodes;
+  _lib + q1+q3 (the two that gate everything); q2+q5+q6+q7; q4; summary template +
+  config writeback placeholder. `make lint test` green before each.
 - Performance: everything vectorized with polars/numpy on the 1s grid. A year of one
   coin's features must compute in under a minute; if a function needs a Python loop
   over rows, redesign it.
@@ -132,8 +163,8 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
 
 ## Definition of done
 
-`make lint test` green, zero skips, features in the mypy strict list. All six scripts
-run against the fixture lake and produce reports. Owner-run acceptance: the six real
+`make lint test` green, zero skips, features in the mypy strict list. All seven scripts
+run against the fixture lake and produce reports. Owner-run acceptance: the seven real
 reports plus SUMMARY.md exist with real DECISIONs; `reports/proxy_calibration.md`
 exists; config writebacks match the evidence. The phase's real exit condition is a
 human one: the owner reads SUMMARY.md and decides continue or stop.
