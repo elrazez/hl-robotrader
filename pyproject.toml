@@ -71,11 +71,16 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "N806"]
+# Tests may block in async bodies (ASYNC240): they drive the code under test rather
+# than sharing an event loop with the trading loop.
+"tests/**" = ["S", "N806", "ASYNC240"]
 "scripts/probe/**" = ["S", "T201"]
 
 [tool.mypy]
 python_version = "3.12"
+# Without this plugin mypy cannot see that Field(...) supplies a default, and every
+# optional model field looks like a required constructor argument.
+plugins = ["pydantic.mypy"]
 files = ["liqfade"]
 ignore_missing_imports = true
 
