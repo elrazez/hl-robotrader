@@ -55,7 +55,8 @@ def _free_path(directory: Path, venue: str, hour: int) -> Path:
     raise RuntimeError(f"more than 10000 files for {base}")  # pragma: no cover
 
 
-def _write_atomic(table: pa.Table, path: Path) -> None:
+def write_atomic(table: pa.Table, path: Path) -> None:
+    """Write one Parquet file so a reader sees all of it or none of it."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         pq.write_table(table, tmp, compression=COMPRESSION)
@@ -86,7 +87,7 @@ def write_rows(
     directory = partition_dir(root, table_name, date)
     directory.mkdir(parents=True, exist_ok=True)
     path = _free_path(directory, venue, hour)
-    _write_atomic(arrow, path)
+    write_atomic(arrow, path)
     log.info(
         "parquet_written",
         table=table_name,
@@ -135,7 +136,7 @@ def compact_day(root: Path, date: str) -> dict[str, int]:
                 f"compaction row mismatch for {directory}: {arrow.num_rows} != {expected}"
             )
 
-        _write_atomic(arrow, output)
+        write_atomic(arrow, output)
         after = pq.read_metadata(output).num_rows
         if after != expected:  # pragma: no cover - a torn write would have raised first
             raise RuntimeError(f"compacted {output} has {after} rows, expected {expected}")

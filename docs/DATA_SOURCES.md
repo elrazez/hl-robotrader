@@ -91,6 +91,7 @@ All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for his
 - `asset_ctx`: `coin, ts_ms, rx_ms, source, mark_px, oracle_px, mid_px, funding, open_interest, day_ntl_vlm, premium`
 - `candles_1m`: `coin, ts_ms, source, o, h, l, c, v, n`
 - `xchg_ctx` (Coinalyze): `venue, coin, ts_ms, rx_ms, source, open_interest, funding, predicted_funding`
+- `fills_full` (the pay-once archive, `hl_s3` only): `coin, ts_ms, rx_ms, source, block_time, block_number, local_time, user_address, px, sz, side (B|A raw), start_position, dir, closed_pnl, hash, oid, crossed, fee, fee_token, tid, cloid, builder, builder_fee, twap_id, liq_user, liq_mark_px, liq_method`. Every field of every Hyperliquid fill for every coin, no universe filter. `liquidations` and `trades` for `source = hl_s3` are derived from this table and can be rebuilt with `liqfade backfill rederive` at no cost. See "Pay once, keep everything" below.
 
 Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day. A buffer that fills before the hour is out writes `{venue}_{hour}_{n}.parquet` alongside it rather than rewriting the hour file; readers glob the partition and compaction folds the day into one file, so nothing downstream needs to know.
 

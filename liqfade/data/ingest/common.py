@@ -282,3 +282,42 @@ def write_partitioned(
         write_rows(root, key, group, source=source)
         written += len(group)
     return written
+
+
+def replace_source_rows(
+    root: Path, table: str, day: str, venue: str, source: str, rows: list[dict[str, Any]]
+) -> int:
+    """Rewrite one day's partition so `source`'s rows are exactly `rows`.
+
+    This is what makes a rederive idempotent. Compaction folds a day into one file per
+    table, so recorded rows and backfilled rows share a file and the old rows cannot be
+    dropped by deleting a file: they are read back, filtered by `source`, and written
+    alongside the new ones.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from liqfade.recorder.writer import partition_dir, write_atomic
+
+    directory = partition_dir(root, table, day)
+    existing = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
+
+    kept = []
+    for path in existing:
+        arrow = pq.read_table(path, partitioning=None)
+        others = arrow.filter(pc.not_equal(arrow.column("source"), source))
+        if others.num_rows:
+            kept.append(others)
+
+    # Everything is read before anything is deleted, so a failure above leaves the
+    # partition untouched rather than half rewritten.
+    for path in existing:
+        path.unlink()
+
+    written = write_partitioned(root, table, venue, source, rows)
+    if kept:
+        merged = pa.concat_tables(kept).sort_by([("ts_ms", "ascending")])
+        directory.mkdir(parents=True, exist_ok=True)
+        write_atomic(merged, directory / "kept_00.parquet")
+    return written

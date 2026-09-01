@@ -34,7 +34,41 @@ def test_every_table_documented_in_data_sources_exists() -> None:
         "asset_ctx",
         "candles_1m",
         "xchg_ctx",
+        "fills_full",
     }
+
+
+def test_fills_full_keeps_every_field_of_a_hyperliquid_fill() -> None:
+    """The pay-once archive. A column dropped here is an S3 bill to get it back."""
+    assert SCHEMAS["fills_full"].names == [
+        "coin",
+        "ts_ms",
+        "rx_ms",
+        "source",
+        "block_time",
+        "block_number",
+        "local_time",
+        "user_address",
+        "px",
+        "sz",
+        "side",
+        "start_position",
+        "dir",
+        "closed_pnl",
+        "hash",
+        "oid",
+        "crossed",
+        "fee",
+        "fee_token",
+        "tid",
+        "cloid",
+        "builder",
+        "builder_fee",
+        "twap_id",
+        "liq_user",
+        "liq_mark_px",
+        "liq_method",
+    ]
 
 
 def test_column_order_matches_the_schema_doc() -> None:

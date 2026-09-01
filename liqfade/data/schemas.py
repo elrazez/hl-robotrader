@@ -139,6 +139,47 @@ CANDLES_1M = pa.schema(
     ]
 )
 
+# The pay-once archive. Every field of every fill for every coin, no universe filter, so
+# a parsing rule that turns out wrong is fixed by rederiving locally rather than by
+# buying the S3 bytes a second time. Source field names are Hyperliquid's camelCase
+# (`startPosition`, `closedPnl`, `feeToken`, `builderFee`, `twapId`); they are spelled
+# snake_case here to match the rest of the lake. `ts_ms` is the fill's own `time`.
+#
+# px, sz and the other decimals arrive as strings and are stored as float64. Hyperliquid
+# prices carry at most 5 significant figures and sizes are bounded by szDecimals, so
+# float64 holds every value it emits exactly.
+FILLS_FULL = pa.schema(
+    [
+        ("coin", STR),
+        ("ts_ms", I64),  # the fill's `time`
+        ("rx_ms", I64),  # always 0: a historical pull has no local receive time
+        ("source", STR),
+        ("block_time", I64),
+        ("block_number", I64),
+        ("local_time", I64),  # when the node saw the block, not when we did
+        ("user_address", STR),
+        ("px", F64),
+        ("sz", F64),
+        ("side", STR),  # B | A as Hyperliquid sends it, this user's side of the fill
+        ("start_position", F64),
+        ("dir", STR),  # human readable action, e.g. "Close Long"
+        ("closed_pnl", F64),
+        ("hash", STR),
+        ("oid", I64),
+        ("crossed", pa.bool_()),  # true when this user was the taker
+        ("fee", F64),
+        ("fee_token", STR),
+        ("tid", I64),
+        ("cloid", STR),
+        ("builder", STR),
+        ("builder_fee", F64),
+        ("twap_id", I64),
+        ("liq_user", STR),  # the three liq_ columns are null on a normal fill
+        ("liq_mark_px", F64),
+        ("liq_method", STR),  # market | backstop
+    ]
+)
+
 XCHG_CTX = pa.schema(
     [
         ("venue", STR),
@@ -160,6 +201,7 @@ SCHEMAS: dict[str, pa.Schema] = {
     "asset_ctx": ASSET_CTX,
     "candles_1m": CANDLES_1M,
     "xchg_ctx": XCHG_CTX,
+    "fills_full": FILLS_FULL,
 }
 
 # Tables written by more than one venue. Used by compaction to decide whether a day
