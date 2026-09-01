@@ -18,6 +18,10 @@ dependencies = [
     "httpx>=0.28,<1",
     "aiosqlite>=0.21,<1",
     "pyyaml>=6.0,<7",
+    # Phase 2 historical ingestion only. boto3 is the only client that speaks
+    # requester-pays S3; lz4 reads the archive frames.
+    "boto3>=1.35,<2",
+    "lz4>=4.3,<5",
 ]
 
 [project.optional-dependencies]
@@ -72,8 +76,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # Tests may block in async bodies (ASYNC240): they drive the code under test rather
-# than sharing an event loop with the trading loop.
-"tests/**" = ["S", "N806", "ASYNC240"]
+# than sharing an event loop with the trading loop. N803: the fake S3 client has to
+# mirror boto3's PascalCase keyword arguments or it is not a stand-in for one.
+"tests/**" = ["S", "N803", "N806", "ASYNC240"]
 "scripts/probe/**" = ["S", "T201"]
 
 [tool.mypy]
