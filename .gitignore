@@ -4,9 +4,9 @@
 !.env.example
 
 # Data lake and run artifacts
-data/
-reports/
-logs/
+/data/
+/reports/
+/logs/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
