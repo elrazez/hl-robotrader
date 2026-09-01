@@ -80,7 +80,8 @@ def _snapshot(obj: Any) -> dict[str, Any] | None:
 def _level(levels: Any, index: int) -> dict[str, Any]:
     if not isinstance(levels, list) or index >= len(levels) or not isinstance(levels[index], dict):
         return {}
-    return levels[index]
+    level: dict[str, Any] = levels[index]
+    return level
 
 
 def _f(value: Any) -> float | None:
