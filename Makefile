@@ -1,5 +1,5 @@
 # All targets go through `uv run` so they behave identically on the laptop and the VPS.
-.PHONY: setup lint test test-int record backfill backtest paper panel status sync clean frontend
+.PHONY: setup lint test test-int record backfill data-quality backtest paper panel status sync clean frontend
 
 CFG ?= config/backtest/v0.yaml
 
@@ -22,8 +22,13 @@ test-int:
 record:
 	uv run liqfade record
 
+# Jobs: s3-fills rederive l2 candles tardis hydromancer-check. JOB and the dates are
+# required; every S3 job estimates the egress and refuses over $5 without --yes.
 backfill:
-	uv run liqfade backfill
+	uv run liqfade backfill $(JOB) --start $(START) --end $(END)
+
+data-quality:
+	uv run python scripts/research/data_quality.py
 
 backtest:
 	uv run liqfade backtest --config $(CFG)

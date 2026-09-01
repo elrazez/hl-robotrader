@@ -47,6 +47,15 @@ L2_LEVELS = 20  # what the recorder records, so both sources are the same shape
 HOURS = range(24)
 
 
+def check_coins(coins: list[str]) -> None:
+    """Raise unless the caller named the coins. Called before an S3 client is built."""
+    if not coins:
+        raise BackfillError(
+            "--coins is required for the l2 job: the archive holds every coin and a "
+            "whole-market hourly pull is expensive. Name the coins the backtest trades."
+        )
+
+
 def hour_prefix(day: date, hour: int) -> str:
     return f"market_data/{day:%Y%m%d}/{hour}/l2Book/"
 
@@ -134,12 +143,7 @@ def run(
     keep_raw: bool = False,
 ) -> int:
     """Pull hourly L2 snapshots for `coins` over [start, end], newest day first."""
-    if not coins:
-        raise BackfillError(
-            "--coins is required for the l2 job: the archive holds every coin and a "
-            "whole-market hourly pull is expensive. Name the coins the backtest trades."
-        )
-
+    check_coins(coins)
     root = Path(data_dir) / "parquet"
     manifest = Manifest.load(data_dir, JOB)
     wanted = set(coins)

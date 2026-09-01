@@ -24,7 +24,6 @@ from liqfade.config.models import Settings
 
 # Subcommands that later phases fill in. Value is the phase number in docs/ROADMAP.md.
 NOT_YET: dict[str, int] = {
-    "backfill": 2,
     "backtest": 4,
     "paper": 5,
     "testnet": 5,
@@ -108,6 +107,95 @@ def cmd_record(args: argparse.Namespace) -> int:
     recorder = Recorder(settings, minutes=args.minutes)
     run_main(lambda: recorder.run(shutdown_event()))
     return 0
+
+
+# --- backfill -----------------------------------------------------------------
+
+BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "candles", "tardis", "hydromancer-check")
+
+
+def _dates(args: argparse.Namespace) -> tuple[Any, Any]:
+    """--start and --end as dates. Both are required for every job but the check."""
+    from liqfade.data.ingest.common import BackfillError, parse_day
+
+    if not args.start or not args.end:
+        raise BackfillError(f"{args.job} needs --start and --end (YYYY-MM-DD, inclusive, UTC)")
+    return parse_day(args.start), parse_day(args.end)
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Historical ingestion. Every S3 job estimates before it spends. See docs/DATA_SOURCES.md."""
+    import httpx
+
+    from liqfade.data.ingest import hl_archive_l2, hl_candles, hl_s3, hydromancer, tardis_free
+    from liqfade.data.ingest.common import BackfillError, s3_client
+    from liqfade.log import setup_logging
+
+    settings = _settings(args)
+    setup_logging(proc="backfill", env=settings.env, level=settings.logging.level)
+    data_dir = settings.paths.data_dir
+    coins = [coin.strip().upper() for coin in args.coins.split(",") if coin.strip()]
+
+    try:
+        if args.job == "hydromancer-check":
+            if not args.check_day:
+                raise BackfillError("hydromancer-check needs --check-day YYYY-MM-DD")
+            from liqfade.data.ingest.common import parse_day
+
+            return hydromancer.run(data_dir, settings.paths.reports_dir, parse_day(args.check_day))
+
+        start, end = _dates(args)
+
+        if args.job == "s3-fills":
+            return hl_s3.run(
+                s3_client(),
+                data_dir,
+                start,
+                end,
+                estimate_only=args.estimate_only,
+                yes=args.yes,
+                keep_raw=args.keep_raw,
+            )
+        if args.job == "rederive":
+            return hl_s3.rederive(data_dir, start, end)
+        if args.job == "l2":
+            # Checked before the S3 client is built, so a missing --coins is a one line
+            # error rather than an AWS configuration error on top of it.
+            hl_archive_l2.check_coins(coins)
+            return hl_archive_l2.run(
+                s3_client(),
+                data_dir,
+                start,
+                end,
+                coins,
+                estimate_only=args.estimate_only,
+                yes=args.yes,
+                keep_raw=args.keep_raw,
+            )
+        if args.job == "candles":
+            with httpx.Client() as client:
+                return hl_candles.run(
+                    client,
+                    data_dir,
+                    settings.venues.hyperliquid.api_url,
+                    start,
+                    end,
+                    coins=coins or None,
+                    estimate_only=args.estimate_only,
+                )
+        # tardis: the free days need a coin list, and the core coins are the sane default.
+        with httpx.Client() as client:
+            return tardis_free.run(
+                client,
+                data_dir,
+                start,
+                end,
+                coins or list(settings.universe.core_coins),
+                estimate_only=args.estimate_only,
+            )
+    except BackfillError as exc:
+        print(f"backfill error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
 
 # --- status -------------------------------------------------------------------
@@ -317,7 +405,27 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--date", default=None, help="YYYY-MM-DD for --compact-only (default: yesterday)"
     )
-    sub.add_parser("backfill", parents=[common], help="pull historical data (Phase 2)")
+    backfill = sub.add_parser(
+        "backfill", parents=[common], help="pull historical data into the lake"
+    )
+    backfill.add_argument("job", choices=BACKFILL_JOBS, help="which source to pull")
+    backfill.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    backfill.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    backfill.add_argument(
+        "--coins",
+        default="",
+        help="comma separated HL coins. Required for l2, defaults to the core coins for "
+        "tardis, and to every live perp for candles",
+    )
+    backfill.add_argument("--check-day", default=None, help="YYYY-MM-DD for hydromancer-check")
+    backfill.add_argument("--estimate-only", action="store_true", help="print the cost and exit 0")
+    backfill.add_argument(
+        "--yes", action="store_true", help="proceed with a pull estimated over $5"
+    )
+    backfill.add_argument(
+        "--keep-raw", action="store_true", help="keep downloads under data/raw after parsing"
+    )
+    backfill.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
     sub.add_parser("paper", parents=[common], help="live feeds, simulated fills (Phase 5)")
     sub.add_parser("testnet", parents=[common], help="live loop against testnet (Phase 5)")
@@ -353,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 HANDLERS = {
     "config": cmd_config,
+    "backfill": cmd_backfill,
     "record": cmd_record,
     "status": cmd_status,
     "sync": cmd_sync,

@@ -124,3 +124,36 @@ exactly the case that matters: `liquidations` and `trades` have four possible pr
 as a required argument rather than read from each row dict, so one file is always one
 job's output and no parser can write a row with no provenance. `rx_ms = 0` keeps its
 separate meaning: no local receive time exists, so no-lookahead checks cannot use it.
+
+**boto3 and lz4 added to the core dependency group.** boto3 is the only maintained client
+that speaks requester-pays S3, and `RequestPayer` is not optional on either Hyperliquid
+bucket; lz4 reads the archive frames, which are LZ4 rather than gzip. Both pinned to a
+major version. boto3 is imported lazily inside `s3_client()`, so the CLI, the recorder and
+every offline test never import it and a machine with no AWS credentials only fails at the
+point it actually tries to spend.
+
+**The liquidation side rule, and how it is checked.** A Hyperliquid liquidation fill
+carries `liquidation.liquidatedUser`. The forced party is the record whose `user_address`
+is that address, and its own `side` says what it was made to do: `A` (sell) means it held
+a long, so `side = "long"`. Reading the counterparty's record instead inverts the answer,
+which is why the rule names the address explicitly. `SideRuleCheck` verifies it on the
+first day pulled by measuring the 60s price move into each liquidation: long liquidations
+are forced selling, so the mean return before them must be below the mean before short
+liquidations. The run prints `consistent`, `INVERTED` or `inconclusive`. Correcting an
+inversion is flipping `LIQUIDATED_ON_SELL` and `LIQUIDATED_ON_BUY` in
+`liqfade/data/ingest/hl_s3.py` and running `liqfade backfill rederive`, never a second
+download. Verified against the committed fixture; the owner records the result of the real
+first day here.
+
+**node_fills_by_block only covers 2025-07-27 onward.** The `hourly/` prefix begins there.
+Older history lives under the `node_fills` and `node_trades` prefixes in a different
+format that this parser does not read, so a request reaching further back prints what it
+is skipping and why rather than quietly returning less data than asked for. Writing that
+parser is the work item if a backtest ever needs more than about 13 months.
+
+**Logging resolves stdout at write time.** `setup_logging` used to hand `sys.stdout` to
+structlog's PrintLoggerFactory and to a StreamHandler, both of which keep the object. Any
+later replacement of the stream left every subsequent log line writing to a closed file.
+Found when the new `liqfade backfill` CLI tests configured logging under pytest's capture
+and broke every test that logged afterwards. A small proxy now looks up `sys.stdout` on
+each write. Under systemd the stream never moves, so this changes nothing in production.

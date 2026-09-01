@@ -201,3 +201,78 @@ def test_sync_without_a_host_is_a_config_error() -> None:
 def test_sync_command_reports_a_missing_host(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["sync", "--dry-run"]) == 1
     assert "sync.host is not set" in capsys.readouterr().err
+
+
+# --- backfill -----------------------------------------------------------------
+
+
+def test_backfill_lists_every_job() -> None:
+    parser = build_parser()
+    backfill = parser._subparsers._group_actions[0].choices["backfill"]
+    job = next(action for action in backfill._actions if action.dest == "job")
+    assert set(job.choices) == {
+        "s3-fills",
+        "rederive",
+        "l2",
+        "candles",
+        "tardis",
+        "hydromancer-check",
+    }
+
+
+def test_backfill_without_dates_explains_itself_and_exits_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["backfill", "s3-fills"]) == 1
+    assert "needs --start and --end" in capsys.readouterr().err
+
+
+def test_hydromancer_check_without_a_day_explains_itself(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["backfill", "hydromancer-check"]) == 1
+    assert "needs --check-day" in capsys.readouterr().err
+
+
+def test_a_bad_date_is_reported_rather_than_traced(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["backfill", "rederive", "--start", "2026-13-01", "--end", "2026-09-01"]) == 1
+    assert "bad date" in capsys.readouterr().err
+
+
+def test_the_l2_job_refuses_without_coins_before_touching_aws(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--coins is checked before the S3 client is built, so this needs no credentials."""
+    code = main(
+        [
+            "backfill",
+            "l2",
+            "--start",
+            "2026-09-01",
+            "--end",
+            "2026-09-01",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert code == 1
+    assert "--coins is required" in capsys.readouterr().err
+
+
+def test_rederive_runs_offline_over_an_empty_lake(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    code = main(
+        [
+            "backfill",
+            "rederive",
+            "--start",
+            "2026-09-01",
+            "--end",
+            "2026-09-01",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert code == 0
+    assert "no fills_full" in capsys.readouterr().out

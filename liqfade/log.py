@@ -11,10 +11,13 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import orjson
 import structlog
+
+if TYPE_CHECKING:
+    from typing import TextIO
 
 # Keys that must never appear in a log line even if a caller passes them. CLAUDE.md rule
 # 6: the agent private key is read once in execution/signer.py and never travels further.
@@ -32,6 +35,27 @@ _REDACT = frozenset(
         "cookie",
     }
 )
+
+
+class _Stdout:
+    """A stand-in for stdout that resolves `sys.stdout` at write time.
+
+    structlog's PrintLogger and logging.StreamHandler both hold on to the stream object
+    they are given, so binding `sys.stdout` at setup_logging() time means anything that
+    replaces the stream afterwards (a `contextlib.redirect_stdout`, pytest's capture)
+    leaves every later log line writing to a file that has since been closed. Under
+    systemd the stream never moves and this changes nothing; the point is that the
+    process logs to whatever stdout is now rather than to whatever it was at startup.
+    """
+
+    def write(self, text: str) -> int:
+        return sys.stdout.write(text)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
+_STDOUT = _Stdout()
 
 
 def _redact(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
@@ -75,12 +99,14 @@ def setup_logging(*, proc: str, env: str, level: str = "INFO") -> None:
             structlog.processors.JSONRenderer(serializer=_dumps),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(numeric),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        # cast: PrintLoggerFactory is typed for a full TextIO, but PrintLogger only
+        # ever calls write() and flush(), which is all _Stdout provides.
+        logger_factory=structlog.PrintLoggerFactory(file=cast("TextIO", _STDOUT)),
         cache_logger_on_first_use=True,
     )
 
     # Route stdlib logging (uvicorn, websockets, httpx) through the same renderer.
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(_STDOUT)
     handler.setFormatter(
         structlog.stdlib.ProcessorFormatter(
             foreign_pre_chain=shared,
