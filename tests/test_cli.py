@@ -276,3 +276,64 @@ def test_rederive_runs_offline_over_an_empty_lake(
     )
     assert code == 0
     assert "no fills_full" in capsys.readouterr().out
+
+
+def test_missing_aws_credentials_are_a_message_not_a_traceback(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The owner's first run of this command will not have keys yet."""
+    from botocore.exceptions import NoCredentialsError
+
+    import liqfade.data.ingest.common as ingest_common
+
+    def no_creds() -> None:
+        raise NoCredentialsError()
+
+    monkeypatch.setattr(ingest_common, "s3_client", no_creds)
+    code = main(
+        [
+            "backfill",
+            "s3-fills",
+            "--start",
+            "2026-08-01",
+            "--end",
+            "2026-08-02",
+            "--estimate-only",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "no AWS credentials" in err
+    assert "Traceback" not in err
+
+
+def test_an_aws_client_setup_failure_is_a_message_not_a_traceback(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from botocore.exceptions import ProfileNotFound
+
+    import liqfade.data.ingest.common as ingest_common
+
+    def bad_profile() -> None:
+        raise ProfileNotFound(profile="nope")
+
+    monkeypatch.setattr(ingest_common, "s3_client", bad_profile)
+    code = main(
+        [
+            "backfill",
+            "l2",
+            "--start",
+            "2026-08-01",
+            "--end",
+            "2026-08-02",
+            "--coins",
+            "BTC",
+            "--estimate-only",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert code == 1
+    assert "AWS client setup failed" in capsys.readouterr().err

@@ -126,6 +126,12 @@ def _dates(args: argparse.Namespace) -> tuple[Any, Any]:
 def cmd_backfill(args: argparse.Namespace) -> int:
     """Historical ingestion. Every S3 job estimates before it spends. See docs/DATA_SOURCES.md."""
     import httpx
+    from botocore.exceptions import (
+        BotoCoreError,
+        ClientError,
+        NoCredentialsError,
+        PartialCredentialsError,
+    )
 
     from liqfade.data.ingest import hl_archive_l2, hl_candles, hl_s3, hydromancer, tardis_free
     from liqfade.data.ingest.common import BackfillError, s3_client
@@ -195,6 +201,30 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             )
     except BackfillError as exc:
         print(f"backfill error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except (NoCredentialsError, PartialCredentialsError):
+        print(
+            "backfill error: no AWS credentials. Set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY in .env (see .env.example) for an IAM user with "
+            "s3:GetObject and s3:ListBucket on the Hyperliquid buckets, and set a "
+            "billing alarm first. See docs/DATA_SOURCES.md.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    except BotoCoreError as exc:
+        # ProfileNotFound, EndpointConnectionError and friends: report the message
+        # rather than a twenty frame botocore traceback.
+        print(f"backfill error: AWS client setup failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        hint = (
+            " These buckets are requester-pays: a 403 usually means the IAM user lacks "
+            "s3:ListBucket or s3:GetObject on the bucket and its /* resource."
+            if code in ("AccessDenied", "403")
+            else ""
+        )
+        print(f"backfill error: S3 refused the request ({code}).{hint}", file=sys.stderr)
         return EXIT_ERROR
 
 
