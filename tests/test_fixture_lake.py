@@ -60,6 +60,12 @@ def test_recorded_rows_all_carry_a_receive_time() -> None:
         )
 
 
+def test_every_recorded_row_names_the_recorder_as_its_source() -> None:
+    """Provenance survives compaction, which a filename convention would not."""
+    for table in TABLES:
+        assert distinct(table, "source") == {"recorder"}
+
+
 def distinct(table: str, column: str) -> set[object]:
     return {row[0] for row in read(table).aggregate(f"{column}").fetchall()}
 

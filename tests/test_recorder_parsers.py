@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from liqfade.data.schemas import rows_to_table, validate_table
+from liqfade.data.schemas import SOURCE_RECORDER, rows_to_table, validate_table
 from liqfade.recorder.streams import binance, bybit, hl, okx
 
 RX = 1788098890000
@@ -98,7 +98,7 @@ def rows_for(parsed: list[tuple[str, dict[str, Any]]], table: str) -> list[dict[
     """Rows for one table, after proving they fit the canonical schema."""
     rows = [row for name, row in parsed if name == table]
     if rows:
-        validate_table(table, rows_to_table(table, rows))
+        validate_table(table, rows_to_table(table, rows, SOURCE_RECORDER))
     return rows
 
 

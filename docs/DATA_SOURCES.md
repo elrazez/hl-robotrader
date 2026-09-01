@@ -82,13 +82,15 @@ Approach for v0:
 
 All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for historical pulls), `source` (string enum), `coin` (HL symbol, e.g. `BTC`) and for cross-exchange rows `venue_symbol` (e.g. `BTCUSDT`).
 
-- `liquidations`: `venue, coin, venue_symbol, ts_ms, rx_ms, side (long|short liquidated), px, sz, notional_usd, method (market|backstop|unknown), complete (bool: venue publishes all events)`
-- `trades`: `venue, coin, ts_ms, rx_ms, px, sz, side (buy|sell aggressor), tid`
-- `bbo`: `coin, ts_ms, rx_ms, bid_px, bid_sz, ask_px, ask_sz`
-- `l2`: `coin, ts_ms, rx_ms, level, bid_px, bid_sz, ask_px, ask_sz` (top 20 levels)
-- `asset_ctx`: `coin, ts_ms, rx_ms, mark_px, oracle_px, mid_px, funding, open_interest, day_ntl_vlm, premium`
-- `candles_1m`: `coin, ts_ms, o, h, l, c, v, n`
-- `xchg_ctx` (Coinalyze): `venue, coin, ts_ms, rx_ms, open_interest, funding, predicted_funding`
+`source` names the job that produced the row: `recorder`, `hl_s3`, `hl_api`, `hl_archive`, `tardis`, `hydromancer`. It is orthogonal to `venue`, which names the exchange the event happened on. It has to be a column rather than a filename convention, because nightly compaction folds every file of a day into one and a recorded day and a backfilled day for the same table land in the same file. `rx_ms = 0` still marks a historical row; `source` says which pull it came from.
+
+- `liquidations`: `venue, coin, venue_symbol, ts_ms, rx_ms, source, side (long|short liquidated), px, sz, notional_usd, method (market|backstop|unknown), complete (bool: venue publishes all events)`
+- `trades`: `venue, coin, ts_ms, rx_ms, source, px, sz, side (buy|sell aggressor), tid`
+- `bbo`: `coin, ts_ms, rx_ms, source, bid_px, bid_sz, ask_px, ask_sz`
+- `l2`: `coin, ts_ms, rx_ms, source, level, bid_px, bid_sz, ask_px, ask_sz` (top 20 levels)
+- `asset_ctx`: `coin, ts_ms, rx_ms, source, mark_px, oracle_px, mid_px, funding, open_interest, day_ntl_vlm, premium`
+- `candles_1m`: `coin, ts_ms, source, o, h, l, c, v, n`
+- `xchg_ctx` (Coinalyze): `venue, coin, ts_ms, rx_ms, source, open_interest, funding, predicted_funding`
 
 Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day. A buffer that fills before the hour is out writes `{venue}_{hour}_{n}.parquet` alongside it rather than rewriting the hour file; readers glob the partition and compaction folds the day into one file, so nothing downstream needs to know.
 

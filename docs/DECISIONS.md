@@ -101,3 +101,26 @@ per instrument-day at EUR 1 but only carries liquidation events in 2026+ files. 
 table in docs/DATA_SOURCES.md. Reverse if research question 4 shows cross-venue signals
 matter; Hyblock 1-minute aggregates or a small CryptoStruct order are the affordable
 paths then.
+
+## 2026-09-02 (Phase 2, historical ingestion)
+
+**liqfade/data/ was never in git.** The `.gitignore` rule for the data lake was written
+`data/` with no leading slash, so it matched `liqfade/data/` too and `schemas.py` and
+`symbols.py` existed only on the owner's disk. A clean clone had no `liqfade.data`
+package, so CI could not have been passing. The lake, reports and logs rules are now
+anchored to the repo root. Lesson: an unanchored directory rule in `.gitignore` matches
+at every depth.
+
+**`source` added to every canonical table, correcting a Phase 1 deviation.**
+`docs/DATA_SOURCES.md` has listed `source` on every table since it was written;
+`schemas.py` shipped without it in Phase 1 and used `venue` alone. The two are not the
+same thing: `venue` is the exchange an event happened on, `source` is the job that put
+the row in the lake (`recorder`, `hl_s3`, `hl_api`, `hl_archive`, `tardis`,
+`hydromancer`). Encoding provenance in the filename instead was considered and rejected,
+because nightly compaction folds a day into one file per table and would erase it
+permanently the first time a recorded day and a backfilled day overlapped, which is
+exactly the case that matters: `liquidations` and `trades` have four possible producers,
+`l2` and `candles_1m` have two. `source` is stamped by `rows_to_table(name, rows, source)`
+as a required argument rather than read from each row dict, so one file is always one
+job's output and no parser can write a row with no provenance. `rx_ms = 0` keeps its
+separate meaning: no local receive time exists, so no-lookahead checks cannot use it.

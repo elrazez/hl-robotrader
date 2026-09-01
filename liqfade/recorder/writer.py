@@ -25,7 +25,12 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from liqfade.data.schemas import MULTI_VENUE_TABLES, rows_to_table, validate_table
+from liqfade.data.schemas import (
+    MULTI_VENUE_TABLES,
+    SOURCE_RECORDER,
+    rows_to_table,
+    validate_table,
+)
 from liqfade.log import get_logger
 from liqfade.recorder.buffer import PartitionKey
 
@@ -60,12 +65,23 @@ def _write_atomic(table: pa.Table, path: Path) -> None:
             tmp.unlink()
 
 
-def write_rows(root: Path, key: PartitionKey, rows: list[dict[str, Any]]) -> Path | None:
-    """Write one buffer to its Parquet file. Returns the path, or None for no rows."""
+def write_rows(
+    root: Path,
+    key: PartitionKey,
+    rows: list[dict[str, Any]],
+    *,
+    source: str = SOURCE_RECORDER,
+) -> Path | None:
+    """Write one buffer to its Parquet file. Returns the path, or None for no rows.
+
+    `source` is stamped on every row of the file. It defaults to the recorder because
+    the recorder is the only caller that writes live feeds; the ingestion jobs in
+    liqfade/data/ingest/ reuse this function and pass their own.
+    """
     if not rows:
         return None
     table_name, venue, date, hour = key
-    arrow = rows_to_table(table_name, rows)
+    arrow = rows_to_table(table_name, rows, source)
     validate_table(table_name, arrow)
     directory = partition_dir(root, table_name, date)
     directory.mkdir(parents=True, exist_ok=True)

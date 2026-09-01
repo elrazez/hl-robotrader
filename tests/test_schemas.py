@@ -7,6 +7,7 @@ import pytest
 
 from liqfade.data.schemas import (
     SCHEMAS,
+    SOURCE_RECORDER,
     SchemaError,
     rows_to_table,
     schema_for,
@@ -43,6 +44,7 @@ def test_column_order_matches_the_schema_doc() -> None:
         "venue_symbol",
         "ts_ms",
         "rx_ms",
+        "source",
         "side",
         "px",
         "sz",
@@ -50,11 +52,27 @@ def test_column_order_matches_the_schema_doc() -> None:
         "method",
         "complete",
     ]
-    assert SCHEMAS["candles_1m"].names == ["coin", "ts_ms", "o", "h", "l", "c", "v", "n"]
+    assert SCHEMAS["candles_1m"].names == [
+        "coin",
+        "ts_ms",
+        "source",
+        "o",
+        "h",
+        "l",
+        "c",
+        "v",
+        "n",
+    ]
 
 
 def test_a_good_table_validates() -> None:
-    validate_table("bbo", rows_to_table("bbo", [GOOD_BBO]))
+    validate_table("bbo", rows_to_table("bbo", [GOOD_BBO], SOURCE_RECORDER))
+
+
+def test_source_is_stamped_on_every_row_and_never_read_from_the_row() -> None:
+    """Provenance is per file, so a row that carries its own `source` cannot override it."""
+    table = rows_to_table("bbo", [GOOD_BBO, {**GOOD_BBO, "source": "lies"}], "hl_s3")
+    assert table.column("source").to_pylist() == ["hl_s3", "hl_s3"]
 
 
 def test_a_wrong_typed_column_is_rejected() -> None:
@@ -78,7 +96,9 @@ def test_a_reordered_or_extra_column_is_rejected() -> None:
 
 
 def test_missing_keys_become_null_rather_than_failing() -> None:
-    table = rows_to_table("liquidations", [{"venue": "bybit", "venue_symbol": "BTCUSDT"}])
+    table = rows_to_table(
+        "liquidations", [{"venue": "bybit", "venue_symbol": "BTCUSDT"}], SOURCE_RECORDER
+    )
     validate_table("liquidations", table)
     assert table.column("coin").to_pylist() == [None]
 

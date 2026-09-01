@@ -9,8 +9,14 @@ Layout written by the recorder, per docs/DATA_SOURCES.md:
 
     data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet
 
-Historical pulls write `rx_ms = 0`, which is how a reader tells recorded data (a true
-local receive time exists, so no-lookahead checks are meaningful) from backfilled data.
+Every table carries `source`, naming the job that produced the row: `recorder` for the
+live feeds, and one of the ingestion job names for a historical pull. Provenance has to
+be a column and not a filename because nightly compaction folds every file of a day into
+one, so a Tardis day and a recorded day for the same table end up in the same file.
+
+Historical pulls also write `rx_ms = 0`, which is how a reader tells recorded data (a
+true local receive time exists, so no-lookahead checks are meaningful) from backfilled
+data. `source` says where it came from, `rx_ms` says whether it has a receive time.
 """
 
 from __future__ import annotations
@@ -29,6 +35,22 @@ LIQ_SIDES = ("long", "short")  # which side was liquidated, not the taker direct
 LIQ_METHODS = ("market", "backstop", "unknown")
 TRADE_SIDES = ("buy", "sell")  # the aggressor
 
+# Values for `source`: which job wrote the row.
+SOURCE_RECORDER = "recorder"
+SOURCE_HL_S3 = "hl_s3"  # requester-pays node_fills_by_block
+SOURCE_HL_API = "hl_api"  # public Info API: candleSnapshot
+SOURCE_HL_ARCHIVE = "hl_archive"  # requester-pays hyperliquid-archive L2 snapshots
+SOURCE_TARDIS = "tardis"  # free first-of-month CSVs
+SOURCE_HYDROMANCER = "hydromancer"  # Reservoir S3, pre-parsed
+SOURCES = (
+    SOURCE_RECORDER,
+    SOURCE_HL_S3,
+    SOURCE_HL_API,
+    SOURCE_HL_ARCHIVE,
+    SOURCE_TARDIS,
+    SOURCE_HYDROMANCER,
+)
+
 LIQUIDATIONS = pa.schema(
     [
         ("venue", STR),
@@ -36,6 +58,7 @@ LIQUIDATIONS = pa.schema(
         ("venue_symbol", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("side", STR),  # long | short: the side that was liquidated
         ("px", F64),
         ("sz", F64),
@@ -51,6 +74,7 @@ TRADES = pa.schema(
         ("coin", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("px", F64),
         ("sz", F64),
         ("side", STR),  # buy | sell aggressor
@@ -63,6 +87,7 @@ BBO = pa.schema(
         ("coin", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("bid_px", F64),
         ("bid_sz", F64),
         ("ask_px", F64),
@@ -75,6 +100,7 @@ L2 = pa.schema(
         ("coin", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("level", pa.int32()),  # 0 is the touch, up to 19
         ("bid_px", F64),
         ("bid_sz", F64),
@@ -88,6 +114,7 @@ ASSET_CTX = pa.schema(
         ("coin", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("mark_px", F64),
         ("oracle_px", F64),
         ("mid_px", F64),
@@ -102,6 +129,7 @@ CANDLES_1M = pa.schema(
     [
         ("coin", STR),
         ("ts_ms", I64),  # candle open time
+        ("source", STR),
         ("o", F64),
         ("h", F64),
         ("l", F64),
@@ -117,6 +145,7 @@ XCHG_CTX = pa.schema(
         ("coin", STR),
         ("ts_ms", I64),
         ("rx_ms", I64),
+        ("source", STR),
         ("open_interest", F64),
         ("funding", F64),
         ("predicted_funding", F64),
@@ -170,6 +199,13 @@ def validate_table(name: str, table: pa.Table) -> None:
     raise SchemaError(f"{name}: wrong column types: {', '.join(wrong)}")
 
 
-def rows_to_table(name: str, rows: list[dict[str, Any]]) -> pa.Table:
-    """Build a canonical table from parsed rows. Missing keys become null."""
-    return pa.Table.from_pylist(rows, schema=schema_for(name))
+def rows_to_table(name: str, rows: list[dict[str, Any]], source: str) -> pa.Table:
+    """Build a canonical table from parsed rows. Missing keys become null.
+
+    `source` is stamped on the whole table rather than read from the rows: one file is
+    always the output of one job, and a required argument here is what stops a parser
+    from quietly writing rows with no provenance.
+    """
+    table = pa.Table.from_pylist(rows, schema=schema_for(name))
+    index = table.schema.get_field_index("source")
+    return table.set_column(index, "source", pa.array([source] * table.num_rows, STR))
