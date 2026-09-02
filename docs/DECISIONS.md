@@ -169,3 +169,10 @@ which suits a USB drive (good at sequential copies, bad at concurrent small writ
 Default `--workers 6` on the s3-fills and l2 jobs. Staged files get a random name
 suffix so concurrent workers can never collide in a partition. Reverse to workers=1 by
 flag if a venue ever throttles concurrent S3 GETs.
+
+Amended same day: threads did not help. The drive bottleneck gone, the run pegged one
+core at 100% (orjson parsing holds the GIL) and stayed at ~3 GiB/hour. Workers are now
+processes (spawn), each with its own boto3 client; the parent alone inspects, merges and
+records the manifest. Handlers are module-level functions because they pickle into the
+workers; the fills side-rule check moved to a parent-side inspector reading the staged
+Parquet, since processes cannot share the accumulator.

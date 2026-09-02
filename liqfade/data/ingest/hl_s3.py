@@ -29,7 +29,6 @@ sign of the entire strategy.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -335,6 +334,11 @@ def _warn_before_hourly_prefix(days: list[date]) -> list[date]:
     return [day for day in days if day >= HOURLY_PREFIX_START]
 
 
+def stage_fills(local: Path, key: str, stage_root: Path) -> dict[str, int]:
+    """The ObjectHandler for this job. Module level so worker processes can import it."""
+    return write_one_file(stage_root, local, None)
+
+
 def write_one_file(root: Path, path: Path, check: SideRuleCheck | None = None) -> dict[str, int]:
     """Parse one downloaded object and write its three tables. Returns rows per table."""
     fills = list(parse_fills(read_lz4_lines(path)))
@@ -359,6 +363,7 @@ def run(
     yes: bool = False,
     keep_raw: bool = False,
     workers: int = 1,
+    client_factory: Any = None,
 ) -> int:
     """Pull fills for [start, end], newest day first. Returns a process exit code."""
     days = _warn_before_hourly_prefix(day_range(start, end))
@@ -385,14 +390,22 @@ def run(
     check_cost_gate(est, yes=yes)
 
     check = SideRuleCheck()
-    check_lock = threading.Lock()
-    first_day_key = todo[0]["Key"].rsplit("/", 2)[-2] if todo else None
+    first_day = todo[0]["Key"].rsplit("/", 2)[-2] if todo else None
 
-    def handler(local: Path, key: str, stage_root: Path) -> dict[str, int]:
-        if key.rsplit("/", 2)[-2] == first_day_key:
-            with check_lock:
-                return write_one_file(stage_root, local, check)
-        return write_one_file(stage_root, local, None)
+    def inspect(staged: Path, key: str) -> None:
+        # Parent side, before the merge: feed the side rule check from the staged files
+        # of the first day pulled. Workers cannot share the check across processes.
+        if key.rsplit("/", 2)[-2] != first_day:
+            return
+        import pyarrow.parquet as pq
+
+        def rows_of(table: str) -> list[dict[str, Any]]:
+            files = sorted((staged / table).rglob("*.parquet"))
+            return [
+                row for path in files for row in pq.read_table(path, partitioning=None).to_pylist()
+            ]
+
+        check.add(rows_of("liquidations"), rows_of("trades"))
 
     fetched = parallel_pull(
         client,
@@ -401,9 +414,11 @@ def run(
         data_dir,
         JOB,
         manifest,
-        handler,
+        stage_fills,
         workers=workers,
         keep_raw=keep_raw,
+        inspect=inspect,
+        client_factory=client_factory,
     )
 
     print(f"\n{check.report()}\n")

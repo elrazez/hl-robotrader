@@ -129,6 +129,12 @@ def parse_snapshots(lines: Iterable[bytes], coin: str) -> list[dict[str, Any]]:
     return rows
 
 
+def stage_l2(local: Path, key: str, stage_root: Path) -> dict[str, int]:
+    """The ObjectHandler for this job. Module level so worker processes can import it."""
+    rows = parse_snapshots(read_lz4_lines(local), coin_of_key(key))
+    return {"l2": write_partitioned(stage_root, "l2", VENUE, SOURCE_HL_ARCHIVE, rows)}
+
+
 def run(
     client: Any,
     data_dir: Path,
@@ -140,6 +146,7 @@ def run(
     yes: bool = False,
     keep_raw: bool = False,
     workers: int = 1,
+    client_factory: Any = None,
 ) -> int:
     """Pull hourly L2 snapshots for `coins` over [start, end], newest day first."""
     check_coins(coins)
@@ -162,10 +169,6 @@ def run(
         return 0
     check_cost_gate(est, yes=yes)
 
-    def handler(local: Path, key: str, stage_root: Path) -> dict[str, int]:
-        rows = parse_snapshots(read_lz4_lines(local), coin_of_key(key))
-        return {"l2": write_partitioned(stage_root, "l2", VENUE, SOURCE_HL_ARCHIVE, rows)}
-
     fetched = parallel_pull(
         client,
         BUCKET,
@@ -173,9 +176,10 @@ def run(
         data_dir,
         JOB,
         manifest,
-        handler,
+        stage_l2,
         workers=workers,
         keep_raw=keep_raw,
+        client_factory=client_factory,
     )
 
     print(f"fetched {fetched} objects this run, {len(manifest.objects)} in the manifest")

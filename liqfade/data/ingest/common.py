@@ -26,7 +26,6 @@ import concurrent.futures
 import os
 import shutil
 import tempfile
-import threading
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -329,20 +328,65 @@ def replace_source_rows(
 
 # --- parallel pull ------------------------------------------------------------
 #
-# Measured on the owner's machine: the sequential loop left Python at 4% CPU while the
-# fuse-t NTFS layer choked on many small writes. The fix has two parts. Workers overlap
-# download and parse (both release the GIL), and every Parquet file is written on the
-# local SSD first, then streamed to the lake by one serialized mover, because a USB
-# drive does sequential copies well and concurrent small writes badly.
+# Measured on the owner's machine, twice. Sequential: Python at 4% CPU, the fuse-t NTFS
+# layer for the lake drive choking on small writes, ~3 GiB/hour. Threaded workers with
+# local staging: the drive problem gone, Python pegged at 100% of ONE core, still
+# ~3 GiB/hour, because orjson parsing holds the GIL and threads cannot spread it over
+# cores. So the workers are processes. Each worker process downloads and parses on the
+# local SSD; the parent alone moves finished files onto the lake disk one at a time
+# (a USB drive is good at sequential copies and bad at concurrent small writes) and is
+# the only writer of the manifest.
 
 STAGE_MIN_FREE_GIB = 5.0  # floor for the local staging disk, distinct from the lake floor
 
-_MOVE_LOCK = threading.Lock()  # one file lands on the lake disk at a time, by design
-_MANIFEST_LOCK = threading.Lock()
-
-# (local raw file, key, staging parquet root) -> rows per table. Runs inside a worker;
-# must write only under the staging root it was given.
+# (local raw file, key, staging parquet root) -> rows per table. Runs inside a worker
+# process, so it must be a module level function (pickled by reference) and must write
+# only under the staging root it was given.
 ObjectHandler = Callable[[Path, str, Path], dict[str, int]]
+# Runs in the PARENT on the staged parquet root before it is merged, for jobs that need
+# to look at what a worker produced (the fills side rule check). May be a closure.
+StagedInspector = Callable[[Path, str], None]
+
+_WORKER_CLIENT: Any = None
+
+
+def _worker_client(factory: Callable[[], Any]) -> Any:
+    """One S3 client per worker process, created on first use."""
+    global _WORKER_CLIENT
+    if _WORKER_CLIENT is None:
+        _WORKER_CLIENT = factory()
+    return _WORKER_CLIENT
+
+
+def _stage_object(
+    client: Any,
+    bucket: str,
+    key: str,
+    size: int,
+    stage_base: str,
+    handler: ObjectHandler,
+) -> tuple[str, int, str, dict[str, int]]:
+    """Download one object and parse it into staged Parquet.
+
+    Returns (key, size, scratch dir, rows per table). The caller owns everything after
+    that: inspection, the move onto the lake, the manifest, and deleting the scratch.
+    """
+    scratch = Path(tempfile.mkdtemp(dir=stage_base))
+    local = download_object(client, bucket, key, scratch / "raw" / Path(key).name)
+    rows = handler(local, key, scratch / "parquet")
+    return key, size, str(scratch), rows
+
+
+def _pull_one(
+    factory: Callable[[], Any],
+    bucket: str,
+    key: str,
+    size: int,
+    stage_base: str,
+    handler: ObjectHandler,
+) -> tuple[str, int, str, dict[str, int]]:
+    """Worker process body: _stage_object with the per-process cached client."""
+    return _stage_object(_worker_client(factory), bucket, key, size, stage_base, handler)
 
 
 def merge_staged(stage_root: Path, lake_root: Path) -> None:
@@ -354,6 +398,8 @@ def merge_staged(stage_root: Path, lake_root: Path) -> None:
     temp name on the destination filesystem then `os.replace`, the atomicity rule every
     lake write follows.
     """
+    if not stage_root.exists():
+        return
     for staged in sorted(stage_root.rglob("*.parquet")):
         relative = staged.relative_to(stage_root)
         final = lake_root / relative.parent / f"{staged.stem}_{uuid.uuid4().hex[:6]}.parquet"
@@ -379,62 +425,80 @@ def parallel_pull(
     *,
     workers: int = 1,
     keep_raw: bool = False,
+    inspect: StagedInspector | None = None,
+    client_factory: Callable[[], Any] | None = None,
 ) -> int:
-    """Fetch and process `todo` with a thread pool. Returns objects completed this run.
+    """Fetch and process `todo`; returns objects completed this run.
 
-    Per object: download raw to local staging, run `handler` (parse + write Parquet
-    under a private staging root), then under the move lock stream the results onto the
-    lake and record the manifest. A failure in any object stops new work, lets in-flight
-    objects finish, and re-raises; the manifest holds exactly the completed objects, so
-    the re-run resumes. Low disk on either the lake or the staging SSD stops the pull
-    the same way the sequential loop did: warning, exit as success, resume later.
+    workers == 1 runs everything in this process with `client`, which is also what the
+    offline tests inject. workers > 1 spawns worker processes that each build their own
+    client from `client_factory` (default: real boto3), because a client cannot cross a
+    process boundary. Either way the parent alone merges staged files onto the lake and
+    records the manifest, so a crash or a failed object leaves the manifest holding
+    exactly the completed work and a re-run resumes. Low disk on the lake or the staging
+    SSD stops the pull with a warning and exit-as-success, the documented behavior.
     """
     lake_root = Path(data_dir) / "parquet"
     stage_base = Path(tempfile.mkdtemp(prefix=f"liqfade-{job}-"))
-    stop = threading.Event()
-    low_disk = threading.Event()
     fetched = 0
+    low_disk = False
 
-    def one(obj: dict[str, Any]) -> str | None:
-        key = str(obj["Key"])
-        if stop.is_set():
-            return None
-        if not enough_disk(data_dir) or not enough_disk(
-            stage_base, min_free_gib=STAGE_MIN_FREE_GIB
-        ):
-            low_disk.set()
-            stop.set()
-            return None
-        with tempfile.TemporaryDirectory(dir=stage_base) as scratch:
-            scratch_path = Path(scratch)
-            local = download_object(client, bucket, key, scratch_path / "raw" / Path(key).name)
-            stage_root = scratch_path / "parquet"
-            rows = handler(local, key, stage_root)
-            with _MOVE_LOCK:
-                merge_staged(stage_root, lake_root)
-                if keep_raw:
-                    kept = raw_path(data_dir, job, key)
-                    kept.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(local), kept)
-        with _MANIFEST_LOCK:
-            manifest.record(key, int(obj.get("Size", 0)), rows)
+    def disk_ok() -> bool:
+        return enough_disk(data_dir) and enough_disk(stage_base, min_free_gib=STAGE_MIN_FREE_GIB)
+
+    def finish(key: str, size: int, scratch: str, rows: dict[str, int]) -> None:
+        nonlocal fetched
+        scratch_path = Path(scratch)
+        staged_parquet = scratch_path / "parquet"
+        if inspect is not None:
+            inspect(staged_parquet, key)
+        merge_staged(staged_parquet, lake_root)
+        if keep_raw:
+            raws = list((scratch_path / "raw").glob("*"))
+            if raws:
+                kept = raw_path(data_dir, job, key)
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(raws[0]), kept)
+        shutil.rmtree(scratch_path, ignore_errors=True)
+        manifest.record(key, size, rows)
+        fetched += 1
         log.info("backfill_object", job=job, key=key, **rows)
-        return key
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = [pool.submit(one, obj) for obj in todo]
-            try:
-                for future in concurrent.futures.as_completed(futures):
-                    if future.result() is not None:
-                        fetched += 1
-            except BaseException:
-                stop.set()
-                raise
+        if workers <= 1:
+            for obj in todo:
+                if not disk_ok():
+                    low_disk = True
+                    break
+                key, size = str(obj["Key"]), int(obj.get("Size", 0))
+                finish(*_stage_object(client, bucket, key, size, str(stage_base), handler))
+        else:
+            factory = client_factory or s3_client
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        _pull_one,
+                        factory,
+                        bucket,
+                        str(obj["Key"]),
+                        int(obj.get("Size", 0)),
+                        str(stage_base),
+                        handler,
+                    )
+                    for obj in todo
+                ]
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        finish(*future.result())
+                        if not disk_ok():
+                            low_disk = True
+                            break
+                finally:
+                    pool.shutdown(wait=True, cancel_futures=True)
     finally:
         shutil.rmtree(stage_base, ignore_errors=True)
 
-    if low_disk.is_set():
+    if low_disk:
         print(
             f"WARNING: stopping, free disk is under the floor. Fetched {fetched} of "
             f"{len(todo)} objects. Re-run to continue where this left off."

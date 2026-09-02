@@ -429,3 +429,38 @@ def test_rederive_with_no_archive_says_so(
 ) -> None:
     assert hl_s3.rederive(tmp_path, DAY, DAY) == 0
     assert "no fills_full" in capsys.readouterr().out
+
+
+def test_a_pull_with_process_workers_matches_the_serial_pull(tmp_path: Path) -> None:
+    """workers=2 exercises the spawned-process path end to end, side rule included."""
+    from functools import partial
+
+    factory = partial(FakeS3, {KEY: SAMPLE_LZ4.read_bytes()})
+    serial_dir = tmp_path / "serial"
+    pooled_dir = tmp_path / "pooled"
+
+    assert hl_s3.run(FakeS3({KEY: SAMPLE_LZ4.read_bytes()}), serial_dir, DAY, DAY) == 0
+    assert (
+        hl_s3.run(
+            FakeS3({KEY: SAMPLE_LZ4.read_bytes()}),
+            pooled_dir,
+            DAY,
+            DAY,
+            workers=2,
+            client_factory=factory,
+        )
+        == 0
+    )
+
+    import pyarrow.parquet as pq
+
+    for table in ("fills_full", "liquidations", "trades"):
+        serial_rows = sum(
+            pq.read_metadata(p).num_rows
+            for p in (serial_dir / "parquet" / table).rglob("*.parquet")
+        )
+        pooled_rows = sum(
+            pq.read_metadata(p).num_rows
+            for p in (pooled_dir / "parquet" / table).rglob("*.parquet")
+        )
+        assert serial_rows == pooled_rows, table
