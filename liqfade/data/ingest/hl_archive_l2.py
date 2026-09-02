@@ -27,11 +27,9 @@ from liqfade.data.ingest.common import (
     Manifest,
     check_cost_gate,
     day_range,
-    download_object,
-    enough_disk,
     estimate,
     list_objects,
-    raw_path,
+    parallel_pull,
     read_lz4_lines,
     write_partitioned,
 )
@@ -141,10 +139,10 @@ def run(
     estimate_only: bool = False,
     yes: bool = False,
     keep_raw: bool = False,
+    workers: int = 1,
 ) -> int:
     """Pull hourly L2 snapshots for `coins` over [start, end], newest day first."""
     check_coins(coins)
-    root = Path(data_dir) / "parquet"
     manifest = Manifest.load(data_dir, JOB)
     wanted = set(coins)
 
@@ -164,23 +162,21 @@ def run(
         return 0
     check_cost_gate(est, yes=yes)
 
-    fetched = 0
-    for obj in todo:
-        key = str(obj["Key"])
-        if not enough_disk(data_dir):
-            print(
-                f"WARNING: stopping, free disk is under the floor. Fetched {fetched} of "
-                f"{len(todo)} objects. Re-run to continue where this left off."
-            )
-            break
-        local = download_object(client, BUCKET, key, raw_path(data_dir, JOB, key))
+    def handler(local: Path, key: str, stage_root: Path) -> dict[str, int]:
         rows = parse_snapshots(read_lz4_lines(local), coin_of_key(key))
-        written = write_partitioned(root, "l2", VENUE, SOURCE_HL_ARCHIVE, rows)
-        manifest.record(key, int(obj.get("Size", 0)), {"l2": written})
-        if not keep_raw:
-            local.unlink()
-        fetched += 1
-        log.info("backfill_object", job=JOB, key=key, l2=written)
+        return {"l2": write_partitioned(stage_root, "l2", VENUE, SOURCE_HL_ARCHIVE, rows)}
+
+    fetched = parallel_pull(
+        client,
+        BUCKET,
+        todo,
+        data_dir,
+        JOB,
+        manifest,
+        handler,
+        workers=workers,
+        keep_raw=keep_raw,
+    )
 
     print(f"fetched {fetched} objects this run, {len(manifest.objects)} in the manifest")
     print(f"  l2: {manifest.total_rows().get('l2', 0)} rows")

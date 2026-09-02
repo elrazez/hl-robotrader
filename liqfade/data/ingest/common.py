@@ -22,9 +22,13 @@ run offline against a fake and no test can accidentally spend money.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import shutil
-from collections.abc import Iterator
+import tempfile
+import threading
+import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -321,3 +325,118 @@ def replace_source_rows(
         directory.mkdir(parents=True, exist_ok=True)
         write_atomic(merged, directory / "kept_00.parquet")
     return written
+
+
+# --- parallel pull ------------------------------------------------------------
+#
+# Measured on the owner's machine: the sequential loop left Python at 4% CPU while the
+# fuse-t NTFS layer choked on many small writes. The fix has two parts. Workers overlap
+# download and parse (both release the GIL), and every Parquet file is written on the
+# local SSD first, then streamed to the lake by one serialized mover, because a USB
+# drive does sequential copies well and concurrent small writes badly.
+
+STAGE_MIN_FREE_GIB = 5.0  # floor for the local staging disk, distinct from the lake floor
+
+_MOVE_LOCK = threading.Lock()  # one file lands on the lake disk at a time, by design
+_MANIFEST_LOCK = threading.Lock()
+
+# (local raw file, key, staging parquet root) -> rows per table. Runs inside a worker;
+# must write only under the staging root it was given.
+ObjectHandler = Callable[[Path, str, Path], dict[str, int]]
+
+
+def merge_staged(stage_root: Path, lake_root: Path) -> None:
+    """Move every staged Parquet file into the lake, keeping the partition layout.
+
+    Names get a short random suffix so files staged by concurrent workers for the same
+    (table, date, hour) can never collide; readers glob the partition and compaction
+    folds the day, so nothing downstream cares what a file is called. The copy goes to a
+    temp name on the destination filesystem then `os.replace`, the atomicity rule every
+    lake write follows.
+    """
+    for staged in sorted(stage_root.rglob("*.parquet")):
+        relative = staged.relative_to(stage_root)
+        final = lake_root / relative.parent / f"{staged.stem}_{uuid.uuid4().hex[:6]}.parquet"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        tmp = final.with_name(f".{final.name}.tmp")
+        try:
+            shutil.copyfile(staged, tmp)
+            os.replace(tmp, final)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        staged.unlink()
+
+
+def parallel_pull(
+    client: Any,
+    bucket: str,
+    todo: list[dict[str, Any]],
+    data_dir: Path,
+    job: str,
+    manifest: Manifest,
+    handler: ObjectHandler,
+    *,
+    workers: int = 1,
+    keep_raw: bool = False,
+) -> int:
+    """Fetch and process `todo` with a thread pool. Returns objects completed this run.
+
+    Per object: download raw to local staging, run `handler` (parse + write Parquet
+    under a private staging root), then under the move lock stream the results onto the
+    lake and record the manifest. A failure in any object stops new work, lets in-flight
+    objects finish, and re-raises; the manifest holds exactly the completed objects, so
+    the re-run resumes. Low disk on either the lake or the staging SSD stops the pull
+    the same way the sequential loop did: warning, exit as success, resume later.
+    """
+    lake_root = Path(data_dir) / "parquet"
+    stage_base = Path(tempfile.mkdtemp(prefix=f"liqfade-{job}-"))
+    stop = threading.Event()
+    low_disk = threading.Event()
+    fetched = 0
+
+    def one(obj: dict[str, Any]) -> str | None:
+        key = str(obj["Key"])
+        if stop.is_set():
+            return None
+        if not enough_disk(data_dir) or not enough_disk(
+            stage_base, min_free_gib=STAGE_MIN_FREE_GIB
+        ):
+            low_disk.set()
+            stop.set()
+            return None
+        with tempfile.TemporaryDirectory(dir=stage_base) as scratch:
+            scratch_path = Path(scratch)
+            local = download_object(client, bucket, key, scratch_path / "raw" / Path(key).name)
+            stage_root = scratch_path / "parquet"
+            rows = handler(local, key, stage_root)
+            with _MOVE_LOCK:
+                merge_staged(stage_root, lake_root)
+                if keep_raw:
+                    kept = raw_path(data_dir, job, key)
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(local), kept)
+        with _MANIFEST_LOCK:
+            manifest.record(key, int(obj.get("Size", 0)), rows)
+        log.info("backfill_object", job=job, key=key, **rows)
+        return key
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(one, obj) for obj in todo]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    if future.result() is not None:
+                        fetched += 1
+            except BaseException:
+                stop.set()
+                raise
+    finally:
+        shutil.rmtree(stage_base, ignore_errors=True)
+
+    if low_disk.is_set():
+        print(
+            f"WARNING: stopping, free disk is under the floor. Fetched {fetched} of "
+            f"{len(todo)} objects. Re-run to continue where this left off."
+        )
+    return fetched

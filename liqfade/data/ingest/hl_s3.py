@@ -29,6 +29,7 @@ sign of the entire strategy.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -41,11 +42,9 @@ from liqfade.data.ingest.common import (
     Manifest,
     check_cost_gate,
     day_range,
-    download_object,
-    enough_disk,
     estimate,
     list_objects,
-    raw_path,
+    parallel_pull,
     read_lz4_lines,
     replace_source_rows,
     write_partitioned,
@@ -359,6 +358,7 @@ def run(
     estimate_only: bool = False,
     yes: bool = False,
     keep_raw: bool = False,
+    workers: int = 1,
 ) -> int:
     """Pull fills for [start, end], newest day first. Returns a process exit code."""
     days = _warn_before_hourly_prefix(day_range(start, end))
@@ -367,7 +367,6 @@ def run(
             f"no days in range are covered by {PREFIX}/, which begins {HOURLY_PREFIX_START}"
         )
 
-    root = Path(data_dir) / "parquet"
     manifest = Manifest.load(data_dir, JOB)
 
     objects: list[dict[str, Any]] = []
@@ -386,24 +385,26 @@ def run(
     check_cost_gate(est, yes=yes)
 
     check = SideRuleCheck()
+    check_lock = threading.Lock()
     first_day_key = todo[0]["Key"].rsplit("/", 2)[-2] if todo else None
-    fetched = 0
-    for obj in todo:
-        key = str(obj["Key"])
-        if not enough_disk(data_dir):
-            print(
-                f"WARNING: stopping, free disk is under the floor. Fetched {fetched} of "
-                f"{len(todo)} objects. Re-run to continue where this left off."
-            )
-            break
-        local = download_object(client, BUCKET, key, raw_path(data_dir, JOB, key))
-        day_of_key = key.rsplit("/", 2)[-2]
-        rows = write_one_file(root, local, check if day_of_key == first_day_key else None)
-        manifest.record(key, int(obj.get("Size", 0)), rows)
-        if not keep_raw:
-            local.unlink()
-        fetched += 1
-        log.info("backfill_object", job=JOB, key=key, **rows)
+
+    def handler(local: Path, key: str, stage_root: Path) -> dict[str, int]:
+        if key.rsplit("/", 2)[-2] == first_day_key:
+            with check_lock:
+                return write_one_file(stage_root, local, check)
+        return write_one_file(stage_root, local, None)
+
+    fetched = parallel_pull(
+        client,
+        BUCKET,
+        todo,
+        data_dir,
+        JOB,
+        manifest,
+        handler,
+        workers=workers,
+        keep_raw=keep_raw,
+    )
 
     print(f"\n{check.report()}\n")
     totals = manifest.total_rows()

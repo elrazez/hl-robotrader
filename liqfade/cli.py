@@ -161,6 +161,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
+                workers=args.workers,
             )
         if args.job == "rederive":
             return hl_s3.rederive(data_dir, start, end)
@@ -177,6 +178,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
+                workers=args.workers,
             )
         if args.job == "candles":
             with httpx.Client() as client:
@@ -454,6 +456,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument(
         "--keep-raw", action="store_true", help="keep downloads under data/raw after parsing"
+    )
+    backfill.add_argument(
+        "--workers",
+        type=int,
+        default=6,
+        help="parallel download workers for the S3 jobs; parsing is staged on the local "
+        "disk and moved to the lake serially, so more workers cost RAM, not disk seeks",
     )
     backfill.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")

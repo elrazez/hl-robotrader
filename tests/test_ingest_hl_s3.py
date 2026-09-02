@@ -13,7 +13,7 @@ import orjson
 import pyarrow.parquet as pq
 import pytest
 
-from liqfade.data.ingest import hl_s3
+from liqfade.data.ingest import common, hl_s3
 from liqfade.data.ingest.common import BackfillError, Manifest
 from liqfade.data.schemas import SOURCE_HL_S3, validate_table
 from tests.conftest import FakeS3
@@ -340,7 +340,8 @@ def test_the_disk_guard_stops_the_loop_before_downloading(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(hl_s3, "enough_disk", lambda *a, **k: False)
+    # The guard moved into common.parallel_pull when the loop went parallel.
+    monkeypatch.setattr(common, "enough_disk", lambda *a, **k: False)
     assert hl_s3.run(client, tmp_path, DAY, DAY) == 0
     assert client.downloaded == []
     assert "free disk is under the floor" in capsys.readouterr().out

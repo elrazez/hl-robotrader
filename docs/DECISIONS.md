@@ -157,3 +157,15 @@ later replacement of the stream left every subsequent log line writing to a clos
 Found when the new `liqfade backfill` CLI tests configured logging under pytest's capture
 and broke every test that logged afterwards. A small proxy now looks up `sys.stdout` on
 each write. Under systemd the stream never moves, so this changes nothing in production.
+
+## 2026-09-01
+
+**Backfill parallelized with local staging after a measured bottleneck.** 13 hours of
+the sequential pull moved 38 GB with Python at 4% CPU while fuse-t's NFS layer for the
+owner's NTFS drive burned half a core on small writes. `parallel_pull` in
+ingest/common.py now runs N download-and-parse workers against a staging directory on
+the internal SSD and one serialized mover streams finished Parquet onto the lake disk,
+which suits a USB drive (good at sequential copies, bad at concurrent small writes).
+Default `--workers 6` on the s3-fills and l2 jobs. Staged files get a random name
+suffix so concurrent workers can never collide in a partition. Reverse to workers=1 by
+flag if a venue ever throttles concurrent S3 GETs.
