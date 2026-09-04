@@ -198,7 +198,14 @@ def derive_trades(fills: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 "tid": source_fill["tid"],
             }
         )
-    rows.sort(key=lambda row: (row["ts_ms"] or 0, row["tid"] or 0))
+    # Sort on ts_ms alone. `tid` is a hash, not a sequence (997296749534590 precedes
+    # 653061949558227 in one sweep), so adding it to the key replaces the exchange's
+    # order inside a millisecond with an arbitrary one, and a minute's first and last
+    # trade are then the wrong ones. Python's sort is stable, and `_groups` yields in
+    # first-appearance order, so this keeps the block's event order. Measured against
+    # `candleSnapshot` on 2026-09-04: tid order matched the API's open on 76% of BTC
+    # minutes, block order on 100%. See liqfade/data/derive/candles.py.
+    rows.sort(key=lambda row: row["ts_ms"] or 0)
     return rows
 
 

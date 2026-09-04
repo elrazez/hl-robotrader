@@ -239,6 +239,35 @@ def test_the_aggressor_side_comes_from_the_crossed_record(
     assert trades[333]["side"] == "buy"
 
 
+def test_trades_of_one_millisecond_keep_the_blocks_event_order() -> None:
+    """`tid` is a hash, so sorting ties by it picks the wrong first and last trade.
+
+    One sweep filling three makers in a millisecond, with tids deliberately out of
+    order. The rows must come back in the order the block listed them, because that is
+    the only record of the exchange's sequence that `trades` carries.
+    """
+    sweep = [
+        {
+            "block_time": 1,
+            "coin": "BTC",
+            "ts_ms": 1_000,
+            "tid": tid,
+            "px": px,
+            "sz": 1.0,
+            "side": "B",
+            "crossed": True,
+            "user_address": "0xtaker",
+        }
+        for tid, px in (
+            (997_296_749_534_590, 78_784.0),
+            (14_159_527_887_985, 78_782.0),
+            (653_061_949_558_227, 78_780.0),
+        )
+    ]
+    rows = hl_s3.derive_trades(sweep)
+    assert [row["px"] for row in rows] == [78_784.0, 78_782.0, 78_780.0]
+
+
 def test_a_group_with_only_the_maker_half_inverts_to_the_aggressor_side(
     fills: list[dict[str, object]],
 ) -> None:
