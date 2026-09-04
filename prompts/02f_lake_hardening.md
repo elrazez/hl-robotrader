@@ -158,16 +158,13 @@ Fourteen commits, then a cleanup commit.
 
 ## Check while you are in there
 
-`docs/DECISIONS.md` records that the old one-coin-per-day Tardis side-table files
-(`{venue}_00.parquet`) still sit beside the correct new ones (`{venue}_{coin}_00.parquet`)
-and have to be deleted by name. Verify whether that is still true on the drive and, if it
-is, do it as part of commit 5 and report the row counts. If it was already done, say so.
-This is not a code change, and the lake was not mounted when the review ran, so it is
-unverified either way.
+The old one-coin-per-day Tardis side-table files (`{venue}_00.parquet`, against the
+correct `{venue}_{coin}_00.parquet`) were deleted from the lake on 2026-09-04; confirm
+zero remain. The `docs/DECISIONS.md` line still says they are outstanding, so correct it.
 
 ## Report back
 
 The fourteen commit hashes plus the cleanup one, the before/after counts from the Tardis
-Hyperliquid delete, whether the stale side-table files were still there, the candle
+Hyperliquid delete, confirmation that no stale side-table files remain, the candle
 validation table the new script produces, and what changed in `docs/`. Next prompt:
 `prompts/02e_quality_gate.md`.

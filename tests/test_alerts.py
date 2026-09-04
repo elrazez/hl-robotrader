@@ -10,7 +10,6 @@ from typing import ClassVar
 
 import httpx
 import pytest
-import structlog
 
 from liqfade.alerts import telegram
 from liqfade.alerts.telegram import send_alert
@@ -124,13 +123,8 @@ def test_a_send_leaves_no_bot_token_in_the_log(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("TELEGRAM_ALERT_CHAT_ID", "42")
 
     buf = io.StringIO()
-    try:
-        with redirect_stdout(buf):
-            setup_logging(proc="unit", env="paper", level="INFO")
-            assert asyncio.run(send_alert("cascade on BTC")) is True
-    finally:
-        # setup_logging is global. Put structlog back to unconfigured so this test does
-        # not change the log format every later test reads.
-        structlog.reset_defaults()
-        structlog.contextvars.clear_contextvars()
+    with redirect_stdout(buf):
+        # setup_logging is global; the autouse restore_structlog fixture undoes it.
+        setup_logging(proc="unit", env="paper", level="INFO")
+        assert asyncio.run(send_alert("cascade on BTC")) is True
     assert token not in buf.getvalue()

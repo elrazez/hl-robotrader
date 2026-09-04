@@ -8,6 +8,35 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import structlog
+
+
+@pytest.fixture(autouse=True)
+def restore_structlog() -> Iterator[None]:
+    """Put structlog back the way the test found it.
+
+    setup_logging configures structlog globally and binds contextvars, so a test that
+    calls it changes the log format and the bound keys for every test that runs after.
+    That is not hypothetical: test_cli's test_status_json reads the first stdout line
+    starting with "{", which only works while structlog is unconfigured and rendering
+    console output, so any earlier test configuring logging broke it from a distance.
+
+    Restoring rather than forbidding, because testing what the logs actually contain is
+    the only way to catch a secret reaching them.
+    """
+    configured = structlog.is_configured()
+    config = structlog.get_config().copy()
+    context = structlog.contextvars.get_contextvars()
+    try:
+        yield
+    finally:
+        if configured:
+            structlog.configure(**config)
+        else:
+            # Never configured: configure() would itself mark it configured.
+            structlog.reset_defaults()
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(**context)
 
 
 @pytest.fixture
