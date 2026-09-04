@@ -544,3 +544,28 @@ The case the prompt named, 2026-09-01, is not in the lake: the backfill ends 202
 and the candle validation pulled that day's Tardis trades ad hoc rather than through the
 lake. The script stays for the day a partition with no `fills_full` does land, which the
 rederive returns `"empty"` for and therefore never cleans.
+
+**The candle validation is a script now, and it reproduces.**
+`scripts/research/candle_validate.py` builds our bars either from the lake's
+`candles_1m` or, for a day the lake does not cover, from Tardis's free first-of-month
+Hyperliquid trades, and compares them against `candleSnapshot` or against the recorder's
+own `candle` stream. It writes `reports/data_quality/candle_validation_{day}_{ref}.md`.
+Re-run on 2026-09-05, four days after the day it validates, so `candleSnapshot` still
+held 1,059 of the day's 1,440 BTC minutes rather than all of them:
+
+| coin | minutes | o | h | l | c | v | n | o/h/l/c where n agrees |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BTC | 1,059 | 100.00% | 100.00% | 99.53% | 100.00% | 99.34% | 99.34% | 99.71% of 1,052 |
+| ETH | 1,056 | 100.00% | 100.00% | 99.91% | 100.00% | 99.62% | 99.62% | 99.90% of 1,052 |
+| HYPE | 918 | 100.00% | 100.00% | 99.78% | 99.89% | 99.24% | 99.24% | 99.78% of 911 |
+| SOL | 1,047 | 100.00% | 99.90% | 99.33% | 100.00% | 99.62% | 99.62% | 99.42% of 1,043 |
+
+Same answer as the prose entry above: `o` and `c` exact, and the residual sits in `l`,
+`v` and `n`, which move together because they are the three a missed trade changes.
+The last column is the one that says something about the derivation: it is measured only
+on minutes where both sides counted the same trades, and it is 99.4 to 99.9%.
+
+The reason the reference is Tardis and not the lake is unchanged and now enforced by the
+script's own error message: `candleSnapshot` keeps about three days of `1m` bars and the
+lake's `trades` end 2026-08-30, so there is no day both hold. The moment the recorder
+starts there will be, and `--ours lake` is that run.
