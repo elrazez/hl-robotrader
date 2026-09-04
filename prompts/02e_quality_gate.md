@@ -18,7 +18,7 @@ per day with no *unexplained* holes, written down.
 ## Do
 
 1. Extend `scripts/research/data_quality.py` so the report covers every table now in the
-   lake: `fills_full`, `liquidations`, `trades`, `l2`, `candles_1m`,
+   lake: `fills_full`, `liquidations`, `trades`, `l2`, `candles_1m`, `asset_ctx`,
    `tardis_book_snapshot_5`, `tardis_derivative_ticker`. Per table, per day: rows, files
    (should be 1 after compaction; flag anything else, except the two `tardis_*` side
    tables, which are not compacted and hold one file per venue per coin), and for `liquidations` and
@@ -46,6 +46,9 @@ per day with no *unexplained* holes, written down.
    - `fills_full` was compacted last, detached (`~/fills_compact.log`, 22,795 files to
      365). If it is still running, say so and do not count its file counts as holes.
    - `candles_1m` days equal `trades` days.
+   - `asset_ctx`: 364 days from Hyperliquid's archive (02f item 16), `source ==
+     hl_archive`, one file per day, rows per day close to coins x samples at the cadence
+     02f recorded in `docs/DATA_SOURCES.md`. Flag a day under 90% of the median.
    - `trades` holds no `venue == hyperliquid, source == tardis` rows after 02d; Tardis rows
      are Binance, Bybit and OKX only. Every `candles_1m` file is newer than its day's
      `trades` file (rebuilt with `--force` after the rederive).

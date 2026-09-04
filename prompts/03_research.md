@@ -108,9 +108,10 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
     reversion captured. DECISION yes if exhaustion beats every fixed delay.
   - **Q3 proxy calibration**: compute hl_forced_proxy on the grid, mark proxy
     triggers, match against exact episodes within a 120s window. Precision, recall,
-    F1, per tier, at proxy thresholds 2/3/4/6. For the historical year the proxy is
-    trades-only (no OI gate, no mark-mid gate); see the grill section for the
-    gate-lift check and the trigger branch this decides. Writes
+    F1, per tier, at proxy thresholds 2/3/4/6. The full three-gate proxy runs on the
+    year, with OI and mark from the archive-backed `asset_ctx`; the trades-only
+    variant is reported beside it as the gate-lift measure. See the grill section for
+    the trigger branch this decides. Writes
     `reports/proxy_calibration.md` (this exact path, other docs reference it).
     DECISION yes if any threshold reaches precision >= 0.6 AND recall >= 0.4 on
     core+major tiers.
@@ -158,20 +159,20 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
 These supersede any conflicting rule above. Where a bullet above states a DECISION bar,
 the bar here wins.
 
-**Step 0, before anything else: backfill funding.** The Info API's `fundingHistory`
-returns hourly funding per coin across the whole lake window, free, one call per coin.
-Write it into `asset_ctx`-compatible rows (`source = hl_api`, `rx_ms = 0`) so
-`context.py`'s `funding` is real for the year and Q6's funding filter is evaluable.
-This is data preparation and may precede the preregistration commit.
+**Step 0 was done by `prompts/02f_lake_hardening.md`, confirm it before anything else.**
+`asset_ctx` holds the year from Hyperliquid's own archive: open interest, mark, oracle,
+funding and premium per coin at the cadence recorded in `docs/DATA_SOURCES.md`
+(`source = hl_archive`, `rx_ms = 0`), validated against `fundingHistory` and the twelve
+Tardis days. So `context.py` is real for the year at that cadence, Q6's funding filter is
+evaluable, and all three of the proxy's gates can be calibrated on the year, not on
+twelve days. If `asset_ctx` is missing or short, stop and say so; do not build a
+trades-only workaround. `scripts/research/oi_from_fills.py` gives block-level OI
+changes from `fills_full` if a gate needs finer than the archive's cadence.
 
-`asset_ctx` is otherwise a recorder-only table, and the recorder has not yet run on
-the VPS (as of 2026-09-04 the lake has no recorder rows: no `bbo`, no `asset_ctx`), so for the
-historical year `open_interest`, `mark_px`, `oracle_px` and `premium` are absent, and
-Coinalyze cannot fill them (its intraday history keeps about 2,000 points, useless at
-scalp resolution). `book.py` is NaN for the year as well: there is no historical `bbo`
-and `l2` is hourly snapshots on four coins. The live bot is unaffected, since
-`activeAssetCtx` carries OI, mark and premium at every block. What is missing is a year
-of history to calibrate two of the proxy's three gates, not the gates themselves.
+The recorder has not yet run on the VPS (as of 2026-09-04 the lake has no recorder rows:
+no `bbo`, no live `asset_ctx`). `book.py` is NaN for the year: there is no historical
+`bbo` and `l2` is hourly snapshots on four coins. The live bot reads the same `asset_ctx`
+table from `activeAssetCtx` at every block, so features have one code path.
 
 **Cost model. Every table reports three columns: gross, net-9bps, net-stress. Every
 DECISION reads net-stress and nothing else.**
@@ -253,17 +254,19 @@ roughly 40 clusters a per-slice CI means nothing; only the pooled number carries
 Anything that passes pooled and fails a split is written **"conditional yes, gated on
 X"**, and the gate becomes Phase 4 config. Never a plain yes.
 
-**Q3, restated.** The headline is a **trades-only proxy** over the full year:
-aggressive volume ratio versus its trailing median, with no OI gate and no mark-mid
-gate, because neither exists historically. Precision, recall and F1 by tier at
-thresholds 2/3/4/6, cluster-aware, against exact S3 liquidations. The bar is unchanged:
-precision >= 0.6 AND recall >= 0.4 on core+major. Separately, a **gate-lift check** on
-the 12 Tardis `tardis_derivative_ticker` days asks whether adding the two gates raises
-precision; reported with an explicit "12 days, not a sample size" caveat and **no
-DECISION of its own**, and rerun at 60 recorder days. `reports/proxy_calibration.md`
-keeps its path.
+**Q3, restated.** The headline is the **full three-gate proxy** as the spec defines it,
+over the full year: aggressive volume ratio versus its trailing median, gated by
+`oi_delta_w < 0` and mark-versus-mid above its trailing p95, both read from the
+archive-backed `asset_ctx` at the archive's cadence (02f item 16). Precision, recall and
+F1 by tier at thresholds 2/3/4/6, cluster-aware, against exact S3 liquidations. The bar
+is unchanged: precision >= 0.6 AND recall >= 0.4 on core+major. The **trades-only
+variant** (no gates) is computed on the same year and reported beside it: the
+difference is the gate lift, measured on 364 days rather than twelve, with no DECISION
+of its own. Rerun both at 60 recorder days, where the gates read live block-level
+values instead of the archive's sampling. `reports/proxy_calibration.md` keeps its
+path.
 
-**The trigger branch, decided by Q3 and written into its report.** If the trades-only
+**The trigger branch, decided by Q3 and written into its report.** If the three-gate
 proxy reaches precision >= 0.6 and recall >= 0.4 on core+major, the v0 live trigger is
 HL-native and Q4 stays inconclusive and non-blocking, revisited in Phase 7. If it does
 not, **the v0 trigger is cross-venue (Bybit is the only complete feed) and Q4 becomes a
@@ -290,7 +293,7 @@ run only.**
 4. **No capacity.** Capacity-weighted expected net dollars, at the sample's own episode
    rate and 25% participation, is under **$2,000/year** (roughly 5x infra plus margin).
    A clean 25 bps edge you can put $800 into is not a business.
-5. **No trigger.** Q1 and Q8 pass on exact liquidations, but the trades-only proxy is
+5. **No trigger.** Q1 and Q8 pass on exact liquidations, but the three-gate proxy is
    under precision 0.5 and Q4 cannot be answered for months. Park the project until the
    recorder has the data; do not build Phase 4 blind.
 
@@ -305,8 +308,7 @@ on the held-out last 25% before mainnet is mentioned.
 
 **Preregistration.** `reports/research/PREREGISTRATION.md` is written verbatim from this
 "Decisions already made" section and committed as the **first commit of the phase**,
-before any script touches the real lake. The funding backfill is data preparation and
-may precede it. `SUMMARY.md` cites its commit hash. Any later change is a dated
+before any script touches the real lake. `SUMMARY.md` cites its commit hash. Any later change is a dated
 amendment in `docs/DECISIONS.md` stating what had already been seen when the change was
 made.
 
@@ -329,13 +331,13 @@ Each change carries the report path, the sample size and the old value in
 largest build serving its least load-bearing question, so none of them precede the
 gate. This replaces the commit order under "How to work".
 
-1. funding backfill (step 0)
+1. confirm `asset_ctx` covers the year (step 0)
 2. `reports/research/PREREGISTRATION.md`
 3. `episodes.py`
 4. `grid.py` + `flow.py` + `intensity.py` + `zscore.py`
 5. `_lib.py`, then **Q1**, then **Q8**
 6. **Stop and read both reports.** Only if both pass:
-7. `proxy.py` (trades-only) + Q3, including the trigger branch decision
+7. `proxy.py` (three gates, plus the trades-only variant) + Q3, including the trigger branch decision
 8. Q4 skeleton on the 12 Tardis days
 9. Q5 + Q6
 10. `levels.py` + Q7
@@ -364,7 +366,7 @@ unchanged; only the order is.
    reading "RUN PENDING" so the owner sees exactly what will be filled in.
 6. `reports/research/PREREGISTRATION.md`, committed first, before any script touches
    the real lake.
-7. The `fundingHistory` backfill (step 0), with its own test.
+7. The step 0 confirmation, one paragraph in `SUMMARY.md`: `asset_ctx` days, cadence, source.
 
 ## How to work
 

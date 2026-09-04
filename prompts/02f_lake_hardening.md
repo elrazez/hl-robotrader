@@ -43,9 +43,10 @@ file into Python are streamed.
   and for validation only.
 - **A file name is not a freshness signal.** 02d already learned this: the resume rule
   reads a stamp in the Parquet footer. Derived candles get the same treatment.
-- **Nothing in this prompt spends money.** No S3 pull. The one-off Tardis delete and the
-  candle validation both work on data already on disk, except the validation day, which is
-  a Tardis free day and free.
+- **Only item 16 spends money, and cents.** The fifteen commits touch data already on
+  disk (the candle validation day is a Tardis free day). Item 16 pulls Hyperliquid's
+  daily asset-context files, a few MB a day, behind the same estimate and $5 gate as
+  every S3 job, with a fresh IAM key that lives on this laptop only.
 - **The dict functions in `hl_s3.py` stay the reference.** If a change would make
   `derive_trades_frame` and `derive_trades` disagree, the change is wrong.
 
@@ -162,9 +163,51 @@ The old one-coin-per-day Tardis side-table files (`{venue}_00.parquet`, against 
 correct `{venue}_{coin}_00.parquet`) were deleted from the lake on 2026-09-04; confirm
 zero remain. The `docs/DECISIONS.md` line still says they are outstanding, so correct it.
 
+## Two backfills the research needs, after the fifteen commits
+
+Phase 3 calibrates the live cascade detector, whose gates read open interest and
+mark-versus-mid from `activeAssetCtx`. The lake has no `asset_ctx` history and the
+recorder has not started, so without this the detector is calibrated on trade prints
+alone. Hyperliquid's archive fixes that for under a dollar.
+
+16. **`liqfade backfill asset-ctxs`.** The `hyperliquid-archive` bucket, requester-pays,
+    holds a daily asset-context file per UTC day at `asset_ctxs/YYYYMMDD.csv.lz4` with
+    per-coin open interest, mark price, oracle price, funding and premium, sampled at a
+    fixed cadence. **Verify the layout before writing the job**: list the prefix, pull
+    one day, print the header, the row count per coin and the cadence, and write those
+    three facts into `docs/DATA_SOURCES.md` under Hyperliquid before anything else.
+    Then the job, in the shape of `hl_archive_l2.py`: same S3 client and requester-pays
+    header, `--estimate-only`, the $5 gate, manifest job `s3-asset-ctxs`, resume by key.
+    Rows go into `asset_ctx` with `source = hl_archive`, `rx_ms = 0`, `ts_ms` from the
+    file's timestamp column, every schema column the file provides and null for any it
+    does not; a column the file has and the schema lacks is documented, not silently
+    dropped. One file per day named `hyperliquid_day.parquet`, sorted by `ts_ms`, so the
+    compaction leaves it alone. Run the year 2025-09-01 to 2026-08-30. Validate before
+    reporting: funding against the Info API's `fundingHistory` on BTC, ETH and HYPE for
+    one week (free; expect exact equality at the funding timestamps) and open interest
+    and mark against the twelve `tardis_derivative_ticker` days (expect agreement within
+    the sampling interval). Both tables go into `docs/DECISIONS.md`. Tests use a
+    hand-built two-coin, three-row CSV through the same fake S3 the other jobs use.
+
+17. **`scripts/research/oi_from_fills.py`.** `fills_full` carries `start_position`, `sz`
+    and `side` on every fill, so the change in open interest per coin per minute is the
+    sum of long exposure opened minus closed across all fills in that minute, exactly,
+    block by block. Write it, with a test over five hand-built fills, and compare it
+    with the archive's minute-to-minute OI change on 2025-10-10 and one quiet day.
+    Agreement proves the archive series; the script stays as the sub-minute source if a
+    Phase 3 gate ever needs one. Report the correlation and the largest disagreement.
+
+Owner step before item 16, print it and stop until it is done: create an IAM user for
+this laptop only, with `s3:GetObject` and `s3:ListBucket` on `hyperliquid-archive` and
+nothing else, put its key in `.env`, and plan to delete it once the pull is verified.
+One key per machine; AWS can flag one key used from
+two places as stolen.
+
 ## Report back
 
 The fourteen commit hashes plus the cleanup one, the before/after counts from the Tardis
 Hyperliquid delete, confirmation that no stale side-table files remain, the candle
-validation table the new script produces, and what changed in `docs/`. Next prompt:
+validation table the new script produces, the archive's cadence, row and dollar totals
+with the two validation tables from item 16, item 17's agreement numbers, and what
+changed in `docs/`. Next prompt:
 `prompts/02e_quality_gate.md`.
