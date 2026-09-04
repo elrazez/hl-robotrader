@@ -132,18 +132,10 @@ share one control socket; and the recorder has no untested module.
     but `LatencyState` exposes only p50/p95 scalars, and the panel renders six static rows
     (REST p95 is not even rendered). Add `/api/recorder/latency` returning the retained
     `(ts_ms, ms)` samples and plot it with the uPlot component already in the bundle.
-15. **`deploy.sh` never auto-enables `liqfade-live`.** It runs `systemctl enable` and
-    `restart` for any changed unit, so editing the live unit permanently enables the
-    trading loop. Harmless today because `liqfade live` exits 2; load bearing from Phase 5
-    on. Exclude it explicitly, matching the note the script already prints.
-16. **Drop the watchdog unit until the process exists.** `liqfade-watchdog.service` is
-    installed, enabled and restarted, but `liqfade.execution.watchdog` is an empty stub, so
-    the unit crash loops and reads as "a watchdog is running". Remove the unit and its
-    deploy wiring; `prompts/05_execution.md` adds both back together.
-17. **`orjson` in `universe.py` and `streams/coinalyze.py`.** Both call `response.json()`,
+15. **`orjson` in `universe.py` and `streams/coinalyze.py`.** Both call `response.json()`,
     which is stdlib `json`. CLAUDE.md section 4 says orjson for all JSON.
 
-18. **Cleanup, one commit.** `_REDACT` in `log.py` is exact-match on top-level keys, so
+16. **Cleanup, one commit.** `_REDACT` in `log.py` is exact-match on top-level keys, so
     `secret`, `signature`, `private` and anything nested pass through: make it a substring
     match on the lowered key. Delete `StreamStats.gaps_1h`, which is incremented and never
     read. Rename `record_message`, which fires per row so `msgs_1m` for `hyperliquid.l2`
@@ -162,7 +154,7 @@ share one control socket; and the recorder has no untested module.
     dead `--reload` flag on `panel serve`, which uvicorn ignores because it is passed an
     app object rather than an import string.
 
-19. **Shutdown never drops the rows a failed write left buffered.** `_write` was changed on
+17. **Shutdown never drops the rows a failed write left buffered.** `_write` was changed on
     2026-09-04 to leave rows in the buffer when the write raises, so the next flush tick
     retries them rather than destroying the partition. At shutdown there is no next tick:
     `flush_all` walks the partitions once, and whatever is still buffered when it returns
