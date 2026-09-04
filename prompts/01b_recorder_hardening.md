@@ -162,6 +162,18 @@ share one control socket; and the recorder has no untested module.
     dead `--reload` flag on `panel serve`, which uvicorn ignores because it is passed an
     app object rather than an import string.
 
+19. **Shutdown never drops the rows a failed write left buffered.** `_write` was changed on
+    2026-09-04 to leave rows in the buffer when the write raises, so the next flush tick
+    retries them rather than destroying the partition. At shutdown there is no next tick:
+    `flush_all` walks the partitions once, and whatever is still buffered when it returns
+    goes out with the process, with only a `log.error` behind it and a `health.alert` that
+    may not survive the shutdown either. So the fix that stopped a failed write destroying
+    rows mid-run still loses them at the end of one. Retry once, then write what is still
+    buffered to a quarantine file under `data/` and alert; never drop. Use the quarantine
+    mechanism item 3 introduces, so there is one place to look. Test: a `flush_all` whose
+    writes fail every time leaves every row in a quarantine file and loses none. Pairs with
+    item 10, which is the same window seen from cancellation rather than from a bad write.
+
 ## Deploy
 
 After the commits, deploy to the VPS with `scripts/deploy.sh` and confirm on the box:

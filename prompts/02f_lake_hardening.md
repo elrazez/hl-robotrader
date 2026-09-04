@@ -75,12 +75,12 @@ Fourteen commits, then a cleanup commit.
    `{stem}_{uuid4().hex[:6]}.parquet`. Two consequences, both latent rather than observed:
    `sorted(lake_files(...))` does not return an hour's batches in write order
    (`..._07_1_9f0e` sorts before `..._07_ab12`), and the whole 02d repair rests on file
-   order being the exchange's order; and a crash between `merge_staged` and
-   `manifest.record` makes a re-run append a second copy of the same object's rows under
-   different names, undetectably. Derive the name from the S3 key plus a zero-padded batch
-   index so it is stable and sorts in write order, and so a redo overwrites instead of
-   appending. Test: files from a multi-batch hour sort in batch order; running the same
-   object twice leaves one copy.
+   order being the exchange's order (item 20 folds the check of that assumption in here);
+   and a crash between `merge_staged` and `manifest.record` makes a re-run append a second
+   copy of the same object's rows under different names, undetectably. Derive the name from
+   the S3 key plus a zero-padded batch index so it is stable and sorts in write order, and
+   so a redo overwrites instead of appending. Test: files from a multi-batch hour sort in
+   batch order; running the same object twice leaves one copy.
 4. **`lake_files()` in the three readers that bypass it.**
    `scripts/research/data_quality.py:37`, `liqfade/panel/app.py` (`liquidations_by_venue`,
    which globs `date=*/*.parquet`) and `liqfade/data/ingest/hydromancer.py:176`. The
@@ -203,11 +203,64 @@ nothing else, put its key in `.env`, and plan to delete it once the pull is veri
 One key per machine; AWS can flag one key used from
 two places as stolen.
 
+## The 02d review, four more commits
+
+A second review on 2026-09-04, this one of 02d itself, found four more. The
+two it turned up outside this area (a kill that reported success when `data/KILL` never
+reached disk, and the resume rule `02d_rederive.md` described as an mtime comparison) were
+fixed the same day in `main`. These four all sit in `liqfade/data/ingest/*` and
+`liqfade/data/derive/*`, which the rederive and the compaction re-import on every restart,
+so they wait for the same green light as everything above. One commit each.
+
+18. **`_assemble` is atomic.** It writes `all_day.parquet` and only then unlinks the hourly
+    files it read. A crash in that window, or one `unlink` failing on a mount that times
+    out an open every few hours, leaves both; the rerun then keeps the non-`hl_s3` rows
+    from the old files *and* the copy of them already inside the new one, silently doubling
+    every recorder and Tardis row in that partition. The docstring's "a failure anywhere
+    leaves the partition as it was" is not true today. Write under a temp name in the same
+    directory, unlink every input, then `os.replace`, so a rerun after a crash anywhere in
+    that window keeps exactly one copy of the foreign-source rows. Test with an injected
+    failure between the write and the unlink. Fix the docstring.
+19. **The polars twins match the dict functions on nulls.** Two disagreements, both silent,
+    neither of which fired on the year, which is why they are worth closing before one
+    does. `derive_liquidations_frame`'s semi join takes polars' default `join_nulls=False`,
+    so a group with a null `block_time` or `tid` (both nullable Int64 in `schemas.py`) is
+    dropped where the dict keeps it, Python tuple keys matching `None` happily. And with no
+    `crossed` row and a null `side`, the frame emits `sell` where the dict emits `buy`.
+    Pass `join_nulls=True`, and mirror the dict's `side == "B"` test rather than the XOR on
+    `_has_taker`. The dict functions stay the reference, per the decision above. Add both
+    cases to `test_both_twins_equal`.
+20. **`_assemble` drops every Hyperliquid row that is not ours, and `read_fills` checks its
+    own assumption.** It drops only `source == "tardis"` today, so a recorder-written
+    Hyperliquid trade survives and, sitting in `kept`, is concatenated ahead of our rows
+    and sorts first inside a shared millisecond: the same open-before-close failure 02d
+    exists to fix, waiting for the recorder to start. `docs/DATA_SOURCES.md` now says
+    `hl_s3` is the one source of Hyperliquid trades and liquidations, so on any day that
+    has `fills_full` the rule is `venue == "hyperliquid"` and `source != "hl_s3"`, per
+    "Counting a trade once". Separately, the whole repair rests on "all fills of one
+    millisecond sit in one file" and nothing checks it: have `read_fills` assert that the
+    `[min_ts, max_ts]` ranges of its input files do not overlap, so the assumption is
+    tested on every run instead of assumed. Fold that assertion into item 3, which is
+    already replacing the uuid suffix with a batch index and is where file order gets its
+    guarantee in the first place.
+21. **Cleanup in the rederive area, one commit.** One shared `stable_by_ts` used by both
+    `hl_s3._assemble` and `derive/from_fills.py`, instead of the sort rule being written
+    out twice, in two modules, for the hardest invariant in the repo; state the tie rule in
+    its docstring, which after item 20 is that `hl_s3` rows are the only Hyperliquid rows
+    in the partition, so a cross-venue tie inside a millisecond carries no meaning.
+    `--workers` defaults to `None` so an explicit `--workers 0` is refused rather than
+    silently becoming 6 (2 for `rederive`). `--force` is either honoured or removed per
+    backfill job; every job accepts it and only `rederive` acts on it. Rename the `stamp`
+    parameter that holds a date string in `hl_s3.py` to `day`, so the name means one thing
+    in a file where `REDERIVE_STAMP` is footer metadata five lines further down. And merge
+    the shared shape of `derive_trades_frame` and `derive_liquidations_frame` if it reads
+    cleaner once 19 has landed.
+
 ## Report back
 
-The fourteen commit hashes plus the cleanup one, the before/after counts from the Tardis
-Hyperliquid delete, confirmation that no stale side-table files remain, the candle
-validation table the new script produces, the archive's cadence, row and dollar totals
-with the two validation tables from item 16, item 17's agreement numbers, and what
-changed in `docs/`. Next prompt:
+The fourteen commit hashes plus the cleanup one, the four from the 02d review, the
+before/after counts from the Tardis Hyperliquid delete, confirmation that no stale
+side-table files remain, the candle validation table the new script produces, the
+archive's cadence, row and dollar totals with the two validation tables from item 16,
+item 17's agreement numbers, and what changed in `docs/`. Next prompt:
 `prompts/02e_quality_gate.md`.
