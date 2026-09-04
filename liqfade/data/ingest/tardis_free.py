@@ -212,17 +212,30 @@ def write_side_table(
     return int(arrow.num_rows)
 
 
+def is_coverage_400(body: str) -> bool:
+    """True only for the documented "this venue never carried it" 400.
+
+    `Data type 'liquidations' is not supported for 'BTC'`, which is how Tardis replies to
+    Hyperliquid liquidations. Every other 400, a throttle or a malformed URL, is a
+    failure: this job records a coverage answer as done-with-zero-rows and never asks
+    again, so treating one of those as coverage is permanent silent data loss.
+    """
+    lowered = body.lower()
+    return "data type" in lowered and "is not supported" in lowered
+
+
 def fetch(client: httpx.Client, url: str) -> bytes | None:
     """The gzipped CSV, or None when Tardis has no file for that combination.
 
     Tardis answers "we do not carry this" two different ways: 404 for a month it has no
-    file for, and 400 with `Data type 'x' is not supported for 'SYMBOL'` for a data type
-    an exchange never had, which is how it replies to Hyperliquid liquidations. Both are
-    answers about coverage rather than failures, so both are reported as missing and the
-    pull carries on to the next file.
+    file for, and the 400 `is_coverage_400` matches. Both are answers about coverage
+    rather than failures, so both are reported as missing and the pull carries on. Any
+    other status, 400 included, raises.
     """
     response = client.get(url, timeout=REQUEST_TIMEOUT_S, follow_redirects=True)
-    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.BAD_REQUEST):
+    if response.status_code == httpx.codes.NOT_FOUND:
+        return None
+    if response.status_code == httpx.codes.BAD_REQUEST and is_coverage_400(response.text):
         return None
     response.raise_for_status()
     return response.content

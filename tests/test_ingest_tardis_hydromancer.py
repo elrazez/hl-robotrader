@@ -300,6 +300,34 @@ def test_an_unsupported_data_type_is_skipped_like_a_missing_month(tmp_path: Path
     )
 
 
+def test_a_400_that_is_not_about_coverage_fails_the_object(tmp_path: Path) -> None:
+    """Every 400 used to be recorded as done with zero rows and never asked again.
+
+    A throttle or a malformed URL answering 400 was therefore permanent silent data loss.
+    """
+    api = FakeTardis({})
+    api.handle = lambda request: httpx.Response(  # type: ignore[method-assign]
+        400, json={"code": 429, "message": "Too many requests, slow down"}
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        tardis_free.run(
+            api.client(),
+            tmp_path,
+            DAY,
+            DAY,
+            ["BTC"],
+            exchanges={"bybit": "bybit"},
+            data_types=("liquidations",),
+        )
+    assert Manifest.load(tmp_path, tardis_free.JOB).objects == {}
+
+
+def test_only_the_documented_body_reads_as_coverage() -> None:
+    assert tardis_free.is_coverage_400("Data type 'liquidations' is not supported for 'BTC'")
+    assert not tardis_free.is_coverage_400("Too many requests, slow down")
+    assert not tardis_free.is_coverage_400("")
+
+
 def test_hyperliquid_trades_and_liquidations_are_not_requested_but_the_side_tables_are(
     tmp_path: Path,
 ) -> None:
