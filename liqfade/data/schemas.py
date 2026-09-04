@@ -42,6 +42,7 @@ SOURCE_HL_API = "hl_api"  # public Info API: candleSnapshot
 SOURCE_HL_ARCHIVE = "hl_archive"  # requester-pays hyperliquid-archive L2 snapshots
 SOURCE_TARDIS = "tardis"  # free first-of-month CSVs
 SOURCE_HYDROMANCER = "hydromancer"  # Reservoir S3, pre-parsed
+SOURCE_DERIVED = "derived"  # built from another table in this lake, no network involved
 SOURCES = (
     SOURCE_RECORDER,
     SOURCE_HL_S3,
@@ -49,6 +50,7 @@ SOURCES = (
     SOURCE_HL_ARCHIVE,
     SOURCE_TARDIS,
     SOURCE_HYDROMANCER,
+    SOURCE_DERIVED,
 )
 
 LIQUIDATIONS = pa.schema(

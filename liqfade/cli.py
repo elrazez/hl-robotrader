@@ -305,6 +305,31 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
 
+# --- derive -------------------------------------------------------------------
+
+DERIVE_JOBS = ("candles",)
+
+
+def cmd_derive(args: argparse.Namespace) -> int:
+    """Rebuild one canonical table from another. Free, offline, no network at all."""
+    from liqfade.data.derive import candles
+    from liqfade.data.ingest.common import BackfillError
+    from liqfade.log import setup_logging
+
+    settings = _settings(args)
+    setup_logging(proc="derive", env=settings.env, level=settings.logging.level)
+    coins = [coin.strip().upper() for coin in args.coins.split(",") if coin.strip()]
+
+    try:
+        start, end = _dates(args)
+        return candles.run(
+            settings.paths.data_dir, start, end, coins=coins or None, force=args.force
+        )
+    except BackfillError as exc:
+        print(f"derive error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+
 # --- status -------------------------------------------------------------------
 
 
@@ -540,6 +565,19 @@ def build_parser() -> argparse.ArgumentParser:
         "disk and moved to the lake serially, so more workers cost RAM, not disk seeks",
     )
     backfill.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+    derive = sub.add_parser(
+        "derive", parents=[common], help="rebuild a table from another one, offline and free"
+    )
+    derive.add_argument("job", choices=DERIVE_JOBS, help="which table to derive")
+    derive.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    derive.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    derive.add_argument(
+        "--coins", default="", help="comma separated HL coins; default is every coin in trades"
+    )
+    derive.add_argument(
+        "--force", action="store_true", help="rewrite days whose output file already exists"
+    )
+    derive.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
 
     compact = sub.add_parser(
@@ -588,6 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
 HANDLERS = {
     "config": cmd_config,
     "backfill": cmd_backfill,
+    "derive": cmd_derive,
     "record": cmd_record,
     "compact": cmd_compact,
     "status": cmd_status,

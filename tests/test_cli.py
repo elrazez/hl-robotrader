@@ -19,6 +19,7 @@ ALL_COMMANDS = {
     "record",
     "compact",
     "backfill",
+    "derive",
     "backtest",
     "paper",
     "testnet",
