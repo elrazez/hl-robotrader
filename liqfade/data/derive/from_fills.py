@@ -36,6 +36,7 @@ from pathlib import Path
 
 import polars as pl
 
+from liqfade.data.ingest.common import BackfillError
 from liqfade.data.ingest.hl_s3 import LIQUIDATED_ON_BUY, LIQUIDATED_ON_SELL, VENUE
 
 # One trade, seen from both sides: fills arrive in maker and taker pairs, so every event
@@ -90,8 +91,29 @@ def read_fills(files: list[Path]) -> pl.DataFrame:
     module is about and an explicit loop is the only way to be sure of it. On this mount
     the cost is the file open, which is paid either way. `rechunk=False` keeps the
     concatenation a relabelling of chunks rather than a copy of the day.
+
+    The whole repair rests on "all fills of one millisecond sit in one file": the sort
+    below is stable on `ts_ms` alone, so rows sharing a millisecond keep their file order,
+    and that is only the exchange's order if no other file holds part of the same
+    millisecond. Nothing checked it, so it is checked here, on every run.
     """
-    frames = [pl.read_parquet(path, columns=FILL_COLUMNS) for path in files]
+    frames = []
+    last_max: int | None = None
+    for path in files:
+        frame = pl.read_parquet(path, columns=FILL_COLUMNS)
+        frames.append(frame)
+        first, last = frame["ts_ms"].min(), frame["ts_ms"].max()
+        if first is None or last is None:
+            continue
+        first_ms, last_ms = int(first), int(last)  # type: ignore[arg-type]
+        if last_max is not None and first_ms <= last_max:
+            raise BackfillError(
+                f"{path.name} starts at ts_ms {first_ms} but an earlier file of "
+                f"{path.parent} already reaches {last_max}: a millisecond spans two "
+                "files, so file order is no longer the exchange's event order. Compact "
+                "the partition before rederiving it."
+            )
+        last_max = last_ms
     return pl.concat(frames, how="vertical", rechunk=False)
 
 

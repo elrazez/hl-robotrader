@@ -20,7 +20,7 @@ from liqfade.data.derive.from_fills import (
     derive_trades_frame,
     read_fills,
 )
-from liqfade.data.ingest.common import read_lz4_lines
+from liqfade.data.ingest.common import BackfillError, read_lz4_lines
 from liqfade.data.ingest.hl_s3 import derive_liquidations, derive_trades, parse_fills
 from liqfade.data.schemas import SOURCE_HL_S3, rows_to_table
 from liqfade.recorder.writer import write_atomic
@@ -148,23 +148,40 @@ def test_two_fills_in_one_millisecond_come_out_in_file_order_not_tid_order() -> 
     assert frame.get_column("px").to_list() == [100.0, 101.0]
 
 
-def test_a_millisecond_split_across_two_files_keeps_the_order_of_the_file_list(
-    tmp_path: Path,
-) -> None:
-    """`read_fills` concatenates in the order it is given, whatever the names sort like.
+def write_fills_file(path: Path, tid: int, ts_ms: int) -> Path:
+    write_atomic(
+        rows_to_table("fills_full", [fill(tid=tid, ts_ms=ts_ms, block_time=ts_ms)], SOURCE_HL_S3),
+        path,
+    )
+    return path
 
-    The hourly files of an un-compacted day are named `hyperliquid_07_2_ab12cd.parquet`
-    by the staging mover, so `hyperliquid_07_10_x` sorts before `hyperliquid_07_2_x`.
-    That is the order they are read in and the order their rows must keep.
+
+def test_read_fills_concatenates_in_the_order_it_is_given(tmp_path: Path) -> None:
+    early = write_fills_file(tmp_path / "hyperliquid_07_07_0000.parquet", 10, 1_000)
+    late = write_fills_file(tmp_path / "hyperliquid_07_07_0001.parquet", 20, 2_000)
+    assert sorted([late, early]) == [early, late]
+    assert derive_trades_frame(read_fills([early, late])).get_column("tid").to_list() == [10, 20]
+
+
+def test_read_fills_refuses_a_millisecond_split_across_two_files(tmp_path: Path) -> None:
+    """The whole repair rests on one millisecond sitting in one file. Nothing checked it.
+
+    A stable sort on `ts_ms` keeps a millisecond's rows in file order, and file order is
+    only the exchange's order while no second file holds part of the same millisecond.
     """
-    for name, tid in (("hyperliquid_07_10_aaaaaa", 20), ("hyperliquid_07_2_bbbbbb", 10)):
-        write_atomic(
-            rows_to_table("fills_full", [fill(tid=tid)], SOURCE_HL_S3), tmp_path / f"{name}.parquet"
-        )
+    files = [
+        write_fills_file(tmp_path / "hyperliquid_07_07_0000.parquet", 10, 1_000),
+        write_fills_file(tmp_path / "hyperliquid_07_07_0001.parquet", 20, 1_000),
+    ]
+    with pytest.raises(BackfillError, match="a millisecond spans two files"):
+        read_fills(files)
 
-    files = sorted(tmp_path.glob("*.parquet"))
-    assert [path.stem for path in files] == ["hyperliquid_07_10_aaaaaa", "hyperliquid_07_2_bbbbbb"]
-    assert derive_trades_frame(read_fills(files)).get_column("tid").to_list() == [20, 10]
+
+def test_read_fills_refuses_a_file_list_that_is_not_in_time_order(tmp_path: Path) -> None:
+    early = write_fills_file(tmp_path / "hyperliquid_07_07_0000.parquet", 10, 1_000)
+    late = write_fills_file(tmp_path / "hyperliquid_07_07_0001.parquet", 20, 2_000)
+    with pytest.raises(BackfillError, match="already reaches"):
+        read_fills([late, early])
 
 
 def test_the_stable_sort_moves_a_late_millisecond_without_disturbing_its_neighbours() -> None:

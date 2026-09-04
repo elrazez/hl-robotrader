@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import re
 import shutil
 import tempfile
-import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -350,20 +350,43 @@ def _pull_one(
     return _stage_object(_worker_client(factory), bucket, key, size, stage_base, handler)
 
 
-def merge_staged(stage_root: Path, lake_root: Path) -> None:
+def staged_name(key: str, staged: Path) -> str:
+    """The lake name for one staged file: `{venue}_{HH}_{token}_{batch}.parquet`.
+
+    The staged name is already `{venue}_{HH}` plus `_{n}` for the second and later
+    batches of an hour, which is the order the parser wrote them in. Two things are added
+    here, both of which the old `uuid4().hex[:6]` suffix broke:
+
+    - **It sorts in write order.** `sorted(lake_files(...))` has to return an hour's
+      batches in the order the parser emitted them, because the whole 02d repair rests on
+      a partition's file order being the exchange's event order, and `..._07_1_9f0e`
+      sorts before `..._07_ab12`. The batch index is zero padded and always present.
+    - **It is stable.** A crash between `merge_staged` and `manifest.record` used to make
+      a re-run of the same object append a second copy of its rows under different names,
+      undetectably. The same object now lands on the same file names and overwrites.
+
+    `token` is the S3 key's own stem, which is what keeps two objects apart when both
+    write the same partition and hour: the coin for the L2 archive, and the neighbouring
+    hour's object for a fill whose `time` falls just outside its own.
+    """
+    fields = staged.stem.split("_")  # {venue}_{HH}[_{batch}]
+    batch = int(fields[2]) if len(fields) > 2 and fields[2].isdigit() else 0
+    token = re.sub(r"[^0-9A-Za-z-]", "-", Path(key).stem) or "x"
+    return f"{fields[0]}_{fields[1]}_{token}_{batch:04d}.parquet"
+
+
+def merge_staged(stage_root: Path, lake_root: Path, key: str) -> None:
     """Move every staged Parquet file into the lake, keeping the partition layout.
 
-    Names get a short random suffix so files staged by concurrent workers for the same
-    (table, date, hour) can never collide; readers glob the partition and compaction
-    folds the day, so nothing downstream cares what a file is called. The copy goes to a
-    temp name on the destination filesystem then `os.replace`, the atomicity rule every
-    lake write follows.
+    `key` is the S3 key the staged files were parsed from; see `staged_name` for what
+    the name has to guarantee. The copy goes to a temp name on the destination
+    filesystem then `os.replace`, the atomicity rule every lake write follows.
     """
     if not stage_root.exists():
         return
     for staged in sorted(stage_root.rglob("*.parquet")):
         relative = staged.relative_to(stage_root)
-        final = lake_root / relative.parent / f"{staged.stem}_{uuid.uuid4().hex[:6]}.parquet"
+        final = lake_root / relative.parent / staged_name(key, staged)
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = final.with_name(f".{final.name}.tmp")
         try:
@@ -413,7 +436,7 @@ def parallel_pull(
         staged_parquet = scratch_path / "parquet"
         if inspect is not None:
             inspect(staged_parquet, key)
-        merge_staged(staged_parquet, lake_root)
+        merge_staged(staged_parquet, lake_root, key)
         if keep_raw:
             raws = list((scratch_path / "raw").glob("*"))
             if raws:

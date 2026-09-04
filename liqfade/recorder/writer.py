@@ -125,7 +125,7 @@ def _hour_of(path: Path) -> int:
     """UTC hour from a partition file name, which is always `{venue}_{HH}[_...].parquet`.
 
     The suffixes come from the second flush of an hour (`_{n}`) and from the backfill's
-    staging mover (`_{n}_{6hex}`), so the hour is always the second underscore field. An
+    staging mover (`_{key stem}_{batch}`), so the hour is always the second field. An
     unrecognisable name raises: guessing hour 0 would put its rows at the front of a file
     that claims to be sorted by time, which is worse than refusing to compact the day.
     """

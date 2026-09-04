@@ -18,6 +18,8 @@ import pytest
 
 from liqfade.data.ingest import common
 from liqfade.data.ingest.common import Manifest, merge_staged, parallel_pull, write_partitioned
+from liqfade.recorder.writer import _hour_of as writer_hour_of
+from liqfade.recorder.writer import lake_files
 from tests.conftest import FakeS3
 
 BUCKET = "fake-bucket"
@@ -222,15 +224,45 @@ def test_keep_raw_lands_the_raw_file_under_the_lake(client: FakeS3, tmp_path: Pa
 
 
 def test_merge_staged_never_collides_on_identical_names(tmp_path: Path) -> None:
+    """Two objects whose rows land in the same partition and hour keep two files."""
     lake = tmp_path / "parquet"
     rows = [_row(BASE)]
     stage_a = tmp_path / "sa"
     stage_b = tmp_path / "sb"
     write_partitioned(stage_a, "trades", "hyperliquid", "hl_s3", rows)
     write_partitioned(stage_b, "trades", "hyperliquid", "hl_s3", rows)
-    merge_staged(stage_a, lake)
-    merge_staged(stage_b, lake)
+    merge_staged(stage_a, lake, "market_data/20260301/0/l2Book/BTC.lz4")
+    merge_staged(stage_b, lake, "market_data/20260301/0/l2Book/ETH.lz4")
     files = list((lake / "trades").rglob("*.parquet"))
     assert len(files) == 2
     assert len({f.name for f in files}) == 2
     assert sum(pq.read_metadata(f).num_rows for f in files) == 2
+
+
+def test_an_hours_batches_sort_in_the_order_the_parser_wrote_them(tmp_path: Path) -> None:
+    """`..._07_1_9f0e` sorted before `..._07_ab12`, and file order is exchange order."""
+    lake = tmp_path / "parquet"
+    stage = tmp_path / "s"
+    for batch in range(12):  # past 9, where an unpadded index starts sorting wrong
+        write_partitioned(stage, "trades", "hyperliquid", "hl_s3", [_row(BASE + batch)])
+
+    merge_staged(stage, lake, "node_fills_by_block/hourly/20260301/07.lz4")
+    files = sorted(lake_files(next((lake / "trades").glob("date=*"))))
+    assert len(files) == 12
+    stamps = [pq.read_table(path).column("ts_ms")[0].as_py() for path in files]
+    assert stamps == [BASE + batch for batch in range(12)]
+    assert len({writer_hour_of(path) for path in files}) == 1  # still compactable
+
+
+def test_running_the_same_object_twice_leaves_one_copy(tmp_path: Path) -> None:
+    """A crash between the merge and the manifest record used to double the object."""
+    lake = tmp_path / "parquet"
+    key = "node_fills_by_block/hourly/20260301/07.lz4"
+    for _ in range(2):
+        stage = tmp_path / "s"
+        write_partitioned(stage, "trades", "hyperliquid", "hl_s3", [_row(BASE)])
+        write_partitioned(stage, "trades", "hyperliquid", "hl_s3", [_row(BASE + 1)])
+        merge_staged(stage, lake, key)
+
+    files = lake_files(next((lake / "trades").glob("date=*")))
+    assert sum(pq.read_metadata(path).num_rows for path in files) == 2
