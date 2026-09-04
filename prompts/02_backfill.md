@@ -5,7 +5,7 @@ BTC/ETH/SOL/HYPE and the Tardis days are on disk, about $25 of egress. Two thing
 prompt assumed turned out wrong and are handled by the follow-ups: the public API keeps
 only ~3 days of 1m candles (`02c_candles.md` derives them from `trades`), and a year of
 hourly files needs compacting before research (`02b_compaction.md`). Then
-`02d_quality_gate.md`. Details in `docs/DECISIONS.md` under 2026-09-04.
+`02e_quality_gate.md`. Details in `docs/DECISIONS.md` under 2026-09-04.
 
 Owner notes: this is the phase that spends money. Before running it you need an AWS
 account, an IAM user with read access to the two Hyperliquid buckets (CLAUDE.md section

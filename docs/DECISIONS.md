@@ -311,7 +311,7 @@ Tested where it can be tested, on `fills_full`, which does carry `tid`: zero exa
 duplicates on every day checked except 10 rows in the 2025-11-13 handoff hour. So nothing
 needs deduping, and 02c is not blocked. The one residual is Tardis `trades`, 173,868 rows
 (0.05%) above a manifest that was never rebuilt; small enough to leave to 02d. See
-`prompts/02d_quality_gate.md`, which settles all of this.
+`prompts/02e_quality_gate.md`, which settles all of this.
 
 **The Tardis side tables kept only the last coin written.** `write_side_table` named its
 output `{venue}_00.parquet` per table and day, but `run` calls it once per coin for the
