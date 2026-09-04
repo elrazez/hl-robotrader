@@ -295,6 +295,23 @@ class Settings(Base):
         return self.paths.data_dir / "KILL"
 
     @property
+    def kill_switch_present(self) -> bool:
+        """True when the kill flag is there, and true when we cannot tell.
+
+        Path.exists() answers False for every OSError, so an unreadable, unmounted or
+        replaced-by-a-file data_dir read as "no kill file" and let live trading through.
+        The kill switch is the one control that has to fail closed, so anything but a
+        clean "not found" counts as present.
+        """
+        try:
+            os.stat(self.kill_file)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    @property
     def state_path(self) -> Path:
         return self.paths.data_dir / self.control.state_file
 
@@ -325,7 +342,7 @@ class Settings(Base):
         return (
             self.env == "mainnet"
             and os.environ.get("LIQFADE_LIVE_TRADING") == "1"
-            and not self.kill_file.exists()
+            and not self.kill_switch_present
         )
 
     def live_trading_block_reason(self) -> str | None:
@@ -334,6 +351,6 @@ class Settings(Base):
             return f"env is {self.env}, not mainnet"
         if os.environ.get("LIQFADE_LIVE_TRADING") != "1":
             return "LIQFADE_LIVE_TRADING is not set to 1"
-        if self.kill_file.exists():
+        if self.kill_switch_present:
             return f"kill switch file present at {self.kill_file}"
         return None

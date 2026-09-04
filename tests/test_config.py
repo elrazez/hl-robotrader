@@ -142,6 +142,28 @@ def test_live_trading_blocked_when_kill_file_exists(
     assert settings.live_trading_enabled is True  # and it recovers when the file goes
 
 
+def test_live_trading_blocked_when_the_kill_file_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill switch fails closed: anything but a clean "not found" counts as present.
+
+    Path.exists() answers False for every OSError, so an unmounted or unreadable data_dir
+    used to read as "no kill file" and let live trading through. Here data_dir is a plain
+    file, so stat on data_dir/KILL raises ENOTDIR rather than ENOENT.
+    """
+    settings = _mainnet(tmp_path, monkeypatch, live="1")
+    assert settings.live_trading_enabled is True
+
+    data_dir = settings.paths.data_dir
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+    data_dir.write_text("not a directory")
+
+    assert settings.kill_switch_present is True
+    assert settings.live_trading_enabled is False
+    assert "kill switch file present" in (settings.live_trading_block_reason() or "")
+
+
 def test_default_environment_is_paper() -> None:
     assert load_settings(environ={}).env == "paper"
 
