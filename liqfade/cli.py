@@ -123,7 +123,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
     from liqfade.data.ingest.common import BackfillError, day_range, parse_day
     from liqfade.data.schemas import SCHEMAS
     from liqfade.log import setup_logging
-    from liqfade.recorder.writer import compact_day
+    from liqfade.recorder.writer import compact_day, lake_files
 
     settings = _settings(args)
     setup_logging(proc="compact", env=settings.env, level=settings.logging.level)
@@ -165,7 +165,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
         date = day.strftime("%Y-%m-%d")
         for table in tables:
             directory = root / table / f"date={date}"
-            inputs = len(list(directory.glob("*.parquet"))) if directory.is_dir() else 0
+            inputs = len(lake_files(directory)) if directory.is_dir() else 0
             files_before += inputs
             began = time.monotonic()
             written = compact_day(root, date, tables=[table])

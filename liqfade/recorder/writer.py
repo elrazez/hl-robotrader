@@ -110,6 +110,17 @@ def write_rows(
     return path
 
 
+def lake_files(directory: Path) -> list[Path]:
+    """The Parquet files of a partition, ignoring anything hidden.
+
+    Hidden covers our own `.name.pid.tmp` and, on the owner's external drive, macOS's
+    AppleDouble sidecars: copying onto a non-native filesystem leaves a 4 KiB `._x.parquet`
+    next to every `x.parquet`, which is not Parquet at all. Readers that glob `*.parquet`
+    have to skip them too.
+    """
+    return [p for p in directory.glob("*.parquet") if not p.name.startswith(".")]
+
+
 def _hour_of(path: Path) -> int:
     """UTC hour from a partition file name, which is always `{venue}_{HH}[_...].parquet`.
 
@@ -211,7 +222,7 @@ def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> di
         if wanted is not None and table_name not in wanted:
             continue
         directory = table_dir / f"date={date}"
-        inputs = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
+        inputs = sorted(lake_files(directory)) if directory.is_dir() else []
         if not inputs:
             continue
         if len(inputs) == 1 and inputs[0].name.endswith(DAY_SUFFIX):

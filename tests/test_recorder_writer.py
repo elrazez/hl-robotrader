@@ -270,3 +270,18 @@ def test_an_hour_that_holds_the_wrong_hours_rows_is_refused(tmp_path: Path) -> N
     with pytest.raises(RuntimeError, match="refusing to write a misordered file"):
         compact_day(tmp_path, DATE)
     assert len(list(directory.glob("*.parquet"))) == 2
+
+
+def test_macos_sidecar_files_are_not_lake_data(tmp_path: Path) -> None:
+    """Copying onto the owner's external drive leaves a `._x.parquet` beside every file."""
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    (directory / "._hyperliquid_10.parquet").write_bytes(b"\x00\x05\x16\x07not parquet")
+
+    assert compact_day(tmp_path, DATE) == {"bbo": 1}
+    assert (directory / "hyperliquid_day.parquet").exists()
+    assert not (directory / "hyperliquid_10.parquet").exists()
+    # Untouched: it is not ours to delete, and it is not data.
+    assert (directory / "._hyperliquid_10.parquet").exists()
+    # And a second run still sees a compacted day.
+    assert compact_day(tmp_path, DATE) == {}
