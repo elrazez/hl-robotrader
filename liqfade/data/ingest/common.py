@@ -195,6 +195,20 @@ class Manifest:
                 tmp.unlink()
 
 
+def log_egress(job: str, manifest: Manifest) -> str:
+    """Log what this job has spent so far and return the line for its run summary.
+
+    Both S3 jobs printed GiB and nothing else, and the "$25 for the year" figure lived
+    only in docs/DECISIONS.md. The Phase 2 definition of done says egress spend is
+    logged, so it goes to the journal as a structured `event=egress` line carrying the
+    byte count as well as to the console.
+    """
+    total = manifest.total_bytes()
+    usd = total / GIB * EGRESS_USD_PER_GB
+    log.info("egress", job=job, bytes=total, gib=round(total / GIB, 3), usd=round(usd, 2))
+    return f"  egress so far: {total / GIB:.2f} GiB, ${usd:.2f} at ${EGRESS_USD_PER_GB:.2f}/GB"
+
+
 # --- S3 -----------------------------------------------------------------------
 
 

@@ -43,6 +43,7 @@ from liqfade.data.ingest.common import (
     day_range,
     estimate,
     list_objects,
+    log_egress,
     parallel_pull,
     read_lz4_lines,
     write_partitioned,
@@ -489,7 +490,7 @@ def run(
     print(f"fetched {fetched} objects this run, {len(manifest.objects)} in the manifest")
     for table in TABLES:
         print(f"  {table}: {totals.get(table, 0)} rows")
-    print(f"  egress so far: {manifest.total_bytes() / 1024**3:.2f} GiB")
+    print(log_egress(JOB, manifest))
     return 0
 
 

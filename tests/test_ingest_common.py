@@ -46,6 +46,31 @@ def test_the_estimate_line_names_objects_gib_and_dollars() -> None:
     assert estimate(SMALL).line() == "1 objects, 1.00 GiB, estimated $0.09 at $0.09/GB"
 
 
+def test_egress_is_logged_in_dollars_as_well_as_gib(tmp_path: Path) -> None:
+    """The Phase 2 DoD says egress spend is logged, not just printed as bytes."""
+    import structlog
+
+    from liqfade.data.ingest.common import Manifest, log_egress
+
+    manifest = Manifest.load(tmp_path, "s3-fills")
+    manifest.record("k", 10 * 1024**3, {})
+
+    with structlog.testing.capture_logs() as entries:
+        line = log_egress("s3-fills", manifest)
+
+    assert line == "  egress so far: 10.00 GiB, $0.90 at $0.09/GB"
+    assert entries == [
+        {
+            "event": "egress",
+            "log_level": "info",
+            "job": "s3-fills",
+            "bytes": 10 * 1024**3,
+            "gib": 10.0,
+            "usd": 0.9,
+        }
+    ]
+
+
 def test_an_empty_listing_costs_nothing() -> None:
     assert estimate([]) == Estimate(objects=0, bytes=0)
     assert estimate([]).usd == 0.0
