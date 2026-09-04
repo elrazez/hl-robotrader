@@ -223,7 +223,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
 # --- backfill -----------------------------------------------------------------
 
-BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "candles", "tardis")
+BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "asset-ctxs", "candles", "tardis")
 
 
 def _dates(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -274,7 +274,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         PartialCredentialsError,
     )
 
-    from liqfade.data.ingest import hl_archive_l2, hl_candles, hl_s3, tardis_free
+    from liqfade.data.ingest import hl_archive_l2, hl_asset_ctxs, hl_candles, hl_s3, tardis_free
     from liqfade.data.ingest.common import BackfillError, s3_client
     from liqfade.log import setup_logging
 
@@ -328,6 +328,16 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 yes=args.yes,
                 keep_raw=args.keep_raw,
                 workers=_workers(args, default=6),
+            )
+        if args.job == "asset-ctxs":
+            return hl_asset_ctxs.run(
+                s3_client(),
+                data_dir,
+                start,
+                end,
+                estimate_only=args.estimate_only,
+                yes=args.yes,
+                keep_raw=args.keep_raw,
             )
         if args.job == "candles":
             with httpx.Client() as client:

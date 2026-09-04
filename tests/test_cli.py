@@ -212,7 +212,14 @@ def test_backfill_lists_every_job() -> None:
     parser = build_parser()
     backfill = parser._subparsers._group_actions[0].choices["backfill"]
     job = next(action for action in backfill._actions if action.dest == "job")
-    assert set(job.choices) == {"s3-fills", "rederive", "l2", "candles", "tardis"}
+    assert set(job.choices) == {
+        "s3-fills",
+        "rederive",
+        "l2",
+        "asset-ctxs",
+        "candles",
+        "tardis",
+    }
 
 
 def test_backfill_without_dates_explains_itself_and_exits_one(

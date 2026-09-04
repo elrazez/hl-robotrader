@@ -4,6 +4,9 @@
   trade history, plus the lossless `fills_full` archive and the `rederive` job that
   rebuilds the canonical tables from it at zero cost.
 - `hl_archive_l2`: requester-pays hourly L2 snapshots from `hyperliquid-archive`.
+- `hl_asset_ctxs`: requester-pays daily asset-context files from the same bucket, one row
+  per coin per minute. Cents for the year, and the only history of open interest, funding
+  and the impact spread the lake has until the recorder has run for a while.
 - `hl_candles`: 1m candles from the free public `candleSnapshot` endpoint.
 - `tardis_free`: the free first-of-month CSVs for Binance, Bybit, OKX and Hyperliquid.
 
