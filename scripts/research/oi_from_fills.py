@@ -1,10 +1,15 @@
 """Open interest per coin per minute, computed exactly from `fills_full`.
 
 Every fill carries `start_position`, the user's position in that coin before the fill, so
-the fill moves that user from `start_position` to `start_position + signed_sz`. Open
-interest is the sum of every account's long exposure, so one fill changes it by
+the fill moves that user from `start_position` to `start_position + signed_sz`.
 
-    max(start_position + signed_sz, 0) - max(start_position, 0)
+**Hyperliquid's `openInterest` counts both sides of the book**, longs plus shorts, which
+is twice the long exposure. Measured, not assumed: the archive's minute-to-minute change
+divided by the long-only sum is 2.000000 at the 5th and 95th percentiles on BTC, ETH, SOL
+and HYPE, and `|2 x ours - theirs|` is float noise. So an account contributes `abs(pos)`
+and one fill changes open interest by
+
+    abs(start_position + signed_sz) - abs(start_position)
 
 and the change over a minute is the sum of that across every fill in the minute. Exact,
 block by block: both halves of a trade are separate fills with their own `user_address`
@@ -30,13 +35,14 @@ from pathlib import Path
 
 MINUTE_MS = 60_000
 
-# The whole computation. `signed` is the fill's effect on the user's position, and the
-# two `greatest(..., 0)` terms are that user's long exposure after and before it.
+# The whole computation. The `CASE` is the fill's effect on the user's position, and the
+# two `abs` terms are that user's contribution to open interest after and before it: a
+# long of 5 and a short of 5 each count 5, because Hyperliquid counts both sides.
 DELTA_QUERY = """
 SELECT coin,
        (ts_ms // $minute) * $minute AS minute_ms,
-       sum(greatest(start_position + CASE WHEN side = 'B' THEN sz ELSE -sz END, 0)
-           - greatest(start_position, 0)) AS oi_delta,
+       sum(abs(start_position + CASE WHEN side = 'B' THEN sz ELSE -sz END)
+           - abs(start_position)) AS oi_delta,
        count(*) AS fills
 FROM read_parquet($files)
 WHERE start_position IS NOT NULL AND sz IS NOT NULL AND ts_ms IS NOT NULL
@@ -46,14 +52,20 @@ GROUP BY 1, 2
 ORDER BY 1, 2
 """
 
-# The archive's own series, differenced the same way, so the two are comparable.
+# The archive's own series, differenced so that `minute_ms` means the same thing on both
+# sides: the change that happened *during* that minute. The archive stamps a sample with
+# the instant it was taken, so the difference between two samples belongs to the earlier
+# one's minute, which is what `lag(ts_ms)` labels it with. Getting this wrong reads as a
+# real disagreement: measured on 2026-08-28, aligning them correctly takes the
+# correlation from 0.08-0.32 to exactly 1.0000 on BTC, ETH, SOL and HYPE.
 ARCHIVE_QUERY = """
-SELECT coin, ts_ms AS minute_ms,
-       open_interest - lag(open_interest) OVER (PARTITION BY coin ORDER BY ts_ms)
-           AS oi_delta
+SELECT coin,
+       lag(ts_ms) OVER w AS minute_ms,
+       open_interest - lag(open_interest) OVER w AS oi_delta
 FROM read_parquet($files)
 WHERE source = 'hl_archive'
   AND ($coins IS NULL OR list_contains($coins, coin))
+WINDOW w AS (PARTITION BY coin ORDER BY ts_ms)
 QUALIFY oi_delta IS NOT NULL
 ORDER BY 1, 2
 """
@@ -98,8 +110,10 @@ def render(day: str, rows: list[tuple]) -> str:
     ]
     for coin, minutes, correlation, worst, median, biggest in rows:
         shown = "n/a" if correlation is None else f"{correlation:.6f}"
+        # `.6g` rather than a fixed 4 decimals: when the two sides agree the residual is
+        # float noise, and rounding it to 0.0000 hides whether that is what happened.
         lines.append(
-            f"| {coin} | {minutes:,} | {shown} | {median:,.4f} | {worst:,.4f} | {biggest:,.4f} |"
+            f"| {coin} | {minutes:,} | {shown} | {median:.6g} | {worst:.6g} | {biggest:,.4f} |"
         )
     return "\n".join(lines) + "\n"
 
