@@ -41,6 +41,12 @@ from them, the order verified, all of it written down.
   partition and the staging files. Do the assembly in Arrow, not through
   `replace_source_rows`'s `list[dict]` path; change or replace that helper as needed.
 - Inputs come from `lake_files()`; never a bare `*.parquet` glob (sidecars).
+- A day the compaction has not reached yet is still many hourly files, and their names
+  do not sort in write order (`hyperliquid_07_10_x` sorts before `hyperliquid_07_2_x`).
+  That is fine: the parser batches whole lines and one line is one block, so all fills
+  of one millisecond sit in one file. Stream `sorted(lake_files())`, stable-sort the
+  assembled day on `ts_ms`, and ties keep file order. Do not wait for the compaction
+  to reach a day before rederiving it.
 - Tardis's Hyperliquid trades are dropped from `trades` in the same pass: `hl_s3` is the
   one source of Hyperliquid trades and liquidations, the same rule as "Counting a
   liquidation once". Rows with `venue == "hyperliquid"` and `source == "tardis"` do not
@@ -57,7 +63,8 @@ from them, the order verified, all of it written down.
 
 1. Before touching the year, prove that `fills_full` still carries the exchange's order
    after compaction. On three days (2025-10-10, 2026-03-01, one quiet day), for each
-   `(user_address, coin)`, walk the rows in file order: every fill's `start_position`
+   `(user_address, coin)`, walk the rows in `ts_ms` order with a stable sort (file order on a compacted day):
+   every fill's `start_position`
    must equal the previous fill's `start_position` plus its signed `sz` (`side == "B"`
    adds, `"A"` subtracts). Count violations with a duckdb window query; the interesting
    ones are pairs with the same `ts_ms`. Expect zero, or a handful explainable by
