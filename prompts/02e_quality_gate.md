@@ -46,9 +46,22 @@ per day with no *unexplained* holes, written down.
    - `fills_full` was compacted last, detached (`~/fills_compact.log`, 22,795 files to
      365). If it is still running, say so and do not count its file counts as holes.
    - `candles_1m` days equal `trades` days.
-   - `asset_ctx`: 364 days from Hyperliquid's archive (02f item 16), `source ==
-     hl_archive`, one file per day, rows per day close to coins x samples at the cadence
-     02f recorded in `docs/DATA_SOURCES.md`. Flag a day under 90% of the median.
+   - `asset_ctx`: **363 days, not 364**, from Hyperliquid's archive (02f item 16),
+     `source == hl_archive`, one file per day, one row per coin per minute. The missing
+     day is **2026-07-08**: that object does not exist in the bucket, July 2026 lists 30
+     files, and 2026-07-07 and 2026-07-09 are both present at their normal size. It is
+     the archive's hole and was deliberately not filled from another source, so a row
+     there would have no honest `source`. Confirm the count is 363 and the one absent day
+     is that one; do not investigate it further.
+     A full day is 1440 minutes per coin, so around 330,000 rows at 229 coins and 334,080
+     at 232. **Two days are short because the archive's own file is truncated, not
+     because the pull stopped**: `2026-08-27` (155,440 rows, ending 14:39 UTC) and
+     `2026-08-30` (119,248, ending 12:03). Both are expected; pass on them. Several other
+     days are truncated at the start or end in the same way, which is why the
+     "days present / days expected" line matters more here than the row count: flag a day
+     under 90% of the median **other than those two**, and treat a partial day as a
+     source gap rather than a failed pull unless its `.lz4` object is larger than the
+     rows it produced can account for.
    - `trades` holds no `venue == hyperliquid, source == tardis` rows after 02d; Tardis rows
      are Binance, Bybit and OKX only. Every `candles_1m` file is newer than its day's
      `trades` file (rebuilt with `--force` after the rederive).
