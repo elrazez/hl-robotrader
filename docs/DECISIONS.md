@@ -545,6 +545,87 @@ and the candle validation pulled that day's Tardis trades ad hoc rather than thr
 lake. The script stays for the day a partition with no `fills_full` does land, which the
 rederive returns `"empty"` for and therefore never cleans.
 
+**The year of asset contexts, measured.** `liqfade backfill asset-ctxs --start 2025-09-01
+--end 2026-08-30`: **362 day files, 116,554,818 rows, 3.75 GiB, $0.34** of egress. A full
+day is 1440 minutes per coin, 334,080 rows at 232 coins. Every file was re-opened
+afterwards and checked for a readable footer against the canonical schema: none truncated,
+none with a stray second file.
+
+364 days were requested and three are not there, all for different reasons, none of them
+worth filling from another source:
+
+| day | why | fix |
+|---|---|---|
+| 2025-08-31 | outside the requested range; it exists in the report because `fills_full` and `trades` start a day earlier | none, expected |
+| 2026-07-08 | **the archive has no such object.** July 2026 lists 30 files and 2026-07-07 and 2026-07-09 are both present at 10.5 and 10.3 MB | none; Hyperliquid's hole |
+| 2026-02-15 | a broken NTFS directory entry from the drive drop below, not a missing pull | chkdsk, then re-pull the one day |
+
+Several days are short rather than absent, because the archive's own file is truncated:
+2026-08-27 ends 14:39 UTC at 155,440 rows and 2026-08-30 ends 12:03 at 119,248, and in
+the 2026-08-24 to 2026-08-30 week alone four of seven days are clipped at one end. That is
+the source, not the pull, and 02e is told to pass on them.
+
+**Validated two ways, and both found bugs in the comparison before they found anything in
+the data.** Funding against the Info API's `fundingHistory` over 2026-08-24 to 2026-08-30,
+and open interest and mark against the twelve `tardis_derivative_ticker` days:
+
+| coin | funding hours | within 2e-5 at HH:59 | worst funding diff | OI median rel | OI p95 rel | mark median rel |
+|---|---:|---:|---:|---:|---:|---:|
+| BTC | 139 of 168 | 100.00% | 5.78e-07 | 0.000% | 0.002% | 0.0000% |
+| ETH | 139 of 168 | 100.00% | 3.2e-07 | 0.000% | 0.001% | 0.0000% |
+| HYPE | 139 of 168 | 100.00% | 1.18e-06 | 0.000% | 0.001% | 0.0000% |
+| SOL | n/a | n/a | n/a | 0.000% | 0.001% | 0.0000% |
+
+The 29 unmatched funding hours are the truncated archive days above. The mark comparison
+is an ASOF join with a median tick age of 0.8 to 1.4s, and matches exactly on 68 to 76% of
+samples: the archive samples on the minute boundary and Tardis's nearest tick is about a
+second earlier, so the residual is a second of price movement, which is why the median
+relative difference is 0.0000% rather than the exact-match rate being 100%.
+
+**Open interest from `fills_full` proves the archive exactly, and the exchange counts both
+sides.** `scripts/research/oi_from_fills.py` sums `abs(start_position + signed_sz) -
+abs(start_position)` over every fill in a minute, which is the exact change in open
+interest across all accounts. Against the archive's own differenced series:
+
+| day | coin | minutes | correlation | sides | worst abs diff | biggest move |
+|---|---|---:|---:|---:|---:|---:|
+| 2025-10-10 (cascade) | BTC | 1,439 | 1.000000 | 2.000000 | 2.0e-10 | 7,454.44 |
+| 2025-10-10 | ETH | 1,439 | 1.000000 | 2.000000 | 7.7e-09 | 168,835.25 |
+| 2025-10-10 | HYPE | 1,439 | 1.000000 | 2.000000 | 2.3e-07 | 7,757,751.74 |
+| 2025-10-10 | SOL | 1,439 | 1.000000 | 2.000000 | 1.8e-08 | 1,991,461.36 |
+| 2026-01-10 (quiet) | BTC | 1,439 | 1.000000 | 2.000000 | 1.0e-10 | 193.60 |
+| 2026-01-10 | ETH | 1,439 | 1.000000 | 2.000000 | 7.2e-10 | 6,521.08 |
+| 2026-01-10 | HYPE | 1,439 | 1.000000 | 2.000000 | 5.2e-08 | 178,329.16 |
+| 2026-01-10 | SOL | 1,436 | 1.000000 | 2.000000 | 1.0e-08 | 79,213.98 |
+
+Correlation 1 and a residual at float noise on both a cascade day and a quiet one. `sides`
+is the archive's change over the long-only sum, and it is a gate rather than a note: 2.0 is
+measured on every run and a run that finds anything else exits non-zero, because a
+one-sided redefinition would still correlate 1.0 and simply halve every number.
+
+**Three comparisons, three ways to be confidently wrong.** Worth writing down because none
+of them would have failed a smoke test, and each produced a number a research note would
+have accepted. The archive's `OI(M+1) - OI(M)` is the change *during* minute M, so
+labelling it M+1 paired every minute with its neighbour and gave correlation 0.08 to 0.32.
+Aligned, it still moved exactly twice as far, because `openInterest` is both sides.
+And Tardis's mark appeared to disagree by 0.56% on HYPE, which turned out to be
+`read_parquet` over files with per-coin inferred types silently truncating 31.215 to 31.
+The rule that caught all three: check the residual against what it must be if the two
+sides describe the same quantity, rather than accepting "broadly agrees".
+
+**The drive dropped mid-pull, and the NTFS damage is not all repaired.** The USB volume
+re-enumerated from `/dev/disk5` to `/dev/disk6` while the pull was writing, leaving a stale
+NFS handle, a read-only remount, and after `ntfsfix` two damaged directory entries:
+`parquet/asset_ctx/date=2026-02-15` and `ingest_state/s3-asset-ctxs.json`. On both, `stat`
+raises EINVAL or ESTALE, and **`rm` and `os.replace` report success and do nothing**, while
+an O_TRUNC write lands and reads back. Two consequences worth knowing before the next run:
+the manifest silently recorded nothing for all 167 days of the resumed pull, so it was
+rebuilt from the lake's own footers plus one S3 listing; and a `date=*` glob dies on the
+partition, which is why `scripts/research/data_quality.py` now reports an unopenable
+partition as a hole instead of crashing. The kernel's own advice, `ntfs3(vda): It is
+recommened to use chkdsk`, is the fix, and it needs Windows. Lesson: a write to this mount
+is not believed until it reads back, and every repair here verifies.
+
 **The panel's liquidation chart is uPlot, not `lightweight-charts`.** CLAUDE.md section 4
 names `lightweight-charts` for price, liquidation and trade-marker charts and uPlot for
 equity and latency series. The panel's 24h liquidation chart is stacked hourly bars per
