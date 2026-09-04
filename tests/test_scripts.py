@@ -26,7 +26,8 @@ REQUIRED_SERVICE_KEYS = {
     "RestartSec": "3",
     "NoNewPrivileges": "yes",
     "ProtectSystem": "strict",
-    "ProtectHome": "yes",
+    # read-only, not yes: yes empties /home in the namespace and uv lives there.
+    "ProtectHome": "read-only",
     "PrivateTmp": "yes",
     "ReadWritePaths": "/srv/liqfade/data /srv/liqfade/logs",
     "LimitNOFILE": "65536",

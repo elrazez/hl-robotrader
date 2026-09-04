@@ -17,9 +17,11 @@ RestartSec=3
 LimitNOFILE=65536
 
 # Hardening. The code directory stays read only; only data and logs are writable.
+# ProtectHome is read-only rather than yes because ExecStart lives under /home: yes empties
+# /home inside the namespace, so systemd cannot execute uv and the unit dies at 203/EXEC.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
