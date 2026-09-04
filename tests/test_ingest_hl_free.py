@@ -16,6 +16,7 @@ import pytest
 from liqfade.data.ingest import hl_archive_l2, hl_candles
 from liqfade.data.ingest.common import BackfillError, Manifest
 from liqfade.data.schemas import SOURCE_HL_API, SOURCE_HL_ARCHIVE, validate_table
+from liqfade.recorder.writer import DAY_SUFFIX
 from tests.conftest import FakeS3
 
 API = "https://api.hyperliquid.xyz"
@@ -183,6 +184,38 @@ def test_an_empty_universe_is_an_error(tmp_path: Path) -> None:
     api = FakeApi([], 0)
     with pytest.raises(BackfillError, match="empty universe"):
         hl_candles.run(api.client(), tmp_path, API, DAY, DAY, sleep_s=0)
+
+
+def derived_day_file(data_dir: Path, day: date) -> Path:
+    """Stand in for what `liqfade derive candles` leaves behind for a day it owns."""
+    directory = data_dir / "parquet" / "candles_1m" / f"date={day.isoformat()}"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{hl_candles.VENUE}{DAY_SUFFIX}"
+    path.write_bytes(b"")
+    return path
+
+
+def test_the_api_job_refuses_a_day_the_derivation_owns(tmp_path: Path) -> None:
+    """Both land in the same partition and no reader filters `source`."""
+    derived_day_file(tmp_path, DAY)
+    api = FakeApi(["BTC"], 0)
+    with pytest.raises(BackfillError, match="already holds derived bars"):
+        hl_candles.run(api.client(), tmp_path, API, DAY, DAY, sleep_s=0)
+    assert api.windows == []
+
+
+def test_only_the_derived_days_of_a_range_are_skipped(tmp_path: Path) -> None:
+    earlier = date(2026, 9, 4)
+    derived_day_file(tmp_path, DAY)
+    api = FakeApi(["BTC"], 0)
+    assert hl_candles.run(api.client(), tmp_path, API, earlier, DAY, sleep_s=0) == 0
+
+    written = {
+        path.parent.name
+        for path in (tmp_path / "parquet" / "candles_1m").glob("date=*/*.parquet")
+        if not path.name.endswith(DAY_SUFFIX)
+    }
+    assert written == {f"date={earlier.isoformat()}"}
 
 
 # --- l2 archive ---------------------------------------------------------------

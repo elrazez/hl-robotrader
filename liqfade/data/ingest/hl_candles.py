@@ -24,13 +24,15 @@ from typing import Any
 
 import httpx
 
-from liqfade.data.ingest.common import BackfillError, Manifest, write_partitioned
+from liqfade.data.ingest.common import BackfillError, Manifest, day_range, write_partitioned
 from liqfade.data.schemas import SOURCE_HL_API
 from liqfade.log import get_logger
+from liqfade.recorder.writer import DAY_SUFFIX, partition_dir
 
 log = get_logger(__name__)
 
 JOB = "candles"
+TABLE = "candles_1m"
 VENUE = "hyperliquid"
 INTERVAL = "1m"
 MAX_CANDLES_PER_CALL = 5000
@@ -112,6 +114,27 @@ def walk_back(
             time.sleep(sleep_s)
 
 
+def derived_days(root: Path, start: date, end: date) -> set[str]:
+    """The days in [start, end] whose `candles_1m` already holds the derivation's file.
+
+    `liqfade derive candles` builds the bars from `trades`, which is every fill on the
+    exchange, and covers the whole year; `candleSnapshot` reaches back about three days.
+    Both write `candles_1m` into the same partition and no reader filters `source`, so a
+    day carrying both counts every bar twice. The derivation owns any day it wrote, and
+    this job stays out of it.
+    """
+    owned = set()
+    for day in day_range(start, end, newest_first=False):
+        stamp = day.isoformat()
+        if (partition_dir(root, TABLE, stamp) / f"{VENUE}{DAY_SUFFIX}").exists():
+            owned.add(stamp)
+    return owned
+
+
+def day_of(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, UTC).strftime("%Y-%m-%d")
+
+
 def to_rows(page: list[dict[str, Any]], start_ms: int, end_ms: int) -> list[dict[str, Any]]:
     """Canonical `candles_1m` rows for the candles of `page` inside the window.
 
@@ -149,8 +172,27 @@ def run(
     estimate_only: bool = False,
     sleep_s: float = SLEEP_S,
 ) -> int:
-    """Pull 1m candles for [start, end]. Free, so there is no cost gate to pass."""
+    """Pull 1m candles for [start, end]. Free, so there is no cost gate to pass.
+
+    Days `liqfade derive candles` has already written are left alone; a range made up
+    entirely of them is refused rather than half-run.
+    """
     start_ms, end_ms = day_bounds(start, end)
+    root = Path(data_dir) / "parquet"
+    owned = derived_days(root, start, end)
+    if len(owned) == (end - start).days + 1:
+        raise BackfillError(
+            f"every day of {start} to {end} already holds derived bars "
+            f"(candles_1m/date=*/{VENUE}{DAY_SUFFIX}), which this job must not write "
+            "alongside: both land in the same partition and no reader filters `source`. "
+            "Use `liqfade derive candles --force` to rebuild them from `trades`."
+        )
+    if owned:
+        log.info("candles_days_owned_by_derivation", days=sorted(owned))
+        print(
+            f"skipping {len(owned)} day(s) already derived from trades: {', '.join(sorted(owned))}"
+        )
+
     wanted = coins or live_coins(client, api_url)
     if not wanted:
         raise BackfillError("no coins to pull: metaAndAssetCtxs returned an empty universe")
@@ -165,7 +207,6 @@ def run(
     if estimate_only:
         return 0
 
-    root = Path(data_dir) / "parquet"
     manifest = Manifest.load(data_dir, JOB)
     total = 0
     for coin in wanted:
@@ -175,10 +216,9 @@ def run(
             continue
         written = 0
         for page in walk_back(client, api_url, coin, start_ms, end_ms, sleep_s=sleep_s):
-            written += write_partitioned(
-                root, "candles_1m", VENUE, SOURCE_HL_API, to_rows(page, start_ms, end_ms)
-            )
-        manifest.record(key, 0, {"candles_1m": written})
+            rows = [r for r in to_rows(page, start_ms, end_ms) if day_of(r["ts_ms"]) not in owned]
+            written += write_partitioned(root, TABLE, VENUE, SOURCE_HL_API, rows)
+        manifest.record(key, 0, {TABLE: written})
         total += written
         log.info("backfill_candles", coin=coin, rows=written)
         print(f"  {coin}: {written} candles")

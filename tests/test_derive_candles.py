@@ -322,3 +322,51 @@ def test_hidden_applestyle_sidecars_are_not_read(tmp_path: Path) -> None:
     (directory / "._all_day.parquet").write_bytes(b"not parquet at all")
     assert candles.run(tmp_path, DAY, DAY) == 0
     assert read_out(tmp_path).num_rows == 1
+
+
+# --- the API job's bars for the same day --------------------------------------
+
+
+def write_api_bars(data_dir: Path, day: date, name: str = "hyperliquid_07.parquet") -> Path:
+    """One `hl_api` bar for the same coin and minute the derivation produces."""
+    from liqfade.data.schemas import SOURCE_HL_API, rows_to_table
+
+    row = {"coin": "BTC", "ts_ms": MINUTE, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0, "v": 0.0, "n": 0}
+    directory = partition_dir(data_dir / "parquet", "candles_1m", day.isoformat())
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    write_atomic(rows_to_table("candles_1m", [row], SOURCE_HL_API), path)  # type: ignore[list-item]
+    return path
+
+
+def test_the_derivation_drops_the_api_bars_of_a_day_it_writes(tmp_path: Path) -> None:
+    """A partition holding both sources ends up with one bar per (coin, ts_ms)."""
+    from liqfade.recorder.writer import lake_files
+
+    write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
+    api_file = write_api_bars(tmp_path, DAY)
+
+    assert candles.run(tmp_path, DAY, DAY) == 0
+    assert not api_file.exists()
+    assert [p.name for p in lake_files(api_file.parent)] == [candles.OUTPUT_NAME]
+
+    arrow = read_out(tmp_path)
+    keys = list(
+        zip(arrow.column("coin").to_pylist(), arrow.column("ts_ms").to_pylist(), strict=True)
+    )
+    assert keys == [("BTC", MINUTE)]
+
+
+def test_a_partition_holding_both_becomes_compactable(tmp_path: Path) -> None:
+    """`_hour_of("hyperliquid_day.parquet")` raises, so the mixed partition never folds."""
+    from liqfade.recorder.writer import compact_day
+
+    root = tmp_path / "parquet"
+    write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
+    write_api_bars(tmp_path, DAY)
+    write_api_bars(tmp_path, DAY, name=candles.OUTPUT_NAME)  # as the old run left it
+    with pytest.raises(RuntimeError, match="cannot read the hour"):
+        compact_day(root, DAY.isoformat(), tables=["candles_1m"])
+
+    assert candles.run(tmp_path, DAY, DAY, force=True) == 0
+    assert compact_day(root, DAY.isoformat(), tables=["candles_1m"]) == {}

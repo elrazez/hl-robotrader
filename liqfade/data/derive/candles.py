@@ -56,7 +56,7 @@ from pathlib import Path
 
 import polars as pl
 
-from liqfade.data.schemas import SOURCE_DERIVED, schema_for, validate_table
+from liqfade.data.schemas import SOURCE_DERIVED, SOURCE_HL_API, schema_for, validate_table
 from liqfade.log import get_logger
 from liqfade.recorder.writer import lake_files, partition_dir, write_atomic
 
@@ -161,6 +161,37 @@ def _fill_empty_minutes(bars: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def drop_hl_api(directory: Path, output: Path) -> int:
+    """Remove the `hl_api` bars of a partition this derivation has just written.
+
+    `liqfade backfill candles` writes `hyperliquid_HH.parquet` with `source = hl_api`
+    into this same partition, and no reader filters `source`, so a day holding both
+    counts every bar twice on exactly the overlap days the validation uses. It also
+    leaves the partition permanently uncompactable, because `_hour_of` cannot read an
+    hour out of `hyperliquid_day.parquet`. The derivation is built from every fill on the
+    exchange and covers the whole year, so it owns any day it writes; the API job is for
+    the last few days and for validation. Returns the rows dropped.
+
+    One file is one job's output, so in practice this unlinks whole files. The filter is
+    still written row-wise because a compaction that folded an `hl_api` file together
+    with a recorded one would leave a file that is not.
+    """
+    dropped = 0
+    for path in lake_files(directory):
+        if path == output:
+            continue
+        frame = pl.read_parquet(path)
+        keep = frame.filter(pl.col("source") != SOURCE_HL_API)
+        if keep.height == frame.height:
+            continue
+        dropped += frame.height - keep.height
+        if keep.height == 0:
+            path.unlink()
+        else:
+            write_atomic(keep.to_arrow().cast(schema_for(TABLE)), path)
+    return dropped
+
+
 def read_trades(files: list[Path], coins: list[str] | None = None) -> pl.DataFrame:
     """Hyperliquid rows of one `trades` partition.
 
@@ -218,11 +249,21 @@ def run(
         directory.mkdir(parents=True, exist_ok=True)
         write_atomic(arrow, output)
 
+        dropped = drop_hl_api(directory, output)
+
         n_coins = bars.get_column("coin").n_unique()
         total_bars += bars.height
-        log.info("derived_candles", date=day.isoformat(), coins=n_coins, bars=bars.height)
+        log.info(
+            "derived_candles",
+            date=day.isoformat(),
+            coins=n_coins,
+            bars=bars.height,
+            hl_api_dropped=dropped,
+        )
         print(
-            f"{day}  {n_coins:>4} coins  {bars.height:>9,} bars  {time.monotonic() - began:7.1f}s",
+            f"{day}  {n_coins:>4} coins  {bars.height:>9,} bars  "
+            + (f"{dropped:,} hl_api bars dropped  " if dropped else "")
+            + f"{time.monotonic() - began:7.1f}s",
             flush=True,
         )
 
