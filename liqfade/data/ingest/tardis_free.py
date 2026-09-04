@@ -34,7 +34,7 @@ from __future__ import annotations
 import csv
 import gzip
 import io
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -119,10 +119,21 @@ def _tid(value: Any) -> int | None:
         return None
 
 
-def read_csv(payload: bytes) -> list[dict[str, str]]:
-    """Rows of a gzipped Tardis CSV, as dicts keyed by the header row."""
-    text = gzip.decompress(payload).decode("utf-8")
-    return list(csv.DictReader(io.StringIO(text)))
+def read_csv(payload: bytes) -> Iterator[dict[str, str]]:
+    """Rows of a gzipped Tardis CSV, as dicts keyed by the header row, streamed.
+
+    It used to `gzip.decompress(...).decode("utf-8")` and then `list(DictReader(...))`,
+    which held three copies of a Binance BTC trades day at once: the decompressed bytes,
+    the decoded string, and a list of dicts on top of the canonical rows built from it.
+    `gzip.open` decompresses and decodes as it is read, so only the rows the caller keeps
+    survive.
+
+    That leaves one copy, the canonical rows, because `write_partitioned` buckets a whole
+    day before it writes. Going below that means an Arrow path through the writer, which
+    is a bigger change than this file.
+    """
+    with gzip.open(io.BytesIO(payload), mode="rt", encoding="utf-8", newline="") as handle:
+        yield from csv.DictReader(handle)
 
 
 def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> list[dict[str, Any]]:

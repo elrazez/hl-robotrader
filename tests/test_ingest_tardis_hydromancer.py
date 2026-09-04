@@ -64,7 +64,15 @@ def gz(text: str) -> bytes:
 
 
 def rows_of(csv_text: str) -> list[dict[str, str]]:
-    return tardis_free.read_csv(gz(csv_text))
+    return list(tardis_free.read_csv(gz(csv_text)))
+
+
+def test_the_csv_reader_streams_rather_than_decompressing_the_whole_file() -> None:
+    """A Binance BTC trades day is gigabytes once decompressed and decoded."""
+    import inspect
+
+    assert inspect.isgeneratorfunction(tardis_free.read_csv)
+    assert rows_of(LIQ_CSV["bybit"])[0]["price"] == "78400.0"
 
 
 # --- URLs and months ----------------------------------------------------------
