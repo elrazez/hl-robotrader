@@ -17,6 +17,7 @@ from liqfade.control.state import write_state
 
 ALL_COMMANDS = {
     "record",
+    "compact",
     "backfill",
     "backtest",
     "paper",
@@ -337,3 +338,71 @@ def test_an_aws_client_setup_failure_is_a_message_not_a_traceback(
     )
     assert code == 1
     assert "AWS client setup failed" in capsys.readouterr().err
+
+
+# --- compact ------------------------------------------------------------------
+
+
+def _lake(root: Path, table: str, date: str, hours: range) -> None:
+    from liqfade.recorder.writer import write_rows
+
+    for hour in hours:
+        write_rows(
+            root / "parquet",
+            (table, "hyperliquid", date, hour),
+            [
+                {
+                    "coin": "BTC",
+                    "ts_ms": hour * 3_600_000,
+                    "rx_ms": 0,
+                    "o": 1.0,
+                    "h": 1.0,
+                    "l": 1.0,
+                    "c": 1.0,
+                    "v": 1.0,
+                    "n": 1,
+                }
+            ],
+            source="hl_s3",
+        )
+
+
+def test_compact_folds_a_range_and_skips_days_already_done(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _lake(tmp_path, "candles_1m", "2026-08-01", range(3))
+    _lake(tmp_path, "candles_1m", "2026-08-02", range(2))
+    argv = ["compact", "--start", "2026-08-01", "--end", "2026-08-03", "--data-dir", str(tmp_path)]
+
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "2026-08-01" in out and "2026-08-02" in out and "2026-08-03" not in out
+    assert "5 files -> 2 files" in out
+
+    # A second pass has nothing to do and says so with an empty table listing.
+    assert main(argv) == 0
+    second = capsys.readouterr().out
+    assert "2026-08-01" not in second
+    assert "total: 0 rows, 2 files -> 2 files" in second
+
+
+def test_compact_honours_the_table_filter_and_rejects_unknown_tables(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _lake(tmp_path, "candles_1m", "2026-08-01", range(2))
+    _lake(tmp_path, "fills_full", "2026-08-01", range(2))
+    common = ["--start", "2026-08-01", "--end", "2026-08-01", "--data-dir", str(tmp_path)]
+
+    assert main(["compact", *common, "--tables", "nope"]) == 1
+    assert "no such table" in capsys.readouterr().err
+
+    # The default set leaves the pay-once archive alone.
+    assert main(["compact", *common]) == 0
+    assert "candles_1m" in capsys.readouterr().out
+    lake = tmp_path / "parquet"
+    assert len(list((lake / "fills_full" / "date=2026-08-01").glob("*.parquet"))) == 2
+
+    assert main(["compact", *common, "--tables", "fills_full"]) == 0
+    assert [p.name for p in (lake / "fills_full" / "date=2026-08-01").glob("*.parquet")] == [
+        "hyperliquid_day.parquet"
+    ]

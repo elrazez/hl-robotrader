@@ -29,6 +29,7 @@ from liqfade.data.schemas import (
     MULTI_VENUE_TABLES,
     SOURCE_RECORDER,
     rows_to_table,
+    schema_for,
     validate_table,
 )
 from liqfade.log import get_logger
@@ -100,20 +101,100 @@ def write_rows(
     return path
 
 
-def compact_day(root: Path, date: str) -> dict[str, int]:
+def _hour_of(path: Path) -> int:
+    """UTC hour from a partition file name, which is always `{venue}_{HH}[_...].parquet`.
+
+    The suffixes come from the second flush of an hour (`_{n}`) and from the backfill's
+    staging mover (`_{n}_{6hex}`), so the hour is always the second underscore field. An
+    unrecognisable name raises: guessing hour 0 would put its rows at the front of a file
+    that claims to be sorted by time, which is worse than refusing to compact the day.
+    """
+    fields = path.stem.split("_")
+    if len(fields) >= 2 and len(fields[1]) == 2 and fields[1].isdigit() and int(fields[1]) < 24:
+        return int(fields[1])
+    raise RuntimeError(f"cannot read the hour from {path}; move it aside to compact this day")
+
+
+def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> int:
+    """Fold one partition into one file, holding at most one hour in memory.
+
+    Returns the row count. Hours are written in ascending order into a single
+    `ParquetWriter`, one row group each. The recorder and the backfill both partition by
+    the UTC hour of the row (liqfade/recorder/buffer.py), so an hour's rows all fall
+    inside that hour and hour-ordered output is globally ordered by `ts_ms`. That is an
+    assumption about the writers, so it is asserted rather than trusted.
+    """
+    venues = {path.name.split("_")[0] for path in inputs}
+    name = "all" if (len(venues) > 1 or table_name in MULTI_VENUE_TABLES) else venues.pop()
+    output = directory / f"{name}{DAY_SUFFIX}"
+
+    by_hour: dict[int, list[Path]] = {}
+    for path in inputs:
+        by_hour.setdefault(_hour_of(path), []).append(path)
+    expected = sum(int(pq.read_metadata(path).num_rows) for path in inputs)
+
+    tmp = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    writer = pq.ParquetWriter(tmp, schema_for(table_name), compression=COMPRESSION)
+    try:
+        last_ts: int | None = None
+        for hour in sorted(by_hour):
+            # partitioning=None: the directory is named date=..., and hive discovery would
+            # otherwise append a `date` column that is not in the canonical schema.
+            arrow = pa.concat_tables(
+                [pq.read_table(path, partitioning=None) for path in by_hour[hour]]
+            )
+            validate_table(table_name, arrow)
+            if arrow.num_rows == 0:
+                continue
+            arrow = arrow.sort_by([("ts_ms", "ascending")])
+            stamps = arrow.column("ts_ms")
+            first = stamps[0].as_py()
+            if last_ts is not None and first < last_ts:
+                raise RuntimeError(
+                    f"{directory}: hour {hour:02d} starts at ts_ms {first}, before the end "
+                    f"of the previous hour ({last_ts}); refusing to write a misordered file"
+                )
+            last_ts = stamps[-1].as_py()
+            writer.write_table(arrow, row_group_size=arrow.num_rows)
+        writer.close()
+        # The row count is checked on the temp file first: a short output must never
+        # replace the inputs, not even for the moment before the check fails.
+        rows = pq.read_metadata(tmp).num_rows
+        if rows != expected:
+            raise RuntimeError(f"compacted {output} has {rows} rows, expected {expected}")
+        os.replace(tmp, output)
+    finally:
+        writer.close()  # idempotent; the failure path needs it before the unlink
+        if tmp.exists():
+            tmp.unlink()
+
+    after = pq.read_metadata(output).num_rows
+    if after != expected:
+        raise RuntimeError(f"compacted {output} has {after} rows, expected {expected}")
+    for path in inputs:
+        if path != output:
+            path.unlink()
+    return expected
+
+
+def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> dict[str, int]:
     """Fold every hourly file of `date` into one file per table. Returns table -> rows.
 
     The hourly files are deleted only after the compacted file exists and its row count
     matches the sum of the inputs. A table whose partition holds rows from several venues
     compacts to `all_day.parquet`; a single venue table keeps its venue in the name.
+    `tables` restricts the work to those table names; None means every table in the lake.
     """
     root = Path(root)
     written: dict[str, int] = {}
     if not root.exists():
         return written
+    wanted = set(tables) if tables is not None else None
 
     for table_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         table_name = table_dir.name
+        if wanted is not None and table_name not in wanted:
+            continue
         directory = table_dir / f"date={date}"
         inputs = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
         if not inputs:
@@ -121,28 +202,7 @@ def compact_day(root: Path, date: str) -> dict[str, int]:
         if len(inputs) == 1 and inputs[0].name.endswith(DAY_SUFFIX):
             continue  # already compacted, and re-running must be a no-op
 
-        venues = {path.name.split("_")[0] for path in inputs}
-        name = "all" if (len(venues) > 1 or table_name in MULTI_VENUE_TABLES) else venues.pop()
-        output = directory / f"{name}{DAY_SUFFIX}"
-
-        expected = sum(pq.read_metadata(path).num_rows for path in inputs)
-        # partitioning=None: the directory is named date=..., and hive discovery would
-        # otherwise append a `date` column that is not in the canonical schema.
-        arrow = pa.concat_tables([pq.read_table(path, partitioning=None) for path in inputs])
-        validate_table(table_name, arrow)
-        arrow = arrow.sort_by([("ts_ms", "ascending")])
-        if arrow.num_rows != expected:  # pragma: no cover - concat cannot lose rows
-            raise RuntimeError(
-                f"compaction row mismatch for {directory}: {arrow.num_rows} != {expected}"
-            )
-
-        write_atomic(arrow, output)
-        after = pq.read_metadata(output).num_rows
-        if after != expected:  # pragma: no cover - a torn write would have raised first
-            raise RuntimeError(f"compacted {output} has {after} rows, expected {expected}")
-        for path in inputs:
-            if path != output:
-                path.unlink()
-        written[table_name] = expected
-        log.info("compacted", table=table_name, date=date, rows=expected, path=str(output))
+        rows = _compact_partition(table_name, directory, inputs)
+        written[table_name] = rows
+        log.info("compacted", table=table_name, date=date, rows=rows, files=len(inputs))
     return written

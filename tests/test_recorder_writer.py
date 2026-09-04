@@ -9,8 +9,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from liqfade.data.schemas import SchemaError, validate_table
-from liqfade.recorder.writer import compact_day, partition_dir, write_rows
+from liqfade.data.schemas import SchemaError, rows_to_table, validate_table
+from liqfade.recorder.writer import compact_day, partition_dir, write_atomic, write_rows
 
 DATE = "2026-08-30"
 
@@ -164,3 +164,86 @@ def test_compacting_a_day_with_nothing_in_it_is_a_no_op(tmp_path: Path) -> None:
     assert compact_day(tmp_path, DATE) == {}
     write_rows(tmp_path, ("bbo", "hyperliquid", "2026-08-29", 10), [bbo(1)])
     assert compact_day(tmp_path, DATE) == {}
+
+
+def test_compaction_streams_suffixed_files_across_hours_into_one_sorted_file(
+    tmp_path: Path,
+) -> None:
+    """The backfill's names: a second flush of an hour, and the staging mover's hex tag."""
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    directory.mkdir(parents=True)
+    expected: list[int] = []
+    for hour, names in {
+        10: ["hyperliquid_10.parquet", "hyperliquid_10_1.parquet"],
+        11: ["hyperliquid_11_2_a1b2c3.parquet"],
+        12: ["hyperliquid_12_0_ffffff.parquet", "hyperliquid_12.parquet"],
+    }.items():
+        for index, name in enumerate(names):
+            # Deliberately out of order inside the hour, so a missing sort shows up.
+            stamps = [hour * 3_600_000 + index * 100 + offset for offset in (7, 1, 4)]
+            expected += stamps
+            write_atomic(
+                rows_to_table("bbo", [bbo(ts) for ts in stamps], "recorder"), directory / name
+            )
+
+    assert compact_day(tmp_path, DATE) == {"bbo": len(expected)}
+    assert [p.name for p in directory.glob("*.parquet")] == ["hyperliquid_day.parquet"]
+    table = read(directory / "hyperliquid_day.parquet")
+    validate_table("bbo", table)
+    assert table.column("ts_ms").to_pylist() == sorted(expected)
+    # One row group per hour, which is what makes an hour range scan cheap.
+    assert pq.read_metadata(directory / "hyperliquid_day.parquet").num_row_groups == 3
+
+
+def test_a_day_holding_backfilled_and_recorded_rows_compacts_to_all_day(tmp_path: Path) -> None:
+    """`liquidations` carries hl_s3 rows and tardis rows (other venues) for the same day."""
+    write_rows(
+        tmp_path, ("liquidations", "hyperliquid", DATE, 10), [liq(1, "hyperliquid")], source="hl_s3"
+    )
+    write_rows(tmp_path, ("liquidations", "bybit", DATE, 11), [liq(2)], source="tardis")
+    assert compact_day(tmp_path, DATE) == {"liquidations": 2}
+    directory = partition_dir(tmp_path, "liquidations", DATE)
+    assert sorted(p.name for p in directory.glob("*.parquet")) == ["all_day.parquet"]
+    assert sorted(read(directory / "all_day.parquet").column("source").to_pylist()) == [
+        "hl_s3",
+        "tardis",
+    ]
+
+
+def test_an_unreadable_hour_in_a_file_name_is_an_error_not_hour_zero(tmp_path: Path) -> None:
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    write_atomic(rows_to_table("bbo", [bbo(2)], "recorder"), directory / "hyperliquid.parquet")
+    with pytest.raises(RuntimeError, match="cannot read the hour"):
+        compact_day(tmp_path, DATE)
+    assert len(list(directory.glob("*.parquet"))) == 2
+
+
+def test_a_short_output_keeps_every_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The row count is the only thing standing between compaction and data loss."""
+
+    class Lossy(pq.ParquetWriter):  # type: ignore[misc]
+        def write_table(self, table: pa.Table, **kwargs: object) -> None:
+            super().write_table(table.slice(0, 1))
+
+    for hour in (10, 11):
+        write_rows(tmp_path, ("bbo", "hyperliquid", DATE, hour), [bbo(hour), bbo(hour + 1)])
+    monkeypatch.setattr(pq, "ParquetWriter", Lossy)
+
+    with pytest.raises(RuntimeError, match="expected 4"):
+        compact_day(tmp_path, DATE)
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    assert sorted(p.name for p in directory.glob("*.parquet")) == [
+        "hyperliquid_10.parquet",
+        "hyperliquid_11.parquet",
+    ]
+    assert not list(directory.glob(".*"))
+
+
+def test_compaction_can_be_restricted_to_some_tables(tmp_path: Path) -> None:
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
+    write_rows(tmp_path, ("liquidations", "bybit", DATE, 10), [liq(1)])
+    assert compact_day(tmp_path, DATE, tables=["bbo"]) == {"bbo": 1}
+    assert sorted(p.name for p in partition_dir(tmp_path, "liquidations", DATE).glob("*")) == [
+        "bybit_10.parquet"
+    ]

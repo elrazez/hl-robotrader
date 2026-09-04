@@ -109,6 +109,69 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- compact ------------------------------------------------------------------
+
+# fills_full is the pay-once archive: 130 GB that no research query reads, so it is not
+# in the default set and gets its own opt-in run, last.
+COMPACT_SKIP_BY_DEFAULT = frozenset({"fills_full"})
+
+
+def cmd_compact(args: argparse.Namespace) -> int:
+    """Fold a range of days into one Parquet file per table per day, oldest first."""
+    import time
+
+    from liqfade.data.ingest.common import BackfillError, day_range, parse_day
+    from liqfade.log import setup_logging
+    from liqfade.recorder.writer import compact_day
+
+    settings = _settings(args)
+    setup_logging(proc="compact", env=settings.env, level=settings.logging.level)
+    root = settings.paths.data_dir / "parquet"
+    if not root.is_dir():
+        print(f"no lake at {root}", file=sys.stderr)
+        return EXIT_ERROR
+
+    present = sorted(p.name for p in root.iterdir() if p.is_dir())
+    if args.tables:
+        tables = [t.strip() for t in args.tables.split(",") if t.strip()]
+        unknown = [t for t in tables if t not in present]
+        if unknown:
+            print(f"no such table in {root}: {', '.join(unknown)}", file=sys.stderr)
+            return EXIT_ERROR
+    else:
+        tables = [t for t in present if t not in COMPACT_SKIP_BY_DEFAULT]
+
+    try:
+        days = day_range(parse_day(args.start), parse_day(args.end), newest_first=False)
+    except BackfillError as exc:
+        print(f"compact error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    files_before = files_after = 0
+    total_rows = 0
+    for day in days:
+        date = day.strftime("%Y-%m-%d")
+        for table in tables:
+            directory = root / table / f"date={date}"
+            inputs = len(list(directory.glob("*.parquet"))) if directory.is_dir() else 0
+            files_before += inputs
+            began = time.monotonic()
+            written = compact_day(root, date, tables=[table])
+            if not written:  # already one file, or no data for that day
+                files_after += inputs
+                continue
+            files_after += 1
+            rows = written[table]
+            total_rows += rows
+            print(
+                f"{date}  {table:<26} {rows:>12,} rows  {inputs:>4} -> 1 files  "
+                f"{time.monotonic() - began:7.1f}s",
+                flush=True,
+            )
+    print(f"\ntotal: {total_rows:,} rows, {files_before} files -> {files_after} files")
+    return 0
+
+
 # --- backfill -----------------------------------------------------------------
 
 BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "candles", "tardis", "hydromancer-check")
@@ -466,6 +529,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
+
+    compact = sub.add_parser(
+        "compact", parents=[common], help="fold a range of days into one file per table"
+    )
+    compact.add_argument("--start", required=True, help="YYYY-MM-DD, inclusive, UTC")
+    compact.add_argument("--end", required=True, help="YYYY-MM-DD, inclusive, UTC")
+    compact.add_argument(
+        "--tables",
+        default="",
+        help="comma separated table names; default is every table but fills_full",
+    )
+    compact.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("paper", parents=[common], help="live feeds, simulated fills (Phase 5)")
     sub.add_parser("testnet", parents=[common], help="live loop against testnet (Phase 5)")
     sub.add_parser("live", parents=[common], help="live loop against mainnet (Phase 6)")
@@ -502,6 +577,7 @@ HANDLERS = {
     "config": cmd_config,
     "backfill": cmd_backfill,
     "record": cmd_record,
+    "compact": cmd_compact,
     "status": cmd_status,
     "sync": cmd_sync,
     "panel": cmd_panel,
