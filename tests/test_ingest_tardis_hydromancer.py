@@ -164,25 +164,40 @@ def test_a_non_numeric_trade_id_becomes_null_rather_than_failing() -> None:
 
 def test_book_snapshots_keep_their_native_columns(tmp_path: Path) -> None:
     written = tardis_free.write_side_table(
-        tmp_path, "tardis_book_snapshot_5", "bybit", DAY, gz(BOOK_CSV)
+        tmp_path, "tardis_book_snapshot_5", "bybit", "BTC", DAY, gz(BOOK_CSV)
     )
     assert written == 1
-    path = tmp_path / "tardis_book_snapshot_5" / f"date={DAY}" / "bybit_00.parquet"
+    path = tmp_path / "tardis_book_snapshot_5" / f"date={DAY}" / "bybit_BTC_00.parquet"
     arrow = pq.read_table(path)
     assert "asks[0].price" in arrow.schema.names
     assert arrow.column("bids[0].amount").to_pylist() == [2.5]
 
 
 def test_derivative_tickers_keep_their_native_columns(tmp_path: Path) -> None:
-    tardis_free.write_side_table(tmp_path, "tardis_derivative_ticker", "bybit", DAY, gz(TICKER_CSV))
-    path = tmp_path / "tardis_derivative_ticker" / f"date={DAY}" / "bybit_00.parquet"
+    tardis_free.write_side_table(
+        tmp_path, "tardis_derivative_ticker", "bybit", "BTC", DAY, gz(TICKER_CSV)
+    )
+    path = tmp_path / "tardis_derivative_ticker" / f"date={DAY}" / "bybit_BTC_00.parquet"
     arrow = pq.read_table(path)
     assert set(arrow.schema.names) >= {"funding_rate", "predicted_funding_rate", "open_interest"}
 
 
+def test_two_coins_of_one_venue_and_day_write_two_files(tmp_path: Path) -> None:
+    """The bug this name guards: one file per venue and day kept only the last coin."""
+    for coin in ("BTC", "ETH"):
+        tardis_free.write_side_table(
+            tmp_path, "tardis_book_snapshot_5", "bybit", coin, DAY, gz(BOOK_CSV)
+        )
+    directory = tmp_path / "tardis_book_snapshot_5" / f"date={DAY}"
+    assert sorted(p.name for p in directory.glob("*.parquet")) == [
+        "bybit_BTC_00.parquet",
+        "bybit_ETH_00.parquet",
+    ]
+
+
 def test_an_empty_side_table_file_writes_nothing(tmp_path: Path) -> None:
     header = BOOK_CSV.splitlines()[0] + "\n"
-    assert tardis_free.write_side_table(tmp_path, "t", "bybit", DAY, gz(header)) == 0
+    assert tardis_free.write_side_table(tmp_path, "t", "bybit", "BTC", DAY, gz(header)) == 0
 
 
 # --- the job ------------------------------------------------------------------

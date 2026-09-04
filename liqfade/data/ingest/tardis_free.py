@@ -166,12 +166,18 @@ def to_trades(rows: Iterable[dict[str, str]], venue: str) -> list[dict[str, Any]
     ]
 
 
-def write_side_table(root: Path, table: str, venue: str, day: date, payload: bytes) -> int:
+def write_side_table(
+    root: Path, table: str, venue: str, coin: str, day: date, payload: bytes
+) -> int:
     """Write a Tardis CSV to its side table with the columns Tardis gave it.
 
     Types are inferred by pyarrow rather than declared: these tables have no canonical
     schema by design, and pinning one would mean re-deriving it every time Tardis adds a
     column.
+
+    The file name carries the coin because `run` calls this once per coin for the same
+    venue and day. It used to be `{venue}_00.parquet` for all of them, so every coin
+    silently overwrote the one before and only the last survived.
     """
     import pyarrow.csv as pa_csv
 
@@ -180,7 +186,7 @@ def write_side_table(root: Path, table: str, venue: str, day: date, payload: byt
         return 0
     directory = partition_dir(root, table, day.isoformat())
     directory.mkdir(parents=True, exist_ok=True)
-    write_atomic(arrow, directory / f"{venue}_00.parquet")
+    write_atomic(arrow, directory / f"{venue}_{coin}_00.parquet")
     return int(arrow.num_rows)
 
 
@@ -248,7 +254,7 @@ def run(
 
         if data_type in SIDE_TABLES:
             table = SIDE_TABLES[data_type]
-            written = write_side_table(root, table, venue, day, payload)
+            written = write_side_table(root, table, venue, coin, day, payload)
         else:
             rows = read_csv(payload)
             table = data_type
