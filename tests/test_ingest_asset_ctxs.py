@@ -149,7 +149,7 @@ def test_a_day_the_archive_does_not_have_is_reported_not_guessed(
     """It starts 2023-05-20 and lags two days, so a range can legitimately overshoot."""
     assert hl_asset_ctxs.run(client, tmp_path, DAY, date(2026, 3, 3)) == 0
     out = capsys.readouterr().out
-    assert "2 of 3 days are not in the archive" in out
+    assert "2 of 3 days are not in the archive: 2026-03-02, 2026-03-03" in out
     assert client.downloaded == [KEY]
 
 

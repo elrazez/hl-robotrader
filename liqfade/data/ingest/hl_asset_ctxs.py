@@ -164,12 +164,12 @@ def run(
     listed = list_objects(client, BUCKET, f"{PREFIX}/")
     objects = [obj for obj in listed if str(obj["Key"]) in wanted]
 
-    absent = sorted(wanted - {str(obj["Key"]) for obj in objects})
+    absent = sorted(day_of_key(key) for key in wanted - {str(obj["Key"]) for obj in objects})
     if absent:
-        log.warning("asset_ctxs_days_absent", days=len(absent), first=absent[0], last=absent[-1])
+        log.warning("asset_ctxs_days_absent", days=absent)
         print(
-            f"WARNING: {len(absent)} of {len(wanted)} days are not in the archive "
-            f"({absent[0]} to {absent[-1]}). It starts 2023-05-20 and lags two days."
+            f"WARNING: {len(absent)} of {len(wanted)} days are not in the archive: "
+            f"{', '.join(absent)}. It starts 2023-05-20 and lags two days."
         )
 
     todo = [obj for obj in objects if not manifest.done(str(obj["Key"]))]
