@@ -321,6 +321,31 @@ carries the coin. `trades` and `liquidations` were never affected; they go throu
 `write_partitioned`, which picks a free file name. The two side tables are deleted and
 re-pulled (384 files, ~6.1 GB, free).
 
+**`fills_full` carries the exchange's event order, and compaction did not disturb it.**
+The 02d repair rests entirely on that, so it was checked rather than assumed. Every fill
+carries `startPosition`, the user's position before the fill, so consecutive fills of one
+`(user_address, coin)` must chain: `start_position[n] == start_position[n-1] +
+signed_sz[n-1]`. Reorder two fills of one sweep and both links break.
+`scripts/research/fills_order_check.py` walks that chain in `ts_ms` order with file order
+as the tie-break, the same stable sort the rederive uses, on the compacted cascade day and
+two days still in hourly files:
+
+| day | files | perp links | perp broken | spot links | spot broken |
+|---|---|---|---|---|---|
+| 2025-10-10 (compacted) | 1 | 17,368,159 | **0** | 1,458,723 | 679,774 |
+| 2026-03-01 (hourly) | 41 | 6,319,572 | **0** | 286,573 | 157,503 |
+| 2026-01-10 (hourly, quiet) | 33 | 2,379,722 | **0** | 180,466 | 86,759 |
+
+Zero broken perp links in 26.1M, including on the day the compaction had already folded
+from 200-odd hourly files into one. Only perps are evidence, and that took a wrong turn
+first: the check counted 86,759 violations on 2026-01-10 before it separated the markets.
+On a perp, `startPosition` is the position and nothing but a fill moves it. On a spot
+market (`coin` is `@107` or `PURR/USDC`) it is the base token balance, which also moves
+on deposits, transfers between the spot and perp wallets, and the fee when the fee is
+taken in that token, none of which appear in this file. Measured: 78,467 of the 86,759
+spot breaks are exactly the previous fill's `fee`, and 83,831 had a non-USDC `fee_token`.
+So spot breaking says nothing about row order, and the script reports the two separately.
+
 **The rederive is vectorised through polars twins, and the dict functions stay as the
 reference.** `derive_trades` and `derive_liquidations` walk Python dicts one row at a
 time, which is right for the S3 parser (one 16 MiB batch of freshly parsed JSON) and
