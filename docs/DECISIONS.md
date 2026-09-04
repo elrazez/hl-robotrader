@@ -346,6 +346,15 @@ the rederive had already done it would be redone for nothing. `_assemble` theref
 stamps `liqfade_rederive=1` into the footer metadata and `_partition_is_current` reads
 it. `--force` is for the one case the stamp cannot see, a genuine re-pull of `fills_full`.
 
+**Tardis's Hyperliquid trades are dropped: `hl_s3` owns the venue.** Both sources carry
+the same Hyperliquid fills under the same `tid`, so on the twelve free days a
+`venue == "hyperliquid"` filter over `trades` counted every trade twice. `tardis_free` no
+longer requests Hyperliquid `trades` or `liquidations` (its Hyperliquid side tables have
+no other source and are still pulled), and the rederive deletes any it finds in a
+partition it rewrites: 1,284,579 rows on 2026-03-01, against 3,371,156 of ours. The other
+three venues in that partition are untouched, 46.8M rows. Same rule as counting a
+liquidation once; see docs/DATA_SOURCES.md, "Counting a trade once".
+
 **Hyperliquid's `tid` is a hash, not a sequence, and that was silently reordering
 `trades`.** Two fills of one sweep carry 997296749534590 and 653061949558227 in that
 order. `hl_s3.derive_trades` sorted its output by `(ts_ms, tid)`, so inside a millisecond

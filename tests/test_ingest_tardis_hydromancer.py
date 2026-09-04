@@ -257,19 +257,21 @@ def test_a_missing_month_is_skipped_and_reported(
         DAY,
         DAY,
         ["BTC"],
-        exchanges={"hyperliquid": "hyperliquid"},
+        exchanges={"bybit": "bybit"},
         data_types=("liquidations",),
     )
     out = capsys.readouterr().out
     assert "1 files Tardis does not have (404, skipped)" in out
-    assert "hyperliquid/liquidations/2026/09/01/BTC.csv.gz" in out
+    assert "bybit/liquidations/2026/09/01/BTCUSDT.csv.gz" in out
 
 
 def test_an_unsupported_data_type_is_skipped_like_a_missing_month(tmp_path: Path) -> None:
-    """Tardis answers 400, not 404, for Hyperliquid liquidations: it never carried them.
+    """Tardis answers 400, not 404, for a data type an exchange never had.
 
     That is coverage information, not a broken request, so the pull records it and moves
-    on instead of aborting the whole run on the first file.
+    on instead of aborting the whole run on the first file. Hyperliquid liquidations were
+    the case that found this; they are no longer requested at all (see the test below),
+    so the same 400 is exercised here on a venue that is still pulled.
     """
     api = FakeTardis({})
     api.handle = lambda request: httpx.Response(  # type: ignore[method-assign]
@@ -282,11 +284,39 @@ def test_an_unsupported_data_type_is_skipped_like_a_missing_month(tmp_path: Path
             DAY,
             DAY,
             ["BTC"],
-            exchanges={"hyperliquid": "hyperliquid"},
+            exchanges={"bybit": "bybit"},
             data_types=("liquidations",),
         )
         == 0
     )
+
+
+def test_hyperliquid_trades_and_liquidations_are_not_requested_but_the_side_tables_are(
+    tmp_path: Path,
+) -> None:
+    """`hl_s3` owns Hyperliquid trades and liquidations; a Tardis copy would double them.
+
+    Both carry the same exchange fills under the same `tid`, so on the twelve free days a
+    `venue == hyperliquid` filter over `trades` would count every trade twice. The side
+    tables have no other source and are still pulled.
+    """
+    api = FakeTardis(
+        {
+            "hyperliquid/book_snapshot_5/2026/09/01/BTC.csv.gz": BOOK_CSV,
+            "hyperliquid/derivative_ticker/2026/09/01/BTC.csv.gz": TICKER_CSV,
+        }
+    )
+    tardis_free.run(
+        api.client(), tmp_path, DAY, DAY, ["BTC"], exchanges={"hyperliquid": "hyperliquid"}
+    )
+    assert [url.rsplit("/v1/", 1)[-1] for url in api.requested] == [
+        "hyperliquid/book_snapshot_5/2026/09/01/BTC.csv.gz",
+        "hyperliquid/derivative_ticker/2026/09/01/BTC.csv.gz",
+    ]
+    root = tmp_path / "parquet"
+    assert not (root / "trades").exists()
+    assert not (root / "liquidations").exists()
+    assert list((root / "tardis_book_snapshot_5").glob("date=*/*.parquet"))
 
 
 def test_a_404_is_remembered_so_the_next_run_does_not_ask_again(tmp_path: Path) -> None:

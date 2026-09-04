@@ -70,6 +70,7 @@ Approach for v0:
 ### Tardis free days
 
 - `GET https://datasets.tardis.dev/v1/{exchange}/{dataType}/{year}/{month}/01/{symbol}.csv.gz` with no auth for day 01 of any month. Exchanges of interest: `binance-futures`, `bybit`, `okex-swap`, `hyperliquid`. Data types: `liquidations`, `trades`, `book_snapshot_5`, `derivative_ticker`.
+- Hyperliquid `liquidations` and `trades` are **not** pulled from Tardis: `hl_s3` owns both, and Tardis's copy is the same fills under the same `tid`. See "Counting a trade once". Its Hyperliquid `book_snapshot_5` and `derivative_ticker` are pulled; nothing else carries them.
 
 ### HL S3
 
@@ -311,6 +312,25 @@ model what a taker order would really have paid.
 Fills arrive in maker and taker pairs, so the same liquidation shows up twice. Key on
 `(block_time, coin, tid)` and count once. Getting this wrong doubles every liquidation
 number and makes the strategy look far better than it is.
+
+### Counting a trade once
+
+The same trap one level up: two sources cover Hyperliquid and they overlap. `hl_s3`
+derives `trades` from every fill on the exchange, and Tardis's free first-of-month days
+carry Hyperliquid as well, the same trades under the same `tid`. On those twelve days a
+naive `venue == "hyperliquid"` filter doubles `v` and `n` for BTC, ETH, SOL and HYPE.
+
+The rule, decided 2026-09-04, is the liquidation rule again: **`hl_s3` is the only source
+of Hyperliquid trades and liquidations.** `tardis_free` no longer requests either one for
+Hyperliquid (it still pulls the Hyperliquid side tables, `book_snapshot_5` and
+`derivative_ticker`, which nothing else carries), and `liqfade backfill rederive` drops
+any Tardis Hyperliquid rows it finds in a partition it rewrites. Tardis was the smaller
+set anyway: 541,237 BTC trades against `hl_s3`'s 541,557 on 2026-03-01, and every Tardis
+`tid` is present in `hl_s3`.
+
+Consumers still deduplicate on `(coin, tid)`, as `liqfade/data/derive/candles.py` does.
+That costs nothing, and it is what will keep a recorded day and a backfilled day of the
+same date from counting twice once the recorder and the backfill overlap.
 
 ### Order to do it in
 

@@ -9,7 +9,10 @@ buy".
 
 Four data types, all free:
 
-- `liquidations` and `trades` map onto the canonical schemas through `data/symbols.py`.
+- `liquidations` and `trades` map onto the canonical schemas through `data/symbols.py`,
+  for Binance, Bybit and OKX only. Hyperliquid's two are skipped: `hl_s3` derives them
+  from every fill on the exchange, and a Tardis copy would be the same trades under the
+  same `tid`. See `HL_TABLES_OWNED_BY_S3` below.
 - `book_snapshot_5` and `derivative_ticker` keep their native Tardis columns in the side
   tables `tardis_book_snapshot_5` and `tardis_derivative_ticker`. Forcing a 5 level
   snapshot into the 20 level `l2` schema would invent fifteen empty levels, and the
@@ -63,6 +66,14 @@ SIDE_TABLES = {
     "book_snapshot_5": "tardis_book_snapshot_5",
     "derivative_ticker": "tardis_derivative_ticker",
 }
+
+# Hyperliquid `trades` and `liquidations` are not pulled from Tardis: `hl_s3` derives
+# both from every fill on the exchange, so a Tardis copy is the same trades under the
+# same `tid` on the twelve free days and doubles `v` and `n` for BTC, ETH, SOL and HYPE
+# there. Same rule as counting a liquidation once; see docs/DATA_SOURCES.md, "Counting a
+# trade once". The Hyperliquid side tables are still pulled: nothing else carries them.
+HL_VENUE = "hyperliquid"
+HL_TABLES_OWNED_BY_S3 = ("liquidations", "trades")
 
 # Bybit has published every liquidation since this date (`allLiquidation`); before it,
 # and on Binance and OKX always, the public feed is throttled to one event per symbol per
@@ -240,6 +251,8 @@ def run(
     totals: dict[str, int] = {}
 
     for exchange, venue, data_type, day, coin in targets:
+        if venue == HL_VENUE and data_type in HL_TABLES_OWNED_BY_S3:
+            continue
         symbol = to_venue_symbol(coin, venue)
         url = url_for(exchange, data_type, day, symbol)
         if manifest.done(url):
