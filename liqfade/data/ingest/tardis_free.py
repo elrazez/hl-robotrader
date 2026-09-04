@@ -185,9 +185,16 @@ def write_side_table(root: Path, table: str, venue: str, day: date, payload: byt
 
 
 def fetch(client: httpx.Client, url: str) -> bytes | None:
-    """The gzipped CSV, or None when Tardis has no file for that month."""
+    """The gzipped CSV, or None when Tardis has no file for that combination.
+
+    Tardis answers "we do not carry this" two different ways: 404 for a month it has no
+    file for, and 400 with `Data type 'x' is not supported for 'SYMBOL'` for a data type
+    an exchange never had, which is how it replies to Hyperliquid liquidations. Both are
+    answers about coverage rather than failures, so both are reported as missing and the
+    pull carries on to the next file.
+    """
     response = client.get(url, timeout=REQUEST_TIMEOUT_S, follow_redirects=True)
-    if response.status_code == httpx.codes.NOT_FOUND:
+    if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.BAD_REQUEST):
         return None
     response.raise_for_status()
     return response.content

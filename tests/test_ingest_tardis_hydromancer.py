@@ -250,6 +250,30 @@ def test_a_missing_month_is_skipped_and_reported(
     assert "hyperliquid/liquidations/2026/09/01/BTC.csv.gz" in out
 
 
+def test_an_unsupported_data_type_is_skipped_like_a_missing_month(tmp_path: Path) -> None:
+    """Tardis answers 400, not 404, for Hyperliquid liquidations: it never carried them.
+
+    That is coverage information, not a broken request, so the pull records it and moves
+    on instead of aborting the whole run on the first file.
+    """
+    api = FakeTardis({})
+    api.handle = lambda request: httpx.Response(  # type: ignore[method-assign]
+        400, json={"code": 300, "message": "Data type 'liquidations' is not supported for 'BTC'"}
+    )
+    assert (
+        tardis_free.run(
+            api.client(),
+            tmp_path,
+            DAY,
+            DAY,
+            ["BTC"],
+            exchanges={"hyperliquid": "hyperliquid"},
+            data_types=("liquidations",),
+        )
+        == 0
+    )
+
+
 def test_a_404_is_remembered_so_the_next_run_does_not_ask_again(tmp_path: Path) -> None:
     api = FakeTardis({})
     kwargs = {"exchanges": {"bybit": "bybit"}, "data_types": ("liquidations",)}
