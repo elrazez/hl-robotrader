@@ -116,8 +116,9 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
     core+major tiers.
   - **Q4 cross-venue**: Bybit episode without a matching HL episode within 120s ->
     does HL still revert per Q1's measure? First cut runs on the 12 Tardis days that
-    already hold Binance/Bybit/OKX liquidations alongside exact HL ones; rerun on
-    2026-09-13 when the recorder crosses 14 days. Whether Q4 blocks Phase 4 is decided
+    already hold Binance/Bybit/OKX liquidations alongside exact HL ones; rerun 14 days
+    after the VPS recorder starts (it has not started as of 2026-09-04; the lake holds
+    no recorder rows at all). Whether Q4 blocks Phase 4 is decided
     by Q3's trigger branch in the grill section.
   - **Q5 partial liquidation rhythm**: every qualifying episode (the $250k floor
     already clears the 100k partial-liquidation threshold the spec named):
@@ -163,7 +164,8 @@ Write it into `asset_ctx`-compatible rows (`source = hl_api`, `rx_ms = 0`) so
 `context.py`'s `funding` is real for the year and Q6's funding filter is evaluable.
 This is data preparation and may precede the preregistration commit.
 
-`asset_ctx` is otherwise a recorder-only table starting 2026-08-30, so for the
+`asset_ctx` is otherwise a recorder-only table, and the recorder has not yet run on
+the VPS (as of 2026-09-04 the lake has no recorder rows: no `bbo`, no `asset_ctx`), so for the
 historical year `open_interest`, `mark_px`, `oracle_px` and `premium` are absent, and
 Coinalyze cannot fill them (its intraday history keeps about 2,000 points, useless at
 scalp resolution). `book.py` is NaN for the year as well: there is no historical `bbo`
@@ -273,7 +275,7 @@ HL-reverting events, not establishing the edge, which Q1 already did on exact da
 **Q4 is not empty today.** Tardis carries Binance, Bybit and OKX liquidations on the
 1st of every month of the lake window, and we hold exact HL liquidations for those same
 12 days. Run Q4's skeleton on those 12 days as the first cut on the day it is built,
-and again on **2026-09-13** when the recorder crosses 14 days. Twelve days cannot reach
+and again 14 days after the VPS recorder starts (not yet running as of 2026-09-04). Twelve days cannot reach
 any bar, but a cross-venue cascade that never once coincides with an HL episode is
 worth knowing before Q3 has run.
 
