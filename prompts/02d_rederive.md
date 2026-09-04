@@ -68,8 +68,13 @@ from them, the order verified, all of it written down.
   once" paragraph in `docs/DATA_SOURCES.md` next to the liquidation one.
 - Days run in a process pool, newest first, one day per task, like the backfill workers.
   A day whose `trades` and `liquidations` partitions are already a single `all_day.parquet`
-  newer than every `fills_full` file of that day is skipped unless `--force`, so a crashed
-  run resumes.
+  carrying this job's stamp in the Parquet footer is skipped unless `--force`, so a crashed
+  run resumes. The stamp, not the mtime: `liqfade compact` produced that same file name for
+  every day of the year in 02b, out of the wrongly ordered rows this job exists to replace,
+  so the name says nothing about whether the rows are right; and the `fills_full` compaction
+  runs alongside this and rewrites a day's fills without changing a single row of them, so
+  comparing timestamps would redo every day it happened to reach. After a genuine re-pull of
+  `fills_full`, use `--force`.
 - Run detached in the same `until ... ; do sleep 30; done` loop the compaction uses; the
   mount times out an open every few hours and the resume rule makes a restart cheap.
 
