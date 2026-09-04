@@ -338,7 +338,7 @@ That is small but not negligible next to 4.5 bps of taker fee, and it matters mo
 exactly the entries and exits a scalp backtest models. `fills_full` was never sorted and
 still carries the true order, so the repair is free: `liqfade backfill rederive` over the
 year, then `liqfade derive candles --force`. Two things block that today and are handed
-to `prompts/02d_quality_gate.md`: the `fills_full` compaction is still running, and
+to `prompts/02d_rederive.md`: the `fills_full` compaction is still running, and
 `rederive` reads a whole day of fills into Python objects (the failure mode that already
 killed the parser on the 2025-10-10 cascade day) and globs hidden AppleDouble sidecars,
 so it needs streaming and `lake_files()` first. Lesson, and the reason this is written

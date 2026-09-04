@@ -1,8 +1,8 @@
-# Prompt 02d: the data quality gate into Phase 3
+# Prompt 02e: the data quality gate into Phase 3
 
 Owner notes: last step before research. It answers one question: is there a hole in the
 year that would silently bias the backtest? Run in a fresh chat after
-`prompts/02b_compaction.md` and `prompts/02c_candles.md`. Drive mounted via
+`prompts/02d_rederive.md` (which itself follows 02b and 02c). Drive mounted via
 anylinuxfs/ntfs3, `.env` loaded through `bash -c 'set -a && source .env && set +a && ...'`.
 
 ---
@@ -46,12 +46,15 @@ per day with no *unexplained* holes, written down.
    - `fills_full` was compacted last, detached (`~/fills_compact.log`, 22,795 files to
      365). If it is still running, say so and do not count its file counts as holes.
    - `candles_1m` days equal `trades` days.
+   - `trades` holds no `venue == hyperliquid, source == tardis` rows after 02d; Tardis rows
+     are Binance, Bybit and OKX only. Every `candles_1m` file is newer than its day's
+     `trades` file (rebuilt with `--force` after the rederive).
    Anything else, in particular a Hyperliquid day with unusually few liquidations or
    trades, or a `fills_full` day whose row count is far below its neighbours, gets
    checked against the manifest in `data/ingest_state/s3-fills.json` (the `rows`
    recorded per object for that day) before it is called a hole.
 
-   Three things already settled on 2026-09-04, so do not re-investigate them:
+   Four things already settled on 2026-09-04, so do not re-investigate them:
    - **Duplicates.** `liquidations` has no `tid`, so keying it on
      `(coin, ts_ms, px, sz, side, method)` finds ~375k "duplicates" on every day of the
      year. They are distinct fills: the liquidation engine fills many positions at one
@@ -66,6 +69,9 @@ per day with no *unexplained* holes, written down.
      hourly footers, `liquidations` rows from the compacted day files, and `trades: 0`.
      The manifest's job is resume (never re-buy the year); its row totals are not a
      source of truth for those keys. Compare against the lake, not the manifest, there.
+   - **Order inside a millisecond.** `tid` is a hash. 02d rebuilt `trades` and
+     `liquidations` from `fills_full` in file order and proved the order with the
+     position chain; the bars were rebuilt after. Do not sort anything by `tid`.
    - **`._*` sidecars.** macOS writes an AppleDouble file beside every Parquet on this
      NFS-backed mount; they hold no data and break naive globs
      (`read_parquet('date=*/*.parquet')`). Every reader in this repo must skip names

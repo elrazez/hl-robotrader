@@ -69,7 +69,7 @@ shows all four coins for every venue.
    running detached (`~/fills_compact.log`) or with the candle files below. Before
    reporting back, `tail ~/tardis_repull.log`; if it has finished, put its two row
    totals in the report (expected about 281.8M and 36.6M), otherwise say it is still
-   running and leave that to 02d.
+   running and leave that to 02e.
 
 ## Build
 
@@ -129,4 +129,4 @@ shows all four coins for every venue.
 The Step 0 commit and the re-pull's state, the API comparison table (per coin: bars
 compared, ohlc match %, v/n match %), the empty-minute decision, the year run summary,
 and a dated `docs/DECISIONS.md` entry.
-Next prompt: `prompts/02d_quality_gate.md`.
+Next prompt: `prompts/02d_rederive.md`.

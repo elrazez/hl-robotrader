@@ -11,8 +11,9 @@ exceptions are noted below.
 | `02_backfill.md` | 2 | Historical data download (S3, Tardis, candles) | AWS keys, billing alarm |
 | `02b_compaction.md` | 2 | Streaming compaction + `liqfade compact`, run over the year | 02 data on disk (done 2026-09-04) |
 | `02c_candles.md` | 2 | Tardis side-table fix + re-pull, then `liqfade derive candles`: the year of 1m bars from `trades` | 02b |
-| `02d_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02b, 02c |
-| `03_research.md` | 3 | Feature functions + the six research questions | 02d says no unexplained holes |
+| `02d_rederive.md` | 2 | Streaming `backfill rederive` in exchange order, Tardis HL trades dropped, candles rebuilt | 02c; `fills_full` compaction done |
+| `02e_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02d |
+| `03_research.md` | 3 | Feature functions + the six research questions | 02e says no unexplained holes |
 | `04_backtest.md` | 4 | Backtester, strategy v0, sizing, risk + Panel v2 | Phase 3 said "yes" |
 | `05_execution.md` | 5 | Live loop, paper mode, testnet execution, Telegram bot + Panel v3 | Phase 4 done, testnet keys |
 | `06_mainnet.md` | 6 | Mainnet go-live at minimum size, reporting | Phase 5 ran clean 1 week |
