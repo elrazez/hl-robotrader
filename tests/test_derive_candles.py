@@ -229,12 +229,18 @@ def test_low_is_below_open_and_close_and_high_is_above_them(seed: int) -> None:
 # --- the runner ---------------------------------------------------------------
 
 
-def write_trades(data_dir: Path, day: date, rows: list[dict[str, object]]) -> None:
+def write_trades(
+    data_dir: Path, day: date, rows: list[dict[str, object]], *, rederived: bool = False
+) -> None:
+    """One `trades` partition. `rederived` stamps the footer as the rederive does."""
+    from liqfade.data.ingest.hl_s3 import REDERIVE_STAMP
     from liqfade.data.schemas import rows_to_table
 
     directory = partition_dir(data_dir / "parquet", "trades", day.isoformat())
     directory.mkdir(parents=True, exist_ok=True)
     table = rows_to_table("trades", rows, SOURCE_HL_S3)  # type: ignore[arg-type]
+    if rederived:
+        table = table.replace_schema_metadata(dict([REDERIVE_STAMP]))
     write_atomic(table, directory / "all_day.parquet")
 
 
@@ -272,20 +278,32 @@ def test_a_day_with_no_hyperliquid_trades_writes_nothing(tmp_path: Path) -> None
     assert not output_path(tmp_path, DAY).exists()
 
 
-def test_a_second_run_skips_the_day_and_force_rewrites_it(tmp_path: Path) -> None:
+def test_a_second_run_over_unchanged_trades_skips_the_day(tmp_path: Path) -> None:
     write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
     candles.run(tmp_path, DAY, DAY)
     first = output_path(tmp_path, DAY).stat().st_mtime_ns
 
-    write_trades(
-        tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1), trade(MINUTE, 111.0, 1.0, tid=2)]
-    )
     candles.run(tmp_path, DAY, DAY)
     assert output_path(tmp_path, DAY).stat().st_mtime_ns == first
-    assert read_out(tmp_path).column("n").to_pylist() == [1]
 
     candles.run(tmp_path, DAY, DAY, force=True)
-    assert read_out(tmp_path).column("n").to_pylist() == [2]
+    assert output_path(tmp_path, DAY).stat().st_mtime_ns != first
+
+
+def test_a_rederived_day_rebuilds_without_force(tmp_path: Path) -> None:
+    """The file name and the row count are unchanged; only the rederive stamp moved.
+
+    That is what 353 of the year's 365 days look like after `liqfade backfill rederive`:
+    the same `all_day.parquet` holding the same rows in the exchange's order instead of
+    an arbitrary one. A resume rule reading the name or the mtime keeps the wrong bars.
+    """
+    write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
+    candles.run(tmp_path, DAY, DAY)
+    assert read_out(tmp_path).column("o").to_pylist() == [100.0]
+
+    write_trades(tmp_path, DAY, [trade(MINUTE, 222.0, 1.0, tid=1)], rederived=True)
+    candles.run(tmp_path, DAY, DAY)
+    assert read_out(tmp_path).column("o").to_pylist() == [222.0]
 
 
 def test_the_writer_leaves_no_temp_file_behind(tmp_path: Path) -> None:

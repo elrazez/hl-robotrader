@@ -70,6 +70,19 @@ MINUTE_MS = 60_000
 # alone: writer.compact_day skips a partition that is already a single `_day` file.
 OUTPUT_NAME = f"{VENUE}_day.parquet"
 
+# Footer metadata on every day file written here: a fingerprint of the `trades`
+# partition the bars came from. The obvious resume rule, "skip a day whose output file
+# already exists", is the same "the file name says nothing" mistake `_partition_is_current`
+# exists to avoid in hl_s3.py. `liqfade backfill rederive` rebuilds a day's `trades` in
+# the exchange's order without touching the bars, and on 353 of the year's 365 days it
+# writes the same file name with the same row count, so the bars stay wrong until
+# somebody remembers `--force`. The fingerprint is every source file's name and row count
+# plus whether it carries the rederive stamp, which is what makes a rederive visible.
+#
+# What it cannot see, exactly as in hl_s3.py, is a second rederive of an already stamped
+# day: the stamp is a flag, not a version. `--force` is for that.
+SOURCE_STAMP = b"liqfade_trades"
+
 # The canonical `candles_1m` columns, in order, as polars types. `to_arrow().cast()`
 # turns this into the pyarrow schema; polars spells strings `large_string` and the cast
 # is what reconciles that.
@@ -161,6 +174,34 @@ def _fill_empty_minutes(bars: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def trades_stamp(files: list[Path]) -> bytes:
+    """Fingerprint of the `trades` partition a day's bars are derived from.
+
+    Footers only: no row is read. See SOURCE_STAMP for why the rederive flag is in it.
+    """
+    import hashlib
+
+    import pyarrow.parquet as pq
+
+    from liqfade.data.ingest.hl_s3 import REDERIVE_STAMP
+
+    parts = []
+    for path in sorted(files):
+        meta = pq.read_metadata(path)
+        rederived = (meta.metadata or {}).get(REDERIVE_STAMP[0], b"-")
+        parts.append(f"{path.name}:{meta.num_rows}:{rederived.decode()}")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest().encode()
+
+
+def stamp_of(path: Path) -> bytes | None:
+    """The `trades` fingerprint a day file was written with, or None if it has none."""
+    import pyarrow.parquet as pq
+
+    if not path.exists():
+        return None
+    return (pq.read_metadata(path).metadata or {}).get(SOURCE_STAMP)
+
+
 def drop_hl_api(directory: Path, output: Path) -> int:
     """Remove the `hl_api` bars of a partition this derivation has just written.
 
@@ -216,9 +257,10 @@ def run(
 ) -> int:
     """Derive `candles_1m` from `trades` for [start, end], oldest day first.
 
-    One file per day, `candles_1m/date=YYYY-MM-DD/hyperliquid_day.parquet`. A day whose
-    file already exists is skipped unless `force`, so an interrupted year resumes where
-    it stopped.
+    One file per day, `candles_1m/date=YYYY-MM-DD/hyperliquid_day.parquet`. A day is
+    skipped when its bars already carry the fingerprint of the `trades` partition they
+    would be built from, so an interrupted year resumes where it stopped and a day whose
+    `trades` was rederived underneath it is rebuilt without anyone remembering `--force`.
     """
     from liqfade.data.ingest.common import BackfillError, day_range
 
@@ -232,11 +274,13 @@ def run(
         began = time.monotonic()
         directory = partition_dir(root, TABLE, day.isoformat())
         output = directory / OUTPUT_NAME
-        if output.exists() and not force:
-            print(f"{day}  skipped (exists)", flush=True)
-            continue
 
         files = lake_files(partition_dir(root, SOURCE_TABLE, day.isoformat()))
+        stamp = trades_stamp(files)
+        if not force and files and stamp_of(output) == stamp:
+            print(f"{day}  skipped (bars match the trades they came from)", flush=True)
+            continue
+
         bars = (
             bars_from_trades(read_trades(files, coins)) if files else pl.DataFrame(schema=_SCHEMA)
         )
@@ -245,7 +289,8 @@ def run(
             continue
 
         arrow = bars.to_arrow().cast(schema_for(TABLE))
-        validate_table(TABLE, arrow)
+        validate_table(TABLE, arrow)  # schema only; the stamp below is footer metadata
+        arrow = arrow.replace_schema_metadata({SOURCE_STAMP: stamp})
         directory.mkdir(parents=True, exist_ok=True)
         write_atomic(arrow, output)
 
