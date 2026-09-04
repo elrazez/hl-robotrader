@@ -242,6 +242,25 @@ def test_compaction_can_be_restricted_to_some_tables(tmp_path: Path) -> None:
     ]
 
 
+def test_a_table_with_no_canonical_schema_is_skipped_not_attempted(tmp_path: Path) -> None:
+    """`liqfade record --compact-only` used to raise on any of the twelve Tardis days.
+
+    The Tardis side tables keep Tardis's own columns by design, so they have no schema to
+    write and no `ts_ms` to sort on, and the job already writes them one file per venue
+    per day.
+    """
+    import pyarrow as pa
+
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
+    side = partition_dir(tmp_path, "tardis_book_snapshot_5", DATE)
+    side.mkdir(parents=True)
+    write_atomic(pa.table({"whatever_tardis_called_it": [1, 2]}), side / "binance_BTC_00.parquet")
+    write_atomic(pa.table({"whatever_tardis_called_it": [3]}), side / "bybit_BTC_00.parquet")
+
+    assert compact_day(tmp_path, DATE) == {"bbo": 1}
+    assert len(list(side.glob("*.parquet"))) == 2
+
+
 def test_receive_time_partitioning_may_straddle_an_hour_by_the_feed_latency(
     tmp_path: Path,
 ) -> None:

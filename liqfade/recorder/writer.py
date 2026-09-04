@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 
 from liqfade.data.schemas import (
     MULTI_VENUE_TABLES,
+    SCHEMAS,
     SOURCE_RECORDER,
     rows_to_table,
     schema_for,
@@ -209,7 +210,17 @@ def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> di
     The hourly files are deleted only after the compacted file exists and its row count
     matches the sum of the inputs. A table whose partition holds rows from several venues
     compacts to `all_day.parquet`; a single venue table keeps its venue in the name.
-    `tables` restricts the work to those table names; None means every table in the lake.
+    `tables` restricts the work to those table names; None means every canonical table in
+    the lake.
+
+    A directory with no canonical schema is skipped, never attempted. That is the two
+    Tardis side tables, which keep Tardis's own columns by design and so have no schema
+    to write and no `ts_ms` to sort on, and which the job already writes one file per
+    venue per day. The rule lives here rather than in the CLI because
+    `liqfade record --compact-only --date ...`, the command docs/DATA_SOURCES.md tells the
+    owner to run, calls this with `tables=None` and used to raise on any of the twelve
+    Tardis days. `liqfade compact --tables` still refuses a side table by name, so asking
+    for one explicitly says so rather than quietly doing nothing.
     """
     root = Path(root)
     written: dict[str, int] = {}
@@ -219,6 +230,8 @@ def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> di
 
     for table_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         table_name = table_dir.name
+        if table_name not in SCHEMAS:
+            continue
         if wanted is not None and table_name not in wanted:
             continue
         directory = table_dir / f"date={date}"
