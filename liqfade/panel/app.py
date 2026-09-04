@@ -36,7 +36,14 @@ class LoginBody(BaseModel):
 
 
 def is_loopback(host: str) -> bool:
-    if host in ("localhost", ""):
+    """True only for a literal loopback address or `localhost`.
+
+    The empty string is not loopback: uvicorn hands it straight to socket.bind, which
+    reads it as INADDR_ANY, so `panel.host: ""` used to pass this guard and then listen
+    on every interface. The panel is reached over Tailscale or an SSH tunnel and must
+    never bind a public address by accident.
+    """
+    if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback

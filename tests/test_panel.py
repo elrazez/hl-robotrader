@@ -206,6 +206,8 @@ def test_the_built_bundle_is_served(client: TestClient) -> None:
         ("0.0.0.0", False),
         ("10.0.0.5", False),
         ("example.com", False),
+        # uvicorn passes "" to socket.bind, which reads it as INADDR_ANY.
+        ("", False),
     ],
 )
 def test_is_loopback(host: str, expected: bool) -> None:
@@ -217,6 +219,24 @@ def test_serve_refuses_a_non_loopback_bind(tmp_path: Path) -> None:
         "paper",
         environ={"LIQFADE_PATHS__DATA_DIR": str(tmp_path), "LIQFADE_PANEL__HOST": "0.0.0.0"},
     )
+    with pytest.raises(SystemExit, match="not loopback"):
+        serve(settings)
+
+
+def test_serve_refuses_an_empty_host(tmp_path: Path) -> None:
+    """An empty host binds every interface, so it must not pass the guard.
+
+    It arrives from a YAML layer rather than an env var: LIQFADE_PANEL__HOST="" parses
+    as a YAML null and is rejected by the model before it ever reaches serve().
+    """
+    extra = tmp_path / "run.yaml"
+    extra.write_text('panel:\n  host: ""\n')
+    settings = load_settings(
+        "paper",
+        extra_files=[extra],
+        environ={"LIQFADE_PATHS__DATA_DIR": str(tmp_path)},
+    )
+    assert settings.panel.host == ""
     with pytest.raises(SystemExit, match="not loopback"):
         serve(settings)
 
