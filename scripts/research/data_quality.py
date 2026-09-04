@@ -14,6 +14,7 @@ fast over a lake with a year of fills in it. The liquidation series does read th
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -38,11 +39,22 @@ def scan(root: Path) -> dict[str, dict[str, int]]:
         return counts
     for table_dir in sorted(path for path in root.iterdir() if path.is_dir()):
         per_day: dict[str, int] = {}
-        for partition in sorted(table_dir.glob("date=*")):
+        for partition in sorted(table_dir.iterdir()):
+            if not partition.name.startswith("date="):
+                continue
             day = partition.name.removeprefix("date=")
-            per_day[day] = sum(
-                pq.read_metadata(path).num_rows for path in sorted(lake_files(partition))
-            )
+            try:
+                per_day[day] = sum(
+                    pq.read_metadata(path).num_rows for path in sorted(lake_files(partition))
+                )
+            except OSError as exc:
+                # A partition the filesystem itself cannot open. On the owner's NTFS
+                # volume a drive drop left one directory entry that raises EINVAL on
+                # `stat`, which a `date=*` glob dies on before reaching any good day.
+                # A report that is the Phase 2 gate has to name that as a hole, not
+                # crash on it.
+                print(f"UNREADABLE {partition}: {exc}", file=sys.stderr)
+                per_day[day] = 0
         if per_day:
             counts[table_dir.name] = per_day
     return counts

@@ -62,6 +62,30 @@ def test_an_empty_lake_scans_to_nothing(tmp_path: Path) -> None:
     assert dq.scan(tmp_path / "parquet") == {}
 
 
+def test_a_partition_the_filesystem_cannot_open_is_a_hole_not_a_crash(
+    lake: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A drive drop left one directory entry on the owner's volume raising EINVAL.
+
+    A `date=*` glob dies on it before reaching any good day, and this report is the
+    Phase 2 gate, so it has to name the partition and carry on.
+    """
+    from liqfade.recorder import writer
+
+    real = writer.lake_files
+
+    def fails_on_one(directory: Path) -> list[Path]:
+        if directory.name == "date=2026-09-03":
+            raise OSError(22, "Invalid argument")
+        return real(directory)
+
+    monkeypatch.setattr(writer, "lake_files", fails_on_one)
+    counts = dq.scan(lake / "parquet")
+
+    assert counts == {"liquidations": {"2026-09-01": 3, "2026-09-03": 0}}
+    assert "UNREADABLE" in capsys.readouterr().err
+
+
 def test_an_appledouble_sidecar_does_not_break_the_report(lake: Path) -> None:
     """macOS leaves a 4 KiB `._x.parquet` beside every file our code writes to the drive.
 
