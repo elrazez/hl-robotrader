@@ -370,3 +370,33 @@ more. 2026-09-01 is a Tardis free day, so its Hyperliquid trades are downloadabl
 cost and the API still had it. That is what the 100% `o`/`h`/`c` match is measured on.
 Residual `l` at 99.6% and `n` at 99.4% is Tardis's own incompleteness (0.05% of trades),
 not the derivation.
+
+**The year of candles, measured.** `liqfade derive candles --start 2025-09-01 --end
+2026-08-30`: 364 partitions, one `hyperliquid_day.parquet` each, 174,697,608 bars, 2.4 GB
+zstd, 34.9 minutes of wall clock (median 5.3s a day, 21.2s on the Tardis days, which carry
+four venues in the same `trades` partition). Every file re-opened afterwards and checked
+against `CANDLES_1M`: none truncated, none with a stray second file. Bars a day grow with
+the exchange: 327,788 across 277 coins on 2025-09-01, 508,319 across 393 on 2026-03-01,
+649,986 across 578 on 2026-08-30. That is roughly double the 90M the plan guessed,
+because empty minutes are bars here rather than gaps; they cost little on disk since a
+filled bar repeats one price. Dedup verified on a Tardis day: 2025-10-01 BTC has 679,311
+trade rows, 339,656 after `(coin, tid)`, and the day's bars sum to exactly 339,656 trades
+and 30,800.3529 coins.
+
+**The derivation validated a second way, against the live `candle` stream.** The Tardis
+check cannot separate a derivation bug from a source gap, so a 45 minute recorder capture
+was compared against Hyperliquid's own bars for the same minutes: 899 minutes over 20
+coins. On the 854 minutes where our trade count equals the exchange's, meaning we caught
+the whole minute, `o/h/l/c` is exact on 851 (99.65%) and `v` matches to within a float
+ULP on all 854. On the 45 minutes where the counts differ, which is the laptop's
+WebSocket dropping frames (the run logged `stream_gap` throughout), `o/h/l/c` agrees on
+38%. The three residual complete minutes are all fast ones and differ by a single tick in
+one of `o`, `l` or `c`, with identical `n` and identical `v`; the BTC case is a trade at
+79067 that our feed carries 25 seconds into the minute and the exchange's bar does not
+count, so it is not a boundary or ordering effect. Left unexplained at 0.35% rather than
+guessed at.
+
+**The Tardis side-table re-pull finished:** `tardis_book_snapshot_5` 281,773,008 rows and
+`tardis_derivative_ticker` 36,619,381, both matching the pre-bug expectation, so no coin
+is missing now. The old one-coin-per-day files still sit beside the new ones and have to
+be deleted by name (`{venue}_00.parquet`, against the new `{venue}_{coin}_00.parquet`).
