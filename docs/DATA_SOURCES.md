@@ -73,6 +73,7 @@ Approach for v0:
 
 - `GET https://datasets.tardis.dev/v1/{exchange}/{dataType}/{year}/{month}/01/{symbol}.csv.gz` with no auth for day 01 of any month. Exchanges of interest: `binance-futures`, `bybit`, `okex-swap`, `hyperliquid`. Data types: `liquidations`, `trades`, `book_snapshot_5`, `derivative_ticker`.
 - Hyperliquid `liquidations` and `trades` are **not** pulled from Tardis: `hl_s3` owns both, and Tardis's copy is the same fills under the same `tid`. See "Counting a trade once". Its Hyperliquid `book_snapshot_5` and `derivative_ticker` are pulled; nothing else carries them.
+- **Read the two side tables with `union_by_name = true`, always.** They keep Tardis's own columns and declare no schema, so pyarrow infers types per file, and a coin whose prices happen to be whole numbers infers `int64` where every other coin infers `double`. Measured on 2026-03-01: `tardis_derivative_ticker.mark_price` is `BIGINT` for BTC and `DOUBLE` for ETH, HYPE and SOL. A plain `read_parquet([...])` across coins takes the first file's type and **silently truncates** 31.215 to 31 — it reads as data, not as an error, and it cost an hour chasing a phantom 0.5% disagreement against the asset-context archive before the cause was found. `union_by_name = true` promotes to `double` and is correct. Declaring the types in `write_side_table` instead would fix it at the source and needs a re-pull of 384 free files; worth doing if anything beyond validation ever reads these tables.
 
 ### HL S3
 

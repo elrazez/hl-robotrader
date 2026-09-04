@@ -43,6 +43,12 @@ per day with no *unexplained* holes, written down.
      `tardis_book_snapshot_5`, 36.6M in `tardis_derivative_ticker`. Fewer means the
      re-pull did not finish: check `~/tardis_repull.log` and rerun the same command
      (the manifest resumes) before calling it a hole.
+     **Any query over these two must pass `union_by_name = true`.** They declare no
+     schema, so types are inferred per file and a coin with whole-number prices lands as
+     `int64` while the rest are `double`; a plain multi-file read takes the first file's
+     type and silently truncates every other coin's prices. Row counts are unaffected, so
+     this does not change the gate's numbers, but a report that reads a price out of
+     these tables without it is reporting a truncated one. See docs/DATA_SOURCES.md.
    - `fills_full` was compacted last, detached (`~/fills_compact.log`, 22,795 files to
      365). If it is still running, say so and do not count its file counts as holes.
    - `candles_1m` days equal `trades` days.
