@@ -545,6 +545,17 @@ and the candle validation pulled that day's Tardis trades ad hoc rather than thr
 lake. The script stays for the day a partition with no `fills_full` does land, which the
 rederive returns `"empty"` for and therefore never cleans.
 
+**The panel's liquidation chart is uPlot, not `lightweight-charts`.** CLAUDE.md section 4
+names `lightweight-charts` for price, liquidation and trade-marker charts and uPlot for
+equity and latency series. The panel's 24h liquidation chart is stacked hourly bars per
+venue, which is a time series and not a price chart: it has no candles, no crosshair on a
+price scale and no trade markers. `lightweight-charts` has no stacked bar series, so
+drawing it there would mean a histogram series per venue with the stacking done by hand
+anyway, plus a second charting library in the bundle for one chart. uPlot already has to
+be there for the equity and latency series. Reverse when the panel gets its per-coin price
+chart with liquidation and trade markers, which is what section 4's rule is actually
+about: that one is `lightweight-charts`, and this chart can stay where it is.
+
 **The candle validation is a script now, and it reproduces.**
 `scripts/research/candle_validate.py` builds our bars either from the lake's
 `candles_1m` or, for a day the lake does not cover, from Tardis's free first-of-month
