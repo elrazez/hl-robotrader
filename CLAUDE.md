@@ -129,6 +129,7 @@ make sync         # rsync data/parquet, data/orders.sqlite and reports/ from the
 - Never run `liqfade live` yourself. Never modify `config/mainnet.yaml` risk limits without an explicit instruction in the same message.
 - When unsure about a Hyperliquid API detail, write a tiny script under `scripts/probe/` that hits testnet and prints the raw response, then encode what you learned in `docs/HYPERLIQUID.md`.
 - Keep this file under control: if a section grows beyond a screen, move detail into `docs/` and leave a pointer.
+- The `mattpocock-skills` plugin is installed. Use its skills whenever one fits, and when handing the owner a prompt for a new chat, put the skill invocation at the top of it: `/mattpocock-skills:code-review <commit>` at every phase boundary and after any batch of agent commits; `/grill-me` before a phase's design is pasted; `/mattpocock-skills:wizard` for anything only the owner can do by hand (VPS, keys, dashboards); `/mattpocock-skills:diagnosing-bugs` for a hard bug or a performance regression; `/mattpocock-skills:handoff` when a chat must continue elsewhere. Do not reach for the ticket, triage or architecture-scan skills mid-phase; they invite refactors CLAUDE.md forbids.
 
 ## 7. Owner's manual tasks (Phase 0 checklist)
 
