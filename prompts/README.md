@@ -8,11 +8,13 @@ exceptions are noted below.
 |---|---|---|---|
 | `00_scaffold.md` | 0 | Skeleton, config, control plane, CLI, panel, VPS scripts | nothing (done) |
 | `01_recorder.md` | 1 | 24/7 market data recorder + Panel v1 | nothing; VPS optional |
+| `01b_recorder_hardening.md` | 1 | Recorder fixes from the 2026-09-04 review; deploy before Phase 5 | 02d and 02f committed |
 | `02_backfill.md` | 2 | Historical data download (S3, Tardis, candles) | AWS keys, billing alarm |
 | `02b_compaction.md` | 2 | Streaming compaction + `liqfade compact`, run over the year | 02 data on disk (done 2026-09-04) |
 | `02c_candles.md` | 2 | Tardis side-table fix + re-pull, then `liqfade derive candles`: the year of 1m bars from `trades` | 02b |
 | `02d_rederive.md` | 2 | Streaming `backfill rederive` in exchange order, Tardis HL trades dropped, candles rebuilt | 02c; `fills_full` compaction done |
-| `02e_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02d |
+| `02f_lake_hardening.md` | 2 | Ingestion and lake fixes from the 2026-09-04 review | 02d committed, both its runs finished |
+| `02e_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02d, 02f |
 | `03_research.md` | 3 | Feature functions + the six research questions | 02e says no unexplained holes |
 | `04_backtest.md` | 4 | Backtester, strategy v0, sizing, risk + Panel v2 | Phase 3 said "yes" |
 | `05_execution.md` | 5 | Live loop, paper mode, testnet execution, Telegram bot + Panel v3 | Phase 4 done, testnet keys |
@@ -27,6 +29,8 @@ Ordering rules from the roadmap:
   and that is a valid outcome. Do not run 04 until 03's summary says to continue.
 - Do not run 06 until Phase 5 has run at least one week with zero reconciliation
   mismatches.
+- `02f_lake_hardening.md` runs after 02d's two long jobs finish, then `02e_quality_gate.md`.
+  `01b_recorder_hardening.md` runs any time after 02f and must be deployed before Phase 5.
 
 Rules for whoever runs these prompts (human or agent):
 

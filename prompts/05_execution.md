@@ -34,6 +34,21 @@ panel v3.
 
 ## Decisions already made
 
+**Carried in from the 2026-09-04 code review (do these in Stage A, they are one commit each)**
+- Split `venues.hyperliquid.api_url` into `info_url` and `exchange_url`, or derive the
+  exchange base from `env` alone. Today one key is documented as the base for both, it
+  defaults to mainnet, and `paper.yaml` does not override it, so an execution client that
+  reads it in paper env would point at the mainnet exchange. Nothing hits `/exchange`
+  yet, which is the only reason this is not already a bug.
+- `universe.min_listing_days` is configured, documented and read by nothing. The recorder
+  deliberately does not apply it (`metaAndAssetCtxs` carries no listing date); `risk/` is
+  where the floor belongs, so consume it here or delete the key.
+- `/api/config` returns `flatten(resolve(...))`, the raw pre-validation merge, so an
+  unknown `LIQFADE_X__Y` env var present at request time is echoed to the browser instead
+  of being rejected by `extra="forbid"`. Dump the validated `Settings` instead. Low risk
+  today (the endpoint is behind auth) but the Phase 5 settings page writes through this
+  surface.
+
 **Stage A: execution/**
 - `signer.py`: reads `HL_{TESTNET|MAINNET}_AGENT_PRIVATE_KEY` and
   `HL_{...}_ACCOUNT_ADDRESS` per env at construction, builds the SDK signing objects,
