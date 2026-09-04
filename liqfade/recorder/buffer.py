@@ -56,6 +56,31 @@ class Buffers:
         """Remove and return one buffer. The caller owns the rows from here on."""
         return self._rows.pop(key, [])
 
+    def partitions(self) -> list[PartitionKey]:
+        """Every buffered key, in a stable order, as a snapshot safe to iterate."""
+        return sorted(self._rows)
+
+    def peek(self, key: PartitionKey) -> list[dict[str, Any]]:
+        """A snapshot of one buffer's rows, leaving them buffered.
+
+        The pair of this and `drop_written` is how the recorder writes without owning the
+        rows: nothing leaves the buffer until the Parquet file is on disk.
+        """
+        return list(self._rows.get(key, ()))
+
+    def drop_written(self, key: PartitionKey, count: int) -> None:
+        """Forget the first `count` rows of one buffer, which have just been written.
+
+        Rows that arrived while the write was in flight were appended after them, so
+        dropping from the front never discards a row that was not written.
+        """
+        rows = self._rows.get(key)
+        if rows is None:
+            return
+        del rows[:count]
+        if not rows:
+            del self._rows[key]
+
     def take_all(self) -> list[tuple[PartitionKey, list[dict[str, Any]]]]:
         """Drain everything, for shutdown."""
         taken = sorted(self._rows.items())

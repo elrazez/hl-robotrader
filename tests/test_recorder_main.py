@@ -85,7 +85,12 @@ async def test_shutdown_flushes_every_buffer_to_parquet(settings: Settings) -> N
     written = sorted(recorder.root.glob("trades/date=*/*.parquet"))
     assert len(written) == 1
     assert pq.read_metadata(written[0]).num_rows == 1
-    assert recorder.counters == {"rows_written": 1, "files_written": 1, "flushes": 0}
+    assert recorder.counters == {
+        "rows_written": 1,
+        "files_written": 1,
+        "flushes": 0,
+        "write_failures": 0,
+    }
     assert recorder.buffers.pending_rows() == 0
 
 
@@ -137,3 +142,88 @@ def test_compaction_is_scheduled_for_the_next_occurrence_of_the_hour(
 ) -> None:
     at = datetime.fromisoformat(now).replace(tzinfo=UTC)
     assert _seconds_until_utc_hour(hour, at) == pytest.approx(expected_h * 3600)
+
+
+def _trade(at: int, tid: int) -> dict[str, object]:
+    return {
+        "venue": "hyperliquid",
+        "coin": "BTC",
+        "ts_ms": at,
+        "rx_ms": at,
+        "px": 1.0,
+        "sz": 2.0,
+        "side": "buy",
+        "tid": tid,
+    }
+
+
+async def test_a_failed_write_keeps_the_rows_and_alerts(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write must not be the thing that destroys the rows it was writing.
+
+    They used to be taken out of the buffer before write_rows was called, so a full disk
+    or one row failing schema validation lost the partition silently.
+    """
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 7))
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise OSError("no space left on device")
+
+    alerts: list[str] = []
+
+    async def capture(text: str) -> bool:
+        alerts.append(text)
+        return True
+
+    monkeypatch.setattr("liqfade.recorder.main.write_rows", explode)
+    monkeypatch.setattr(recorder.health, "alert", capture)
+
+    await recorder.flush_all()
+
+    assert recorder.buffers.pending_rows() == 1  # still there for the next tick
+    assert recorder.counters["write_failures"] == 1
+    assert recorder.counters["rows_written"] == 0
+    assert len(alerts) == 1
+    assert "still buffered" in alerts[0]
+
+    # And the retry succeeds once the failure clears.
+    monkeypatch.undo()
+    await recorder.flush_all()
+    assert recorder.buffers.pending_rows() == 0
+    assert recorder.counters["rows_written"] == 1
+
+
+async def test_rows_arriving_during_a_write_are_not_dropped(settings: Settings) -> None:
+    """The receive loop keeps appending while the write runs in a thread.
+
+    Only the rows actually handed to write_rows may be forgotten, so the drop is from the
+    front of the buffer rather than a wholesale clear.
+    """
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 1))
+
+    real_write = recorder.buffers.drop_written
+    late = _trade(at, 2)
+
+    def drop_after_a_late_arrival(key: tuple[str, str, str, int], count: int) -> None:
+        # Stands in for a row appended while write_rows was in its thread.
+        recorder.buffers.add("trades", "hyperliquid", late)
+        real_write(key, count)
+
+    recorder.buffers.drop_written = drop_after_a_late_arrival  # type: ignore[method-assign]
+    await recorder.flush_all()
+
+    assert recorder.counters["rows_written"] == 1
+    assert recorder.buffers.pending_rows() == 1
+    remaining = recorder.buffers.peek(("trades", "hyperliquid", *_partition(at)))
+    assert remaining == [late]
+
+
+def _partition(ms: int) -> tuple[str, int]:
+    from liqfade.recorder.buffer import partition_of
+
+    return partition_of(ms)

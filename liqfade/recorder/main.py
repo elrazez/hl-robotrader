@@ -20,7 +20,6 @@ import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -62,7 +61,12 @@ class Recorder:
         self.root = Path(settings.paths.data_dir) / "parquet"
         self.buffers = Buffers(settings.recorder.ring_buffer_rows)
         self.latency = LatencyTracker()
-        self.counters: dict[str, int] = {"rows_written": 0, "files_written": 0, "flushes": 0}
+        self.counters: dict[str, int] = {
+            "rows_written": 0,
+            "files_written": 0,
+            "flushes": 0,
+            "write_failures": 0,
+        }
         self.streams: list[WSStream] = self._build_streams()
         self.poller = CoinalyzePoller(settings.venues.coinalyze, self.buffers.add)
         self.universe = UniverseManager(
@@ -206,20 +210,50 @@ class Recorder:
 
     # --- flushing ------------------------------------------------------------
 
-    async def _write(self, key: tuple[str, str, str, int], rows: list[dict[str, Any]]) -> None:
-        path = await asyncio.to_thread(write_rows, self.root, key, rows)
+    async def _write(self, key: tuple[str, str, str, int]) -> None:
+        """Write one buffer, and only then forget the rows it held.
+
+        The rows used to be taken out of the buffer before the write was attempted, so
+        any failure (a full disk, one row that fails schema validation) destroyed that
+        partition's rows and the supervisor simply restarted the flush loop. Now a
+        failure leaves them buffered for the next tick and raises an alert; the cost is
+        that a persistent failure grows memory, which is what the alert is for.
+        """
+        rows = self.buffers.peek(key)
+        if not rows:
+            return
+        table, venue, date, hour = key
+        try:
+            path = await asyncio.to_thread(write_rows, self.root, key, rows)
+        except Exception as exc:
+            self.counters["write_failures"] += 1
+            log.error(
+                "flush_failed",
+                table=table,
+                venue=venue,
+                date=date,
+                hour=hour,
+                rows=len(rows),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            await self.health.alert(
+                f"recorder: writing {table}/{venue} {date} hour {hour} failed, "
+                f"{len(rows)} rows still buffered: {type(exc).__name__}"
+            )
+            return
+        self.buffers.drop_written(key, len(rows))
         if path is not None:
             self.counters["rows_written"] += len(rows)
             self.counters["files_written"] += 1
 
     async def flush_ready(self) -> None:
         for key in self.buffers.ready(now_ms()):
-            await self._write(key, self.buffers.take(key))
+            await self._write(key)
         self.counters["flushes"] += 1
 
     async def flush_all(self) -> None:
-        for key, rows in self.buffers.take_all():
-            await self._write(key, rows)
+        for key in self.buffers.partitions():
+            await self._write(key)
 
     async def _flush_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
