@@ -575,12 +575,17 @@ def _finish_interrupted(directory: Path) -> None:
 def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, int]:
     """Rewrite one day's partition: our rows become `derived`, other sources are kept.
 
-    Two kinds of row do not survive. Ours, `source == "hl_s3"`, because that is what is
-    being replaced. And Tardis's Hyperliquid rows, because `hl_s3` is the one source of
-    Hyperliquid trades and liquidations: Tardis covers Hyperliquid on the twelve free
-    first-of-month days with the same trades under the same `tid`, so leaving them in
-    counts every trade twice on those days. Same rule as "counting a liquidation once";
-    see docs/DATA_SOURCES.md, "Counting a trade once".
+    **No Hyperliquid row survives that is not ours.** This is only ever called for a day
+    that has `fills_full`, so our derived rows are that day's complete Hyperliquid set,
+    and any other Hyperliquid row in the partition is a second copy of an event we
+    already hold: Tardis's on the twelve free first-of-month days, under the same `tid`,
+    and the recorder's from the day it starts. `hl_s3` is the one source of Hyperliquid
+    trades and liquidations; see docs/DATA_SOURCES.md, "Counting a trade once".
+
+    The rule used to name Tardis specifically, which left a recorder-written Hyperliquid
+    trade in `kept`. `kept` is concatenated ahead of ours and the sort is stable, so that
+    row would sort first inside a shared millisecond: the same open-before-close failure
+    02d exists to fix, waiting for the recorder to start.
 
     The rewrite is atomic, which it was not: it used to write `all_day.parquet` and only
     then unlink the hourly files it had read. A crash in that window, or one `unlink`
@@ -600,7 +605,7 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     """
     import polars as pl
 
-    from liqfade.data.schemas import SOURCE_TARDIS, schema_for, validate_table
+    from liqfade.data.schemas import schema_for, validate_table
     from liqfade.recorder.writer import lake_files, partition_dir
 
     directory = partition_dir(root, table, stamp)
@@ -611,8 +616,7 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     kept = []
     for path in existing:
         others = pl.read_parquet(path).filter(
-            (pl.col("source") != SOURCE_HL_S3)
-            & ~((pl.col("venue") == VENUE) & (pl.col("source") == SOURCE_TARDIS))
+            (pl.col("venue") != VENUE) & (pl.col("source") != SOURCE_HL_S3)
         )
         if others.height:
             kept.append(others.select(columns))

@@ -575,20 +575,23 @@ def _trade(**overrides: object) -> dict[str, object]:
     return row | overrides
 
 
-def test_rederive_drops_the_tardis_copy_of_hyperliquid_and_keeps_the_other_venues(
+def test_rederive_drops_every_hyperliquid_row_that_is_not_ours(
     client: FakeS3, tmp_path: Path
 ) -> None:
-    """`hl_s3` is the one source of Hyperliquid trades; Tardis carries the same fills.
+    """`hl_s3` is the one source of Hyperliquid trades, and this day has `fills_full`.
 
-    On the twelve free first-of-month days Tardis's Hyperliquid trades are the same
-    trades under the same `tid`, so leaving them in doubles `v` and `n` for the coins it
-    covers. Its Binance, Bybit and OKX rows have no other source and stay.
+    So our derived rows are the day's complete Hyperliquid set and any other Hyperliquid
+    row is a second copy: Tardis's on the twelve free days, under the same `tid`, and the
+    recorder's from the day it starts. A surviving one would sit in `kept`, which is
+    concatenated ahead of ours, and sort first inside a shared millisecond. Binance,
+    Bybit and OKX rows have no other source and stay.
     """
     from liqfade.data.ingest.common import write_partitioned
 
     hl_s3.run(client, tmp_path, DAY, DAY)
     root = tmp_path / "parquet"
     write_partitioned(root, "trades", "hyperliquid", "tardis", [_trade(venue="hyperliquid")])
+    write_partitioned(root, "trades", "hyperliquid", "recorder", [_trade(venue="hyperliquid")])
     write_partitioned(root, "trades", "binance", "tardis", [_trade()])
 
     hl_s3.rederive(tmp_path, DAY, DAY, workers=1)
