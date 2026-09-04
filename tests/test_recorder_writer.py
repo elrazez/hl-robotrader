@@ -247,3 +247,26 @@ def test_compaction_can_be_restricted_to_some_tables(tmp_path: Path) -> None:
     assert sorted(p.name for p in partition_dir(tmp_path, "liquidations", DATE).glob("*")) == [
         "bybit_10.parquet"
     ]
+
+
+def test_receive_time_partitioning_may_straddle_an_hour_by_the_feed_latency(
+    tmp_path: Path,
+) -> None:
+    """The recorder files by rx_ms and compaction sorts by ts_ms, so boundaries overlap."""
+    hour_11 = 11 * 3_600_000
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(hour_11 - 5), bbo(hour_11 - 1)])
+    # Sent at 10:59:59.998, arrived at 11:00:00.x, so it is in hour 11's file.
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 11), [bbo(hour_11 - 2), bbo(hour_11 + 9)])
+    assert compact_day(tmp_path, DATE) == {"bbo": 4}
+
+
+def test_an_hour_that_holds_the_wrong_hours_rows_is_refused(tmp_path: Path) -> None:
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(10 * 3_600_000)])
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    # Named hour 11, but the rows are from hour 3: a mis-parsed name, not feed latency.
+    write_atomic(
+        rows_to_table("bbo", [bbo(3 * 3_600_000)], "recorder"), directory / "hyperliquid_11.parquet"
+    )
+    with pytest.raises(RuntimeError, match="refusing to write a misordered file"):
+        compact_day(tmp_path, DATE)
+    assert len(list(directory.glob("*.parquet"))) == 2

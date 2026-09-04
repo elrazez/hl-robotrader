@@ -40,6 +40,15 @@ log = get_logger(__name__)
 COMPRESSION = "zstd"
 DAY_SUFFIX = "_day.parquet"
 
+# How far an hour's first `ts_ms` may fall behind the previous hour's last before
+# compaction refuses to write the file. The recorder partitions by `rx_ms` and sorts by
+# `ts_ms`, so an event that happened at 10:59:59.9 and arrived at 11:00:00.1 is in hour
+# 11's file and legitimately predates the end of hour 10 by the feed's latency. A minute
+# is far more than any feed's latency and far less than a mis-parsed hour, which is the
+# mistake worth catching. Backfilled rows all carry `rx_ms = 0` and partition on `ts_ms`,
+# so for them the overlap is always zero.
+ORDER_TOLERANCE_MS = 60_000
+
 
 def partition_dir(root: Path, table: str, date: str) -> Path:
     return Path(root) / table / f"date={date}"
@@ -150,9 +159,15 @@ def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> 
             stamps = arrow.column("ts_ms")
             first = stamps[0].as_py()
             if last_ts is not None and first < last_ts:
-                raise RuntimeError(
-                    f"{directory}: hour {hour:02d} starts at ts_ms {first}, before the end "
-                    f"of the previous hour ({last_ts}); refusing to write a misordered file"
+                overlap = last_ts - first
+                if overlap > ORDER_TOLERANCE_MS:
+                    raise RuntimeError(
+                        f"{directory}: hour {hour:02d} starts at ts_ms {first}, {overlap} ms "
+                        f"before the end of the previous hour; refusing to write a "
+                        f"misordered file"
+                    )
+                log.warning(
+                    "compaction_hour_overlap", path=str(directory), hour=hour, overlap_ms=overlap
                 )
             last_ts = stamps[-1].as_py()
             writer.write_table(arrow, row_group_size=arrow.num_rows)
