@@ -15,6 +15,7 @@ rather than a stream. Only the top 20 levels are kept, matching what the recorde
 
 from __future__ import annotations
 
+import concurrent.futures
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
@@ -153,11 +154,13 @@ def run(
     manifest = Manifest.load(data_dir, JOB)
     wanted = set(coins)
 
-    objects: list[dict[str, Any]] = []
-    for day in day_range(start, end):
-        for hour in HOURS:
-            found = list_objects(client, BUCKET, hour_prefix(day, hour))
-            objects.extend(obj for obj in found if coin_of_key(str(obj["Key"])) in wanted)
+    # One LIST per hour prefix. A year is 8,760 of them, and done one at a time from far
+    # away that is 40 minutes of round trips before the first byte, so they fan out.
+    # The order (newest day first) is preserved by map().
+    prefixes = [hour_prefix(day, hour) for day in day_range(start, end) for hour in HOURS]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        listed = list(pool.map(lambda prefix: list_objects(client, BUCKET, prefix), prefixes))
+    objects = [obj for found in listed for obj in found if coin_of_key(str(obj["Key"])) in wanted]
 
     todo = [obj for obj in objects if not manifest.done(str(obj["Key"]))]
     est = estimate(todo)
