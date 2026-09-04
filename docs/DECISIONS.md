@@ -526,5 +526,21 @@ guessed at.
 
 **The Tardis side-table re-pull finished:** `tardis_book_snapshot_5` 281,773,008 rows and
 `tardis_derivative_ticker` 36,619,381, both matching the pre-bug expectation, so no coin
-is missing now. The old one-coin-per-day files still sit beside the new ones and have to
-be deleted by name (`{venue}_00.parquet`, against the new `{venue}_{coin}_00.parquet`).
+is missing now. The old one-coin-per-day files were deleted the same day; verified
+2026-09-05, zero `{venue}_00.parquet` remain against 384 `{venue}_{coin}_00.parquet`.
+
+## 2026-09-05 (lake hardening)
+
+**The Tardis Hyperliquid sweep found nothing, which is the answer.**
+`scripts/research/drop_tardis_hl.py` walks every `trades` and `liquidations` day for
+`source = tardis AND venue = hyperliquid`, reports before and after per day, and refuses
+to touch anything without `--yes`. Over 2025-09-01 to 2026-09-04, all 365 partitions of
+each table: **0 rows found, nothing dropped.** The year rederive reached every day it
+covers, so it had already dropped all 13,918,962 of them; spot-checked on 2026-03-01,
+which now holds 21,291,201 Binance, 17,131,835 OKX and 8,337,259 Bybit `tardis` rows
+around 3,371,156 `hl_s3` Hyperliquid rows and no `tardis` Hyperliquid row at all.
+
+The case the prompt named, 2026-09-01, is not in the lake: the backfill ends 2026-08-30,
+and the candle validation pulled that day's Tardis trades ad hoc rather than through the
+lake. The script stays for the day a partition with no `fills_full` does land, which the
+rederive returns `"empty"` for and therefore never cleans.
