@@ -171,9 +171,9 @@ share one control socket; and the recorder has no untested module.
 After the commits, deploy to the VPS with `scripts/deploy.sh` and confirm on the box:
 `liqfade status` shows every declared stream with a non-zero message rate (in particular
 `binance.liquidations`, which is the whole point of item 7), the control socket and
-`state.json` are both 0600 and owned by the service user, no watchdog unit is loaded, and
-`liqfade-live` is present but disabled. Then let it run 24 hours and check the gap and
-parse-error counters are zero or explainable.
+`state.json` are both 0600 and owned by the service user, the watchdog unit is installed
+but disabled, and `liqfade-live` is present but disabled. Then let it run 24 hours and
+check the gap and parse-error counters are zero or explainable.
 
 ## Report back
 

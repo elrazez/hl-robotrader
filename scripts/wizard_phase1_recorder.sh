@@ -1070,7 +1070,7 @@ finish
 printf '  %sThe recorder is now the only thing running that matters. Phase 1 is done\n' "$DIM"
 printf '  when it has been up 48 hours with no gap over 5s. What is left is waiting,\n'
 printf '  and then, from this Mac:%s\n\n' "$RESET"
-printf '    LIQFADE_SYNC_HOST=liqfade@%s make sync\n' "$TS_IP"
+printf '    LIQFADE_SYNC_HOST=root@%s make sync\n' "$TS_IP"
 printf '    duckdb -c "select venue, count(*) from '"'"'data/parquet/liquidations/**/*.parquet'"'"' group by 1"\n\n'
 printf '  %sPanel:    ssh -p %s -L %s:127.0.0.1:%s root@%s\n' "$DIM" "$SSH_PORT" "$PANEL_PORT" "$PANEL_PORT" "$TS_IP"
 printf '  Journal:  ssh -p %s root@%s journalctl -u liqfade-recorder -f\n' "$SSH_PORT" "$VPS_HOST"
