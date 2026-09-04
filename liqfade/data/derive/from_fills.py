@@ -146,6 +146,13 @@ def derive_trades_frame(fills: pl.DataFrame) -> pl.DataFrame:
     )
     rows = _gather(fills, picked).with_columns(_has_taker=picked.get_column("_has_taker"))
 
+    # The taker's B is a buy; a lone maker's B means the aggressor sold to it. Written as
+    # the dict function's two branches rather than as `(side == "B") == _has_taker`,
+    # because the XOR reads a null `side` as "not B" in both branches, where the dict
+    # reads it as "not B" in one and falls through to `buy` in the other. The two
+    # disagreed on a maker-only group with no side; neither writer emits one today.
+    bid = pl.col("side") == "B"
+    buy, sell = pl.lit("buy"), pl.lit("sell")
     return _stable_by_ts(
         rows.select(
             venue=pl.lit(VENUE, pl.String),
@@ -154,12 +161,9 @@ def derive_trades_frame(fills: pl.DataFrame) -> pl.DataFrame:
             rx_ms=pl.lit(0, pl.Int64),
             px=pl.col("px"),
             sz=pl.col("sz"),
-            # The taker's B is a buy; a lone maker's B means the aggressor sold to it.
-            # So the aggressor is a buyer exactly when `side == "B"` agrees with whether
-            # the row we picked is the taker's.
-            side=pl.when((pl.col("side") == "B") == pl.col("_has_taker"))
-            .then(pl.lit("buy"))
-            .otherwise(pl.lit("sell")),
+            side=pl.when(pl.col("_has_taker"))
+            .then(pl.when(bid).then(buy).otherwise(sell))
+            .otherwise(pl.when(bid).then(sell).otherwise(buy)),
             tid=pl.col("tid"),
         )
     )
@@ -181,8 +185,17 @@ def derive_liquidations_frame(fills: pl.DataFrame) -> pl.DataFrame:
     # A semi-join does not promise to preserve the left frame's order, so the row index
     # taken before it is what restores it. Everything after this is first-appearance
     # order again, as `_groups` sees it.
+    # nulls_equal=True (polars' current spelling of join_nulls), because `block_time` and
+    # `tid` are both nullable Int64 and the default drops a row whose key holds a null.
+    # `_groups` builds a Python tuple key, which matches `None` to `None` happily, so the
+    # default silently dropped a liquidation the dict function keeps.
     liq = (
-        indexed.join(indexed.filter(named).select(GROUP_KEY).unique(), on=GROUP_KEY, how="semi")
+        indexed.join(
+            indexed.filter(named).select(GROUP_KEY).unique(),
+            on=GROUP_KEY,
+            how="semi",
+            nulls_equal=True,
+        )
         .sort("_row")
         # `over` broadcasts the group's liquidated user back onto each of its fills, so
         # the victim can be recognised row by row in the aggregation below.

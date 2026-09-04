@@ -128,6 +128,14 @@ def test_both_twins_equal_the_dict_derivation_on_every_pairing_shape() -> None:
         ),
         # a liquidation with no method: "unknown", not null
         fill(tid=5, side="A", crossed=True, user_address=VICTIM, liq_user=VICTIM),
+        # a maker-only group with no side: the frame's XOR read this as a sell, where
+        # the dict falls through to buy. `side` is nullable in the schema.
+        fill(tid=6, side=None, crossed=False, user_address=MAKER),
+        # a liquidation whose group key holds a null: polars' semi join drops it by
+        # default, where a Python tuple key matches None to None and keeps it. Both
+        # `block_time` and `tid` are nullable Int64 in schemas.py.
+        fill(tid=None, side="A", crossed=True, user_address=VICTIM, liq_user=VICTIM),
+        fill(tid=7, block_time=None, side="A", crossed=True, user_address=VICTIM, liq_user=VICTIM),
     ]
     frame = as_frame(fills)
     assert derive_trades_frame(frame).to_dicts() == derive_trades(fills)
