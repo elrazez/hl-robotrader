@@ -311,6 +311,23 @@ def test_the_side_rule_check_shouts_when_the_rule_is_inverted(
     assert "INVERTED" in check.report()
 
 
+def test_the_check_reads_only_the_columns_it_uses(
+    fills: list[dict[str, object]],
+) -> None:
+    """The parent-side inspection projects these, so it never holds a whole partition."""
+    liquidations = [
+        {key: row[key] for key in hl_s3.SIDE_CHECK_LIQ_COLUMNS}
+        for row in hl_s3.derive_liquidations(fills)
+    ]
+    trades = [
+        {key: row[key] for key in hl_s3.SIDE_CHECK_TRADE_COLUMNS}
+        for row in hl_s3.derive_trades(fills)
+    ]
+    check = hl_s3.SideRuleCheck()
+    check.add(liquidations, trades)
+    assert check.result()["verdict"] == "consistent"
+
+
 def test_the_side_rule_check_says_so_when_there_is_nothing_to_check() -> None:
     check = hl_s3.SideRuleCheck()
     assert check.result()["verdict"] == "inconclusive"

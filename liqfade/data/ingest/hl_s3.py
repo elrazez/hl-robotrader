@@ -71,6 +71,11 @@ LIQUIDATED_ON_BUY = "short"
 # Seconds of price action either side of a liquidation used by the side rule check.
 SIDE_CHECK_WINDOW_S = 60
 
+# The only columns `SideRuleCheck.add` reads. Named so the parent-side inspection can
+# project them out of the staged files instead of materialising a whole partition.
+SIDE_CHECK_TRADE_COLUMNS = ["coin", "ts_ms", "px"]
+SIDE_CHECK_LIQ_COLUMNS = ["coin", "ts_ms", "side"]
+
 # Raw JSON bytes parsed and written per batch. Counted in bytes rather than lines
 # because a line is one block and a block during a cascade carries hundreds of events:
 # on 2025-10-10 a few thousand lines are already gigabytes, while a quiet hour needs tens
@@ -444,13 +449,26 @@ def run(
             return
         import pyarrow.parquet as pq
 
-        def rows_of(table: str) -> list[dict[str, Any]]:
+        def rows_of(table: str, columns: list[str]) -> list[dict[str, Any]]:
+            """Only the columns `SideRuleCheck.add` reads.
+
+            Reading the whole staged `trades` partition into Python dicts is the same
+            "millions of rows as Python objects" failure BATCH_BYTES was introduced to
+            fix, moved into the parent process: a cascade hour is millions of rows over
+            eight columns where three are wanted. The staging root is a `mkdtemp` on the
+            internal SSD, not the lake, so a bare glob is safe here.
+            """
             files = sorted((staged / table).rglob("*.parquet"))
             return [
-                row for path in files for row in pq.read_table(path, partitioning=None).to_pylist()
+                row
+                for path in files
+                for row in pq.read_table(path, columns=columns, partitioning=None).to_pylist()
             ]
 
-        check.add(rows_of("liquidations"), rows_of("trades"))
+        check.add(
+            rows_of("liquidations", SIDE_CHECK_LIQ_COLUMNS),
+            rows_of("trades", SIDE_CHECK_TRADE_COLUMNS),
+        )
 
     fetched = parallel_pull(
         client,
