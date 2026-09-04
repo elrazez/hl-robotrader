@@ -6,7 +6,7 @@ data/state.json every second for readers that must never block the trading loop.
 Governed by CLAUDE.md section 3 and section 5.
 """
 
-from liqfade.control.backend import ControlBackend, NoopBackend
+from liqfade.control.backend import ControlBackend, NoopBackend, write_kill_file
 from liqfade.control.client import ControlClient
 from liqfade.control.protocol import (
     RESULT_MODELS,
@@ -58,5 +58,6 @@ __all__ = [
     "StateWriter",
     "now_ms",
     "read_state",
+    "write_kill_file",
     "write_state",
 ]

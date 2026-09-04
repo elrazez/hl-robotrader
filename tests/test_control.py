@@ -273,3 +273,23 @@ async def test_state_writer_survives_a_failing_source(tmp_path: Path) -> None:
     await asyncio.wait_for(task, timeout=1.0)
     assert calls > 1
     assert read_state(path).ts_ms > 1
+
+
+async def test_kill_writes_the_flag_before_it_reports_killed(tmp_path: Path) -> None:
+    """Written first, so a crash midway through flattening still leaves the box halted."""
+    kill_file = tmp_path / "KILL"
+    backend = NoopBackend(kill_file=kill_file)
+    result = await backend.kill("manual")
+    assert result.killed is True
+    assert kill_file.exists()
+    assert "manual" in kill_file.read_text()
+
+
+async def test_a_kill_file_that_cannot_be_written_still_kills(tmp_path: Path) -> None:
+    """The in-process half has to run even when the flag cannot be persisted."""
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("occupied")
+    backend = NoopBackend(kill_file=blocked / "KILL")
+    result = await backend.kill("manual")
+    assert result.killed is True
+    assert (await backend.status()).risk.killed is True

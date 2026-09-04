@@ -75,6 +75,23 @@ async def test_kill_stops_the_recorder(wired) -> None:
     assert (await client.status()).risk.killed is True
 
 
+async def test_kill_writes_the_flag_file(wired) -> None:
+    """The durable half of a kill. The live unit is Restart=always and gates on this file,
+
+    so a kill that only stopped the process would be undone three seconds later.
+    """
+    backend, client = wired
+    kill_file = backend.settings.kill_file
+    assert not kill_file.exists()
+
+    await client.kill("cascade went wrong")
+
+    assert kill_file.exists()
+    assert "cascade went wrong" in kill_file.read_text()
+    # And the config gate now reads it, whatever the process does next.
+    assert backend.settings.kill_switch_present is True
+
+
 async def test_metrics_carry_the_process_counters(wired) -> None:
     _, client = wired
     metrics = await client.get_metrics()

@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from liqfade.config.models import Settings
+from liqfade.control.backend import write_kill_file
 from liqfade.control.protocol import (
     FeedState,
     FlatResult,
@@ -126,6 +127,9 @@ class RecorderBackend:
 
     async def kill(self, reason: str | None = None) -> KillResult:
         log.warning("recorder_kill", reason=reason)
+        # The flag first: it is the half that outlives this process and that the live
+        # unit gates on. Stopping the recorder alone would leave nothing behind.
+        write_kill_file(self.settings.kill_file, reason)
         self._stop.set()
         return KillResult(killed=True, reason=reason or "kill via control plane")
 

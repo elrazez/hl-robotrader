@@ -7,6 +7,8 @@ built and tested against the same surface the real loop will present.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from liqfade.control.protocol import (
@@ -22,6 +24,34 @@ from liqfade.control.protocol import (
     StateSnapshot,
     now_ms,
 )
+from liqfade.log import get_logger
+
+log = get_logger(__name__)
+
+
+def write_kill_file(path: Path, reason: str | None = None) -> bool:
+    """Create the kill flag, returning whether it is now on disk.
+
+    This is the durable half of a kill and the reason it is written first, before
+    anything is cancelled or closed: the live systemd unit gates on this file but carries
+    Restart=always, so a kill that only stopped the loop was undone three seconds later,
+    and a crash midway through flattening left nothing behind. Removing the file stays a
+    deliberate manual act, per docs/RUNBOOK.md.
+
+    A write failure is logged rather than raised: the in-process half of the kill still
+    has to run.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = f"killed_at: {datetime.now(UTC).isoformat()}\n"
+        if reason:
+            stamp += f"reason: {reason}\n"
+        path.write_text(stamp)
+    except OSError as exc:
+        log.error("kill_file_write_failed", path=str(path), error=f"{type(exc).__name__}: {exc}")
+        return False
+    log.warning("kill_file_written", path=str(path), reason=reason)
+    return True
 
 
 @runtime_checkable
@@ -54,9 +84,16 @@ class NoopBackend:
     places, cancels or closes anything, so it is safe to run anywhere.
     """
 
-    def __init__(self, *, env: str = "paper", proc: str = "noop") -> None:
+    def __init__(
+        self,
+        *,
+        env: str = "paper",
+        proc: str = "noop",
+        kill_file: Path | None = None,
+    ) -> None:
         self.env = env
         self.proc = proc
+        self.kill_file = kill_file
         self._paused = False
         self._killed = False
         self._started_ms = now_ms()
@@ -105,6 +142,8 @@ class NoopBackend:
 
     async def kill(self, reason: str | None = None) -> KillResult:
         self._record("kill", reason=reason)
+        if self.kill_file is not None:
+            write_kill_file(self.kill_file, reason)
         self._killed = True
         self._paused = True
         return KillResult(killed=True, canceled_orders=0, closed_positions=0, reason=reason)
