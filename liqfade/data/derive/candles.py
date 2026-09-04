@@ -112,17 +112,24 @@ def bars_from_trades(trades: pl.DataFrame) -> pl.DataFrame:
     order the exchange emitted them; see ROW_ORDER_IS_EXCHANGE_ORDER below.
     Returns an empty frame with the canonical columns when there are no Hyperliquid rows.
     """
-    rows = (
-        trades.filter(pl.col("venue") == VENUE)
-        .with_row_index("_row")
-        # `tid` is the exchange's fill id, unique per coin-day and never null on a
-        # Hyperliquid row (both writers parse it as an int). The twelve Tardis days
-        # carry the same Hyperliquid trades a second time; this is what stops them
-        # counting twice. keep="first" on a frame still in file order keeps the copy
-        # that came first, so `_row` stays a file position.
-        .unique(subset=["coin", "tid"], keep="first", maintain_order=True)
-        .sort(["coin", "ts_ms", "_row"])
+    hyperliquid = trades.filter(pl.col("venue") == VENUE).with_row_index("_row")
+    # `tid` is the exchange's fill id, unique per coin-day and never null on a Hyperliquid
+    # row (both writers parse it as an int). The twelve Tardis days carry the same
+    # Hyperliquid trades a second time; this is what stops them counting twice.
+    # keep="first" on a frame still in file order keeps the copy that came first, so
+    # `_row` stays a file position.
+    #
+    # Rows with a null `tid` go round the dedup rather than through it, because polars
+    # treats two nulls as equal and would collapse every one of a coin's untagged trades
+    # into a single bar-defining row. Nothing writes such a row today; a future source
+    # that cannot supply a `tid` must lose trades loudly, not silently.
+    deduped = hyperliquid.filter(pl.col("tid").is_not_null()).unique(
+        subset=["coin", "tid"], keep="first", maintain_order=True
     )
+    untagged = hyperliquid.filter(pl.col("tid").is_null())
+    # The sort is on `_row` last, so which of the two halves is concatenated first
+    # cannot change the result.
+    rows = pl.concat([deduped, untagged]).sort(["coin", "ts_ms", "_row"])
     if rows.height == 0:
         return pl.DataFrame(schema=_SCHEMA)
 

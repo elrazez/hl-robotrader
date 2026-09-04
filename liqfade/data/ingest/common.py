@@ -497,6 +497,9 @@ def parallel_pull(
         shutil.rmtree(stage_base, ignore_errors=True)
 
     if low_disk:
+        # Logged as well as printed: a detached run's console scrollback is gone by the
+        # time anyone asks why the pull is short, and the journal is not.
+        log.warning("backfill_low_disk", job=job, fetched=fetched, todo=len(todo))
         print(
             f"WARNING: stopping, free disk is under the floor. Fetched {fetched} of "
             f"{len(todo)} objects. Re-run to continue where this left off."

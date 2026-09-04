@@ -163,6 +163,27 @@ def test_the_same_hyperliquid_trade_from_two_sources_counts_once() -> None:
     assert bar["v"] == 5.0
 
 
+def test_rows_with_no_trade_id_are_kept_rather_than_collapsed() -> None:
+    """polars treats two nulls as equal, so `unique` would fold them into one trade.
+
+    Nothing writes a Hyperliquid row without a `tid` today. A future source that cannot
+    supply one has to lose trades loudly, not by way of a dedup that was never meant to
+    apply to it.
+    """
+    bars = candles.bars_from_trades(
+        frame(
+            [
+                trade(MINUTE, 100.0, 1.0, tid=None),  # type: ignore[arg-type]
+                trade(MINUTE + 1, 110.0, 1.0, tid=None),  # type: ignore[arg-type]
+                trade(MINUTE + 2, 120.0, 1.0, tid=7),
+            ]
+        )
+    )
+    assert bars.row(0, named=True)["n"] == 3
+    assert bars.row(0, named=True)["o"] == 100.0
+    assert bars.row(0, named=True)["c"] == 120.0
+
+
 def test_no_hyperliquid_rows_gives_an_empty_frame_with_the_right_columns() -> None:
     bars = candles.bars_from_trades(
         frame([trade(MINUTE, 1.0, 1.0, tid=1, venue="bybit", source=SOURCE_TARDIS)])

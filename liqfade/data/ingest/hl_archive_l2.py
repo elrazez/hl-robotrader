@@ -35,6 +35,7 @@ from liqfade.data.ingest.common import (
     read_lz4_lines,
     write_partitioned,
 )
+from liqfade.data.parse import to_float
 from liqfade.data.schemas import SOURCE_HL_ARCHIVE
 from liqfade.log import get_logger
 
@@ -93,25 +94,28 @@ def _level(levels: Any, index: int) -> dict[str, Any]:
     return level
 
 
-def _f(value: Any) -> float | None:
-    return None if value is None or value == "" else float(value)
-
-
 def parse_snapshots(lines: Iterable[bytes], coin: str) -> list[dict[str, Any]]:
     """Canonical `l2` rows, one per level per snapshot, top `L2_LEVELS` deep.
 
     `coin` comes from the key and is used when the payload omits it, which is the case
     in the flatter archive envelopes.
+
+    Lines this parser cannot read are skipped, and the skips are counted and logged. A
+    silent `continue` means an archive format change reads as a thin coin-hour, which is
+    indistinguishable from a quiet market until somebody backtests on it.
     """
     rows: list[dict[str, Any]] = []
+    unreadable = no_time = 0
     for line in lines:
         snapshot = _snapshot(orjson.loads(line))
         if snapshot is None:
+            unreadable += 1
             continue
         levels = snapshot.get("levels") or [[], []]
         bids, asks = [*levels, [], []][:2]
         ts_ms = snapshot.get("time")
         if ts_ms is None:
+            no_time += 1
             continue
         depth = min(L2_LEVELS, max(len(bids), len(asks)))
         for index in range(depth):
@@ -122,12 +126,19 @@ def parse_snapshots(lines: Iterable[bytes], coin: str) -> list[dict[str, Any]]:
                     "ts_ms": int(ts_ms),
                     "rx_ms": 0,
                     "level": index,
-                    "bid_px": _f(bid.get("px")),
-                    "bid_sz": _f(bid.get("sz")),
-                    "ask_px": _f(ask.get("px")),
-                    "ask_sz": _f(ask.get("sz")),
+                    "bid_px": to_float(bid.get("px")),
+                    "bid_sz": to_float(bid.get("sz")),
+                    "ask_px": to_float(ask.get("px")),
+                    "ask_sz": to_float(ask.get("sz")),
                 }
             )
+    if unreadable or no_time:
+        message = (
+            f"WARNING: {coin}: skipped {unreadable} lines with no readable snapshot and "
+            f"{no_time} with no timestamp, keeping {len(rows)} rows"
+        )
+        log.warning("l2_lines_skipped", coin=coin, unreadable=unreadable, no_time=no_time)
+        print(message)
     return rows
 
 

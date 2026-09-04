@@ -257,6 +257,26 @@ def test_a_snapshot_with_no_timestamp_is_skipped() -> None:
     assert hl_archive_l2.parse_snapshots([b'{"coin":"BTC","levels":[[],[]]}'], "BTC") == []
 
 
+def test_skipped_lines_are_counted_so_a_format_change_is_not_a_thin_coin_hour() -> None:
+    """A silent `continue` reads as a quiet market, which is what makes it dangerous."""
+    import structlog
+
+    with structlog.testing.capture_logs() as entries:
+        rows = hl_archive_l2.parse_snapshots(
+            [b'{"something":"else"}', b'{"coin":"BTC","levels":[[],[]]}'], "BTC"
+        )
+    assert rows == []
+    assert entries == [
+        {
+            "event": "l2_lines_skipped",
+            "log_level": "warning",
+            "coin": "BTC",
+            "unreadable": 1,
+            "no_time": 1,
+        }
+    ]
+
+
 def test_the_l2_job_refuses_to_run_without_coins(tmp_path: Path) -> None:
     with pytest.raises(BackfillError, match="--coins is required"):
         hl_archive_l2.run(FakeS3({}), tmp_path, DAY, DAY, [])

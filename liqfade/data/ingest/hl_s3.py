@@ -30,7 +30,7 @@ sign of the entire strategy.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from datetime import UTC, date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,7 @@ from liqfade.data.ingest.common import (
     read_lz4_lines,
     write_partitioned,
 )
+from liqfade.data.parse import to_float, to_int, to_ms
 from liqfade.data.schemas import SOURCE_HL_S3
 from liqfade.log import get_logger
 
@@ -92,65 +93,35 @@ def day_prefix(day: date) -> str:
 # --- parsing ------------------------------------------------------------------
 
 
-def _ms(value: Any) -> int | None:
-    """Milliseconds UTC from either an epoch number or an ISO 8601 string.
-
-    Envelope times in the node data are ISO strings, fill times are epoch milliseconds,
-    and both have to end up as the integer milliseconds the lake uses everywhere.
-    """
-    if value is None or value == "":
-        return None
-    if isinstance(value, int | float):
-        return int(value)
-    text = str(value).replace("Z", "+00:00")
-    moment = datetime.fromisoformat(text)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return int(moment.timestamp() * 1000)
-
-
-def _f(value: Any) -> float | None:
-    """Hyperliquid sends every number as a string. None and "" become null, not 0.0."""
-    if value is None or value == "":
-        return None
-    return float(value)
-
-
-def _i(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    return int(value)
-
-
 def parse_fill(user: str, fill: dict[str, Any], envelope: dict[str, Any]) -> dict[str, Any]:
     """One `fills_full` row from one `[user_address, fill]` event and its block."""
     liq = fill.get("liquidation") or {}
     return {
         "coin": fill.get("coin"),
-        "ts_ms": _ms(fill.get("time")),
+        "ts_ms": to_ms(fill.get("time")),
         "rx_ms": 0,
-        "block_time": _ms(envelope.get("block_time")),
-        "block_number": _i(envelope.get("block_number")),
-        "local_time": _ms(envelope.get("local_time")),
+        "block_time": to_ms(envelope.get("block_time")),
+        "block_number": to_int(envelope.get("block_number")),
+        "local_time": to_ms(envelope.get("local_time")),
         "user_address": user,
-        "px": _f(fill.get("px")),
-        "sz": _f(fill.get("sz")),
+        "px": to_float(fill.get("px")),
+        "sz": to_float(fill.get("sz")),
         "side": fill.get("side"),
-        "start_position": _f(fill.get("startPosition")),
+        "start_position": to_float(fill.get("startPosition")),
         "dir": fill.get("dir"),
-        "closed_pnl": _f(fill.get("closedPnl")),
+        "closed_pnl": to_float(fill.get("closedPnl")),
         "hash": fill.get("hash"),
-        "oid": _i(fill.get("oid")),
+        "oid": to_int(fill.get("oid")),
         "crossed": fill.get("crossed"),
-        "fee": _f(fill.get("fee")),
+        "fee": to_float(fill.get("fee")),
         "fee_token": fill.get("feeToken"),
-        "tid": _i(fill.get("tid")),
+        "tid": to_int(fill.get("tid")),
         "cloid": fill.get("cloid"),
         "builder": fill.get("builder"),
-        "builder_fee": _f(fill.get("builderFee")),
-        "twap_id": _i(fill.get("twapId")),
+        "builder_fee": to_float(fill.get("builderFee")),
+        "twap_id": to_int(fill.get("twapId")),
         "liq_user": liq.get("liquidatedUser"),
-        "liq_mark_px": _f(liq.get("markPx")),
+        "liq_mark_px": to_float(liq.get("markPx")),
         "liq_method": liq.get("method"),
     }
 
@@ -344,6 +315,14 @@ def _warn_before_hourly_prefix(days: list[date]) -> list[date]:
     """Split off days the hourly prefix does not cover, loudly."""
     old = [day for day in days if day < HOURLY_PREFIX_START]
     if old:
+        log.warning(
+            "backfill_days_before_prefix",
+            job=JOB,
+            days=len(old),
+            first=str(min(old)),
+            last=str(max(old)),
+            prefix=PREFIX,
+        )
         print(
             f"WARNING: {len(old)} requested days ({min(old)} to {max(old)}) are before "
             f"{HOURLY_PREFIX_START}, when the {PREFIX}/ prefix begins. Older history lives "
@@ -355,7 +334,7 @@ def _warn_before_hourly_prefix(days: list[date]) -> list[date]:
 
 def stage_fills(local: Path, key: str, stage_root: Path) -> dict[str, int]:
     """The ObjectHandler for this job. Module level so worker processes can import it."""
-    return write_one_file(stage_root, local, None)
+    return write_one_file(stage_root, local)
 
 
 def _batches(lines: Iterable[bytes], max_bytes: int) -> Iterator[list[bytes]]:
@@ -376,7 +355,7 @@ def _batches(lines: Iterable[bytes], max_bytes: int) -> Iterator[list[bytes]]:
         yield batch
 
 
-def write_one_file(root: Path, path: Path, check: SideRuleCheck | None = None) -> dict[str, int]:
+def write_one_file(root: Path, path: Path) -> dict[str, int]:
     """Parse one downloaded object and write its three tables. Returns rows per table.
 
     Parsed in byte-bounded batches rather than all at once. Hours are not the same size:
@@ -388,14 +367,15 @@ def write_one_file(root: Path, path: Path, check: SideRuleCheck | None = None) -
     of a trade stay in the same batch and `derive_trades` still sees its pairs. Each
     batch appends its own Parquet file to the partition, which readers glob and
     compaction folds, exactly as the recorder's hourly flushes already do.
+
+    The side rule check is fed by the parent-side inspector in `run`, not from here: this
+    runs inside a worker process, and processes cannot share an accumulator.
     """
     totals = {"fills_full": 0, "liquidations": 0, "trades": 0}
     for batch in _batches(read_lz4_lines(path), BATCH_BYTES):
         fills = list(parse_fills(batch))
         liquidations = derive_liquidations(fills)
         trades = derive_trades(fills)
-        if check is not None:
-            check.add(liquidations, trades)
         totals["fills_full"] += write_partitioned(root, "fills_full", VENUE, SOURCE_HL_S3, fills)
         totals["liquidations"] += write_partitioned(
             root, "liquidations", VENUE, SOURCE_HL_S3, liquidations
@@ -429,6 +409,7 @@ def run(
     for day in days:
         found = list_objects(client, BUCKET, day_prefix(day))
         if not found:
+            log.warning("backfill_day_empty", job=JOB, bucket=BUCKET, prefix=day_prefix(day))
             print(f"WARNING: nothing under s3://{BUCKET}/{day_prefix(day)}")
         objects.extend(found)
 

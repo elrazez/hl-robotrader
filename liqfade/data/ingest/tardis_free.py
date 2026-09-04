@@ -42,6 +42,7 @@ from typing import Any
 import httpx
 
 from liqfade.data.ingest.common import Manifest, write_partitioned
+from liqfade.data.parse import to_float
 from liqfade.data.schemas import SOURCE_TARDIS
 from liqfade.data.symbols import to_venue_symbol
 from liqfade.log import get_logger
@@ -107,10 +108,6 @@ def _us_to_ms(value: Any) -> int | None:
     return int(value) // 1000
 
 
-def _f(value: Any) -> float | None:
-    return None if value in (None, "") else float(value)
-
-
 def _tid(value: Any) -> int | None:
     """Tardis trade ids are numeric on some venues and opaque strings on others."""
     try:
@@ -150,7 +147,7 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
     out = []
     for row in rows:
         symbol = row["symbol"]
-        px, sz = _f(row["price"]), _f(row["amount"])
+        px, sz = to_float(row["price"]), to_float(row["amount"])
         out.append(
             {
                 "venue": venue,
@@ -179,8 +176,8 @@ def to_trades(rows: Iterable[dict[str, str]], venue: str) -> list[dict[str, Any]
             "coin": to_coin(row["symbol"], venue),
             "ts_ms": _us_to_ms(row["timestamp"]),
             "rx_ms": 0,
-            "px": _f(row["price"]),
-            "sz": _f(row["amount"]),
+            "px": to_float(row["price"]),
+            "sz": to_float(row["amount"]),
             "side": "buy" if row["side"] == "buy" else "sell",
             "tid": _tid(row.get("id")),
         }
