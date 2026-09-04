@@ -3,13 +3,22 @@
 #
 #   ssh -p 2222 root@vps 'bash -s' < scripts/deploy.sh
 #
-# Pulls the repo, syncs dependencies from the lockfile, installs the systemd units, and
-# restarts only the services whose unit file actually changed. Restarting the trading
-# loop because the panel's unit was edited is exactly the kind of surprise this avoids.
+# Pulls the repo, syncs dependencies from the lockfile, installs every systemd unit, and
+# restarts only the units this phase runs whose file actually changed. Restarting the
+# trading loop because the panel's unit was edited is exactly the kind of surprise this
+# avoids, and so is enabling a unit whose code arrives two phases from now.
 set -euo pipefail
 
 REPO_URL="${LIQFADE_REPO_URL:-}"
 BRANCH="${LIQFADE_BRANCH:-main}"
+# Which units this deploy may enable and restart. Every unit file in scripts/systemd/ is
+# installed either way; only these are started, because a unit whose code lands in a later
+# phase would otherwise crash loop every RestartSec seconds from the first deploy on.
+UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"
+# Never enabled here whatever UNITS says. Starting the trading loop is a decision the owner
+# makes on the box, not a side effect of deploying a branch, and the watchdog has no module
+# behind it until Phase 5.
+NEVER_ENABLE="liqfade-live liqfade-watchdog"
 SERVICE_USER="liqfade"
 APP_ROOT="/srv/liqfade"
 APP_DIR="$APP_ROOT/app"
@@ -51,7 +60,20 @@ log "dependencies"
 su -s /bin/bash -c "cd '$APP_DIR' && '$UV' sync --frozen --extra panel" "$SERVICE_USER"
 
 # --- units ----------------------------------------------------------------------
-# Compare before copying so we know which services actually need a restart.
+# Compare before copying so we know which services actually need a restart. Every unit
+# file is installed; the enable and restart pass afterwards is the one that is selective.
+
+# runnable NAME: is this unit one this deploy may start?
+runnable() {
+  local name="${1%.service}" candidate
+  for candidate in $NEVER_ENABLE; do
+    if [ "$candidate" = "$name" ]; then return 1; fi
+  done
+  for candidate in $UNITS; do
+    if [ "$candidate" = "$name" ]; then return 0; fi
+  done
+  return 1
+}
 
 log "units"
 changed=()
@@ -69,16 +91,21 @@ done
 
 systemctl daemon-reload
 
-if [ ${#changed[@]} -eq 0 ]; then
-  echo "  no unit changed, nothing restarted"
-else
-  log "restarting changed units"
-  for name in "${changed[@]}"; do
-    # liqfade-live refuses to start while data/KILL exists; that is the intended behaviour.
-    systemctl enable "$name"
-    systemctl restart "$name" || echo "  $name did not start, check: journalctl -u $name -n 50"
-  done
+log "enabling and restarting: $UNITS"
+started=0
+for name in "${changed[@]}"; do
+  if ! runnable "$name"; then
+    echo "  installed $name, left alone"
+    continue
+  fi
+  systemctl enable "$name"
+  systemctl restart "$name" || echo "  $name did not start, check: journalctl -u $name -n 50"
+  started=$((started + 1))
+done
+if [ "$started" -eq 0 ]; then
+  echo "  no unit of this phase changed, nothing restarted"
 fi
+echo "  left disabled, by design: $NEVER_ENABLE"
 
 log "status"
 systemctl --no-pager --lines=0 status \
@@ -88,7 +115,10 @@ cat <<'NOTE'
 
 Code changed but a unit did not? Restart the service yourself, on purpose:
     systemctl restart liqfade-recorder
-    systemctl restart liqfade-live
+
+liqfade-live and liqfade-watchdog are never enabled by this script. When Phase 5
+gives them code, start them by hand on the box:
+    systemctl enable --now liqfade-live
 
 Live trading still needs LIQFADE_ENV=mainnet and LIQFADE_LIVE_TRADING=1 in
 /srv/liqfade/.env and no /srv/liqfade/data/KILL file. Deploying does not enable it.
