@@ -169,6 +169,19 @@ def resolve(
         merged["env"] = env
         sources["env"] = "argument"
 
+    # Only --env and LIQFADE_ENV pick the environment. `chosen` was fixed before the
+    # extra_files and overrides.yaml layers merged, so a file that writes `env` would
+    # otherwise be believed while its environment file was never loaded: overrides.yaml
+    # saying `env: mainnet` opened the mainnet gate and left paper's looser risk limits
+    # in place, which is exactly what CLAUDE.md rule 3 forbids. overrides.yaml is written
+    # by the panel, and nothing in the panel may enable live trading.
+    if merged.get("env") != chosen:
+        raise ConfigError(
+            f"{sources.get('env', 'a config layer')} sets env to {merged.get('env')!r}, "
+            f"but the loaded environment is {chosen!r}. Only --env and LIQFADE_ENV may "
+            f"choose the environment; remove `env` from that file."
+        )
+
     return merged, sources
 
 

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
 
 from liqfade.config import ConfigError, flatten, load_settings, resolve
+from liqfade.config.loader import CONFIG_DIR
 
 
 def test_every_environment_loads() -> None:
@@ -158,3 +160,28 @@ def test_secret_env_vars_are_never_merged_into_the_config() -> None:
     assert "deadbeef" not in rendered
     assert "super-secret" not in rendered
     assert "live_trading" not in merged
+
+
+def test_an_overrides_file_may_not_choose_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """overrides.yaml is written by the panel, and the panel may not enable live trading.
+
+    The environment file is picked before this layer merges, so `env: mainnet` here used
+    to give env == "mainnet" (the gate open) while mainnet.yaml was never loaded and
+    paper's looser sizing and risk limits stayed in place.
+    """
+    shutil.copytree(CONFIG_DIR, tmp_path / "config")
+    (tmp_path / "config" / "overrides.yaml").write_text("env: mainnet\n")
+    monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
+    with pytest.raises(ConfigError, match="Only --env and LIQFADE_ENV"):
+        load_settings(environ={})
+
+
+def test_an_explicit_env_argument_still_beats_liqfade_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(CONFIG_DIR, tmp_path / "config")
+    monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
+    settings = load_settings("paper", environ={"LIQFADE_ENV": "testnet"})
+    assert settings.env == "paper"
