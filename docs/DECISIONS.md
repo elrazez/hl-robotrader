@@ -312,3 +312,61 @@ duplicates on every day checked except 10 rows in the 2025-11-13 handoff hour. S
 needs deduping, and 02c is not blocked. The one residual is Tardis `trades`, 173,868 rows
 (0.05%) above a manifest that was never rebuilt; small enough to leave to 02d. See
 `prompts/02d_quality_gate.md`, which settles all of this.
+
+**The Tardis side tables kept only the last coin written.** `write_side_table` named its
+output `{venue}_00.parquet` per table and day, but `run` calls it once per coin for the
+same venue and day, so each coin overwrote the one before: 57.2M of 281.8M rows survived
+in `tardis_book_snapshot_5` and 7.7M of 36.6M in `tardis_derivative_ticker`. The name now
+carries the coin. `trades` and `liquidations` were never affected; they go through
+`write_partitioned`, which picks a free file name. The two side tables are deleted and
+re-pulled (384 files, ~6.1 GB, free).
+
+**Hyperliquid's `tid` is a hash, not a sequence, and that was silently reordering
+`trades`.** Two fills of one sweep carry 997296749534590 and 653061949558227 in that
+order. `hl_s3.derive_trades` sorted its output by `(ts_ms, tid)`, so inside a millisecond
+the exchange's event order was replaced by an arbitrary one, and any consumer asking
+"what was the first trade of this minute" got the wrong answer. Found while validating
+derived candles against `candleSnapshot`: bars built in `tid` order matched the API's
+open on 76% of BTC minutes and its close on 91%, while the high matched 100% and `n` and
+`v` were identical on the very rows that disagreed, which is a right trade set in a wrong
+order. Bars built in file order match on 100%.
+
+The sort is fixed, so everything written from now on is right. The year already in the
+lake is not: measured on 2026-03-01 against the same day's Tardis rows, `o` and `c`
+disagree on 8 to 19% of minutes by a median of 0.15 to 1 bps, p95 3 to 4 bps, max 11 bps.
+That is small but not negligible next to 4.5 bps of taker fee, and it matters most for
+exactly the entries and exits a scalp backtest models. `fills_full` was never sorted and
+still carries the true order, so the repair is free: `liqfade backfill rederive` over the
+year, then `liqfade derive candles --force`. Two things block that today and are handed
+to `prompts/02d_quality_gate.md`: the `fills_full` compaction is still running, and
+`rederive` reads a whole day of fills into Python objects (the failure mode that already
+killed the parser on the 2025-10-10 cascade day) and globs hidden AppleDouble sidecars,
+so it needs streaming and `lake_files()` first. Lesson, and the reason this is written
+down rather than just fixed: an exchange id is an identity, not an ordering, unless the
+exchange says otherwise.
+
+**`trades` holds every Hyperliquid trade twice on the twelve Tardis days.** `hl_s3` and
+`tardis` both cover Hyperliquid, under the same `tid`, so a naive `venue == hyperliquid`
+filter doubles `v` and `n` for BTC, ETH, SOL and HYPE on those days. The candle
+derivation deduplicates on `(coin, tid)`, which is unique per coin-day and never null on
+a Hyperliquid row. Tardis is also the slightly smaller set: 541,237 BTC trades against
+`hl_s3`'s 541,557 on 2026-03-01, and every Tardis `tid` is present in `hl_s3`.
+
+**Empty minutes are bars, not gaps.** `candleSnapshot` returns a real bar for a minute
+with no trades: `v = 0`, `n = 0`, `o = h = l = c` at the previous close. Measured on
+TNSR, 291 such bars in 360 minutes with no break in the `t` sequence. The derivation
+replicates it, so a window of N bars means N minutes in the backtest exactly as it does
+against the live `candle` stream; sparse bars would have made the same feature mean two
+different things. The fill runs between a coin's first and last trade of the day rather
+than across the whole UTC day, so each day file stays independently rebuildable with
+`--force`; for any coin liquid enough to trade, the two rules agree. Cost of the choice:
+about 185M bars for the year instead of the 92M a sparse table would hold, and they
+compress well because the filled ones repeat one price.
+
+**The candle validation used a free Tardis day, because the API window and the lake do
+not overlap.** `candleSnapshot` keeps about 3 days and the backfilled `trades` end
+2026-08-30, so there is no day with both, and `.env` currently holds no AWS keys to pull
+more. 2026-09-01 is a Tardis free day, so its Hyperliquid trades are downloadable at no
+cost and the API still had it. That is what the 100% `o`/`h`/`c` match is measured on.
+Residual `l` at 99.6% and `n` at 99.4% is Tardis's own incompleteness (0.05% of trades),
+not the derivation.

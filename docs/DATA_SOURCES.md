@@ -82,7 +82,7 @@ Approach for v0:
 
 All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for historical pulls), `source` (string enum), `coin` (HL symbol, e.g. `BTC`) and for cross-exchange rows `venue_symbol` (e.g. `BTCUSDT`).
 
-`source` names the job that produced the row: `recorder`, `hl_s3`, `hl_api`, `hl_archive`, `tardis`, `hydromancer`. It is orthogonal to `venue`, which names the exchange the event happened on. It has to be a column rather than a filename convention, because nightly compaction folds every file of a day into one and a recorded day and a backfilled day for the same table land in the same file. `rx_ms = 0` still marks a historical row; `source` says which pull it came from.
+`source` names the job that produced the row: `recorder`, `hl_s3`, `hl_api`, `hl_archive`, `tardis`, `hydromancer`, `derived` (built from another table in this lake, no network). It is orthogonal to `venue`, which names the exchange the event happened on. It has to be a column rather than a filename convention, because nightly compaction folds every file of a day into one and a recorded day and a backfilled day for the same table land in the same file. `rx_ms = 0` still marks a historical row; `source` says which pull it came from.
 
 - `liquidations`: `venue, coin, venue_symbol, ts_ms, rx_ms, source, side (long|short liquidated), px, sz, notional_usd, method (market|backstop|unknown), complete (bool: venue publishes all events)`
 - `trades`: `venue, coin, ts_ms, rx_ms, source, px, sz, side (buy|sell aggressor), tid`
@@ -266,6 +266,40 @@ historical range and is kept only for the last few days. `liqfade derive candles
 builds `candles_1m` from `trades` (every fill on Hyperliquid, so the bars are exact) and
 is validated against the API on the days both exist. The live recorder still records
 the `candle` stream directly.
+
+Bars land as one file per day, `candles_1m/date=YYYY-MM-DD/hyperliquid_day.parquet`,
+already named like a compacted partition so `liqfade compact` leaves them alone. `source`
+is `derived`.
+
+Three things about the bars, all measured against the live API on 2026-09-04 rather than
+assumed:
+
+- **`v` is coin units, not USD.** It is the plain sum of `sz`.
+- **A minute with no trades is a real bar**, not a gap: the API returns `v = 0`, `n = 0`
+  and `o = h = l = c` at the previous close (TNSR had 291 such bars in 360 minutes, with
+  no break in the `t` sequence). The derivation replicates that, so a window of N bars
+  spans N minutes in the backtest exactly as it does live. It fills between a coin's
+  first and last trade of the day rather than the whole UTC day, which keeps each day
+  file independently rebuildable; for any coin liquid enough to trade the two rules give
+  the same thing.
+- **A Hyperliquid `tid` is a hash, not a sequence.** Two fills of one sweep can carry
+  997296749534590 and 653061949558227 in that order, so ordering a millisecond's trades
+  by `tid` picks an arbitrary open and close. The order that matters is the row's
+  position in the `trades` file, which is the exchange's own event order. Ordering by
+  `tid` matched the API's open on 76% of BTC minutes; file order matches on 100%.
+
+**The year already in the lake predates that last finding.** `hl_s3.derive_trades` sorted
+its output by `(ts_ms, tid)` until 2026-09-04, so for `source = hl_s3` the row order
+inside a millisecond is the arbitrary one and the derived `o` and `c` inherit it.
+Measured on 2026-03-01 against the same day's Tardis rows, whose order is right: `h` and
+`l` agree to within 0.2%, `n` to 99%, and `o` and `c` disagree on 8 to 19% of minutes by
+a median of 0.15 to 1 bps and up to 11 bps. Fixing the data, as opposed to the code,
+means `liqfade backfill rederive` over the year and then `liqfade derive candles
+--force`; `fills_full` was never sorted and still holds the true order, which is what
+makes that free. Two things block it today and belong with the quality gate: the
+`fills_full` compaction is still running, and `rederive` reads a whole day of fills into
+Python objects and globs hidden AppleDouble sidecars, so it needs streaming and
+`lake_files()` before it can be pointed at this year.
 
 Order book snapshots live in `s3://hyperliquid-archive` as one compressed file per coin
 per hour, going back to 2023. Do not pull the whole market. Pick the handful of coins the
