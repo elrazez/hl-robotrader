@@ -222,3 +222,93 @@ only ever ran for recorded days. The year of history landed as 24 to 144 files p
 per day (150,000 files); at 30 ms an open that is 25 minutes of file opens per full scan.
 `liqfade compact` over the range is the next step, then `liqfade derive candles`, then the
 data quality report, then Phase 3.
+
+**Compaction streams by hour instead of loading the day.** `compact_day` used to
+`concat_tables` a whole partition to sort it. `fills_full` on the 2025-10-10 cascade day
+is several GB compressed, tens of GB in Arrow, on an 8 GB laptop. It now groups a
+partition's files by the UTC hour in their name, and folds the hours in ascending order
+into one `pyarrow.parquet.ParquetWriter`, one row group per hour, so peak memory is one
+hour of one table rather than one day. Both writers partition a row by the UTC hour of
+its timestamp, so hour-ordered output is globally ordered by `ts_ms` and an hour range
+scan can skip row groups on the footer statistics. Rows are counted on the temp file
+before `os.replace` and again on the final file after it, and the inputs are deleted only
+if both match; any exception leaves every input in place and removes the temp file.
+
+**The hour ordering check needs a tolerance, because rx_ms files and ts_ms sorts.**
+The recorder buckets a row by `rx_ms` and compaction sorts by `ts_ms`, so an event that
+happened at 10:59:59.9 and arrived at 11:00:00.1 sits in hour 11's file and legitimately
+precedes the end of hour 10. A strict assertion would have failed the nightly compaction
+on any busy feed. Overlap up to `ORDER_TOLERANCE_MS` (60s, far above any feed's latency
+and far below a mis-parsed hour) is logged and allowed; beyond it compaction still
+refuses to write. Backfilled rows all carry `rx_ms = 0` and therefore bucket on `ts_ms`,
+so for the whole historical lake the overlap is exactly zero.
+
+**macOS writes an AppleDouble sidecar next to every file our Python writes to the
+drive.** Sequoia stamps `com.apple.provenance` on files created by the interpreter, NFS
+cannot store an xattr, so the client writes a 4 KiB `._name.parquet` beside `name.parquet`.
+The backfill left 39,760 of them (l2 has none; the fills, liquidations and trades pulls
+have them). They match a `*.parquet` glob, so they broke compaction and they break
+`duckdb.read_parquet('date=*/*.parquet')` outright with "No magic bytes found at end of
+file". A shell redirect to the same drive creates none, so this recurs on every write our
+code makes and cannot be fixed by deleting them once. Rule: hidden files are never lake
+data. `recorder/writer.lake_files()` is the one place that filter lives and every reader
+should go through it or pass an explicit file list.
+
+**The Tardis side tables are not compactable and do not need to be.**
+`tardis_book_snapshot_5` and `tardis_derivative_ticker` keep Tardis's own columns by
+design, so they have no canonical schema and no `ts_ms` to sort on, and the job already
+writes them one file per venue per day (96 files for the 12 free days). `liqfade compact`
+leaves them out of the default set and refuses them by name rather than failing halfway
+through a range.
+
+**`fills_full` is compacted even though nothing reads it today.** It carries 19 fields
+the derived tables drop: `block_time, block_number, local_time, user_address,
+start_position, dir, closed_pnl, hash, oid, crossed, fee, fee_token, cloid, builder,
+builder_fee, twap_id, liq_user, liq_mark_px, liq_method`. Those are the candidate
+features for the questions the derived tables cannot answer: how much vulnerable
+positioning is left in a cascade (`start_position` and `user_address` across the book of
+liquidated accounts), and whether the flow around a cascade is forced closing or fresh
+opening (`dir`, `closed_pnl`, `liq_method`). Leaving it as 22,795 files would make that
+research start with an hour of file opens. It is compacted last and detached, because it
+is 130 GB and blocks nothing.
+
+**Measured: the compacted lake is 146x faster to open.** A full-year metadata scan of
+`l2` (every file's footer, no data read) went from 49,152 files in 686.3s to 343 files in
+4.7s, same 3,425,187,420 rows. The numbers Phase 3 actually cares about are the reads:
+the whole year of `liquidations` (5,770,019 rows, $51.6bn notional) is 4.2s, and one
+coin-month of `l2` (BTC, 2026-08, 9,639,220 rows over 20 levels) is 6.6s. Per-file open
+latency on this drive is about 14 ms, so file count, not bytes, was the cost.
+
+File counts, before and after: `liquidations` 15,715 -> 364, `trades` 27,421 -> 365,
+`l2` 49,152 -> 343. Every one of those 1,072 day files was independently re-opened
+afterwards, checked for a `PAR1` trailer and a readable footer: none truncated, no
+partition left unfolded. That sweep matters because this mount has timed out mid-write
+before and left a Parquet with no footer. `fills_full` (22,795 files) was started
+detached after the rest finished and its result is appended here when it lands.
+
+**Compaction is row-exact; the manifest is not the row authority.** Every partition's
+output footer is compared against the sum of its inputs' footers before a single input is
+deleted, so the compacted totals are the pre-compaction totals by construction. `l2`
+matches its pre-compaction footer sum exactly, 3,425,187,420 either side.
+
+The derived tables hold more rows than the manifests record, and that is the manifest
+being wrong rather than the lake:
+
+| table | source | on disk | manifest |
+|---|---|---|---|
+| `liquidations` | `hl_s3` | 5,633,882 | 4,101,187 |
+| `liquidations` | `tardis` | 136,137 | 136,137 |
+| `trades` | `hl_s3` | 1,428,662,127 | 1,145,240,744 |
+| `trades` | `tardis` | 376,007,141 | 375,833,273 |
+
+The `hl_s3` keys for 2025-09-01 to 2025-11-13 were pulled on a rented box that was wiped
+before its manifest came back, and were rebuilt locally with `trades: 0` and partial
+counts, so for that window the lake is the source of truth and the manifest is only a
+resume ledger. The ~375k `liquidations` rows that share
+`(venue, coin, ts_ms, px, sz, side, method)` are not duplicates either: the table carries
+no `tid`, and the liquidation engine fills many positions at one mark price in one block.
+Tested where it can be tested, on `fills_full`, which does carry `tid`: zero exact
+duplicates on every day checked except 10 rows in the 2025-11-13 handoff hour. So nothing
+needs deduping, and 02c is not blocked. The one residual is Tardis `trades`, 173,868 rows
+(0.05%) above a manifest that was never rebuilt; small enough to leave to 02d. See
+`prompts/02d_quality_gate.md`, which settles all of this.
