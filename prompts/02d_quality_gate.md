@@ -20,7 +20,8 @@ per day with no *unexplained* holes, written down.
 1. Extend `scripts/research/data_quality.py` so the report covers every table now in the
    lake: `fills_full`, `liquidations`, `trades`, `l2`, `candles_1m`,
    `tardis_book_snapshot_5`, `tardis_derivative_ticker`. Per table, per day: rows, files
-   (should be 1 after compaction; flag anything else), and for `liquidations` and
+   (should be 1 after compaction; flag anything else, except the two `tardis_*` side
+   tables, which are not compacted and hold one file per venue per coin), and for `liquidations` and
    `trades` the rows per `venue` and per `source`. Keep the existing sparkline and the
    zero-row-day flagging; add a "days present / days expected" line per table. Keep the
    tests green and add one for the per-source breakdown.
@@ -37,6 +38,13 @@ per day with no *unexplained* holes, written down.
      2025-09-01 carries a few rows stamped 2025-08-31.
    - Tardis rows exist on the first of each month only, for Binance, Bybit and OKX;
      Hyperliquid liquidations are absent from Tardis by design.
+   - The two `tardis_*` side tables were re-pulled by 02c after the per-coin overwrite
+     fix. Expect all four coins per venue on every free day and roughly 281.8M rows in
+     `tardis_book_snapshot_5`, 36.6M in `tardis_derivative_ticker`. Fewer means the
+     re-pull did not finish: check `~/tardis_repull.log` and rerun the same command
+     (the manifest resumes) before calling it a hole.
+   - `fills_full` was compacted last, detached (`~/fills_compact.log`, 22,795 files to
+     365). If it is still running, say so and do not count its file counts as holes.
    - `candles_1m` days equal `trades` days.
    Anything else, in particular a Hyperliquid day with unusually few liquidations or
    trades, or a `fills_full` day whose row count is far below its neighbours, gets
@@ -71,7 +79,8 @@ per day with no *unexplained* holes, written down.
 
 5. Write the findings into `docs/DECISIONS.md` under a dated heading: the expected gaps
    above, any real gap found, the side rule table, and the final table of days and rows
-   per table. Update the Phase 2 DoD line in `docs/ROADMAP.md` to "done" with the date.
+   per table. Append the `fills_full` compaction result from `~/fills_compact.log` to the
+   2026-09-04 compaction entry; 02b left it running. Update the Phase 2 DoD line in `docs/ROADMAP.md` to "done" with the date.
 
 6. Owner checklist to print at the end:
    - Delete the leftover `~/Downloads/03_fills_2025-10.tar` (its contents are verified

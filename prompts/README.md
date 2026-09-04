@@ -10,7 +10,7 @@ exceptions are noted below.
 | `01_recorder.md` | 1 | 24/7 market data recorder + Panel v1 | nothing; VPS optional |
 | `02_backfill.md` | 2 | Historical data download (S3, Tardis, candles) | AWS keys, billing alarm |
 | `02b_compaction.md` | 2 | Streaming compaction + `liqfade compact`, run over the year | 02 data on disk (done 2026-09-04) |
-| `02c_candles.md` | 2 | `liqfade derive candles`: the year of 1m bars from `trades` | 02b |
+| `02c_candles.md` | 2 | Tardis side-table fix + re-pull, then `liqfade derive candles`: the year of 1m bars from `trades` | 02b |
 | `02d_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02b, 02c |
 | `03_research.md` | 3 | Feature functions + the six research questions | 02d says no unexplained holes |
 | `04_backtest.md` | 4 | Backtester, strategy v0, sizing, risk + Panel v2 | Phase 3 said "yes" |

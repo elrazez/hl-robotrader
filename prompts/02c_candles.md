@@ -8,6 +8,10 @@ after `prompts/02b_compaction.md` (the derivation reads the compacted `trades` f
 it works on uncompacted ones too, just slower). Drive mounted via anylinuxfs/ntfs3,
 `.env` loaded through `bash -c 'set -a && source .env && set +a && ...'`.
 
+It opens with a fix 02b found on 2026-09-04: the Tardis side tables kept only the last
+coin written per venue and day. Step 0 deletes those two tables and re-pulls them for
+free in the background. Pasting this prompt is the approval for that deletion.
+
 ---
 
 You are working in the liqfade repo. Read `CLAUDE.md` in full, then
@@ -21,6 +25,51 @@ and `liqfade/recorder/writer.py` (`write_atomic`, `DAY_SUFFIX`).
 Phase: end of Phase 2. Definition of done: a `candles_1m` partition for every day of the
 year with one file per day, built from `trades`, validated against the API on the days
 the API still has, with the comparison written down.
+
+## Step 0, before anything else, as its own commit
+
+`write_side_table` in `liqfade/data/ingest/tardis_free.py` names its output
+`{venue}_00.parquet` per table and day, but `run` calls it once per coin for the same
+venue and day, so every coin overwrote the one before and only the last survived:
+57.2M of 281.8M rows in `tardis_book_snapshot_5`, 7.7M of 36.6M in
+`tardis_derivative_ticker`. `trades` and `liquidations` are not affected; they go
+through `write_partitioned`, which picks a free file name, and a first-of-month day
+shows all four coins for every venue.
+
+1. Pass `coin` into `write_side_table` and name the file `{venue}_{coin}_00.parquet`.
+   Update the two tests in `tests/test_ingest_tardis_hydromancer.py` that assert the old
+   name, and add one: two coins for the same venue and day give two files.
+2. The manifest holds the 384 side-table URLs as done, so forget those and keep the rest
+   (trades and liquidations were pulled correctly and stay skipped):
+
+   ```
+   bash -c 'set -a && source .env && set +a && uv run python -c "
+   import os; from pathlib import Path
+   from liqfade.data.ingest import tardis_free
+   from liqfade.data.ingest.common import Manifest
+   m = Manifest.load(Path(os.environ[\"LIQFADE_DATA_DIR\"]), tardis_free.JOB)
+   gone = [u for u in m.objects if \"/book_snapshot_5/\" in u or \"/derivative_ticker/\" in u]
+   for u in gone: del m.objects[u]
+   m.save(); print(len(gone), \"forgotten,\", len(m.objects), \"kept\")"'
+   ```
+
+3. Delete the old side-table files; each holds one coin and would sit beside the new
+   ones as a duplicate. Owner approved this by pasting the prompt:
+   `rm -rf "$LIQFADE_DATA_DIR/parquet/tardis_book_snapshot_5" "$LIQFADE_DATA_DIR/parquet/tardis_derivative_ticker"`.
+4. `make lint test` green, commit
+   (`fix: tardis side tables keep every coin, not the last one written`), then start
+   the re-pull detached and carry on with the candles while it runs:
+
+   ```
+   nohup caffeinate -is bash -c 'set -a && source .env && set +a && uv run liqfade backfill tardis --start 2025-09-01 --end 2026-08-30' > ~/tardis_repull.log 2>&1 &
+   ```
+
+   384 files, about 6.1 GB compressed, network bound, no cost. It writes only the two
+   `tardis_*` directories, so it cannot collide with the `fills_full` compaction still
+   running detached (`~/fills_compact.log`) or with the candle files below. Before
+   reporting back, `tail ~/tardis_repull.log`; if it has finished, put its two row
+   totals in the report (expected about 281.8M and 36.6M), otherwise say it is still
+   running and leave that to 02d.
 
 ## Build
 
@@ -77,6 +126,7 @@ the API still has, with the comparison written down.
 
 ## Report back
 
-The API comparison table (per coin: bars compared, ohlc match %, v/n match %), the
-empty-minute decision, the year run summary, and a dated `docs/DECISIONS.md` entry.
+The Step 0 commit and the re-pull's state, the API comparison table (per coin: bars
+compared, ohlc match %, v/n match %), the empty-minute decision, the year run summary,
+and a dated `docs/DECISIONS.md` entry.
 Next prompt: `prompts/02d_quality_gate.md`.
