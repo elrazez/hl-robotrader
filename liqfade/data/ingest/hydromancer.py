@@ -161,7 +161,7 @@ def run(data_dir: Path, reports_dir: Path, day: date) -> int:
     """Compare one day. Returns 2 while the Hydromancer half is unimplemented."""
     import pyarrow.parquet as pq
 
-    from liqfade.recorder.writer import partition_dir
+    from liqfade.recorder.writer import lake_files, partition_dir
 
     theirs = fetch_day(day)
     if theirs is None:
@@ -173,7 +173,9 @@ def run(data_dir: Path, reports_dir: Path, day: date) -> int:
         return 2
 
     directory = partition_dir(Path(data_dir) / "parquet", "liquidations", day.isoformat())
-    files = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
+    # lake_files, not a glob: macOS leaves a 4 KiB AppleDouble `._x.parquet` beside every
+    # file our code writes to the owner's drive and pyarrow fails outright on one.
+    files = sorted(lake_files(directory)) if directory.is_dir() else []
     ours = [
         row
         for path in files

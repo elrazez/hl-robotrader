@@ -321,6 +321,17 @@ def test_liquidations_are_bucketed_by_hour_and_venue(settings: Settings) -> None
     assert body["events"] == {"bybit": 2, "okx": 1}
 
 
+def test_an_appledouble_sidecar_does_not_break_the_chart(settings: Settings) -> None:
+    """duckdb fails outright on one: "No magic bytes found at end of file"."""
+    root = settings.paths.data_dir / "parquet"
+    _write_liquidations(root, [_liq("bybit", FIXED_HOUR, 7.0)])
+    partition = next((root / "liquidations").glob("date=*"))
+    (partition / "._bybit_00.parquet").write_bytes(b"not parquet at all")
+
+    body = liquidations_by_venue(root, 24, now=FIXED_HOUR + 60_000)
+    assert body["totals"] == {"bybit": 7.0}
+
+
 def test_liquidations_older_than_the_window_are_left_out(settings: Settings) -> None:
     hour = FIXED_HOUR
     _write_liquidations(

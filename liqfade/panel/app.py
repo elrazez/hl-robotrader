@@ -66,8 +66,14 @@ def liquidations_by_venue(
 
     `now` pins the end of the grid, in ms. It exists so tests are not racing the wall
     clock rolling over an hour between writing a row and reading it back.
+
+    Files come from `lake_files`, never a `date=*/*.parquet` glob: on the owner's drive
+    macOS leaves a 4 KiB AppleDouble `._x.parquet` beside every file our code writes, and
+    `read_parquet` fails on one with "No magic bytes found at end of file".
     """
     import duckdb
+
+    from liqfade.recorder.writer import lake_files
 
     end_hour = ((now_ms() if now is None else now) // HOUR_MS) * HOUR_MS
     since_ms = end_hour - (hours - 1) * HOUR_MS
@@ -79,7 +85,11 @@ def liquidations_by_venue(
         "totals": {},
         "events": {},
     }
-    partitions = sorted((parquet_root / "liquidations").glob("date=*/*.parquet"))
+    partitions = sorted(
+        path
+        for directory in (parquet_root / "liquidations").glob("date=*")
+        for path in lake_files(directory)
+    )
     if not partitions:
         return empty
 

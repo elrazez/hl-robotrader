@@ -62,6 +62,17 @@ def test_an_empty_lake_scans_to_nothing(tmp_path: Path) -> None:
     assert dq.scan(tmp_path / "parquet") == {}
 
 
+def test_an_appledouble_sidecar_does_not_break_the_report(lake: Path) -> None:
+    """macOS leaves a 4 KiB `._x.parquet` beside every file our code writes to the drive.
+
+    This report is the Phase 2 gate, and a bare glob made it raise on the owner's lake
+    the moment it met one.
+    """
+    partition = lake / "parquet" / "liquidations" / "date=2026-09-01"
+    (partition / "._hyperliquid_00.parquet").write_bytes(b"not parquet at all")
+    assert dq.scan(lake / "parquet") == {"liquidations": {"2026-09-01": 3, "2026-09-03": 9}}
+
+
 def test_a_day_with_no_partition_at_all_still_appears_in_the_range(lake: Path) -> None:
     """A missing directory is the worst hole, so it must not be silently absent."""
     counts = dq.scan(lake / "parquet")

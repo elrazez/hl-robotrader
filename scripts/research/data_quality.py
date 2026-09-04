@@ -25,7 +25,14 @@ BLOCKS = "▁▂▃▄▅▆▇█"
 
 
 def scan(root: Path) -> dict[str, dict[str, int]]:
-    """table -> {YYYY-MM-DD: rows}, from Parquet metadata only."""
+    """table -> {YYYY-MM-DD: rows}, from Parquet metadata only.
+
+    Files come from `lake_files`, never a bare `*.parquet` glob: on the owner's drive
+    macOS leaves a 4 KiB AppleDouble `._x.parquet` beside every file our code writes and
+    `pq.read_metadata` fails outright on one, which is this report, the Phase 2 gate.
+    """
+    from liqfade.recorder.writer import lake_files
+
     counts: dict[str, dict[str, int]] = {}
     if not root.is_dir():
         return counts
@@ -34,7 +41,7 @@ def scan(root: Path) -> dict[str, dict[str, int]]:
         for partition in sorted(table_dir.glob("date=*")):
             day = partition.name.removeprefix("date=")
             per_day[day] = sum(
-                pq.read_metadata(path).num_rows for path in sorted(partition.glob("*.parquet"))
+                pq.read_metadata(path).num_rows for path in sorted(lake_files(partition))
             )
         if per_day:
             counts[table_dir.name] = per_day

@@ -7,7 +7,8 @@ to read the header next to the assertion is the point.
 from __future__ import annotations
 
 import gzip
-from datetime import date
+from datetime import UTC, date, datetime
+from datetime import time as dt_time
 from pathlib import Path
 
 import httpx
@@ -427,3 +428,32 @@ def test_the_job_exits_two_while_the_fetch_is_unimplemented(
 ) -> None:
     assert hydromancer.run(tmp_path, tmp_path / "reports", DAY) == 2
     assert "only the fetch" in capsys.readouterr().out
+
+
+def test_an_appledouble_sidecar_does_not_break_the_comparison(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reference side reads the lake, so it needs `lake_files` like every reader."""
+    from liqfade.data.ingest.common import write_partitioned
+    from liqfade.recorder.writer import partition_dir
+
+    row = {
+        "venue": "hyperliquid",
+        "coin": "BTC",
+        "venue_symbol": "BTC",
+        "ts_ms": int(datetime.combine(DAY, dt_time(12), tzinfo=UTC).timestamp() * 1000),
+        "rx_ms": 0,
+        "side": "long",
+        "px": 100.0,
+        "sz": 1.0,
+        "notional_usd": 100.0,
+        "method": "market",
+        "complete": True,
+    }
+    root = tmp_path / "parquet"
+    write_partitioned(root, "liquidations", "hyperliquid", "hl_s3", [row])
+    partition = partition_dir(root, "liquidations", DAY.isoformat())
+    (partition / "._hyperliquid_00.parquet").write_bytes(b"not parquet at all")
+
+    monkeypatch.setattr(hydromancer, "fetch_day", lambda day: [liq("BTC", 100.0)])
+    assert hydromancer.run(tmp_path, tmp_path / "reports", DAY) == 0
