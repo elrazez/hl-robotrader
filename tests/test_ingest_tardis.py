@@ -1,4 +1,4 @@
-"""Tardis CSV mapping for each exchange, and the Hydromancer comparison.
+"""Tardis CSV mapping for each exchange, and what the free-day pull does with it.
 
 Sample rows are embedded rather than fixtured: they are three lines each and being able
 to read the header next to the assertion is the point.
@@ -7,15 +7,14 @@ to read the header next to the assertion is the point.
 from __future__ import annotations
 
 import gzip
-from datetime import UTC, date, datetime
-from datetime import time as dt_time
+from datetime import date
 from pathlib import Path
 
 import httpx
 import pyarrow.parquet as pq
 import pytest
 
-from liqfade.data.ingest import hydromancer, tardis_free
+from liqfade.data.ingest import tardis_free
 from liqfade.data.ingest.common import Manifest
 from liqfade.data.schemas import SOURCE_TARDIS, validate_table
 
@@ -386,110 +385,3 @@ def test_a_completed_file_is_recorded_in_the_manifest(tmp_path: Path) -> None:
         data_types=("liquidations",),
     )
     assert Manifest.load(tmp_path, tardis_free.JOB).total_rows() == {"liquidations": 1}
-
-
-# --- hydromancer --------------------------------------------------------------
-
-
-def liq(coin: str, notional: float) -> dict[str, object]:
-    return {"coin": coin, "notional_usd": notional}
-
-
-def test_a_summary_counts_events_and_sums_notional_per_coin() -> None:
-    summary = hydromancer.summarise([liq("BTC", 100.0), liq("BTC", 50.0), liq("ETH", 20.0)])
-    assert summary == {
-        "BTC": {"count": 2.0, "notional_usd": 150.0},
-        "ETH": {"count": 1.0, "notional_usd": 20.0},
-    }
-
-
-def test_two_sources_that_agree_are_a_match() -> None:
-    rows = [liq("BTC", 100.0), liq("ETH", 20.0)]
-    result = hydromancer.compare(hydromancer.summarise(rows), hydromancer.summarise(rows))
-    assert result["verdict"] == "match"
-    assert result["mismatched"] == []
-
-
-def test_a_missing_coin_on_one_side_is_a_mismatch() -> None:
-    result = hydromancer.compare(
-        hydromancer.summarise([liq("BTC", 100.0)]),
-        hydromancer.summarise([liq("BTC", 100.0), liq("ETH", 20.0)]),
-    )
-    assert result["verdict"] == "MISMATCH"
-    assert result["mismatched"] == ["ETH"]
-
-
-def test_a_difference_inside_tolerance_is_not_a_mismatch() -> None:
-    result = hydromancer.compare(
-        hydromancer.summarise([liq("BTC", 100.0)]),
-        hydromancer.summarise([liq("BTC", 100.5)]),
-    )
-    assert result["verdict"] == "match"
-
-
-def test_a_notional_difference_outside_tolerance_is_caught() -> None:
-    """Same event count, wrong sizes: the failure mode a count-only check would miss."""
-    result = hydromancer.compare(
-        hydromancer.summarise([liq("BTC", 100.0)]),
-        hydromancer.summarise([liq("BTC", 200.0)]),
-    )
-    assert result["verdict"] == "MISMATCH"
-
-
-def test_the_report_names_the_verdict_and_every_coin(tmp_path: Path) -> None:
-    result = hydromancer.compare(
-        hydromancer.summarise([liq("BTC", 100.0)]),
-        hydromancer.summarise([liq("BTC", 100.0), liq("ETH", 20.0)]),
-    )
-    path = hydromancer.write_report(tmp_path, DAY, result)
-    text = path.read_text()
-    assert path == tmp_path / "data_quality" / "hydromancer_check.md"
-    assert "**Verdict: MISMATCH**" in text
-    assert "| BTC |" in text and "| ETH |" in text
-    assert str(DAY) in text
-
-
-def test_the_fetch_is_a_stub_that_prints_what_to_look_up(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert hydromancer.fetch_day(DAY) is None
-    out = capsys.readouterr().out
-    assert "will not guess at a requester-pays bucket" in out
-    for item in hydromancer.LOOKUP_CHECKLIST:
-        assert item.split(",")[0] in out
-
-
-def test_the_job_exits_two_while_the_fetch_is_unimplemented(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert hydromancer.run(tmp_path, tmp_path / "reports", DAY) == 2
-    assert "only the fetch" in capsys.readouterr().out
-
-
-def test_an_appledouble_sidecar_does_not_break_the_comparison(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The reference side reads the lake, so it needs `lake_files` like every reader."""
-    from liqfade.data.ingest.common import write_partitioned
-    from liqfade.recorder.writer import partition_dir
-
-    row = {
-        "venue": "hyperliquid",
-        "coin": "BTC",
-        "venue_symbol": "BTC",
-        "ts_ms": int(datetime.combine(DAY, dt_time(12), tzinfo=UTC).timestamp() * 1000),
-        "rx_ms": 0,
-        "side": "long",
-        "px": 100.0,
-        "sz": 1.0,
-        "notional_usd": 100.0,
-        "method": "market",
-        "complete": True,
-    }
-    root = tmp_path / "parquet"
-    write_partitioned(root, "liquidations", "hyperliquid", "hl_s3", [row])
-    partition = partition_dir(root, "liquidations", DAY.isoformat())
-    (partition / "._hyperliquid_00.parquet").write_bytes(b"not parquet at all")
-
-    monkeypatch.setattr(hydromancer, "fetch_day", lambda day: [liq("BTC", 100.0)])
-    assert hydromancer.run(tmp_path, tmp_path / "reports", DAY) == 0

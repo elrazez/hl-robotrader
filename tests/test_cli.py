@@ -212,14 +212,7 @@ def test_backfill_lists_every_job() -> None:
     parser = build_parser()
     backfill = parser._subparsers._group_actions[0].choices["backfill"]
     job = next(action for action in backfill._actions if action.dest == "job")
-    assert set(job.choices) == {
-        "s3-fills",
-        "rederive",
-        "l2",
-        "candles",
-        "tardis",
-        "hydromancer-check",
-    }
+    assert set(job.choices) == {"s3-fills", "rederive", "l2", "candles", "tardis"}
 
 
 def test_backfill_without_dates_explains_itself_and_exits_one(
@@ -227,13 +220,6 @@ def test_backfill_without_dates_explains_itself_and_exits_one(
 ) -> None:
     assert main(["backfill", "s3-fills"]) == 1
     assert "needs --start and --end" in capsys.readouterr().err
-
-
-def test_hydromancer_check_without_a_day_explains_itself(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["backfill", "hydromancer-check"]) == 1
-    assert "needs --check-day" in capsys.readouterr().err
 
 
 def test_a_bad_date_is_reported_rather_than_traced(capsys: pytest.CaptureFixture[str]) -> None:

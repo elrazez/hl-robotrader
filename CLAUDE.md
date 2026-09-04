@@ -45,7 +45,7 @@ Single Python package, three long-running processes, one shared Parquet data lak
 ```
 liqfade/
   recorder/      24/7 market data recorder (HL + Binance + Bybit + OKX + Coinalyze) -> Parquet
-  data/          schemas, loaders, historical ingestion (HL S3, Hydromancer, Tardis free days)
+  data/          schemas, loaders, historical ingestion (HL S3, Tardis free days)
   features/      pure functions: liquidation intensity, cascade detection, exhaustion, vol, CVD, OI delta
   strategy/      signal -> intent (side, coin, target, stop, urgency). No I/O. Deterministic. Backtest and live share this code.
   sizing/        intent -> notional, given equity, liquidity caps and risk config

@@ -22,7 +22,7 @@ test-int:
 record:
 	uv run liqfade record
 
-# Jobs: s3-fills rederive l2 candles tardis hydromancer-check. JOB and the dates are
+# Jobs: s3-fills rederive l2 candles tardis. JOB and the dates are
 # required; every S3 job estimates the egress and refuses over $5 without --yes.
 backfill:
 	uv run liqfade backfill $(JOB) --start $(START) --end $(END)

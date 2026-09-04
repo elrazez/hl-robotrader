@@ -247,15 +247,20 @@ any time with `liqfade backfill rederive` at zero cost. This is what makes later
 (whale tracking, liquidation-cluster levels, ADL studies, anything not thought of yet)
 free instead of a second egress bill. Budget roughly 1 GB per day of history for it.
 
-### Check Hydromancer first
+### Hydromancer: surveyed, never used, and the job is gone
 
 Hydromancer's Reservoir S3 bucket carries Hyperliquid perps from August 2025 with fills,
-liquidations and auto-deleveraging already separated out. The vendor says free forever,
-egress only. If their liquidation table is correct, it is a much smaller download than
-parsing every fill yourself, and it happens to cover exactly the 12 month window you want.
+liquidations and auto-deleveraging already separated out, free forever per the vendor,
+egress only. The plan was to pull one day from both sources, compare the liquidation
+count and total notional, and use Hydromancer if they matched.
 
-Verify it before relying on it: pull one day from both sources and confirm the liquidation
-count and total notional match. If they do, use Hydromancer and save most of the $33.
+That never happened. The bucket layout is not published anywhere readable without a
+Hydromancer account, so the `hydromancer-check` job's `fetch_day` was a stub that printed
+what to look up and exited 2, and the whole S3 pull went ahead unchecked. The job was
+removed on 2026-09-05: a comparison that cannot fetch either side is not a check. If a
+future pull wants it, the work is the four things `LOOKUP_CHECKLIST` named (bucket name,
+region and requester-pays, key layout, and their liquidation column names), and the
+comparison and report are recoverable from git.
 
 ### Candles and order book
 
@@ -337,15 +342,14 @@ same date from counting twice once the recorder and the backfill overlap.
 
 1. Set the AWS billing alarm.
 2. Pull one day. Confirm the file layout matches this document.
-3. Compare that day against Hydromancer. Pick the cheaper source.
-4. Pull 6 months, newest first, and check the daily counts for holes.
-5. Pull hourly order book snapshots for the coins you will actually trade.
-6. Cross-check against the Tardis free 1st-of-month days.
-7. Compact every backfilled day (`liqfade record --compact-only --date ...`): the pull
+3. Pull 6 months, newest first, and check the daily counts for holes.
+4. Pull hourly order book snapshots for the coins you will actually trade.
+5. Cross-check against the Tardis free 1st-of-month days.
+6. Compact every backfilled day (`liqfade record --compact-only --date ...`): the pull
    leaves 24 or more files per table per day and a year of that is 50,000 file opens
    per scan. Research reads the compacted lake.
-8. Derive 1 minute candles from `trades` (`liqfade derive candles`).
-9. Run `scripts/research/data_quality.py`. Only then start Phase 3 research.
+7. Derive 1 minute candles from `trades` (`liqfade derive candles`).
+8. Run `scripts/research/data_quality.py`. Only then start Phase 3 research.
 
 **Actual spend, 2025-09-01 to 2026-08-30:** fills 227 GiB ($20.43), L2 for four coins
 30 GiB ($2.70), plus a few dollars of retries: about $25.

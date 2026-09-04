@@ -223,11 +223,11 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
 # --- backfill -----------------------------------------------------------------
 
-BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "candles", "tardis", "hydromancer-check")
+BACKFILL_JOBS = ("s3-fills", "rederive", "l2", "candles", "tardis")
 
 
 def _dates(args: argparse.Namespace) -> tuple[Any, Any]:
-    """--start and --end as dates. Both are required for every job but the check."""
+    """--start and --end as dates. Both are required for every job."""
     from liqfade.data.ingest.common import BackfillError, parse_day
 
     if not args.start or not args.end:
@@ -245,7 +245,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         PartialCredentialsError,
     )
 
-    from liqfade.data.ingest import hl_archive_l2, hl_candles, hl_s3, hydromancer, tardis_free
+    from liqfade.data.ingest import hl_archive_l2, hl_candles, hl_s3, tardis_free
     from liqfade.data.ingest.common import BackfillError, s3_client
     from liqfade.log import setup_logging
 
@@ -255,13 +255,6 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     coins = [coin.strip().upper() for coin in args.coins.split(",") if coin.strip()]
 
     try:
-        if args.job == "hydromancer-check":
-            if not args.check_day:
-                raise BackfillError("hydromancer-check needs --check-day YYYY-MM-DD")
-            from liqfade.data.ingest.common import parse_day
-
-            return hydromancer.run(data_dir, settings.paths.reports_dir, parse_day(args.check_day))
-
         start, end = _dates(args)
 
         if args.job == "s3-fills":
@@ -598,7 +591,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma separated HL coins. Required for l2, defaults to the core coins for "
         "tardis, and to every live perp for candles",
     )
-    backfill.add_argument("--check-day", default=None, help="YYYY-MM-DD for hydromancer-check")
     backfill.add_argument("--estimate-only", action="store_true", help="print the cost and exit 0")
     backfill.add_argument(
         "--dry-run",

@@ -6,7 +6,6 @@
 - `hl_archive_l2`: requester-pays hourly L2 snapshots from `hyperliquid-archive`.
 - `hl_candles`: 1m candles from the free public `candleSnapshot` endpoint.
 - `tardis_free`: the free first-of-month CSVs for Binance, Bybit, OKX and Hyperliquid.
-- `hydromancer`: a verification job that compares one day against `hl_s3`.
 
 Money rules live in `common.py` and are not optional: every S3 job estimates before it
 pulls, refuses over $5 without `--yes`, records every completed object in a manifest so a
