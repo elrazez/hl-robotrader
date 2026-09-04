@@ -92,6 +92,45 @@ async def test_kill_writes_the_flag_file(wired) -> None:
     assert backend.settings.kill_switch_present is True
 
 
+async def test_a_kill_that_cannot_write_the_flag_reports_failure_and_alerts(
+    sock_dir: Path,
+) -> None:
+    """A kill whose flag never reached disk is a failed kill, and it says so on Telegram.
+
+    The recorder itself risks nothing by stopping, but the flag is what the live unit
+    gates on, so reporting this one as done is the kill switch failing silently.
+    """
+    settings = load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(sock_dir)})
+    settings.kill_file.mkdir(parents=True)  # a directory sitting where the flag must go
+    sent: list[str] = []
+
+    async def capture(text: str) -> bool:
+        sent.append(text)
+        return True
+
+    stop = asyncio.Event()
+    backend = RecorderBackend(
+        settings,
+        feeds=lambda _at: FEEDS,
+        universe=lambda: [],
+        latency=LatencyTracker(),
+        counters={},
+        stop=stop,
+        reload=lambda: ReloadResult(),
+        alert=capture,
+    )
+
+    result = await backend.kill("disk full")
+
+    assert result.killed is False
+    assert result.reason is not None
+    assert "disk full" in result.reason
+    assert "NOT written" in result.reason
+    assert sent and "NOT written" in sent[0]
+    # The in-process half of a kill runs either way.
+    assert stop.is_set()
+
+
 async def test_metrics_carry_the_process_counters(wired) -> None:
     _, client = wired
     metrics = await client.get_metrics()

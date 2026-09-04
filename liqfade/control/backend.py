@@ -38,8 +38,9 @@ def write_kill_file(path: Path, reason: str | None = None) -> bool:
     and a crash midway through flattening left nothing behind. Removing the file stays a
     deliberate manual act, per docs/RUNBOOK.md.
 
-    A write failure is logged rather than raised: the in-process half of the kill still
-    has to run.
+    A write failure is logged and returned rather than raised: the in-process half of the
+    kill still has to run, but the caller has to report the failure instead of confirming
+    a kill it did not get.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +53,19 @@ def write_kill_file(path: Path, reason: str | None = None) -> bool:
         return False
     log.warning("kill_file_written", path=str(path), reason=reason)
     return True
+
+
+def kill_not_persisted(path: Path, reason: str | None) -> str:
+    """The reason a kill reports when the flag never reached disk.
+
+    The flag is the half of a kill that outlives the process: the live unit carries
+    Restart=always and gates on it, so without the file the box comes back trading three
+    seconds later. Every reader of a KillResult renders `reason`, so putting the failure
+    there is what makes the Telegram confirmation, the panel and `liqfade status` all say
+    the kill did not fully take.
+    """
+    failed = f"kill flag {path} was NOT written, a restart will not stay killed"
+    return f"{reason}; {failed}" if reason else failed
 
 
 @runtime_checkable
@@ -142,11 +156,16 @@ class NoopBackend:
 
     async def kill(self, reason: str | None = None) -> KillResult:
         self._record("kill", reason=reason)
-        if self.kill_file is not None:
-            write_kill_file(self.kill_file, reason)
+        if self.kill_file is None:
+            killed, reported = True, reason
+        else:
+            killed = write_kill_file(self.kill_file, reason)
+            reported = reason if killed else kill_not_persisted(self.kill_file, reason)
+        # The in-process half runs either way, but `killed` reports what was actually
+        # achieved: the kill switch never claims a success it did not get.
         self._killed = True
         self._paused = True
-        return KillResult(killed=True, canceled_orders=0, closed_positions=0, reason=reason)
+        return KillResult(killed=killed, canceled_orders=0, closed_positions=0, reason=reported)
 
     async def reload_config(self) -> ReloadResult:
         self._record("reload_config")

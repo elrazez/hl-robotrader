@@ -17,7 +17,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from liqfade.config.models import Settings
-from liqfade.control.backend import write_kill_file
+from liqfade.control.backend import kill_not_persisted, write_kill_file
 from liqfade.control.protocol import (
     FeedState,
     FlatResult,
@@ -32,6 +32,7 @@ from liqfade.control.protocol import (
     now_ms,
 )
 from liqfade.log import get_logger
+from liqfade.recorder.health import Alerter
 
 log = get_logger(__name__)
 
@@ -89,6 +90,7 @@ class RecorderBackend:
         counters: dict[str, int],
         stop: asyncio.Event,
         reload: Callable[[], ReloadResult],
+        alert: Alerter | None = None,
         started_ms: int | None = None,
     ) -> None:
         self.settings = settings
@@ -98,6 +100,7 @@ class RecorderBackend:
         self._counters = counters
         self._stop = stop
         self._reload = reload
+        self._alert = alert
         self._started_ms = started_ms or now_ms()
 
     async def status(self) -> StateSnapshot:
@@ -129,9 +132,18 @@ class RecorderBackend:
         log.warning("recorder_kill", reason=reason)
         # The flag first: it is the half that outlives this process and that the live
         # unit gates on. Stopping the recorder alone would leave nothing behind.
-        write_kill_file(self.settings.kill_file, reason)
+        written = write_kill_file(self.settings.kill_file, reason)
         self._stop.set()
-        return KillResult(killed=True, reason=reason or "kill via control plane")
+        given = reason or "kill via control plane"
+        if written:
+            return KillResult(killed=True, reason=given)
+        # The process still stops, but a kill without its flag is not the kill that was
+        # asked for, so it is reported as a failure and pushed to Telegram rather than
+        # confirmed. Nobody should have to read the journal to find out.
+        failed = kill_not_persisted(self.settings.kill_file, given)
+        if self._alert is not None:
+            await self._alert(f"recorder: {failed}")
+        return KillResult(killed=False, reason=failed)
 
     async def reload_config(self) -> ReloadResult:
         return self._reload()

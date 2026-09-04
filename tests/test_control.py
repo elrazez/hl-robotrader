@@ -285,11 +285,21 @@ async def test_kill_writes_the_flag_before_it_reports_killed(tmp_path: Path) -> 
     assert "manual" in kill_file.read_text()
 
 
-async def test_a_kill_file_that_cannot_be_written_still_kills(tmp_path: Path) -> None:
-    """The in-process half has to run even when the flag cannot be persisted."""
+async def test_a_kill_that_cannot_write_the_flag_does_not_claim_success(tmp_path: Path) -> None:
+    """The in-process half still runs, but the result says the kill did not fully take.
+
+    The live unit is Restart=always and gates on the file, so a kill reported as done
+    while the flag never reached disk comes back trading three seconds later. Kill switch
+    wins means never confirming a success it did not get, and the reason is what the
+    Telegram confirmation renders.
+    """
     blocked = tmp_path / "not-a-dir"
     blocked.write_text("occupied")
     backend = NoopBackend(kill_file=blocked / "KILL")
     result = await backend.kill("manual")
-    assert result.killed is True
+    assert result.killed is False
+    assert result.reason is not None
+    assert "manual" in result.reason
+    assert "NOT written" in result.reason
+    # The in-process half ran regardless.
     assert (await backend.status()).risk.killed is True

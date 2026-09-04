@@ -309,6 +309,7 @@ class Recorder:
             counters=self.counters,
             stop=stop,
             reload=self.reload,
+            alert=self.health.alert,
         )
         server = ControlServer(backend, settings.socket_path)
         state_writer = StateWriter(
