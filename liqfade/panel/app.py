@@ -54,17 +54,22 @@ def is_loopback(host: str) -> bool:
 HOUR_MS = 3_600_000
 
 
-def liquidations_by_venue(parquet_root: Path, hours: int) -> dict[str, Any]:
+def liquidations_by_venue(
+    parquet_root: Path, hours: int, *, now: int | None = None
+) -> dict[str, Any]:
     """Aggregate the `liquidations` table into hourly notional per venue.
 
     Returns uplot shaped data: the complete hour grid for the window and one aligned list
     of values per venue, with quiet hours as nulls. The grid is always complete so the
     chart's x axis spans the window the caller asked for, rather than collapsing onto
     whichever two hours happened to have a liquidation in them.
+
+    `now` pins the end of the grid, in ms. It exists so tests are not racing the wall
+    clock rolling over an hour between writing a row and reading it back.
     """
     import duckdb
 
-    end_hour = (now_ms() // HOUR_MS) * HOUR_MS
+    end_hour = ((now_ms() if now is None else now) // HOUR_MS) * HOUR_MS
     since_ms = end_hour - (hours - 1) * HOUR_MS
     hour_list = [since_ms + step * HOUR_MS for step in range(hours)]
     empty: dict[str, Any] = {

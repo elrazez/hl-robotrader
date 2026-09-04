@@ -13,7 +13,7 @@ from liqfade.config import load_settings
 from liqfade.config.models import Settings
 from liqfade.control.protocol import RiskState, StateSnapshot, now_ms
 from liqfade.control.state import write_state
-from liqfade.panel.app import create_app, is_loopback, serve
+from liqfade.panel.app import create_app, is_loopback, liquidations_by_venue, serve
 from liqfade.panel.auth import (
     AuthNotConfiguredError,
     LoginLimiter,
@@ -23,6 +23,8 @@ from liqfade.panel.auth import (
 )
 
 PASSWORD = "a-long-enough-password"
+# A fixed UTC hour, so the hour grid never depends on when the suite runs.
+FIXED_HOUR = (1_788_000_000_000 // 3_600_000) * 3_600_000
 
 
 @pytest.fixture
@@ -293,10 +295,13 @@ def test_liquidations_with_no_lake_yet_is_an_empty_chart_rather_than_an_error(
     assert len(body["hour_ms"]) == 24
 
 
-def test_liquidations_are_bucketed_by_hour_and_venue(
-    client: TestClient, settings: Settings
-) -> None:
-    hour = (now_ms() // 3_600_000) * 3_600_000
+def test_liquidations_are_bucketed_by_hour_and_venue(settings: Settings) -> None:
+    """The hour is pinned rather than read from the clock.
+
+    Reading now_ms() twice, once to write the rows and once to serve them, fails whenever
+    the wall clock rolls an hour in between.
+    """
+    hour = FIXED_HOUR
     _write_liquidations(
         settings.paths.data_dir / "parquet",
         [
@@ -305,8 +310,7 @@ def test_liquidations_are_bucketed_by_hour_and_venue(
             _liq("okx", hour - 3_600_000, 5_000.0),
         ],
     )
-    client.post("/api/login", json={"password": PASSWORD})
-    body = client.get("/api/recorder/liquidations?hours=24").json()
+    body = liquidations_by_venue(settings.paths.data_dir / "parquet", 24, now=hour + 60_000)
 
     assert body["hour_ms"][-1] == hour
     assert len(body["hour_ms"]) == 24
@@ -317,16 +321,13 @@ def test_liquidations_are_bucketed_by_hour_and_venue(
     assert body["events"] == {"bybit": 2, "okx": 1}
 
 
-def test_liquidations_older_than_the_window_are_left_out(
-    client: TestClient, settings: Settings
-) -> None:
-    hour = (now_ms() // 3_600_000) * 3_600_000
+def test_liquidations_older_than_the_window_are_left_out(settings: Settings) -> None:
+    hour = FIXED_HOUR
     _write_liquidations(
         settings.paths.data_dir / "parquet",
         [_liq("bybit", hour - 48 * 3_600_000, 1.0), _liq("bybit", hour, 2.0)],
     )
-    client.post("/api/login", json={"password": PASSWORD})
-    body = client.get("/api/recorder/liquidations?hours=24").json()
+    body = liquidations_by_venue(settings.paths.data_dir / "parquet", 24, now=hour + 60_000)
     assert body["totals"] == {"bybit": 2.0}
 
 

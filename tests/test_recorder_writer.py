@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pyarrow as pa
@@ -77,37 +76,31 @@ def test_a_second_flush_in_the_same_hour_does_not_overwrite_the_first(tmp_path: 
     )
 
 
-async def test_a_reader_never_catches_a_partial_file(tmp_path: Path) -> None:
-    """Same technique as test_state_writer_never_leaves_a_partial_file.
+ROUNDS = 20
 
-    A non-atomic writer (write straight to the final path) fails this quickly because the
-    reader opens the file while pyarrow is still flushing pages into it.
+
+def test_a_reader_never_catches_a_partial_file(tmp_path: Path) -> None:
+    """A reader globbing the partition only ever sees complete files.
+
+    write_rows is synchronous and lands each file with temp + os.replace, so the property
+    under test is that rename, not a thread race: the recorder is what calls it through
+    asyncio.to_thread. A non-atomic writer (straight to the final path) fails here on the
+    first round, because pyarrow is still flushing pages when read_table opens it.
+
+    Bounded and counted rather than looped for a fixed wall clock: the writer adds a file
+    each round and the reader re-reads the whole partition, so an unbounded version is
+    quadratic and used to take 27 of the suite's 28 seconds.
     """
     directory = partition_dir(tmp_path, "bbo", DATE)
-    stop = asyncio.Event()
     reads = 0
-
-    async def writer_loop() -> None:
-        i = 0
-        while not stop.is_set():
-            i += 1
-            write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 12), [bbo(i)] * 50)
-            await asyncio.sleep(0)
-
-    async def reader_loop() -> None:
-        nonlocal reads
-        for _ in range(200):
-            for path in sorted(directory.glob("*.parquet")):
-                pq.read_table(path)  # raises on a truncated file
-                reads += 1
-            await asyncio.sleep(0)
-
-    task = asyncio.create_task(writer_loop())
-    await reader_loop()
-    stop.set()
-    await task
-    assert reads > 0
-    assert not list(directory.glob("*.tmp"))
+    for i in range(1, ROUNDS + 1):
+        write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 12), [bbo(i)] * 50)
+        for path in sorted(directory.glob("*.parquet")):
+            pq.read_table(path)  # raises on a truncated file
+            reads += 1
+        assert not list(directory.glob("*.tmp"))  # never visible, not merely cleaned up
+    assert reads == ROUNDS * (ROUNDS + 1) // 2
+    assert len(list(directory.glob("*.parquet"))) == ROUNDS
 
 
 def test_compaction_preserves_row_counts_and_deletes_the_hourlies(tmp_path: Path) -> None:

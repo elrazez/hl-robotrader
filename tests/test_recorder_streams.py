@@ -16,7 +16,9 @@ from liqfade.recorder.streams.base import (
     backoff_delay,
 )
 
-CFG: Recorder = load_settings("paper").recorder
+CFG: Recorder = load_settings(
+    "paper", environ={}
+).recorder  # environ={}: these thresholds are the test's, not the box's .env or overrides.yaml
 NOW_MS = 1788099600000
 BYBIT_LIQ = (
     b'{"topic":"allLiquidation.BTCUSDT","type":"snapshot","ts":1788099227482,'

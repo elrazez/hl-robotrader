@@ -8,7 +8,9 @@ from liqfade.config import load_settings
 from liqfade.config.models import Universe
 from liqfade.recorder.universe import select_universe
 
-CFG: Universe = load_settings("paper").universe
+CFG: Universe = load_settings(
+    "paper", environ={}
+).universe  # environ={}: these thresholds are the test's, not the box's .env or overrides.yaml
 
 
 def payload(*assets: tuple[str, float, float, float]) -> list[Any]:

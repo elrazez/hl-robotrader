@@ -6,6 +6,7 @@ them into spawned processes; that constraint is part of the contract being teste
 
 from __future__ import annotations
 
+import os
 import time
 from functools import partial
 from pathlib import Path
@@ -51,8 +52,29 @@ def handler_five(local: Path, key: str, stage_root: Path) -> dict[str, int]:
     return _write(local, stage_root, 5)
 
 
-def handler_slow(local: Path, key: str, stage_root: Path) -> dict[str, int]:
-    time.sleep(0.5)
+OVERLAP_ENV = "LIQFADE_TEST_OVERLAP_DIR"
+
+
+def handler_overlapping(local: Path, key: str, stage_root: Path) -> dict[str, int]:
+    """Records how many handlers were inside at once, so overlap is counted, not timed.
+
+    Runs in a worker process, so the tally goes to a directory named by an env var the
+    children inherit: the staging root the handler is handed is deleted when the run ends.
+    """
+    shared = Path(os.environ[OVERLAP_ENV])
+    inflight = shared / "inflight"
+    peaks = shared / "peaks"
+    for directory in (inflight, peaks):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    name = key.replace("/", "_")
+    marker = inflight / name
+    marker.write_text("")
+    try:
+        time.sleep(0.2)  # long enough that co-running workers certainly overlap
+        (peaks / name).write_text(str(len(list(inflight.iterdir()))))
+    finally:
+        marker.unlink()
     return _write(local, stage_root, 1)
 
 
@@ -111,10 +133,17 @@ def test_process_pool_completes_everything_and_the_manifest_agrees(
     assert leftovers == []
 
 
-def test_workers_run_concurrently_by_wall_clock(client: FakeS3, tmp_path: Path) -> None:
-    """8 objects sleeping 0.5s each: sequential is 4s of sleep, 4 workers must beat it."""
+def test_workers_run_concurrently(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overlap is asserted from a counter, not from a wall clock budget.
+
+    The old version allowed 3.5s for 4s of sleeps, which is a flake on a loaded CI box and
+    says nothing about why it was slow. Each handler records how many were inside with it.
+    """
+    shared = tmp_path / "overlap"
+    monkeypatch.setenv(OVERLAP_ENV, str(shared))
     manifest = Manifest.load(tmp_path, "t")
-    started = time.monotonic()
     parallel_pull(
         client,
         BUCKET,
@@ -122,13 +151,16 @@ def test_workers_run_concurrently_by_wall_clock(client: FakeS3, tmp_path: Path) 
         tmp_path,
         "t",
         manifest,
-        handler_slow,
+        handler_overlapping,
         workers=4,
         client_factory=FACTORY,
     )
-    elapsed = time.monotonic() - started
     assert len(manifest.objects) == 8
-    assert elapsed < 3.5, f"took {elapsed:.1f}s, workers are not overlapping"
+
+    peaks = [int(path.read_text()) for path in (shared / "peaks").iterdir()]
+    assert len(peaks) == 8  # every object went through the handler
+    assert max(peaks) > 1, f"no two workers were ever inside at once: {sorted(peaks)}"
+    assert not list((shared / "inflight").iterdir())  # every handler left
 
 
 def test_a_failing_object_stops_the_run_but_keeps_completed_work(

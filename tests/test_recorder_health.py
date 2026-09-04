@@ -9,7 +9,9 @@ from liqfade.control.protocol import now_ms
 from liqfade.recorder.health import Health, disk_stats
 from liqfade.recorder.streams.base import StreamStats
 
-CFG = load_settings("paper").recorder
+CFG = load_settings(
+    "paper", environ={}
+).recorder  # environ={}: these thresholds are the test's, not the box's .env or overrides.yaml
 
 
 class Source:
