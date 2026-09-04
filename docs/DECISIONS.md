@@ -380,6 +380,76 @@ partition it rewrites: 1,284,579 rows on 2026-03-01, against 3,371,156 of ours. 
 three venues in that partition are untouched, 46.8M rows. Same rule as counting a
 liquidation once; see docs/DATA_SOURCES.md, "Counting a trade once".
 
+**2026-03-01, before and after, against the Tardis reference.** Bars built from Tardis's
+Hyperliquid trades, whose order is right, on the four coins it covers. "Before" is bars
+from the lake's `hl_s3` rows alone, which is what the other 353 days of the year looked
+like; the lake's own `candles_1m` for this day scored better than that only because the
+dedup sometimes picked Tardis's copy of a trade.
+
+| coin | minutes | `o` before | `o` after | `c` before | `c` after |
+|---|---|---|---|---|---|
+| BTC | 1,440 | 89.72% | 99.86% | 88.40% | 99.79% |
+| ETH | 1,440 | 91.04% | 99.65% | 92.36% | 99.72% |
+| HYPE | 1,440 | 80.90% | 99.65% | 85.76% | 99.72% |
+| SOL | 1,440 | 88.12% | 99.65% | 89.24% | 99.79% |
+
+The residual is not ordering, and that is the number that matters. Splitting the
+disagreements by whether our trade count for the minute equals Tardis's: before, 1,238 of
+1,270 disagreeing minutes had an **identical** `n`, which is a right trade set in a wrong
+order. After, **zero** of the remaining 28 do; every one is a minute where Tardis itself
+saw a different number of trades, its known 0.05% incompleteness. So on every minute where
+the two sources agree on the trades, `o` and `c` now agree exactly. `h` and `l` were
+already 99.7%+ either way, and `n` is unchanged at 99.0 to 99.2%.
+
+**The year rederived, measured.** `liqfade backfill rederive --start 2025-08-31 --end
+2026-08-30`, two workers, newest first, running the whole time alongside the `fills_full`
+compaction going the other way. 365 days in 2.0 hours of wall clock, median 33s a day,
+slowest 178s (2026-02-01, a Tardis day, where the `trades` partition also carries 46.8M
+Binance, Bybit and OKX rows that have to be read and written back around ours). Peak RSS
+per worker 2.6 GB on the 2025-10-10 cascade day, 19,127,562 fills, which is why the
+default is two workers and not four on this 8 GB machine.
+
+Counted from the lake afterwards rather than from the run's own summary, all 365 days:
+
+| table | source | after | before (2026-09-04, pre-repair) |
+|---|---|---|---|
+| `trades` | `hl_s3` | 1,428,662,127 | 1,428,662,127 |
+| `liquidations` | `hl_s3` | 5,633,882 | 5,633,882 |
+| `trades` | `tardis` (Binance, OKX, Bybit) | 362,088,179 | 376,007,141 incl. Hyperliquid |
+| `liquidations` | `tardis` | 136,137 | 136,137 |
+
+Row for row identical on our two tables: the same trades and the same liquidations out of
+the same fills, in a different order. The 13,918,962 rows that went are Tardis's copy of
+Hyperliquid `trades`; its `liquidations` were untouched because Tardis never carried
+Hyperliquid liquidations at all. Every one of the 730 partitions is a single
+`all_day.parquet` carrying the rederive stamp.
+
+**Five restarts in two hours, all of them the mount.** Two `OSError 60` (the open timed
+out) and three polars panics wrapping `OSError 22`, on both the `fills_full` read and the
+existing-partition read. Three things came out of that and are now in the code. A polars
+`PanicException` derives from `BaseException`, not `Exception`, so it has to be named or
+no handler ever sees it. It also cannot be pickled back out of a pool worker, so the
+parent reported a `PicklingError` for `pyo3_runtime` and the real cause never reached the
+log; the worker now re-raises as a `BackfillError` carrying the message. And what decides
+whether a failed read is retried is the listing, not the exception: if the day's files are
+all still there it is a real failure and is raised, and if they are not the compaction
+folded the day underneath us and it is redone from the new listing.
+
+The restarts also exposed a reporting bug worth writing down, because the lake looked
+short when it was not. `pool.shutdown(cancel_futures=True)` cannot recall a day already
+handed to the pool's call queue, so after a failure a few more days run to completion
+while the consuming loop has stopped. Their work is written and stamped, but their row
+counts were never reported: the first year run was 26 days short in its own accounting
+over a complete lake. `unconsumed()` drains them now.
+
+**The year of candles rebuilt.** `liqfade derive candles --start 2025-09-01 --end
+2026-08-30 --force`, 364 days, 174,697,608 bars, 33.4 minutes. The bar count is identical
+to 02c's, to the bar, and that is the expected result rather than a suspicious one:
+reordering the trades inside a millisecond changes which trade is a minute's first and
+last, never how many minutes a coin traded or how many trades fell in each. `o` and `c`
+are what moved. Bars a day still grow with the exchange, 327,788 across 277 coins on
+2025-09-01 to 649,986 across 578 on 2026-08-30.
+
 **Hyperliquid's `tid` is a hash, not a sequence, and that was silently reordering
 `trades`.** Two fills of one sweep carry 997296749534590 and 653061949558227 in that
 order. `hl_s3.derive_trades` sorted its output by `(ts_ms, tid)`, so inside a millisecond
@@ -390,19 +460,18 @@ open on 76% of BTC minutes and its close on 91%, while the high matched 100% and
 `v` were identical on the very rows that disagreed, which is a right trade set in a wrong
 order. Bars built in file order match on 100%.
 
-The sort is fixed, so everything written from now on is right. The year already in the
-lake is not: measured on 2026-03-01 against the same day's Tardis rows, `o` and `c`
-disagree on 8 to 19% of minutes by a median of 0.15 to 1 bps, p95 3 to 4 bps, max 11 bps.
-That is small but not negligible next to 4.5 bps of taker fee, and it matters most for
-exactly the entries and exits a scalp backtest models. `fills_full` was never sorted and
-still carries the true order, so the repair is free: `liqfade backfill rederive` over the
-year, then `liqfade derive candles --force`. Two things block that today and are handed
-to `prompts/02d_rederive.md`: the `fills_full` compaction is still running, and
-`rederive` reads a whole day of fills into Python objects (the failure mode that already
-killed the parser on the 2025-10-10 cascade day) and globs hidden AppleDouble sidecars,
-so it needs streaming and `lake_files()` first. Lesson, and the reason this is written
-down rather than just fixed: an exchange id is an identity, not an ordering, unless the
-exchange says otherwise.
+The sort was fixed the same day, so everything written since is right. The year that was
+already in the lake was not: measured on 2026-03-01 against the same day's Tardis rows,
+`o` and `c` disagreed on 8 to 19% of minutes by a median of 0.15 to 1 bps, p95 3 to 4
+bps, max 11 bps. Small, but not negligible next to 4.5 bps of taker fee, and worst
+exactly at the entries and exits a scalp backtest models. **That data has since been
+repaired.** `fills_full` was never sorted and still carried the true order, so the fix
+cost nothing but time: `liqfade backfill rederive` rebuilt every `hl_s3` row of `trades`
+and `liquidations` from it in file order, and `liqfade derive candles --force` rebuilt
+the bars. See the 02d entries above for the order proof, the before-and-after match
+rates and the run itself. Lesson, and the reason this is written down rather than just
+fixed: an exchange id is an identity, not an ordering, unless the exchange says
+otherwise.
 
 **`trades` holds every Hyperliquid trade twice on the twelve Tardis days.** `hl_s3` and
 `tardis` both cover Hyperliquid, under the same `tid`, so a naive `venue == hyperliquid`

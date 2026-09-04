@@ -289,18 +289,19 @@ assumed:
   position in the `trades` file, which is the exchange's own event order. Ordering by
   `tid` matched the API's open on 76% of BTC minutes; file order matches on 100%.
 
-**The year already in the lake predates that last finding.** `hl_s3.derive_trades` sorted
-its output by `(ts_ms, tid)` until 2026-09-04, so for `source = hl_s3` the row order
-inside a millisecond is the arbitrary one and the derived `o` and `c` inherit it.
-Measured on 2026-03-01 against the same day's Tardis rows, whose order is right: `h` and
-`l` agree to within 0.2%, `n` to 99%, and `o` and `c` disagree on 8 to 19% of minutes by
-a median of 0.15 to 1 bps and up to 11 bps. Fixing the data, as opposed to the code,
-means `liqfade backfill rederive` over the year and then `liqfade derive candles
---force`; `fills_full` was never sorted and still holds the true order, which is what
-makes that free. Two things block it today and belong with the quality gate: the
-`fills_full` compaction is still running, and `rederive` reads a whole day of fills into
-Python objects and globs hidden AppleDouble sidecars, so it needs streaming and
-`lake_files()` before it can be pointed at this year.
+**The year in the lake was rebuilt on 2026-09-04 to fix exactly that.**
+`hl_s3.derive_trades` sorted its output by `(ts_ms, tid)` until then, so for
+`source = hl_s3` the row order inside a millisecond was arbitrary and the derived `o` and
+`c` inherited it: measured on 2026-03-01 against the same day's Tardis rows, whose order
+is right, `o` and `c` disagreed on 8 to 19% of minutes by a median of 0.15 to 1 bps and
+up to 11 bps, while `h` and `l` agreed to within 0.2%. `fills_full` was never sorted and
+still held the true order, so the repair cost nothing: `liqfade backfill rederive` over
+the year rebuilt every `hl_s3` row of `trades` and `liquidations` from it in file order,
+and `liqfade derive candles --force` rebuilt the bars from those. After the rebuild, on
+every minute where our trade set and Tardis's agree, `o` and `c` agree exactly; the
+residual disagreement is Tardis's own 0.05% incompleteness. The proof that `fills_full`
+really carries the exchange's order, including after compaction, is
+`scripts/research/fills_order_check.py`; see docs/DECISIONS.md, 2026-09-04.
 
 Order book snapshots live in `s3://hyperliquid-archive` as one compressed file per coin
 per hour, going back to 2023. Do not pull the whole market. Pick the handful of coins the
