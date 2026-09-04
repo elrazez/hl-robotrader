@@ -489,12 +489,9 @@ def test_rederive_is_idempotent_and_does_not_duplicate_rows(client: FakeS3, tmp_
     assert counts == [2, 2]
 
 
-def test_rederive_preserves_rows_from_other_sources(client: FakeS3, tmp_path: Path) -> None:
-    """A recorded day and a backfilled day share a partition after compaction."""
-    from liqfade.data.ingest.common import write_partitioned
-
-    hl_s3.run(client, tmp_path, DAY, DAY)
-    recorded = {
+def _recorded() -> dict[str, object]:
+    """One `liquidations` row from another venue and source, for the day the fixture uses."""
+    return {
         "venue": "bybit",
         "coin": "BTC",
         "venue_symbol": "BTCUSDT",
@@ -507,7 +504,14 @@ def test_rederive_preserves_rows_from_other_sources(client: FakeS3, tmp_path: Pa
         "method": "unknown",
         "complete": True,
     }
-    write_partitioned(tmp_path / "parquet", "liquidations", "bybit", "recorder", [recorded])
+
+
+def test_rederive_preserves_rows_from_other_sources(client: FakeS3, tmp_path: Path) -> None:
+    """A recorded day and a backfilled day share a partition after compaction."""
+    from liqfade.data.ingest.common import write_partitioned
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    write_partitioned(tmp_path / "parquet", "liquidations", "bybit", "recorder", [_recorded()])
 
     hl_s3.rederive(tmp_path, DAY, DAY)
     paths = sorted((tmp_path / "parquet" / "liquidations").glob("date=*/*.parquet"))
@@ -625,24 +629,57 @@ def test_a_short_output_leaves_every_input_in_place(
     client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same check `compact_day` has: a short file must never replace its inputs."""
-    from liqfade.recorder import writer
-
     hl_s3.run(client, tmp_path, DAY, DAY)
-    root = tmp_path / "parquet"
-    before = sorted(p.name for p in (root / "trades" / f"date={DAY.isoformat()}").glob("*.parquet"))
-    real = writer.write_atomic
+    directory = tmp_path / "parquet" / "trades" / f"date={DAY.isoformat()}"
+    before = sorted(p.name for p in directory.glob("*.parquet"))
+    real = pq.write_table
 
-    def writes_one_row_short(table: object, path: Path) -> None:
-        real(table.slice(1), path)  # type: ignore[attr-defined]
+    def writes_one_row_short(table: object, where: object, **kwargs: object) -> None:
+        real(table.slice(1), where, **kwargs)  # type: ignore[attr-defined, arg-type]
 
-    # `_assemble` imports write_atomic inside the function, so it resolves at call time.
-    monkeypatch.setattr(writer, "write_atomic", writes_one_row_short)
+    monkeypatch.setattr(pq, "write_table", writes_one_row_short)
     with pytest.raises(BackfillError, match="expected"):
         hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)
 
     monkeypatch.undo()
-    after = sorted(p.name for p in (root / "trades" / f"date={DAY.isoformat()}").glob("*.parquet"))
-    assert set(before) <= set(after)
+    assert sorted(p.name for p in directory.glob("*.parquet")) == before
+    assert not (directory / hl_s3.PENDING_OUTPUT).exists()
+
+
+def test_a_crash_between_the_write_and_the_unlink_does_not_double_the_kept_rows(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The window that used to leave `all_day.parquet` and the files it was built from.
+
+    A rerun then kept the old files' foreign rows and the copy of them already inside the
+    new file. One `unlink` failing on this mount is enough; it times out an open every
+    few hours.
+    """
+    from liqfade.data.ingest.common import write_partitioned
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    write_partitioned(tmp_path / "parquet", "liquidations", "bybit", "recorder", [_recorded()])
+    directory = tmp_path / "parquet" / "liquidations" / f"date={DAY.isoformat()}"
+    real_unlink = Path.unlink
+
+    def fails_on_the_second(self: Path, **kwargs: object) -> None:
+        if self.parent == directory and getattr(fails_on_the_second, "seen", 0):
+            raise OSError(60, "Operation timed out")
+        fails_on_the_second.seen = 1  # type: ignore[attr-defined]
+        real_unlink(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", fails_on_the_second)
+    with pytest.raises(OSError, match="timed out"):
+        hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)
+    monkeypatch.undo()
+
+    # The finished temp is still there and holds the whole partition.
+    assert (directory / hl_s3.PENDING_OUTPUT).exists()
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)[0] == "done"
+
+    rows = _read_day(tmp_path / "parquet", "liquidations")
+    assert sorted(row["source"] for row in rows) == ["hl_s3", "hl_s3", "recorder"]
+    assert [p.name for p in directory.iterdir()] == [hl_s3.REDERIVE_OUTPUT]
 
 
 def test_a_day_the_compaction_folds_mid_read_is_listed_again_and_redone(

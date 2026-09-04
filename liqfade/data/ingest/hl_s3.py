@@ -29,6 +29,7 @@ sign of the entire strategy.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
 from datetime import date
 from pathlib import Path
@@ -51,6 +52,7 @@ from liqfade.data.ingest.common import (
 from liqfade.data.parse import to_float, to_int, to_ms
 from liqfade.data.schemas import SOURCE_HL_S3
 from liqfade.log import get_logger
+from liqfade.recorder.writer import lake_files
 
 log = get_logger(__name__)
 
@@ -491,6 +493,11 @@ def run(
 # partition alone afterwards and a reader still finds one file per table per day.
 REDERIVE_OUTPUT = "all_day.parquet"
 
+# Where the rewritten partition is built before any input is unlinked. Hidden, so
+# `lake_files` never hands it to a reader, and a fixed name rather than a pid, so the run
+# after a crash can find it and finish the job. See `_finish_interrupted`.
+PENDING_OUTPUT = f".{REDERIVE_OUTPUT}.rederive-pending"
+
 # Stamped into the Parquet footer of every partition this job writes, and the only thing
 # the resume rule trusts. The file name cannot carry that on its own: `liqfade compact` produced
 # exactly this name for every day of the year in 02b, out of the wrongly ordered rows
@@ -536,6 +543,35 @@ def _partition_is_current(root: Path, stamp: str) -> bool:
     return True
 
 
+def _finish_interrupted(directory: Path) -> None:
+    """Promote a finished `PENDING_OUTPUT` left behind by an interrupted `_assemble`.
+
+    The temp is written before any input is unlinked and holds every row the partition is
+    meant to end up with, so if it is complete it is the right answer and the partition
+    around it is whatever the interrupted unlink loop got through. Promoting it first
+    means the run that follows reads one file rather than a file plus the leftovers whose
+    rows are already inside it, which is the doubling this ordering exists to prevent.
+
+    "Complete" is a readable Parquet footer. A temp from a crash mid-write has none, and
+    is deleted.
+    """
+    import pyarrow.parquet as pq
+
+    pending = directory / PENDING_OUTPUT
+    if not pending.exists():
+        return
+    try:
+        pq.read_metadata(pending)
+    except Exception:
+        log.warning("rederive_pending_unreadable", path=str(pending))
+        pending.unlink(missing_ok=True)
+        return
+    log.warning("rederive_pending_promoted", path=str(pending))
+    for path in lake_files(directory):
+        path.unlink()
+    os.replace(pending, directory / REDERIVE_OUTPUT)
+
+
 def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, int]:
     """Rewrite one day's partition: our rows become `derived`, other sources are kept.
 
@@ -546,8 +582,17 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     counts every trade twice on those days. Same rule as "counting a liquidation once";
     see docs/DATA_SOURCES.md, "Counting a trade once".
 
-    Everything is read before anything is written, and the old files are deleted only
-    after the new one is in place, so a failure anywhere leaves the partition as it was.
+    The rewrite is atomic, which it was not: it used to write `all_day.parquet` and only
+    then unlink the hourly files it had read. A crash in that window, or one `unlink`
+    failing on a mount that times out an open every few hours, left both, and the rerun
+    then kept the old files' foreign rows *and* the copy of them already inside the new
+    file, silently doubling every recorder and Tardis row in the partition.
+
+    The order now is: write a hidden temp beside the output, check its row count, unlink
+    every input, then `os.replace`. A crash anywhere in that window leaves the finished
+    temp on disk, and `_finish_interrupted` promotes it on the next run, so the partition
+    ends up with exactly one copy of the foreign rows whether the crash landed before the
+    unlinks, between two of them, or after all of them.
 
     Returns (rows derived, rows in the partition). The two differ on any day the
     recorder or Tardis also wrote: 2026-03-01 is a Tardis free day, so its `trades`
@@ -556,9 +601,10 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     import polars as pl
 
     from liqfade.data.schemas import SOURCE_TARDIS, schema_for, validate_table
-    from liqfade.recorder.writer import lake_files, partition_dir, write_atomic
+    from liqfade.recorder.writer import lake_files, partition_dir
 
     directory = partition_dir(root, table, stamp)
+    _finish_interrupted(directory)
     existing = sorted(lake_files(directory)) if directory.is_dir() else []
     columns = schema_for(table).names
 
@@ -576,28 +622,40 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     # order they came in, which for our rows is the exchange's own event order.
     merged = pl.concat([*kept, ours]).sort(pl.col("ts_ms").fill_null(0), maintain_order=True)
 
+    import os
+
+    import pyarrow.parquet as pq
+
     arrow = merged.to_arrow().cast(schema_for(table))
     validate_table(table, arrow)  # schema only; the stamp below is footer metadata
     arrow = arrow.replace_schema_metadata(dict([REDERIVE_STAMP]))
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / REDERIVE_OUTPUT
-    write_atomic(arrow, output)
+    pending = directory / PENDING_OUTPUT
 
-    # The same check `compact_day` has, and for the same reason: a short output must
-    # never replace its inputs. The expected count is the kept rows plus the derived
-    # ones, not the inputs' own sum, because this is exactly where our old rows and
-    # Tardis's Hyperliquid rows are meant to disappear.
-    import pyarrow.parquet as pq
+    from liqfade.recorder.writer import COMPRESSION
 
-    written = int(pq.read_metadata(output).num_rows)
-    if written != merged.height:
-        raise BackfillError(
-            f"{output} has {written} rows, expected {merged.height}; leaving the "
-            f"{len(existing)} input files in place"
-        )
+    try:
+        pq.write_table(arrow, pending, compression=COMPRESSION)
+        # The same check `compact_day` has, and for the same reason: a short output must
+        # never replace its inputs. The expected count is the kept rows plus the derived
+        # ones, not the inputs' own sum, because this is exactly where our old rows and
+        # Tardis's Hyperliquid rows are meant to disappear.
+        written = int(pq.read_metadata(pending).num_rows)
+        if written != merged.height:
+            raise BackfillError(
+                f"{pending} has {written} rows, expected {merged.height}; leaving the "
+                f"{len(existing)} input files in place"
+            )
+    except BaseException:
+        pending.unlink(missing_ok=True)
+        raise
+
+    # From here the temp holds everything, so an interrupted unlink loses nothing:
+    # `_finish_interrupted` promotes it on the next run.
     for path in existing:
-        if path.name != REDERIVE_OUTPUT:
-            path.unlink()
+        path.unlink()
+    os.replace(pending, output)
     return int(ours.height), int(merged.height)
 
 
