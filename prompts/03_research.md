@@ -169,6 +169,13 @@ twelve days. If `asset_ctx` is missing or short, stop and say so; do not build a
 trades-only workaround. `scripts/research/oi_from_fills.py` gives block-level OI
 changes from `fills_full` if a gate needs finer than the archive's cadence.
 
+**Hyperliquid's `open_interest` is both sides of the book, longs plus shorts, so it is
+twice what Binance and Bybit publish.** Halve it before any cross-venue comparison, and
+never inside a same-venue feature: `oi_delta_w` and the proxy's OI gate read one venue's
+own series, where the factor cancels and halving would only make the number wrong in a
+different way. Measured 2026-09-05, see docs/DATA_SOURCES.md, "What the wire actually
+sends".
+
 The recorder has not yet run on the VPS (as of 2026-09-04 the lake has no recorder rows:
 no `bbo`, no live `asset_ctx`). `book.py` is NaN for the year: there is no historical
 `bbo` and `l2` is hourly snapshots on four coins. The live bot reads the same `asset_ctx`

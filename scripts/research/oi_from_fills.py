@@ -35,6 +35,16 @@ from pathlib import Path
 
 MINUTE_MS = 60_000
 
+# Hyperliquid counts both sides of the book, so its `open_interest` is twice the long
+# exposure. That is measured rather than documented, which means it can change under us,
+# and the failure would be quiet: a one-sided definition still correlates 1.0 with ours
+# and just halves every number. So it is a gate. `SIDES` is checked against the archive on
+# every run, and a run that does not find it exits non-zero.
+SIDES = 2.0
+# The residual once the definition is right is float noise: measured 1.7e-7 coin units on
+# HYPE against minute moves of 1e5, a relative 1e-12. A definition change moves it to 0.5.
+AGREEMENT_REL = 1e-6
+
 # The whole computation. The `CASE` is the fill's effect on the user's position, and the
 # two `abs` terms are that user's contribution to open interest after and before it: a
 # long of 5 and a short of 5 each count 5, because Hyperliquid counts both sides.
@@ -43,6 +53,10 @@ SELECT coin,
        (ts_ms // $minute) * $minute AS minute_ms,
        sum(abs(start_position + CASE WHEN side = 'B' THEN sz ELSE -sz END)
            - abs(start_position)) AS oi_delta,
+       -- The one-sided answer, kept only so the run can measure which one the exchange
+       -- is publishing rather than assume it.
+       sum(greatest(start_position + CASE WHEN side = 'B' THEN sz ELSE -sz END, 0)
+           - greatest(start_position, 0)) AS long_delta,
        count(*) AS fills
 FROM read_parquet($files)
 WHERE start_position IS NOT NULL AND sz IS NOT NULL AND ts_ms IS NOT NULL
@@ -76,7 +90,10 @@ SELECT f.coin,
        corr(f.oi_delta, a.oi_delta) AS correlation,
        max(abs(f.oi_delta - a.oi_delta)) AS worst_abs,
        median(abs(f.oi_delta - a.oi_delta)) AS median_abs,
-       max(abs(a.oi_delta)) AS biggest_move
+       max(abs(a.oi_delta)) AS biggest_move,
+       -- How many sides the exchange is counting, measured on the minutes where the
+       -- long-only sum is not zero and the ratio is therefore defined.
+       median(a.oi_delta / nullif(f.long_delta, 0)) AS sides
 FROM fills f JOIN archive a USING (coin, minute_ms)
 GROUP BY 1
 ORDER BY 1
@@ -94,26 +111,56 @@ def oi_deltas(con, files: list[str], coins: list[str] | None):
     return con.execute(DELTA_QUERY, {"files": files, "minute": MINUTE_MS, "coins": coins})
 
 
-def render(day: str, rows: list[tuple]) -> str:
+def failures(rows: list[tuple]) -> list[str]:
+    """The gate. Empty means the archive still means what this script assumes.
+
+    Two things are checked per coin, because a definition change is quiet: a one-sided
+    `open_interest` would still correlate 1.0 with ours and simply halve every number,
+    which is exactly the "broadly agrees" that hid it the first time.
+    """
+    found = []
+    for coin, _minutes, _corr, worst, _median, biggest, sides in rows:
+        if sides is None or abs(sides - SIDES) > AGREEMENT_REL:
+            found.append(
+                f"{coin}: the archive is counting {sides} sides of the book, not {SIDES}. "
+                "Hyperliquid changed what `open_interest` means; fix the formula here, "
+                "docs/DATA_SOURCES.md and every cross-venue OI feature before trusting it."
+            )
+        elif worst > AGREEMENT_REL * max(biggest, 1.0):
+            found.append(
+                f"{coin}: worst disagreement {worst:.6g} coin units against a biggest "
+                f"move of {biggest:,.4f}, over the {AGREEMENT_REL:g} relative bar. The "
+                "fills and the archive no longer describe the same quantity."
+            )
+    return found
+
+
+def render(day: str, rows: list[tuple], bad: list[str]) -> str:
     lines = [
         "# Open interest from fills, against the asset-context archive",
         "",
         f"Day: {day}. Ours is the exact change per minute computed from every fill's",
         "`start_position`; the reference is the archive's own minute series, differenced.",
         "",
-        "`worst` and `median` are in coin units, and `biggest move` is the largest",
-        "minute-to-minute change the archive itself saw, which is what makes `worst`",
-        "readable as large or small.",
+        f"**Gate: {'FAIL' if bad else 'PASS'}.** `sides` is the archive's change divided",
+        "by the long-only sum, measured rather than assumed, and it has to be",
+        f"{SIDES:g}: Hyperliquid counts both sides of the book. `worst` has to be under a",
+        f"relative {AGREEMENT_REL:g} of the biggest move. Both are in coin units.",
         "",
-        "| coin | minutes | correlation | median abs diff | worst abs diff | biggest move |",
-        "|---|---:|---:|---:|---:|---:|",
     ]
-    for coin, minutes, correlation, worst, median, biggest in rows:
+    lines += [f"- {line}" for line in bad] + ([""] if bad else [])
+    lines += [
+        "| coin | minutes | correlation | sides | median abs diff | worst abs diff "
+        "| biggest move |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for coin, minutes, correlation, worst, median, biggest, sides in rows:
         shown = "n/a" if correlation is None else f"{correlation:.6f}"
         # `.6g` rather than a fixed 4 decimals: when the two sides agree the residual is
         # float noise, and rounding it to 0.0000 hides whether that is what happened.
         lines.append(
-            f"| {coin} | {minutes:,} | {shown} | {median:.6g} | {worst:.6g} | {biggest:,.4f} |"
+            f"| {coin} | {minutes:,} | {shown} | {'n/a' if sides is None else f'{sides:.6f}'} | "
+            f"{median:.6g} | {worst:.6g} | {biggest:,.4f} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -165,13 +212,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no minute of {args.day} is in both sets", file=sys.stderr)
         return 1
 
-    report = render(args.day, rows)
+    bad = failures(rows)
+    report = render(args.day, rows, bad)
     out = Path(args.reports_dir) / "data_quality" / f"oi_from_fills_{args.day}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report)
     print(report)
     print(f"wrote {out}")
-    return 0
+    for line in bad:
+        print(f"FAIL {line}", file=sys.stderr)
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

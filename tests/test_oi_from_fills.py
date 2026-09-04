@@ -72,7 +72,7 @@ def write_fills(tmp_path: Path, rows: list[dict[str, object]]) -> list[str]:
 def deltas(tmp_path: Path, rows: list[dict[str, object]]) -> dict[tuple[str, int], float]:
     files = write_fills(tmp_path, rows)
     found = oi.oi_deltas(duckdb.connect(), files, None).fetchall()
-    return {(coin, minute): round(delta, 9) for coin, minute, delta, _ in found}
+    return {(coin, minute): round(delta, 9) for coin, minute, delta, _long, _fills in found}
 
 
 def test_five_fills_give_the_exact_change_in_open_interest(tmp_path: Path) -> None:
@@ -165,21 +165,59 @@ def test_the_archive_difference_is_labelled_with_the_minute_it_happened_in(
 
 
 def test_the_two_sides_agree_when_the_fills_explain_the_archive(tmp_path: Path) -> None:
-    """End to end on the alignment: the same change, computed two ways, matches."""
+    """End to end: the alignment, the both-sides formula and the gate together.
+
+    Fills come in maker and taker pairs, which is why the ratio is 2 in every minute and
+    not only on average: each trade puts one account's `abs(position)` up by the size on
+    each side of it.
+    """
+    other = "0x" + "2" * 40
     write_fills(
         tmp_path,
         [
-            fill("BTC", "B", 2.0, 0.0),  # +2 during minute 0
-            fill("BTC", "A", 0.5, 2.0, ts_ms=MINUTE + 60_000),  # -0.5 during minute 1
+            # minute 0: a 2 long opened against a 2 short. Both sides +4, long only +2.
+            fill("BTC", "B", 2.0, 0.0),
+            fill("BTC", "A", 2.0, 0.0) | {"user_address": other, "crossed": False},
+            # minute 1: half of each closed. Both sides -1, long only -0.5.
+            fill("BTC", "A", 0.5, 2.0, ts_ms=MINUTE + 60_000),
+            fill("BTC", "B", 0.5, -2.0, ts_ms=MINUTE + 60_000)
+            | {"user_address": other, "crossed": False},
         ],
     )
-    write_archive(tmp_path, "BTC", [10.0, 12.0, 11.5])
+    write_archive(tmp_path, "BTC", [10.0, 14.0, 13.0])
     code = oi.main([DAY, "--data-dir", str(tmp_path), "--reports-dir", str(tmp_path / "reports")])
     assert code == 0
 
     text = (tmp_path / "reports" / "data_quality" / f"oi_from_fills_{DAY}.md").read_text()
-    assert "| BTC | 2 |" in text
-    assert "| 1.000000 | 0 | 0 |" in text  # correlation, median and worst absolute diff
+    assert "**Gate: PASS.**" in text
+    assert "| BTC | 2 | 1.000000 | 2.000000 | 0 | 0 |" in text
+
+
+def test_a_one_sided_open_interest_fails_the_gate_loudly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The failure that hid the first time: still correlation 1, every number halved.
+
+    If Hyperliquid ever redefines `open_interest` to one side, the script has to say so
+    rather than report a clean-looking comparison against a quantity that moved.
+    """
+    write_fills(
+        tmp_path,
+        [
+            fill("BTC", "B", 2.0, 0.0),
+            fill("BTC", "A", 2.0, 0.0) | {"user_address": "0x" + "2" * 40},
+            fill("BTC", "A", 1.0, 2.0, ts_ms=MINUTE + 60_000),
+        ],
+    )
+    # The fills move both-sides open interest by +4 then -1, and long-only by +2 then -1.
+    # An archive that moved by the long-only amounts is a one-sided definition.
+    write_archive(tmp_path, "BTC", [10.0, 12.0, 11.0])
+    code = oi.main([DAY, "--data-dir", str(tmp_path), "--reports-dir", str(tmp_path / "reports")])
+
+    assert code == 1
+    assert "counting 1.0 sides of the book, not 2.0" in capsys.readouterr().err
+    text = (tmp_path / "reports" / "data_quality" / f"oi_from_fills_{DAY}.md").read_text()
+    assert "**Gate: FAIL.**" in text
 
 
 def test_a_missing_archive_partition_says_what_to_run(
