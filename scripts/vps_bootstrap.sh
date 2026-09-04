@@ -7,6 +7,11 @@
 # the firewall is opened for it BEFORE ufw is enabled and BEFORE sshd is restarted, so a
 # mistake cannot lock you out mid script. Keep your current session open until you have
 # proved a new one works on the new port.
+#
+# It does not give the box access to a private repo. scripts/deploy.sh clones as the
+# liqfade user, which is created here with no keys of its own, so a private repo needs a
+# read-only deploy key at /home/liqfade/.ssh/id_ed25519 plus github.com in that user's
+# known_hosts. Stage 8 of scripts/wizard_phase1_recorder.sh creates both.
 set -euo pipefail
 
 SSH_PORT="${1:-2222}"
@@ -229,11 +234,18 @@ Do these now, in this order, and do NOT close this session yet.
        install -o $SERVICE_USER -g $SERVICE_USER -m 0600 /dev/null $APP_ROOT/.env
        # then paste the values from .env.example into it. Never paste keys into chat.
 
-5. Deploy the app and install the units:
-       bash scripts/deploy.sh
+5. Deploy the app and install the units. The repo is not on the box yet, and this
+   script did not put it there, so pipe deploy.sh up from your laptop instead:
+       ssh -p $SSH_PORT root@<host> "LIQFADE_REPO_URL=<your repo url> bash -s" < scripts/deploy.sh
+   After the first deploy the clone is on the box, so the URL is no longer needed:
+       ssh -p $SSH_PORT root@<host> 'bash -s' < scripts/deploy.sh
+   It starts the recorder and the panel only. liqfade-live and liqfade-watchdog are
+   installed but never enabled by deploy.sh.
 
 Notes
-  - The panel binds 127.0.0.1:8787 and is reached over Tailscale or an SSH tunnel:
+  - The panel binds 127.0.0.1:8787 and nothing else, so it is reached through an SSH
+    tunnel, which itself runs over Tailscale once that is up. Tailscale alone does not
+    reach it: there is nothing listening on the tailnet address.
         ssh -p $SSH_PORT -L 8787:127.0.0.1:8787 <you>@<this host>
   - Nothing here starts trading. Live orders additionally need LIQFADE_ENV=mainnet,
     LIQFADE_LIVE_TRADING=1 and no $APP_ROOT/data/KILL file.

@@ -113,7 +113,9 @@ Leave it running. Check back the next day and confirm there are no gaps.
 
 ### 6. Open the dashboard
 
-Over Tailscale, or over an SSH tunnel:
+Through an SSH tunnel, which runs over Tailscale once step 2 is done. Tailscale on its
+own does not reach the dashboard: it listens on the server's own loopback address and
+nowhere else, so there is nothing on the tailnet address to connect to.
 
 ```bash
 ssh -p 2222 -L 8787:127.0.0.1:8787 <you>@<server>
@@ -124,7 +126,7 @@ Generate the password hash on the server with `liqfade panel hash-password` and 
 `/srv/liqfade/.env` as `LIQFADE_PANEL_PASSWORD_HASH`.
 
 The dashboard only ever listens on the server's own loopback address. It is never exposed
-to the internet. The code refuses to start if you point it at a public address without
+to the internet, and the tunnel is what carries it to you. The code refuses to start if you point it at a public address without
 explicitly overriding that.
 
 ## The four services
