@@ -312,6 +312,43 @@ def test_a_pull_writes_three_tables_and_records_the_object(client: FakeS3, tmp_p
     assert manifest.total_rows()["liquidations"] == 2
 
 
+def test_batches_are_bounded_by_bytes_not_line_count() -> None:
+    """One fat line fills a batch on its own; small lines are grouped up to the budget.
+
+    Line count is the wrong unit: a block during a cascade carries hundreds of events, so
+    a fixed number of lines is megabytes on a quiet hour and gigabytes on 2025-10-10.
+    """
+    assert list(hl_s3._batches([b"a" * 100], 10)) == [[b"a" * 100]]
+    assert list(hl_s3._batches([b"ab", b"cd", b"ef"], 4)) == [[b"ab", b"cd"], [b"ef"]]
+    assert list(hl_s3._batches([], 10)) == []
+
+
+def test_batching_writes_the_same_rows_as_one_pass(tmp_path: Path, monkeypatch) -> None:
+    """A batch per line must not change a single row.
+
+    The largest hour in the archive (the 2025-10-10 cascade, 340 MB compressed) cannot
+    be held in memory at once, so the parse runs in batches. Batches split on line
+    boundaries and a line is one block, so trade pairs stay together and the output has
+    to be identical however small the batches are.
+    """
+
+    def rows(root: Path, table: str) -> list[dict[str, object]]:
+        files = sorted((root / table).glob("date=*/*.parquet"))
+        return [row for file in files for row in pq.read_table(file).to_pylist()]
+
+    whole = tmp_path / "whole"
+    hl_s3.write_one_file(whole, SAMPLE_LZ4)
+
+    monkeypatch.setattr(hl_s3, "BATCH_BYTES", 1)
+    batched = tmp_path / "batched"
+    counts = hl_s3.write_one_file(batched, SAMPLE_LZ4)
+
+    for table in hl_s3.TABLES:
+        one_pass, in_batches = rows(whole, table), rows(batched, table)
+        assert len(one_pass) == len(in_batches) == counts[table]
+        assert sorted(map(str, one_pass)) == sorted(map(str, in_batches))
+
+
 def test_the_raw_file_is_deleted_after_parsing_unless_keep_raw(
     client: FakeS3, tmp_path: Path
 ) -> None:

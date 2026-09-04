@@ -72,6 +72,13 @@ LIQUIDATED_ON_BUY = "short"
 # Seconds of price action either side of a liquidation used by the side rule check.
 SIDE_CHECK_WINDOW_S = 60
 
+# Raw JSON bytes parsed and written per batch. Counted in bytes rather than lines
+# because a line is one block and a block during a cascade carries hundreds of events:
+# on 2025-10-10 a few thousand lines are already gigabytes, while a quiet hour needs tens
+# of thousands to fill one batch. Parsed rows cost several times their JSON, so this
+# leaves room for a handful of workers on a 16 GB box.
+BATCH_BYTES = 16 * 1024 * 1024
+
 
 def day_prefix(day: date) -> str:
     return f"{PREFIX}/{day:%Y%m%d}/"
@@ -339,18 +346,50 @@ def stage_fills(local: Path, key: str, stage_root: Path) -> dict[str, int]:
     return write_one_file(stage_root, local, None)
 
 
+def _batches(lines: Iterable[bytes], max_bytes: int) -> Iterator[list[bytes]]:
+    """Group lines into batches of at most `max_bytes` of JSON, splitting only on lines.
+
+    A line that is on its own larger than the budget still goes out alone: the point is
+    to bound how much is held at once, not to guarantee a size.
+    """
+    batch: list[bytes] = []
+    size = 0
+    for line in lines:
+        batch.append(line)
+        size += len(line)
+        if size >= max_bytes:
+            yield batch
+            batch, size = [], 0
+    if batch:
+        yield batch
+
+
 def write_one_file(root: Path, path: Path, check: SideRuleCheck | None = None) -> dict[str, int]:
-    """Parse one downloaded object and write its three tables. Returns rows per table."""
-    fills = list(parse_fills(read_lz4_lines(path)))
-    liquidations = derive_liquidations(fills)
-    trades = derive_trades(fills)
-    if check is not None:
-        check.add(liquidations, trades)
-    return {
-        "fills_full": write_partitioned(root, "fills_full", VENUE, SOURCE_HL_S3, fills),
-        "liquidations": write_partitioned(root, "liquidations", VENUE, SOURCE_HL_S3, liquidations),
-        "trades": write_partitioned(root, "trades", VENUE, SOURCE_HL_S3, trades),
-    }
+    """Parse one downloaded object and write its three tables. Returns rows per table.
+
+    Parsed in byte-bounded batches rather than all at once. Hours are not the same size:
+    a quiet hour is 20 MB compressed while the 2025-10-10 cascade is 340 MB, which
+    expands to tens of GB of Python objects and kills the worker holding it. Batching
+    caps that at one batch's worth however big the object is.
+
+    A batch boundary is always a line boundary, and a line is one block, so both halves
+    of a trade stay in the same batch and `derive_trades` still sees its pairs. Each
+    batch appends its own Parquet file to the partition, which readers glob and
+    compaction folds, exactly as the recorder's hourly flushes already do.
+    """
+    totals = {"fills_full": 0, "liquidations": 0, "trades": 0}
+    for batch in _batches(read_lz4_lines(path), BATCH_BYTES):
+        fills = list(parse_fills(batch))
+        liquidations = derive_liquidations(fills)
+        trades = derive_trades(fills)
+        if check is not None:
+            check.add(liquidations, trades)
+        totals["fills_full"] += write_partitioned(root, "fills_full", VENUE, SOURCE_HL_S3, fills)
+        totals["liquidations"] += write_partitioned(
+            root, "liquidations", VENUE, SOURCE_HL_S3, liquidations
+        )
+        totals["trades"] += write_partitioned(root, "trades", VENUE, SOURCE_HL_S3, trades)
+    return totals
 
 
 def run(
