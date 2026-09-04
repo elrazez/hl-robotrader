@@ -177,6 +177,22 @@ def test_hl_asset_ctx_stamps_receive_time_because_the_venue_sends_none() -> None
     assert row["premium"] == -0.0002484705
 
 
+def test_hl_asset_ctx_carries_the_impact_prices_the_archive_also_has() -> None:
+    """`impactPxs` is [bid, ask]: the same spread signal live and for the year."""
+    (row,) = rows_for(hl.parse(HL_ASSET_CTX, RX), "asset_ctx")
+    assert (row["impact_bid_px"], row["impact_ask_px"]) == (78862.0, 78863.0)
+
+
+@pytest.mark.parametrize("impact", [b'"impactPxs":[],', b'"impactPxs":["78862.0"],', b""])
+def test_hl_asset_ctx_leaves_a_missing_impact_price_null_rather_than_zero(
+    impact: bytes,
+) -> None:
+    """A coin with an empty side sends a short list or none at all."""
+    payload = HL_ASSET_CTX.replace(b'"impactPxs":["78862.0","78863.0"],', impact)
+    (row,) = rows_for(hl.parse(payload, RX), "asset_ctx")
+    assert row["impact_ask_px"] is None
+
+
 @pytest.mark.parametrize("payload", [HL_SUB_ACK, HL_PONG])
 def test_hl_control_frames_produce_no_rows(payload: bytes) -> None:
     assert hl.parse(payload, RX) == []

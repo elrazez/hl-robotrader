@@ -172,6 +172,10 @@ def _candle(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 def _asset_ctx(data: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
     ctx = data.get("ctx") or {}
+    # `impactPxs` is [bid, ask], the average fill price of a fixed notional against each
+    # side of the book. A coin with an empty side sends a short list or none at all, so
+    # the pair is read positionally and missing entries stay null rather than becoming 0.
+    impact = ctx.get("impactPxs") or []
     return (
         "asset_ctx",
         {
@@ -186,5 +190,7 @@ def _asset_ctx(data: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
             "open_interest": _f(ctx.get("openInterest")),
             "day_ntl_vlm": _f(ctx.get("dayNtlVlm")),
             "premium": _f(ctx.get("premium")),
+            "impact_bid_px": _f(impact[0]) if len(impact) > 0 else None,
+            "impact_ask_px": _f(impact[1]) if len(impact) > 1 else None,
         },
     )

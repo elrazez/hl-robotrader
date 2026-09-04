@@ -124,6 +124,13 @@ ASSET_CTX = pa.schema(
         ("open_interest", F64),  # coin units
         ("day_ntl_vlm", F64),  # USD
         ("premium", F64),
+        # Hyperliquid's impact prices, the average fill price of a fixed notional against
+        # the book on each side. `activeAssetCtx` sends them as `impactPxs: [bid, ask]`
+        # and the `asset_ctxs` archive as two columns, so the same spread signal is
+        # available live and for the year of history. Nullable: a coin with an empty side
+        # has none, and the archive predates the field on its oldest days.
+        ("impact_bid_px", F64),
+        ("impact_ask_px", F64),
     ]
 )
 

@@ -43,7 +43,7 @@ Approach for v0:
 - REST: `POST https://api.hyperliquid.xyz/info`, `POST https://api.hyperliquid.xyz/exchange`
 - WS: `wss://api.hyperliquid.xyz/ws`; testnet `wss://api.hyperliquid-testnet.xyz/ws`
 - Ping every 20s; server closes idle connections after 60s. Reconnect logic is mandatory; missed data is not replayed except via snapshot on resubscribe.
-- Subscriptions used: `trades` (per coin), `l2Book` (per coin, pushed on block, at least 0.5s apart), `bbo` (per coin), `candle` (per coin, `1m`), `activeAssetCtx` (per coin: markPx, oraclePx, funding, openInterest, dayNtlVlm, premium), `allMids`.
+- Subscriptions used: `trades` (per coin), `l2Book` (per coin, pushed on block, at least 0.5s apart), `bbo` (per coin), `candle` (per coin, `1m`), `activeAssetCtx` (per coin: markPx, oraclePx, midPx, funding, openInterest, dayNtlVlm, premium, impactPxs), `allMids`.
 - Info calls used: `metaAndAssetCtxs` (universe selection: dayNtlVlm, openInterest, maxLeverage, szDecimals), `candleSnapshot` (backfill, max 5000 candles per call), `l2Book`, `clearinghouseState`, `openOrders`, `userFills`, `userFillsByTime`, `fundingHistory`.
 - Universe refresh: every 60 minutes from `metaAndAssetCtxs`. Recorder subscribes to the top N by `dayNtlVlm` plus a fixed core list (BTC, ETH, SOL, HYPE).
 
@@ -89,7 +89,7 @@ All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for his
 - `trades`: `venue, coin, ts_ms, rx_ms, source, px, sz, side (buy|sell aggressor), tid`
 - `bbo`: `coin, ts_ms, rx_ms, source, bid_px, bid_sz, ask_px, ask_sz`
 - `l2`: `coin, ts_ms, rx_ms, source, level, bid_px, bid_sz, ask_px, ask_sz` (top 20 levels)
-- `asset_ctx`: `coin, ts_ms, rx_ms, source, mark_px, oracle_px, mid_px, funding, open_interest, day_ntl_vlm, premium`
+- `asset_ctx`: `coin, ts_ms, rx_ms, source, mark_px, oracle_px, mid_px, funding, open_interest, day_ntl_vlm, premium, impact_bid_px, impact_ask_px`
 - `candles_1m`: `coin, ts_ms, source, o, h, l, c, v, n`
 - `xchg_ctx` (Coinalyze): `venue, coin, ts_ms, rx_ms, source, open_interest, funding, predicted_funding`
 - `fills_full` (the pay-once archive, `hl_s3` only): `coin, ts_ms, rx_ms, source, block_time, block_number, local_time, user_address, px, sz, side (B|A raw), start_position, dir, closed_pnl, hash, oid, crossed, fee, fee_token, tid, cloid, builder, builder_fee, twap_id, liq_user, liq_mark_px, liq_method`. Every field of every Hyperliquid fill for every coin, no universe filter. `liquidations` and `trades` for `source = hl_s3` are derived from this table and can be rebuilt with `liqfade backfill rederive` at no cost. See "Pay once, keep everything" below.
