@@ -222,6 +222,39 @@ def test_backfill_without_dates_explains_itself_and_exits_one(
     assert "needs --start and --end" in capsys.readouterr().err
 
 
+def test_workers_zero_is_refused_rather_than_read_as_the_default(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """`args.workers or 6` read an explicit 0 as "not given", which is the opposite."""
+    code = main(
+        [
+            "backfill",
+            "rederive",
+            "--start",
+            "2026-09-01",
+            "--end",
+            "2026-09-01",
+            "--workers",
+            "0",
+            "--data-dir",
+            str(tmp_path),
+        ]
+    )
+    assert code == 1
+    assert "is not a worker count" in capsys.readouterr().err
+
+
+def test_a_flag_only_one_job_acts_on_is_refused_for_the_others(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Every backfill job accepted --force and only rederive did anything with it."""
+    argv = ["backfill", "tardis", "--start", "2026-09-01", "--end", "2026-09-01"]
+    assert main([*argv, "--force", "--data-dir", str(tmp_path)]) == 1
+    assert "--force does nothing for tardis" in capsys.readouterr().err
+    assert main([*argv, "--dry-run", "--data-dir", str(tmp_path)]) == 1
+    assert "--dry-run does nothing for tardis" in capsys.readouterr().err
+
+
 def test_a_bad_date_is_reported_rather_than_traced(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["backfill", "rederive", "--start", "2026-13-01", "--end", "2026-09-01"]) == 1
     assert "bad date" in capsys.readouterr().err

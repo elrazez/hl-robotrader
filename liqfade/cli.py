@@ -235,6 +235,35 @@ def _dates(args: argparse.Namespace) -> tuple[Any, Any]:
     return parse_day(args.start), parse_day(args.end)
 
 
+# Flags on the shared `backfill` parser that only one job acts on. Passing one to any
+# other job used to do nothing at all, silently.
+JOB_ONLY_FLAGS = {"force": "rederive", "dry_run": "rederive"}
+
+
+def _reject_flags_the_job_ignores(args: argparse.Namespace) -> None:
+    from liqfade.data.ingest.common import BackfillError
+
+    for flag, owner in JOB_ONLY_FLAGS.items():
+        if getattr(args, flag, False) and args.job != owner:
+            spelled = "--" + flag.replace("_", "-")
+            raise BackfillError(f"{spelled} does nothing for {args.job}; only {owner} acts on it")
+
+
+def _workers(args: argparse.Namespace, *, default: int) -> int:
+    """--workers, with `0` refused rather than silently becoming the default.
+
+    `args.workers or default` read an explicit `--workers 0` as "not given", which is the
+    opposite of what somebody typing it means.
+    """
+    from liqfade.data.ingest.common import BackfillError
+
+    if args.workers is None:
+        return default
+    if args.workers < 1:
+        raise BackfillError(f"--workers {args.workers} is not a worker count; pass 1 or more")
+    return int(args.workers)
+
+
 def cmd_backfill(args: argparse.Namespace) -> int:
     """Historical ingestion. Every S3 job estimates before it spends. See docs/DATA_SOURCES.md."""
     import httpx
@@ -255,6 +284,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     coins = [coin.strip().upper() for coin in args.coins.split(",") if coin.strip()]
 
     try:
+        _reject_flags_the_job_ignores(args)
         start, end = _dates(args)
 
         if args.job == "s3-fills":
@@ -266,12 +296,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
-                workers=args.workers or 6,
+                workers=_workers(args, default=6),
             )
         if args.job == "rederive":
             from liqfade.data.ingest.common import day_range
 
-            days = day_range(start, end, newest_first=True)
+            days = [day.isoformat() for day in day_range(start, end, newest_first=True)]
             if args.dry_run:
                 return hl_s3.rederive_plan(data_dir, days)
             # It rewrites both derived partitions of every day and deletes the originals,
@@ -281,7 +311,9 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 raise BackfillError(refuse)
             # Two workers, not six: a rederive worker holds a whole day of fills_full,
             # up to ~13M rows on a cascade day, where an S3 worker holds one hour.
-            return hl_s3.rederive(data_dir, start, end, force=args.force, workers=args.workers or 2)
+            return hl_s3.rederive(
+                data_dir, start, end, force=args.force, workers=_workers(args, default=2)
+            )
         if args.job == "l2":
             # Checked before the S3 client is built, so a missing --coins is a one line
             # error rather than an AWS configuration error on top of it.
@@ -295,7 +327,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
-                workers=args.workers or 6,
+                workers=_workers(args, default=6),
             )
         if args.job == "candles":
             with httpx.Client() as client:

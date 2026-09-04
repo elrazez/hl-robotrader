@@ -117,13 +117,47 @@ def read_fills(files: list[Path]) -> pl.DataFrame:
     return pl.concat(frames, how="vertical", rechunk=False)
 
 
-def _stable_by_ts(frame: pl.DataFrame) -> pl.DataFrame:
+def stable_by_ts(frame: pl.DataFrame) -> pl.DataFrame:
     """Sort on `ts_ms` alone, stably, so rows sharing a millisecond keep their order.
+
+    The hardest invariant in this repo, so it is written once and both callers use it:
+    the twins here, and `hl_s3._assemble`, which sorts the same rows again after
+    concatenating the partition's other venues around them.
+
+    **The tie rule is that there is no tie to break.** Rows sharing a millisecond keep
+    their input order, and for our rows that is `fills_full`'s order, which is the
+    exchange's own event order. Never sort on `tid`: a Hyperliquid `tid` is a hash, not a
+    sequence, so it replaces that order with an arbitrary one and a minute's open and
+    close come out wrong (docs/DECISIONS.md, 2026-09-04). And after `_assemble` drops
+    every Hyperliquid row that is not ours, a cross-venue tie inside one millisecond is
+    between events on different exchanges, so the order between them carries no meaning
+    and any stable answer is as good as another.
 
     `fill_null(0)` mirrors the dict functions' `row["ts_ms"] or 0`: a row with no
     timestamp sorts as if it were at the epoch rather than being pushed to one end.
     """
     return frame.sort(pl.col("ts_ms").fill_null(0), maintain_order=True)
+
+
+def _pick_one_per_group(
+    indexed: pl.DataFrame, fills: pl.DataFrame, preferred: pl.Expr, flag: str
+) -> pl.DataFrame:
+    """One row of `fills` per group of `indexed`, in first-appearance order, plus `flag`.
+
+    `preferred` picks the group's meaningful fill: the taker for a trade, the liquidated
+    user's own record for a liquidation. When the file holds only the other half of the
+    pair there is none, so the group falls back to its first fill and `flag` is False,
+    which is the branch that inverts the side. `indexed` carries `_row`, the position in
+    `fills` taken before any join reordered anything.
+    """
+    picked = (
+        indexed.group_by(GROUP_KEY, maintain_order=True)
+        .agg(_chosen=pl.col("_row").filter(preferred).first(), _first=pl.col("_row").first())
+        .with_columns(**{flag: pl.col("_chosen").is_not_null()})
+    )
+    rows = picked.select(pl.coalesce("_chosen", "_first")).to_series()
+    gathered = fills.clear() if rows.is_empty() else fills[rows]
+    return gathered.with_columns(**{flag: picked.get_column(flag)})
 
 
 def derive_trades_frame(fills: pl.DataFrame) -> pl.DataFrame:
@@ -135,16 +169,7 @@ def derive_trades_frame(fills: pl.DataFrame) -> pl.DataFrame:
     record still produces a row.
     """
     taker = pl.col("crossed").fill_null(False)
-    picked = (
-        fills.with_row_index("_row")
-        .group_by(GROUP_KEY, maintain_order=True)
-        .agg(
-            _chosen=pl.col("_row").filter(taker).first(),
-            _first=pl.col("_row").first(),
-        )
-        .with_columns(_has_taker=pl.col("_chosen").is_not_null())
-    )
-    rows = _gather(fills, picked).with_columns(_has_taker=picked.get_column("_has_taker"))
+    rows = _pick_one_per_group(fills.with_row_index("_row"), fills, taker, "_has_taker")
 
     # The taker's B is a buy; a lone maker's B means the aggressor sold to it. Written as
     # the dict function's two branches rather than as `(side == "B") == _has_taker`,
@@ -153,7 +178,7 @@ def derive_trades_frame(fills: pl.DataFrame) -> pl.DataFrame:
     # disagreed on a maker-only group with no side; neither writer emits one today.
     bid = pl.col("side") == "B"
     buy, sell = pl.lit("buy"), pl.lit("sell")
-    return _stable_by_ts(
+    return stable_by_ts(
         rows.select(
             venue=pl.lit(VENUE, pl.String),
             coin=pl.col("coin"),
@@ -201,20 +226,13 @@ def derive_liquidations_frame(fills: pl.DataFrame) -> pl.DataFrame:
         # the victim can be recognised row by row in the aggregation below.
         .with_columns(_liq_user=pl.col("liq_user").filter(named).first().over(GROUP_KEY))
     )
-    picked = (
-        liq.group_by(GROUP_KEY, maintain_order=True)
-        .agg(
-            _chosen=pl.col("_row").filter(pl.col("user_address") == pl.col("_liq_user")).first(),
-            _first=pl.col("_row").first(),
-        )
-        .with_columns(_has_victim=pl.col("_chosen").is_not_null())
-    )
-    rows = _gather(fills, picked).with_columns(_has_victim=picked.get_column("_has_victim"))
+    victim = pl.col("user_address") == pl.col("_liq_user")
+    rows = _pick_one_per_group(liq, fills, victim, "_has_victim")
 
     # The forced party sold if it is the victim and its side is "A"; if the victim's own
     # record is missing we hold the counterparty's, whose "B" means the victim sold.
     forced_to_sell = (pl.col("side") == "A") == pl.col("_has_victim")
-    return _stable_by_ts(
+    return stable_by_ts(
         rows.select(
             venue=pl.lit(VENUE, pl.String),
             coin=pl.col("coin"),
@@ -233,14 +251,3 @@ def derive_liquidations_frame(fills: pl.DataFrame) -> pl.DataFrame:
             complete=pl.lit(True, pl.Boolean),
         )
     )
-
-
-def _gather(fills: pl.DataFrame, picked: pl.DataFrame) -> pl.DataFrame:
-    """One row of `fills` per group of `picked`, in `picked`'s order.
-
-    `_chosen` is the group's preferred fill (the taker, or the liquidated user's own
-    record) and is null when the file holds only the other half of the pair; `_first`
-    is the group's first fill, which is what the dict functions fall back to.
-    """
-    rows = picked.select(pl.coalesce("_chosen", "_first")).to_series()
-    return fills.clear() if rows.is_empty() else fills[rows]

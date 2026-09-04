@@ -520,7 +520,7 @@ REDERIVE_STATUS = {
 }
 
 
-def _partition_is_current(root: Path, stamp: str) -> bool:
+def _partition_is_current(root: Path, day: str) -> bool:
     """True when both derived tables are one file that this job wrote.
 
     The resume rule. The run is detached behind a retry loop and the mount times out an
@@ -534,7 +534,7 @@ def _partition_is_current(root: Path, stamp: str) -> bool:
     from liqfade.recorder.writer import lake_files, partition_dir
 
     for table in ("trades", "liquidations"):
-        files = lake_files(partition_dir(root, table, stamp))
+        files = lake_files(partition_dir(root, table, day))
         if len(files) != 1 or files[0].name != REDERIVE_OUTPUT:
             return False
         key, value = REDERIVE_STAMP
@@ -572,7 +572,7 @@ def _finish_interrupted(directory: Path) -> None:
     os.replace(pending, directory / REDERIVE_OUTPUT)
 
 
-def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, int]:
+def _assemble(root: Path, table: str, day: str, derived: Any) -> tuple[int, int]:
     """Rewrite one day's partition: our rows become `derived`, other sources are kept.
 
     **No Hyperliquid row survives that is not ours.** This is only ever called for a day
@@ -608,7 +608,7 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     from liqfade.data.schemas import schema_for, validate_table
     from liqfade.recorder.writer import lake_files, partition_dir
 
-    directory = partition_dir(root, table, stamp)
+    directory = partition_dir(root, table, day)
     _finish_interrupted(directory)
     existing = sorted(lake_files(directory)) if directory.is_dir() else []
     columns = schema_for(table).names
@@ -621,10 +621,12 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
         if others.height:
             kept.append(others.select(columns))
 
+    from liqfade.data.derive.from_fills import stable_by_ts
+
     ours = derived.with_columns(source=pl.lit(SOURCE_HL_S3, pl.String)).select(columns)
-    # Stable sort on ts_ms alone, never on tid: rows sharing a millisecond keep the
-    # order they came in, which for our rows is the exchange's own event order.
-    merged = pl.concat([*kept, ours]).sort(pl.col("ts_ms").fill_null(0), maintain_order=True)
+    # One shared sort rule, stated once in `stable_by_ts`: on `ts_ms` alone, stably,
+    # never on `tid`.
+    merged = stable_by_ts(pl.concat([*kept, ours]))
 
     import os
 
@@ -663,7 +665,7 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     return int(ours.height), int(merged.height)
 
 
-def rederive_day(data_dir: str, stamp: str, force: bool) -> tuple[str, dict[str, int], float]:
+def rederive_day(data_dir: str, day: str, force: bool) -> tuple[str, dict[str, int], float]:
     """Rebuild one day. Returns a status, the rows derived per table, and its own seconds.
 
     The duration is measured here rather than in the parent, which submits all 365 days
@@ -691,14 +693,14 @@ def rederive_day(data_dir: str, stamp: str, force: bool) -> tuple[str, dict[str,
     from liqfade.recorder.writer import lake_files, partition_dir
 
     root = Path(data_dir) / "parquet"
-    fills_dir = partition_dir(root, "fills_full", stamp)
+    fills_dir = partition_dir(root, "fills_full", day)
     began = time.monotonic()
 
     for _ in range(RELIST_ATTEMPTS):
         files = sorted(lake_files(fills_dir)) if fills_dir.is_dir() else []
         if not files:
             return "empty", {}, time.monotonic() - began
-        if not force and _partition_is_current(root, stamp):
+        if not force and _partition_is_current(root, day):
             return "skipped", {}, time.monotonic() - began
         try:
             fills = read_fills(files)
@@ -714,10 +716,10 @@ def rederive_day(data_dir: str, stamp: str, force: bool) -> tuple[str, dict[str,
             # as a BackfillError rather than as itself because a PanicException cannot be
             # pickled back to the parent process: the pool then reports a PicklingError
             # for `pyo3_runtime` and the actual cause never reaches the log.
-            raise BackfillError(f"{stamp}: reading fills_full failed: {exc}") from None
-        trades, trades_kept = _assemble(root, "trades", stamp, derive_trades_frame(fills))
+            raise BackfillError(f"{day}: reading fills_full failed: {exc}") from None
+        trades, trades_kept = _assemble(root, "trades", day, derive_trades_frame(fills))
         liquidations, liq_kept = _assemble(
-            root, "liquidations", stamp, derive_liquidations_frame(fills)
+            root, "liquidations", day, derive_liquidations_frame(fills)
         )
         return (
             "done",
@@ -731,7 +733,7 @@ def rederive_day(data_dir: str, stamp: str, force: bool) -> tuple[str, dict[str,
             },
             time.monotonic() - began,
         )
-    raise BackfillError(f"{stamp}: fills_full kept changing under {RELIST_ATTEMPTS} listings")
+    raise BackfillError(f"{day}: fills_full kept changing under {RELIST_ATTEMPTS} listings")
 
 
 def unconsumed(started: dict[Any, str], seen: set[str]) -> list[tuple[str, Any]]:
@@ -744,16 +746,16 @@ def unconsumed(started: dict[Any, str], seen: set[str]) -> list[tuple[str, Any]]
     this reason, over a complete lake.
     """
     return [
-        (stamp, future)
-        for future, stamp in started.items()
-        if stamp not in seen
+        (day, future)
+        for future, day in started.items()
+        if day not in seen
         and future.done()
         and not future.cancelled()
         and future.exception() is None
     ]
 
 
-def rederive_plan(data_dir: Path, days: list[date]) -> int:
+def rederive_plan(data_dir: Path, days: list[str]) -> int:
     """Print what a rederive would read, rewrite and delete per day. Changes nothing.
 
     Sizes come from `stat`, not from the Parquet footers: the point is "how much am I
@@ -765,25 +767,24 @@ def rederive_plan(data_dir: Path, days: list[date]) -> int:
     root = Path(data_dir) / "parquet"
     read_gib, doomed, rewritten = 0.0, 0, 0
     for day in days:
-        stamp = day.isoformat()
-        fills = lake_files(partition_dir(root, "fills_full", stamp))
+        fills = lake_files(partition_dir(root, "fills_full", day))
         if not fills:
-            print(f"{stamp}  {REDERIVE_STATUS['empty']}")
+            print(f"{day}  {REDERIVE_STATUS['empty']}")
             continue
-        if _partition_is_current(root, stamp):
-            print(f"{stamp}  {REDERIVE_STATUS['skipped']}")
+        if _partition_is_current(root, day):
+            print(f"{day}  {REDERIVE_STATUS['skipped']}")
             continue
         deleting = [
             path
             for table in ("trades", "liquidations")
-            for path in lake_files(partition_dir(root, table, stamp))
+            for path in lake_files(partition_dir(root, table, day))
         ]
         gib = sum(path.stat().st_size for path in fills) / 1024**3
         read_gib += gib
         doomed += len(deleting)
         rewritten += 2
         print(
-            f"{stamp}  read {len(fills):>4} fills_full files ({gib:6.2f} GiB)  "
+            f"{day}  read {len(fills):>4} fills_full files ({gib:6.2f} GiB)  "
             f"-> rewrite 2 partitions, delete {len(deleting):>4} files"
         )
     print(
@@ -806,12 +807,12 @@ def rederive(
     import concurrent.futures
     import time
 
-    days = day_range(start, end, newest_first=True)
+    days = [day.isoformat() for day in day_range(start, end, newest_first=True)]
     totals = {"fills": 0, "trades": 0, "liquidations": 0, "kept": 0}
     counts = {"done": 0, "skipped": 0, "empty": 0}
     began = time.monotonic()
 
-    def report(stamp: str, status: str, rows: dict[str, int], seconds: float) -> None:
+    def report(day: str, status: str, rows: dict[str, int], seconds: float) -> None:
         counts[status] += 1
         for table, count in rows.items():
             totals[table] += count
@@ -821,20 +822,17 @@ def rederive(
             if status == "done"
             else REDERIVE_STATUS[status]
         )
-        print(f"{stamp}  {detail}  {seconds:7.1f}s", flush=True)
+        print(f"{day}  {detail}  {seconds:7.1f}s", flush=True)
 
     pool = concurrent.futures.ProcessPoolExecutor(max_workers=max(1, workers))
-    started = {
-        pool.submit(rederive_day, str(data_dir), day.isoformat(), force): day.isoformat()
-        for day in days
-    }
+    started = {pool.submit(rederive_day, str(data_dir), day, force): day for day in days}
     seen: set[str] = set()
 
-    def take(future: concurrent.futures.Future[Any], stamp: str) -> None:
+    def take(future: concurrent.futures.Future[Any], day: str) -> None:
         status, rows, seconds = future.result()
-        seen.add(stamp)
-        report(stamp, status, rows, seconds)
-        log.info("rederived", date=stamp, status=status, seconds=round(seconds, 1), **rows)
+        seen.add(day)
+        report(day, status, rows, seconds)
+        log.info("rederived", date=day, status=status, seconds=round(seconds, 1), **rows)
 
     try:
         for future in concurrent.futures.as_completed(started):
@@ -844,8 +842,8 @@ def rederive(
         # 364 have been worked through. The detached retry loop restarts it and the
         # resume rule skips everything already written.
         pool.shutdown(wait=True, cancel_futures=True)
-        for stamp, future in unconsumed(started, seen):
-            take(future, stamp)
+        for day, future in unconsumed(started, seen):
+            take(future, day)
 
     print(
         f"\n{counts['done']} days rederived, {counts['skipped']} already current, "
