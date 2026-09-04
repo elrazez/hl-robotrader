@@ -120,6 +120,13 @@ def setup_logging(*, proc: str, env: str, level: str = "INFO") -> None:
     root.handlers[:] = [handler]
     root.setLevel(numeric)
 
+    # httpx logs `HTTP Request: POST <full url>` at INFO, and the Telegram bot token sits
+    # in that URL path. _REDACT is keyed on field names and cannot see a secret embedded
+    # in a message string, so the only fix is to not emit the line. Nothing below WARNING
+    # from the HTTP stack is worth the risk of leaking a credential into the journal.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(proc=proc, env=env)
 

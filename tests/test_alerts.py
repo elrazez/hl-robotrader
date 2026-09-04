@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
 from collections.abc import Iterator
+from contextlib import redirect_stdout
 from typing import ClassVar
 
 import httpx
 import pytest
+import structlog
 
 from liqfade.alerts import telegram
 from liqfade.alerts.telegram import send_alert
+from liqfade.log import setup_logging
 
 CREDS = {"TELEGRAM_BOT_TOKEN": "12345:fake", "TELEGRAM_ALERT_CHAT_ID": "42"}
 
@@ -94,3 +99,38 @@ async def test_without_credentials_the_alert_is_logged_and_not_sent(
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_ALERT_CHAT_ID", raising=False)
     assert await send_alert("nobody is listening") is False
+
+
+def test_a_send_leaves_no_bot_token_in_the_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """httpx logs `HTTP Request: POST <url>` at INFO and the token lives in that path.
+
+    A real httpx.AsyncClient over a MockTransport, so httpx's own logging actually runs;
+    a stand-in client would make this test pass without proving anything. Sync, and the
+    send goes through asyncio.run, so setup_logging binds its contextvars in the main
+    context the way test_runtime does rather than in a task that ends with the test.
+    """
+    token = "7654321:SUPERSECRETTOKEN"
+    # Bound before the patch: telegram.httpx is the httpx module itself, so a lambda
+    # reaching for httpx.AsyncClient would find its own replacement.
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        telegram.httpx,
+        "AsyncClient",
+        lambda **_kwargs: real_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, text="{}"))
+        ),
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setenv("TELEGRAM_ALERT_CHAT_ID", "42")
+
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            setup_logging(proc="unit", env="paper", level="INFO")
+            assert asyncio.run(send_alert("cascade on BTC")) is True
+    finally:
+        # setup_logging is global. Put structlog back to unconfigured so this test does
+        # not change the log format every later test reads.
+        structlog.reset_defaults()
+        structlog.contextvars.clear_contextvars()
+    assert token not in buf.getvalue()
