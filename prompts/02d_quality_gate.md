@@ -43,6 +43,26 @@ per day with no *unexplained* holes, written down.
    checked against the manifest in `data/ingest_state/s3-fills.json` (the `rows`
    recorded per object for that day) before it is called a hole.
 
+   Three things already settled on 2026-09-04, so do not re-investigate them:
+   - **Duplicates.** `liquidations` has no `tid`, so keying it on
+     `(coin, ts_ms, px, sz, side, method)` finds ~375k "duplicates" on every day of the
+     year. They are distinct fills: the liquidation engine fills many positions at one
+     mark price in one block. The real test is on `fills_full`, which has `tid` and
+     `user_address`: exact duplicates there were 0 on every day checked (cascade days,
+     crash-restart days, the laptop/VPS handoff) except 10 rows on 2025-11-13, the
+     handoff hour. `liquidations` rows equal the `tid`-deduped liquidation events in
+     `fills_full` exactly. Drop those 10 rows if you like; nothing else needs deduping.
+   - **The manifest.** The keys for 2025-09-01 to 2025-11-13 were pulled on a rented box
+     whose manifest was not copied back before the box was wiped. They were rebuilt
+     locally with `"rebuilt": true`, `size: 0`, `at_ms: 0`, `fills_full` rows from the
+     hourly footers, `liquidations` rows from the compacted day files, and `trades: 0`.
+     The manifest's job is resume (never re-buy the year); its row totals are not a
+     source of truth for those keys. Compare against the lake, not the manifest, there.
+   - **`._*` sidecars.** macOS writes an AppleDouble file beside every Parquet on this
+     NFS-backed mount; they hold no data and break naive globs
+     (`read_parquet('date=*/*.parquet')`). Every reader in this repo must skip names
+     starting with `._`. Delete them freely; they come back on every write.
+
 4. The side rule sanity check on the whole year: for each month, mean signed price move
    in the 60 s into long liquidations and into short liquidations, using the compacted
    tables. `liqfade/data/ingest/hl_s3.py` has `SideRuleCheck` for one day; reuse its
