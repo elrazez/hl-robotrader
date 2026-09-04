@@ -45,7 +45,6 @@ from liqfade.data.ingest.common import (
     list_objects,
     parallel_pull,
     read_lz4_lines,
-    replace_source_rows,
     write_partitioned,
 )
 from liqfade.data.schemas import SOURCE_HL_S3
@@ -476,34 +475,267 @@ def run(
     return 0
 
 
-def rederive(data_dir: Path, start: date, end: date) -> int:
-    """Rebuild `liquidations` and `trades` from the local `fills_full` archive.
+# --- rederive -----------------------------------------------------------------
+#
+# Rebuilding `liquidations` and `trades` from the local `fills_full` archive. Free: it
+# touches no network. This is the whole point of the pay-once rule, and 02d is what it
+# was kept for: `derive_trades` sorted on `(ts_ms, tid)` until 2026-09-04, and a
+# Hyperliquid `tid` is a hash, so the year in the lake has an arbitrary order inside each
+# millisecond. `fills_full` was never sorted and still carries the exchange's order.
+#
+# The work is vectorised through liqfade/data/derive/from_fills.py, not the dict
+# functions above: a year is ~3bn fills and the dict path is hours. The dict functions
+# stay as the reference the twins are tested against.
 
-    Free: it touches no network. This is the whole point of the pay-once rule. Rows from
-    other sources in the same partitions are preserved.
+# The rewritten day is written under the compacted name, so `liqfade compact` leaves the
+# partition alone afterwards and a reader still finds one file per table per day.
+REDERIVE_OUTPUT = "all_day.parquet"
+
+# Stamped into the Parquet footer of every partition this job writes, and the only thing
+# the resume rule trusts. The file name cannot carry that on its own: `liqfade compact` produced
+# exactly this name for every day of the year in 02b, out of the wrongly ordered rows
+# this job exists to replace, so "one file called all_day.parquet" says nothing about
+# whether the rows in it are right. The stamp is not a version either: after a genuine
+# re-pull of `fills_full`, use --force.
+REDERIVE_STAMP = (b"liqfade_rederive", b"1")
+
+# How many times a day is re-listed when its `fills_full` files vanish mid-read. The
+# compaction runs detached alongside this, oldest first, and folds a day's hourly files
+# into one; a day it reaches while a worker is reading it gets listed and redone. Two
+# retries is one more than the single fold that can happen to any given day.
+RELIST_ATTEMPTS = 3
+
+# What a day that did no work prints. `skipped` is the resume rule; `empty` is a day the
+# S3 pull never covered, which is information rather than an error.
+REDERIVE_STATUS = {
+    "skipped": "already current, skipped",
+    "empty": "no fills_full, nothing to rederive",
+}
+
+
+def _partition_is_current(root: Path, stamp: str) -> bool:
+    """True when both derived tables are one file that this job wrote.
+
+    The resume rule. The run is detached behind a retry loop and the mount times out an
+    open every few hours, so a restart has to be cheap. It reads the footer rather than
+    the mtime, because the `fills_full` compaction runs alongside this and rewrites a
+    day's fills without changing a single row of them; comparing timestamps would redo
+    every day it happened to reach after this job had already done it.
     """
     import pyarrow.parquet as pq
 
-    from liqfade.recorder.writer import partition_dir
+    from liqfade.recorder.writer import lake_files, partition_dir
+
+    for table in ("trades", "liquidations"):
+        files = lake_files(partition_dir(root, table, stamp))
+        if len(files) != 1 or files[0].name != REDERIVE_OUTPUT:
+            return False
+        key, value = REDERIVE_STAMP
+        if (pq.read_metadata(files[0]).metadata or {}).get(key) != value:
+            return False
+    return True
+
+
+def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, int]:
+    """Rewrite one day's partition: our rows become `derived`, other sources are kept.
+
+    Two kinds of row do not survive. Ours, `source == "hl_s3"`, because that is what is
+    being replaced. And Tardis's Hyperliquid rows, because `hl_s3` is the one source of
+    Hyperliquid trades and liquidations: Tardis covers Hyperliquid on the twelve free
+    first-of-month days with the same trades under the same `tid`, so leaving them in
+    counts every trade twice on those days. Same rule as "counting a liquidation once";
+    see docs/DATA_SOURCES.md, "Counting a trade once".
+
+    Everything is read before anything is written, and the old files are deleted only
+    after the new one is in place, so a failure anywhere leaves the partition as it was.
+
+    Returns (rows derived, rows in the partition). The two differ on any day the
+    recorder or Tardis also wrote: 2026-03-01 is a Tardis free day, so its `trades`
+    partition keeps 46.8M Binance, Bybit and OKX rows around our 3.4M.
+    """
+    import polars as pl
+
+    from liqfade.data.schemas import SOURCE_TARDIS, schema_for, validate_table
+    from liqfade.recorder.writer import lake_files, partition_dir, write_atomic
+
+    directory = partition_dir(root, table, stamp)
+    existing = sorted(lake_files(directory)) if directory.is_dir() else []
+    columns = schema_for(table).names
+
+    kept = []
+    for path in existing:
+        others = pl.read_parquet(path).filter(
+            (pl.col("source") != SOURCE_HL_S3)
+            & ~((pl.col("venue") == VENUE) & (pl.col("source") == SOURCE_TARDIS))
+        )
+        if others.height:
+            kept.append(others.select(columns))
+
+    ours = derived.with_columns(source=pl.lit(SOURCE_HL_S3, pl.String)).select(columns)
+    # Stable sort on ts_ms alone, never on tid: rows sharing a millisecond keep the
+    # order they came in, which for our rows is the exchange's own event order.
+    merged = pl.concat([*kept, ours]).sort(pl.col("ts_ms").fill_null(0), maintain_order=True)
+
+    arrow = merged.to_arrow().cast(schema_for(table))
+    validate_table(table, arrow)  # schema only; the stamp below is footer metadata
+    arrow = arrow.replace_schema_metadata(dict([REDERIVE_STAMP]))
+    directory.mkdir(parents=True, exist_ok=True)
+    write_atomic(arrow, directory / REDERIVE_OUTPUT)
+    for path in existing:
+        if path.name != REDERIVE_OUTPUT:
+            path.unlink()
+    return int(ours.height), int(merged.height)
+
+
+def rederive_day(data_dir: str, stamp: str, force: bool) -> tuple[str, dict[str, int], float]:
+    """Rebuild one day. Returns a status, the rows derived per table, and its own seconds.
+
+    The duration is measured here rather than in the parent, which submits all 365 days
+    at once and would otherwise be timing each one from the start of the run.
+
+    Module level and taking only picklable arguments, because this is the process pool's
+    task. Status is `done`, `skipped` (already current) or `empty` (no archive for the
+    day).
+
+    The `fills_full` compaction runs detached alongside this and deletes a day's hourly
+    files the moment it has folded them into one. That is the only race, and it is
+    handled by listing again: if a read fails and the listing has changed underneath us,
+    the day is redone from the new listing. If the listing is unchanged the read failure
+    is real and is raised, which the detached retry loop turns into a restart.
+    """
+    import time
+
+    import polars as pl
+
+    from liqfade.data.derive.from_fills import (
+        derive_liquidations_frame,
+        derive_trades_frame,
+        read_fills,
+    )
+    from liqfade.recorder.writer import lake_files, partition_dir
 
     root = Path(data_dir) / "parquet"
-    total = {"liquidations": 0, "trades": 0}
-    for day in day_range(start, end, newest_first=False):
-        stamp = day.isoformat()
-        directory = partition_dir(root, "fills_full", stamp)
-        files = sorted(directory.glob("*.parquet")) if directory.is_dir() else []
+    fills_dir = partition_dir(root, "fills_full", stamp)
+    began = time.monotonic()
+
+    for _ in range(RELIST_ATTEMPTS):
+        files = sorted(lake_files(fills_dir)) if fills_dir.is_dir() else []
         if not files:
-            print(f"{stamp}: no fills_full, nothing to rederive")
-            continue
-        fills = [
-            row for path in files for row in pq.read_table(path, partitioning=None).to_pylist()
-        ]
-        for table, rows in (
-            ("liquidations", derive_liquidations(fills)),
-            ("trades", derive_trades(fills)),
-        ):
-            written = replace_source_rows(root, table, stamp, VENUE, SOURCE_HL_S3, rows)
-            total[table] += written
-        print(f"{stamp}: {len(fills)} fills -> {total}")
-    print(f"rederived {total['liquidations']} liquidations and {total['trades']} trades")
+            return "empty", {}, time.monotonic() - began
+        if not force and _partition_is_current(root, stamp):
+            return "skipped", {}, time.monotonic() - began
+        try:
+            fills = read_fills(files)
+        # A bad read off this mount surfaces two ways, seen both within an hour of the
+        # year run: OSError 60 (the mount timed out an open) and a polars PanicException
+        # wrapping OSError 22. The panic is named explicitly because it derives from
+        # BaseException, so no `except Exception` would ever reach it. Which of the two
+        # it is says nothing; the listing does.
+        except (OSError, pl.exceptions.PanicException) as exc:
+            if sorted(lake_files(fills_dir)) != files:
+                continue  # the compaction folded this day underneath us; list again
+            # Every input is still there, so this is a real read failure. It is re-raised
+            # as a BackfillError rather than as itself because a PanicException cannot be
+            # pickled back to the parent process: the pool then reports a PicklingError
+            # for `pyo3_runtime` and the actual cause never reaches the log.
+            raise BackfillError(f"{stamp}: reading fills_full failed: {exc}") from None
+        trades, trades_kept = _assemble(root, "trades", stamp, derive_trades_frame(fills))
+        liquidations, liq_kept = _assemble(
+            root, "liquidations", stamp, derive_liquidations_frame(fills)
+        )
+        return (
+            "done",
+            {
+                "fills": int(fills.height),
+                "trades": trades,
+                "liquidations": liquidations,
+                # Rows of other sources the rewrite preserved: the recorder's, and Tardis's
+                # Binance, Bybit and OKX rows on the twelve free days.
+                "kept": (trades_kept - trades) + (liq_kept - liquidations),
+            },
+            time.monotonic() - began,
+        )
+    raise BackfillError(f"{stamp}: fills_full kept changing under {RELIST_ATTEMPTS} listings")
+
+
+def unconsumed(started: dict[Any, str], seen: set[str]) -> list[tuple[str, Any]]:
+    """Days that finished but whose result nobody took, oldest submission first.
+
+    `cancel_futures` cannot recall a day already handed to the pool's call queue, so when
+    a failure stops the consuming loop a few more days run to completion during the
+    shutdown. Their work is in the lake and stamped; this is what stops their row counts
+    going unreported. The first year run was 26 days short in its own summary for exactly
+    this reason, over a complete lake.
+    """
+    return [
+        (stamp, future)
+        for future, stamp in started.items()
+        if stamp not in seen
+        and future.done()
+        and not future.cancelled()
+        and future.exception() is None
+    ]
+
+
+def rederive(
+    data_dir: Path, start: date, end: date, *, force: bool = False, workers: int = 2
+) -> int:
+    """Rebuild `liquidations` and `trades` from `fills_full` for [start, end], newest first.
+
+    Newest first so this and the detached `fills_full` compaction, which walks oldest
+    first, meet once in the middle instead of contending for the same day repeatedly.
+    One day is one task; a worker holds a whole day, up to ~13M fills on a cascade day,
+    which is what keeps the default worker count low.
+    """
+    import concurrent.futures
+    import time
+
+    days = day_range(start, end, newest_first=True)
+    totals = {"fills": 0, "trades": 0, "liquidations": 0, "kept": 0}
+    counts = {"done": 0, "skipped": 0, "empty": 0}
+    began = time.monotonic()
+
+    def report(stamp: str, status: str, rows: dict[str, int], seconds: float) -> None:
+        counts[status] += 1
+        for table, count in rows.items():
+            totals[table] += count
+        detail = (
+            f"{rows['fills']:>10,} fills -> {rows['trades']:>9,} trades  "
+            f"{rows['liquidations']:>7,} liquidations  {rows['kept']:>9,} kept"
+            if status == "done"
+            else REDERIVE_STATUS[status]
+        )
+        print(f"{stamp}  {detail}  {seconds:7.1f}s", flush=True)
+
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=max(1, workers))
+    started = {
+        pool.submit(rederive_day, str(data_dir), day.isoformat(), force): day.isoformat()
+        for day in days
+    }
+    seen: set[str] = set()
+
+    def take(future: concurrent.futures.Future[Any], stamp: str) -> None:
+        status, rows, seconds = future.result()
+        seen.add(stamp)
+        report(stamp, status, rows, seconds)
+        log.info("rederived", date=stamp, status=status, seconds=round(seconds, 1), **rows)
+
+    try:
+        for future in concurrent.futures.as_completed(started):
+            take(future, started[future])
+    finally:
+        # cancel_futures, so a failed day stops the run now instead of after the other
+        # 364 have been worked through. The detached retry loop restarts it and the
+        # resume rule skips everything already written.
+        pool.shutdown(wait=True, cancel_futures=True)
+        for stamp, future in unconsumed(started, seen):
+            take(future, stamp)
+
+    print(
+        f"\n{counts['done']} days rederived, {counts['skipped']} already current, "
+        f"{counts['empty']} with no archive, in {(time.monotonic() - began) / 60:.1f} min"
+    )
+    for table in ("trades", "liquidations"):
+        print(f"  {table}: {totals[table]:,} rows derived from {totals['fills']:,} fills")
+    print(f"  rows of other sources preserved in those partitions: {totals['kept']:,}")
     return 0

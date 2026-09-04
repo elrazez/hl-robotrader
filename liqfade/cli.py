@@ -236,10 +236,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
-                workers=args.workers,
+                workers=args.workers or 6,
             )
         if args.job == "rederive":
-            return hl_s3.rederive(data_dir, start, end)
+            # Two workers, not six: a rederive worker holds a whole day of fills_full,
+            # up to ~13M rows on a cascade day, where an S3 worker holds one hour.
+            return hl_s3.rederive(data_dir, start, end, force=args.force, workers=args.workers or 2)
         if args.job == "l2":
             # Checked before the S3 client is built, so a missing --coins is a one line
             # error rather than an AWS configuration error on top of it.
@@ -253,7 +255,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 estimate_only=args.estimate_only,
                 yes=args.yes,
                 keep_raw=args.keep_raw,
-                workers=args.workers,
+                workers=args.workers or 6,
             )
         if args.job == "candles":
             with httpx.Client() as client:
@@ -560,9 +562,15 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument(
         "--workers",
         type=int,
-        default=6,
-        help="parallel download workers for the S3 jobs; parsing is staged on the local "
-        "disk and moved to the lake serially, so more workers cost RAM, not disk seeks",
+        default=None,
+        help="parallel workers; default 6 for the S3 pulls, where parsing is staged on "
+        "the local disk and moved to the lake serially, and 2 for rederive, where one "
+        "worker holds a whole day of fills",
+    )
+    backfill.add_argument(
+        "--force",
+        action="store_true",
+        help="rederive: redo days whose derived tables are already current",
     )
     backfill.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     derive = sub.add_parser(

@@ -321,6 +321,31 @@ carries the coin. `trades` and `liquidations` were never affected; they go throu
 `write_partitioned`, which picks a free file name. The two side tables are deleted and
 re-pulled (384 files, ~6.1 GB, free).
 
+**The rederive is vectorised through polars twins, and the dict functions stay as the
+reference.** `derive_trades` and `derive_liquidations` walk Python dicts one row at a
+time, which is right for the S3 parser (one 16 MiB batch of freshly parsed JSON) and
+wrong for a year: ~3bn fills through that path is six to ten hours. So
+`liqfade/data/derive/from_fills.py` holds `derive_trades_frame` and
+`derive_liquidations_frame`, which do the same work in polars and are never allowed to
+disagree. The contract is the test, not the reading: they are asserted equal row for row
+and in order on the fixture, on every maker/taker and victim/counterparty shape, and on
+all 6,744,520 fills of 2026-03-01 (41 hourly files, compared file by file, then the whole
+day checked against the concatenation of the files, which also proves no `(block_time,
+coin, tid)` group ever spans two files). The dict functions were not touched; if the two
+ever disagree the dict one is right.
+
+**The resume rule reads a stamp in the Parquet footer, not the file name and not the
+mtime.** The obvious rule, "skip a day whose `trades` and `liquidations` are already a
+single `all_day.parquet` newer than its `fills_full` files", is wrong here in both halves,
+and the first run of the year proved it by skipping every day. 02b's compaction already
+wrote exactly that file name for all 365 days, out of the wrongly ordered rows this job
+exists to replace, and wrote them after the fills they came from. So the name says
+nothing. The mtime is worse than useless: the `fills_full` compaction runs alongside this
+and rewrites a day's fills without changing one row of them, so any day it reached after
+the rederive had already done it would be redone for nothing. `_assemble` therefore
+stamps `liqfade_rederive=1` into the footer metadata and `_partition_is_current` reads
+it. `--force` is for the one case the stamp cannot see, a genuine re-pull of `fills_full`.
+
 **Hyperliquid's `tid` is a hash, not a sequence, and that was silently reordering
 `trades`.** Two fills of one sweep carry 997296749534590 and 653061949558227 in that
 order. `hl_s3.derive_trades` sorted its output by `(ts_ms, tid)`, so inside a millisecond

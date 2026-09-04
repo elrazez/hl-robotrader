@@ -439,6 +439,14 @@ def test_a_day_with_no_objects_warns(
 # --- rederive -----------------------------------------------------------------
 
 
+def _read_day(root: Path, table: str) -> list[dict[str, object]]:
+    """Every row of one table's partitions, in file order then row order."""
+    from liqfade.recorder.writer import lake_files
+
+    paths = sorted(p for d in sorted((root / table).glob("date=*")) for p in lake_files(d))
+    return [row for path in paths for row in pq.read_table(path, partitioning=None).to_pylist()]
+
+
 def test_rederive_reproduces_the_canonical_tables_from_the_local_archive(
     client: FakeS3, tmp_path: Path
 ) -> None:
@@ -530,3 +538,207 @@ def test_a_pull_with_process_workers_matches_the_serial_pull(tmp_path: Path) -> 
             for p in (pooled_dir / "parquet" / table).rglob("*.parquet")
         )
         assert serial_rows == pooled_rows, table
+
+
+def _trade(**overrides: object) -> dict[str, object]:
+    row = {
+        "venue": "binance",
+        "coin": "BTC",
+        "ts_ms": 1_788_609_540_000,
+        "rx_ms": 0,
+        "px": 78_000.0,
+        "sz": 1.0,
+        "side": "buy",
+        "tid": 9_001,
+    }
+    return row | overrides
+
+
+def test_rederive_drops_the_tardis_copy_of_hyperliquid_and_keeps_the_other_venues(
+    client: FakeS3, tmp_path: Path
+) -> None:
+    """`hl_s3` is the one source of Hyperliquid trades; Tardis carries the same fills.
+
+    On the twelve free first-of-month days Tardis's Hyperliquid trades are the same
+    trades under the same `tid`, so leaving them in doubles `v` and `n` for the coins it
+    covers. Its Binance, Bybit and OKX rows have no other source and stay.
+    """
+    from liqfade.data.ingest.common import write_partitioned
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    root = tmp_path / "parquet"
+    write_partitioned(root, "trades", "hyperliquid", "tardis", [_trade(venue="hyperliquid")])
+    write_partitioned(root, "trades", "binance", "tardis", [_trade()])
+
+    hl_s3.rederive(tmp_path, DAY, DAY, workers=1)
+
+    rows = _read_day(root, "trades")
+    assert {(row["venue"], row["source"]) for row in rows} == {
+        ("hyperliquid", SOURCE_HL_S3),
+        ("binance", "tardis"),
+    }
+
+
+def test_rederive_writes_one_file_per_day_under_the_compacted_name(
+    client: FakeS3, tmp_path: Path
+) -> None:
+    """`liqfade compact` skips a partition that is already a single `_day` file."""
+    from liqfade.recorder.writer import lake_files, partition_dir
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    hl_s3.rederive(tmp_path, DAY, DAY, workers=1)
+
+    for table in ("trades", "liquidations"):
+        files = lake_files(partition_dir(tmp_path / "parquet", table, DAY.isoformat()))
+        assert [path.name for path in files] == [hl_s3.REDERIVE_OUTPUT]
+
+
+def test_a_second_rederive_skips_the_day_and_a_forced_one_does_not(
+    client: FakeS3, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The resume rule: the run is detached behind a retry loop, so a restart is cheap."""
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), False)[0] == "done"
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), False)[0] == "skipped"
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)[0] == "done"
+    capsys.readouterr()
+
+
+def test_a_day_the_compaction_folds_mid_read_is_listed_again_and_redone(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one race with the detached `fills_full` compaction, which runs alongside this.
+
+    It reads a day's hourly files, writes one compacted file and deletes the inputs. A
+    rederive worker that had already listed those inputs then fails to open one; the day
+    is listed again and redone from what is there now.
+    """
+    from liqfade.data.derive import from_fills
+    from liqfade.recorder.writer import compact_day
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    root = tmp_path / "parquet"
+    before = _read_day(root, "trades")
+    seen: list[list[Path]] = []
+    real = from_fills.read_fills
+
+    def folds_the_day(files: list[Path]) -> object:
+        seen.append(list(files))
+        if len(seen) == 1:
+            compact_day(root, DAY.isoformat(), tables=["fills_full"])
+            raise FileNotFoundError(files[0])
+        return real(files)
+
+    monkeypatch.setattr(from_fills, "read_fills", folds_the_day)
+    status, _, _seconds = hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)
+
+    assert status == "done"
+    assert len(seen) == 2 and len(seen[1]) == 1  # re-listed, and found the folded file
+    assert _read_day(root, "trades") == before
+
+
+def test_a_read_failure_that_is_not_a_vanished_file_is_raised(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mount times out an open every few hours; that is a restart, not a re-list."""
+    from liqfade.data.derive import from_fills
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+
+    def times_out(files: list[Path]) -> object:
+        raise OSError("Input/output error")
+
+    monkeypatch.setattr(from_fills, "read_fills", times_out)
+    # BackfillError, not the OSError itself: this runs in a pool worker and a polars
+    # PanicException cannot be pickled back to the parent, so the cause is carried in
+    # the message instead of the type.
+    with pytest.raises(BackfillError, match="Input/output error"):
+        hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)
+
+
+def test_a_partition_compacted_but_not_rederived_is_not_mistaken_for_current(
+    client: FakeS3, tmp_path: Path
+) -> None:
+    """`liqfade compact` already wrote `all_day.parquet` for every day of the year.
+
+    Out of the wrongly ordered rows this job exists to replace, and with a newer mtime
+    than the `fills_full` files they were derived from. So neither the file name nor the
+    timestamps can tell a compacted day from a rederived one; only the stamp this job
+    puts in the Parquet footer can.
+    """
+    from liqfade.recorder.writer import compact_day
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    compact_day(tmp_path / "parquet", DAY.isoformat(), tables=["trades", "liquidations"])
+
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), False)[0] == "done"
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), False)[0] == "skipped"
+
+
+def test_a_polars_panic_is_treated_like_any_other_bad_read(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """polars raises `PanicException`, which derives from BaseException, not Exception.
+
+    So it has to be named: a blanket handler never sees it, and the year run hit one
+    (`Invalid argument (os error 22)`) within an hour of starting. What decides the
+    response is still the listing, not the exception type.
+    """
+    import polars as pl
+
+    from liqfade.data.derive import from_fills
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    root = tmp_path / "parquet"
+    fills_dir = root / "fills_full" / f"date={DAY.isoformat()}"
+    seen: list[list[Path]] = []
+    real = from_fills.read_fills
+
+    def panics_once(files: list[Path]) -> object:
+        seen.append(list(files))
+        if len(seen) == 1:
+            (fills_dir / "hyperliquid_99_gone.parquet").write_bytes(b"")
+            raise pl.exceptions.PanicException("Invalid argument (os error 22)")
+        return real([path for path in files if path.stat().st_size])
+
+    monkeypatch.setattr(from_fills, "read_fills", panics_once)
+    assert hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)[0] == "done"
+    assert len(seen) == 2
+
+
+def test_a_day_that_finished_during_shutdown_is_still_reported() -> None:
+    """`cancel_futures` cannot recall a day already handed to the pool's call queue.
+
+    Such a day runs to completion while the consuming loop has already stopped, and its
+    work is in the lake and stamped. `unconsumed` is what stops its row counts going
+    unreported: the first year run was 26 days short in its own summary for exactly this
+    reason, over a complete lake. Cancelled days, failed days and days already taken are
+    not reported again.
+    """
+    import concurrent.futures
+
+    def future(**outcome: object) -> concurrent.futures.Future[object]:
+        made: concurrent.futures.Future[object] = concurrent.futures.Future()
+        if "result" in outcome:
+            made.set_running_or_notify_cancel()
+            made.set_result(outcome["result"])
+        elif "exception" in outcome:
+            made.set_running_or_notify_cancel()
+            made.set_exception(outcome["exception"])  # type: ignore[arg-type]
+        else:
+            made.cancel()
+        return made
+
+    taken = future(result=("done", {}, 1.0))
+    finished_late = future(result=("done", {"trades": 7}, 2.0))
+    started = {
+        taken: "2026-03-01",
+        finished_late: "2026-03-02",
+        future(exception=OSError("mount")): "2026-03-03",
+        future(): "2026-03-04",
+        concurrent.futures.Future(): "2026-03-05",  # never started
+    }
+
+    left = hl_s3.unconsumed(started, seen={"2026-03-01"})
+    assert [stamp for stamp, _ in left] == ["2026-03-02"]
+    assert left[0][1].result() == ("done", {"trades": 7}, 2.0)
