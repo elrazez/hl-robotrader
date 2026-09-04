@@ -170,24 +170,30 @@ mark-versus-mid from `activeAssetCtx`. The lake has no `asset_ctx` history and t
 recorder has not started, so without this the detector is calibrated on trade prints
 alone. Hyperliquid's archive fixes that for under a dollar.
 
-16. **`liqfade backfill asset-ctxs`.** The `hyperliquid-archive` bucket, requester-pays,
-    holds a daily asset-context file per UTC day at `asset_ctxs/YYYYMMDD.csv.lz4` with
-    per-coin open interest, mark price, oracle price, funding and premium, sampled at a
-    fixed cadence. **Verify the layout before writing the job**: list the prefix, pull
-    one day, print the header, the row count per coin and the cadence, and write those
-    three facts into `docs/DATA_SOURCES.md` under Hyperliquid before anything else.
-    Then the job, in the shape of `hl_archive_l2.py`: same S3 client and requester-pays
-    header, `--estimate-only`, the $5 gate, manifest job `s3-asset-ctxs`, resume by key.
-    Rows go into `asset_ctx` with `source = hl_archive`, `rx_ms = 0`, `ts_ms` from the
-    file's timestamp column, every schema column the file provides and null for any it
-    does not; a column the file has and the schema lacks is documented, not silently
-    dropped. One file per day named `hyperliquid_day.parquet`, sorted by `ts_ms`, so the
-    compaction leaves it alone. Run the year 2025-09-01 to 2026-08-30. Validate before
-    reporting: funding against the Info API's `fundingHistory` on BTC, ETH and HYPE for
-    one week (free; expect exact equality at the funding timestamps) and open interest
-    and mark against the twelve `tardis_derivative_ticker` days (expect agreement within
-    the sampling interval). Both tables go into `docs/DECISIONS.md`. Tests use a
-    hand-built two-coin, three-row CSV through the same fake S3 the other jobs use.
+16. **`liqfade backfill asset-ctxs`.** Verified on 2026-09-04 with a listing and one
+    file, so no exploration is needed: the `hyperliquid-archive` bucket (requester-pays)
+    holds `asset_ctxs/YYYYMMDD.csv.lz4`, one file per UTC day from 2023-05-20 through
+    two days ago, about 11 MB compressed per day in 2026, 4.05 GB for our year, roughly
+    $0.36 of egress. Columns, in this order: `time` (ISO 8601 UTC, one row per coin per
+    minute, 1440 per coin per day), `coin`, `funding`, `open_interest`, `prev_day_px`,
+    `day_ntl_vlm`, `premium`, `oracle_px`, `mark_px`, `mid_px`, `impact_bid_px`,
+    `impact_ask_px`. 229 perps on 2026-03-01. Write those facts into
+    `docs/DATA_SOURCES.md` under Hyperliquid, then the job, in the shape of
+    `hl_archive_l2.py`: same S3 client and requester-pays header, `--estimate-only`, the
+    $5 gate, manifest job `s3-asset-ctxs`, resume by key. First extend the `asset_ctx`
+    schema with two nullable columns, `impact_bid_px` and `impact_ask_px` (the live
+    `activeAssetCtx` carries them as `impactPxs`; have the recorder parser fill them and
+    add the parser test), so the archive's spread signal is the same column live and
+    historical. Rows go into `asset_ctx` with `source = hl_archive`, `rx_ms = 0`,
+    `ts_ms` from `time`; `prev_day_px` is the one archive column the schema lacks and is
+    dropped with a note. One file per day named `hyperliquid_day.parquet`, sorted by
+    `ts_ms`, so the compaction leaves it alone. Run the year 2025-09-01 to 2026-08-30.
+    Validate before reporting: funding against the Info API's `fundingHistory` on BTC,
+    ETH and HYPE for one week (free; expect exact equality at the funding timestamps),
+    and open interest and mark against the twelve `tardis_derivative_ticker` days
+    (expect agreement within the minute). Both tables go into `docs/DECISIONS.md`.
+    Tests use a hand-built two-coin, three-minute CSV through the same fake S3 the other
+    jobs use.
 
 17. **`scripts/research/oi_from_fills.py`.** `fills_full` carries `start_position`, `sz`
     and `side` on every fill, so the change in open interest per coin per minute is the

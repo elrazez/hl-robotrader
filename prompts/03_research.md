@@ -180,12 +180,15 @@ DECISION reads net-stress and nothing else.**
 - net-9bps = 0.09% round trip (0.045% taker per side).
 - net-stress = 9 bps fees, entry at the first print after `extreme_ts + 1s`, and one
   estimated effective spread subtracted per side.
-- Effective spread is estimated from trades, per episode, at episode time: the mean
-  absolute price change between consecutive prints whose aggressor side flips, over the
-  60s after the extreme. It exists for every coin and every episode and has no
-  lookahead. The 12 Tardis `tardis_book_snapshot_5` days and the hourly `l2` snapshots
-  on the core coins are a sanity check on the estimator, never its source. The
-  recorder's live `bbo` replaces it once a few weeks exist.
+- Effective spread comes from `asset_ctx`: `(impact_ask_px - impact_bid_px) / mid_px`
+  from the last archive sample at or before the entry time (one per coin per minute,
+  the exchange's own impact prices, so it reflects depth, not just the touch). No
+  lookahead: the sample precedes the entry. Cross-check it with the trade-based
+  estimator (mean absolute price change between consecutive prints whose aggressor
+  side flips, over the 60s after the extreme) and report both; if the trade-based
+  number is larger on a cascade minute, use the larger. The 12 Tardis
+  `tardis_book_snapshot_5` days are a sanity check on both. The recorder's live `bbo`
+  replaces them once a few weeks exist.
 - Funding is ignored at these holds. Every report says so.
 - `mid = last trade price` for the historical year is accepted, on the condition that
   the spread haircut above is applied.
