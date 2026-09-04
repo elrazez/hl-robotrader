@@ -122,7 +122,7 @@ the code that does the pulling; this section is what it will pull and what it wi
 |---|---|---|---|---|
 | Hyperliquid exact liquidations and trades | `s3://hl-mainnet-node-data/node_fills_by_block` | about $16 | about $33 | Requester pays. This is the important one |
 | Hyperliquid liquidations, pre-parsed | Hydromancer Reservoir S3 | egress only, likely far less | same | Covers Aug 2025 onward. Check this first |
-| Hyperliquid 1 minute candles | `candleSnapshot` on the public API | free | free | Rate limited, not egress billed |
+| Hyperliquid 1 minute candles | derived from our `trades` table (`liqfade derive candles`) | free | free | The API keeps only ~3 days of 1m bars; see "Candles and order book" |
 | Hyperliquid order book snapshots | `s3://hyperliquid-archive` | varies | varies | Only pull a few coins, hourly. Whole-market is expensive |
 | Cross-exchange liquidations | Nowhere affordable | see below | see below | This is the real gap |
 | Cross-exchange open interest and funding | Coinalyze free tier | free | free | Daily granularity keeps long history, intraday does not |
@@ -185,7 +185,17 @@ so you pay for every coin's bytes and throw away what you do not want after the 
 Filtering to the universe happens locally.
 
 **Disk.** Budget 200 GB free for a 6 month pull, 400 GB for 12, before the raw files are
-turned into the smaller Parquet tables and deleted.
+turned into the smaller Parquet tables and deleted. The finished year is about 190 GB of
+Parquet: 130 GB `fills_full`, 25 GB `l2`, 5 GB `trades`, 50 MB `liquidations`.
+
+**An NTFS drive on macOS must not go through fuse-t.** Measured on the owner's 2.5" USB
+drive: fuse-t/ntfs-3g wrote at 4.6 MB/s and cost 270 ms per file open, which makes a
+year of hourly Parquet unusable (a full L2 scan was 3.7 hours of file opens). The same
+drive through `anylinuxfs` with the Linux `ntfs3` driver does 62 MB/s writes, 81 MB/s
+reads and 30 ms per open. Mount it with
+`sudo anylinuxfs mount /dev/diskNs1 "/Volumes/<name>" -t ntfs3 --ignore-permissions`;
+a volume left dirty by an interrupted write needs `ntfsfix -d /dev/vda` from
+`anylinuxfs shell` first. Or format the drive exFAT and skip all of this.
 
 **Pull in order, newest first.** If the money or the disk runs out, you still have the
 most recent and most relevant months.
@@ -248,8 +258,14 @@ count and total notional match. If they do, use Hydromancer and save most of the
 
 ### Candles and order book
 
-1 minute candles come from the public API for free, 5000 candles per call, no AWS
-involved. Good for the slower context features and for sanity-checking prices.
+**1 minute candles are derived from our own `trades` table, not downloaded.** The public
+`candleSnapshot` endpoint only retains about 3 days of `1m` (and `5m`, `15m`) history;
+measured 2026-09-03: 72 hours back returns bars, 96 hours back returns nothing. Only
+`1h`, `4h` and `1d` go back a year. The `hl_candles` job therefore writes nothing for a
+historical range and is kept only for the last few days. `liqfade derive candles`
+builds `candles_1m` from `trades` (every fill on Hyperliquid, so the bars are exact) and
+is validated against the API on the days both exist. The live recorder still records
+the `candle` stream directly.
 
 Order book snapshots live in `s3://hyperliquid-archive` as one compressed file per coin
 per hour, going back to 2023. Do not pull the whole market. Pick the handful of coins the
@@ -268,7 +284,14 @@ number and makes the strategy look far better than it is.
 2. Pull one day. Confirm the file layout matches this document.
 3. Compare that day against Hydromancer. Pick the cheaper source.
 4. Pull 6 months, newest first, and check the daily counts for holes.
-5. Pull 1 minute candles for the same window.
-6. Pull hourly order book snapshots for the coins you will actually trade.
-7. Cross-check against the Tardis free 1st-of-month days.
-8. Only then start Phase 3 research.
+5. Pull hourly order book snapshots for the coins you will actually trade.
+6. Cross-check against the Tardis free 1st-of-month days.
+7. Compact every backfilled day (`liqfade record --compact-only --date ...`): the pull
+   leaves 24 or more files per table per day and a year of that is 50,000 file opens
+   per scan. Research reads the compacted lake.
+8. Derive 1 minute candles from `trades` (`liqfade derive candles`).
+9. Run `scripts/research/data_quality.py`. Only then start Phase 3 research.
+
+**Actual spend, 2025-09-01 to 2026-08-30:** fills 227 GiB ($20.43), L2 for four coins
+30 GiB ($2.70), plus a few dollars of retries: about $25.
+The $15 target in the roadmap was for 6 months; a full year of fills is the 227 GiB.

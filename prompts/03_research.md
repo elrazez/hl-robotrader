@@ -48,7 +48,9 @@ live code. Do NOT tune parameters to make results look good; the job is measurem
   (oi_delta_w, funding, premium, btc_ret_5m, btc_liq_z_60s, session hour bucket),
   `levels.py` (supply/demand zones, below).
   Every docstring states window, units, inputs, and NaN behavior.
-- `levels.py`, the zone feature set. Built from 1m candles, per coin, and usable at
+- `levels.py`, the zone feature set. Built from 1m candles (the `candles_1m` table,
+  derived from `trades` by `liqfade derive candles`; the API holds no 1m history), per
+  coin, and usable at
   any decision time with only completed bars (a bar at time t is usable from its
   close, never mid-bar; the no-lookahead property test applies here too):
   - swing highs and lows: fractal points where a bar's high (low) exceeds the N bars

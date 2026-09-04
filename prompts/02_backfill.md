@@ -1,5 +1,12 @@
 # Prompt 02: Phase 2 historical ingestion
 
+Outcome (2026-09-04): run. A full year (2025-09-01 to 2026-08-30) of fills, L2 for
+BTC/ETH/SOL/HYPE and the Tardis days are on disk, about $25 of egress. Two things this
+prompt assumed turned out wrong and are handled by the follow-ups: the public API keeps
+only ~3 days of 1m candles (`02c_candles.md` derives them from `trades`), and a year of
+hourly files needs compacting before research (`02b_compaction.md`). Then
+`02d_quality_gate.md`. Details in `docs/DECISIONS.md` under 2026-09-04.
+
 Owner notes: this is the phase that spends money. Before running it you need an AWS
 account, an IAM user with read access to the two Hyperliquid buckets (CLAUDE.md section
 7 item 7), a billing alarm at $10, and the keys in `.env`. Budget: about $16 for 6

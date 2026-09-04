@@ -20,9 +20,9 @@ DoD: 48 hours on the VPS with no gap over 5s on HL trades and BBO for the core c
 
 ## Phase 2: Historical ingestion (2 days plus pull time)
 
-Build: `data/ingest/hl_s3.py` (requester-pays, cost estimate first, resumable, writes canonical `liquidations` and `trades`), `data/ingest/hl_archive_l2.py` for hourly L2 snapshots of the core coins, `data/ingest/tardis_free.py` for first-of-month liquidation and trade CSVs across Binance, Bybit, OKX, HL, `data/ingest/hl_candles.py` via `candleSnapshot` for 1m candles back as far as the API allows. Symbol mapping, dedup by `(block_time, coin, tid)`.
+Build: `data/ingest/hl_s3.py` (requester-pays, cost estimate first, resumable, writes canonical `liquidations` and `trades`), `data/ingest/hl_archive_l2.py` for hourly L2 snapshots of the core coins, `data/ingest/tardis_free.py` for first-of-month liquidation and trade CSVs across Binance, Bybit, OKX, HL, `data/ingest/hl_candles.py` via `candleSnapshot` for 1m candles back as far as the API allows (which turned out to be about 3 days, so the historical `candles_1m` table is instead derived from `trades` by `liqfade derive candles`). Symbol mapping, dedup by `(block_time, coin, tid)`.
 
-DoD: 6 to 12 months of HL exact liquidations and trades for the core universe on disk, egress spend logged and under $15, a `data quality` notebook showing counts per day with no unexplained holes, Tardis days aligned to the same schema.
+DoD: 6 to 12 months of HL exact liquidations and trades for the core universe on disk, egress spend logged (a full year came to about $25, see `docs/DATA_SOURCES.md`), every backfilled day compacted to one file per table, `candles_1m` derived and validated against the API on the overlap days, a `data quality` report showing counts per day with no unexplained holes, Tardis days aligned to the same schema.
 
 Owner: AWS IAM user and billing alarm.
 

@@ -176,3 +176,49 @@ processes (spawn), each with its own boto3 client; the parent alone inspects, me
 records the manifest. Handlers are module-level functions because they pickle into the
 workers; the fills side-rule check moved to a parent-side inspector reading the staged
 Parquet, since processes cannot share the accumulator.
+
+## 2026-09-04
+
+**A year of fills is 227 GiB, not 170.** The earlier figure was an estimate carried
+forward as if measured; listing all 8,736 hourly objects gave 227.0 GiB, $20.43. Recorded
+so nobody plans a re-pull on the smaller number. Total spend for the year, with L2 for
+four coins and the retries below, about $25.
+
+**The fills parser writes in byte-bounded batches.** `write_one_file` used to load a
+whole hour into memory before writing. The 2025-10-10 cascade hour is 342 MiB compressed
+(median hour: 23 MiB) and expanded to tens of GB of Python objects, killing every worker
+that touched it on a 16 GB box with no swap, whatever the worker count. Batches are now
+capped at `BATCH_BYTES` (16 MiB of JSON), which is bytes rather than lines because a
+cascade block carries hundreds of events. A batch boundary is a line boundary and a line
+is one block, so trade pairs stay together. Each batch appends its own Parquet file to the
+partition; compaction folds them. Peak memory on that hour: 3.4 GB across 4 workers.
+
+**L2 listing fans out.** One LIST per hour prefix is 8,760 calls a year; from a distant
+box at 0.4 to 1.5 s each that was 40 minutes before the first byte. `ThreadPoolExecutor`
+over the prefixes, order preserved. About 5 minutes now.
+
+**Tardis 400 is coverage, not failure.** Tardis answers `400 Data type 'liquidations' is
+not supported for 'BTC'` for Hyperliquid liquidations, which it never carried. Treated
+like 404: recorded as missing, run continues.
+
+**Hyperliquid keeps ~3 days of 1m candles.** `candleSnapshot` returns nothing for `1m`,
+`5m` or `15m` older than about 72 hours; `1h` and coarser go back a year. The year of
+`candles_1m` is therefore derived from `trades`, which is every fill and so exact. The
+`hl_candles` job stays for the last few days and as the validation reference.
+
+**One access key per machine.** Never use the
+same access key from two machines at once.
+AWS's exposure detection reads "one key, a datacenter IP, a brand-new account doing
+high-volume paid egress" as a stolen key. Rule from now on: one IAM user and key per
+machine, and a key never leaves the machine it was created for. Recovery is a support
+case stating the above plus MFA.
+
+**The NTFS drive goes through anylinuxfs, not fuse-t.** See docs/DATA_SOURCES.md, Disk.
+12x on throughput, 9x on per-file latency; the difference between a usable and an
+unusable lake for backtests. fuse-t and ntfs-3g removed from the laptop.
+
+**Backfilled days need compaction before research.** The design's nightly compaction
+only ever ran for recorded days. The year of history landed as 24 to 144 files per table
+per day (150,000 files); at 30 ms an open that is 25 minutes of file opens per full scan.
+`liqfade compact` over the range is the next step, then `liqfade derive candles`, then the
+data quality report, then Phase 3.
