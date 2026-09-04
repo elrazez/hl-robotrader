@@ -604,6 +604,30 @@ def test_a_second_rederive_skips_the_day_and_a_forced_one_does_not(
     capsys.readouterr()
 
 
+def test_a_short_output_leaves_every_input_in_place(
+    client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same check `compact_day` has: a short file must never replace its inputs."""
+    from liqfade.recorder import writer
+
+    hl_s3.run(client, tmp_path, DAY, DAY)
+    root = tmp_path / "parquet"
+    before = sorted(p.name for p in (root / "trades" / f"date={DAY.isoformat()}").glob("*.parquet"))
+    real = writer.write_atomic
+
+    def writes_one_row_short(table: object, path: Path) -> None:
+        real(table.slice(1), path)  # type: ignore[attr-defined]
+
+    # `_assemble` imports write_atomic inside the function, so it resolves at call time.
+    monkeypatch.setattr(writer, "write_atomic", writes_one_row_short)
+    with pytest.raises(BackfillError, match="expected"):
+        hl_s3.rederive_day(str(tmp_path), DAY.isoformat(), True)
+
+    monkeypatch.undo()
+    after = sorted(p.name for p in (root / "trades" / f"date={DAY.isoformat()}").glob("*.parquet"))
+    assert set(before) <= set(after)
+
+
 def test_a_day_the_compaction_folds_mid_read_is_listed_again_and_redone(
     client: FakeS3, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -580,7 +580,21 @@ def _assemble(root: Path, table: str, stamp: str, derived: Any) -> tuple[int, in
     validate_table(table, arrow)  # schema only; the stamp below is footer metadata
     arrow = arrow.replace_schema_metadata(dict([REDERIVE_STAMP]))
     directory.mkdir(parents=True, exist_ok=True)
-    write_atomic(arrow, directory / REDERIVE_OUTPUT)
+    output = directory / REDERIVE_OUTPUT
+    write_atomic(arrow, output)
+
+    # The same check `compact_day` has, and for the same reason: a short output must
+    # never replace its inputs. The expected count is the kept rows plus the derived
+    # ones, not the inputs' own sum, because this is exactly where our old rows and
+    # Tardis's Hyperliquid rows are meant to disappear.
+    import pyarrow.parquet as pq
+
+    written = int(pq.read_metadata(output).num_rows)
+    if written != merged.height:
+        raise BackfillError(
+            f"{output} has {written} rows, expected {merged.height}; leaving the "
+            f"{len(existing)} input files in place"
+        )
     for path in existing:
         if path.name != REDERIVE_OUTPUT:
             path.unlink()
@@ -675,6 +689,46 @@ def unconsumed(started: dict[Any, str], seen: set[str]) -> list[tuple[str, Any]]
         and not future.cancelled()
         and future.exception() is None
     ]
+
+
+def rederive_plan(data_dir: Path, days: list[date]) -> int:
+    """Print what a rederive would read, rewrite and delete per day. Changes nothing.
+
+    Sizes come from `stat`, not from the Parquet footers: the point is "how much am I
+    about to rewrite", and reading a year of footers to answer it would cost more file
+    opens than the run itself on this mount.
+    """
+    from liqfade.recorder.writer import lake_files, partition_dir
+
+    root = Path(data_dir) / "parquet"
+    read_gib, doomed, rewritten = 0.0, 0, 0
+    for day in days:
+        stamp = day.isoformat()
+        fills = lake_files(partition_dir(root, "fills_full", stamp))
+        if not fills:
+            print(f"{stamp}  {REDERIVE_STATUS['empty']}")
+            continue
+        if _partition_is_current(root, stamp):
+            print(f"{stamp}  {REDERIVE_STATUS['skipped']}")
+            continue
+        deleting = [
+            path
+            for table in ("trades", "liquidations")
+            for path in lake_files(partition_dir(root, table, stamp))
+        ]
+        gib = sum(path.stat().st_size for path in fills) / 1024**3
+        read_gib += gib
+        doomed += len(deleting)
+        rewritten += 2
+        print(
+            f"{stamp}  read {len(fills):>4} fills_full files ({gib:6.2f} GiB)  "
+            f"-> rewrite 2 partitions, delete {len(deleting):>4} files"
+        )
+    print(
+        f"\nwould read {read_gib:.1f} GiB of fills_full, write {rewritten} partition files "
+        f"and delete {doomed}. Nothing was changed."
+    )
+    return 0
 
 
 def rederive(

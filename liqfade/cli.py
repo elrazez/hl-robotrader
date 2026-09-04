@@ -115,6 +115,23 @@ def cmd_record(args: argparse.Namespace) -> int:
 # in the default set and gets its own opt-in run, last.
 COMPACT_SKIP_BY_DEFAULT = frozenset({"fills_full"})
 
+# Above this many days, `compact` and `backfill rederive` want --yes. Both rewrite lake
+# files and unlink the originals across whatever range they are handed, so a mistyped
+# --data-dir or --start rewrites a year of a 227 GiB pull unattended. CLAUDE.md rule 8:
+# ask before deleting recorded data. A few days is the size of an ordinary catch-up run.
+CONFIRM_ABOVE_DAYS = 7
+
+
+def needs_confirmation(days: list[Any], *, yes: bool, dry_run: bool) -> str | None:
+    """The message to print instead of running, or None to go ahead."""
+    if dry_run or yes or len(days) <= CONFIRM_ABOVE_DAYS:
+        return None
+    return (
+        f"{len(days)} days ({days[0]} to {days[-1]}) is over the {CONFIRM_ABOVE_DAYS} day "
+        "confirmation threshold, and this rewrites lake files and deletes the originals. "
+        "Re-run with --dry-run to see what it would touch, or --yes to do it."
+    )
+
 
 def cmd_compact(args: argparse.Namespace) -> int:
     """Fold a range of days into one Parquet file per table per day, oldest first."""
@@ -123,7 +140,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
     from liqfade.data.ingest.common import BackfillError, day_range, parse_day
     from liqfade.data.schemas import SCHEMAS
     from liqfade.log import setup_logging
-    from liqfade.recorder.writer import compact_day, lake_files
+    from liqfade.recorder.writer import DAY_SUFFIX, compact_day, lake_files
 
     settings = _settings(args)
     setup_logging(proc="compact", env=settings.env, level=settings.logging.level)
@@ -159,14 +176,31 @@ def cmd_compact(args: argparse.Namespace) -> int:
         print(f"compact error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
+    refuse = needs_confirmation(days, yes=args.yes, dry_run=args.dry_run)
+    if refuse:
+        print(f"compact: {refuse}", file=sys.stderr)
+        return EXIT_ERROR
+
     files_before = files_after = 0
     total_rows = 0
     for day in days:
         date = day.strftime("%Y-%m-%d")
         for table in tables:
             directory = root / table / f"date={date}"
-            inputs = len(lake_files(directory)) if directory.is_dir() else 0
+            found = sorted(lake_files(directory)) if directory.is_dir() else []
+            inputs = len(found)
             files_before += inputs
+            if args.dry_run:
+                # Bytes from `stat`, not row counts from the footers: a dry run over an
+                # uncompacted year would otherwise pay for 50,000 file opens to answer a
+                # question that "how much am I about to rewrite" already answers.
+                if inputs > 1 or (inputs == 1 and not found[0].name.endswith(DAY_SUFFIX)):
+                    mib = sum(path.stat().st_size for path in found) / 1024**2
+                    files_after += 1
+                    print(f"{date}  {table:<26} {inputs:>4} files, {mib:>9,.1f} MiB -> 1")
+                else:
+                    files_after += inputs
+                continue
             began = time.monotonic()
             written = compact_day(root, date, tables=[table])
             if not written:  # already one file, or no data for that day
@@ -180,6 +214,9 @@ def cmd_compact(args: argparse.Namespace) -> int:
                 f"{time.monotonic() - began:7.1f}s",
                 flush=True,
             )
+    if args.dry_run:
+        print(f"\nwould fold {files_before} files into {files_after}. Nothing was changed.")
+        return 0
     print(f"\ntotal: {total_rows:,} rows, {files_before} files -> {files_after} files")
     return 0
 
@@ -239,6 +276,16 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 workers=args.workers or 6,
             )
         if args.job == "rederive":
+            from liqfade.data.ingest.common import day_range
+
+            days = day_range(start, end, newest_first=True)
+            if args.dry_run:
+                return hl_s3.rederive_plan(data_dir, days)
+            # It rewrites both derived partitions of every day and deletes the originals,
+            # so the same confirmation `compact` asks for applies. CLAUDE.md rule 8.
+            refuse = needs_confirmation(days, yes=args.yes, dry_run=False)
+            if refuse:
+                raise BackfillError(refuse)
             # Two workers, not six: a rederive worker holds a whole day of fills_full,
             # up to ~13M rows on a cascade day, where an S3 worker holds one hour.
             return hl_s3.rederive(data_dir, start, end, force=args.force, workers=args.workers or 2)
@@ -554,7 +601,14 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--check-day", default=None, help="YYYY-MM-DD for hydromancer-check")
     backfill.add_argument("--estimate-only", action="store_true", help="print the cost and exit 0")
     backfill.add_argument(
-        "--yes", action="store_true", help="proceed with a pull estimated over $5"
+        "--dry-run",
+        action="store_true",
+        help="rederive: print what would be read, rewritten and deleted per day",
+    )
+    backfill.add_argument(
+        "--yes",
+        action="store_true",
+        help=f"over $5 of egress, or a rederive of more than {CONFIRM_ABOVE_DAYS} days",
     )
     backfill.add_argument(
         "--keep-raw", action="store_true", help="keep downloads under data/raw after parsing"
@@ -597,6 +651,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--tables",
         default="",
         help="comma separated table names; default is every table but fills_full",
+    )
+    compact.add_argument(
+        "--dry-run", action="store_true", help="print what would be folded and change nothing"
+    )
+    compact.add_argument(
+        "--yes",
+        action="store_true",
+        help=f"required above {CONFIRM_ABOVE_DAYS} days: this deletes the files it folds",
     )
     compact.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("paper", parents=[common], help="live feeds, simulated fills (Phase 5)")

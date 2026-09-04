@@ -409,6 +409,57 @@ def test_compact_honours_the_table_filter_and_rejects_unknown_tables(
     ]
 
 
+def test_compact_dry_run_reports_and_changes_nothing(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _lake(tmp_path, "candles_1m", "2026-08-01", range(3))
+    argv = ["compact", "--start", "2026-08-01", "--end", "2026-08-01", "--data-dir", str(tmp_path)]
+
+    assert main([*argv, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "3 files" in out and "would fold 3 files into 1" in out
+    assert len(list((tmp_path / "parquet" / "candles_1m" / "date=2026-08-01").glob("*"))) == 3
+
+    assert main(argv) == 0
+    assert "3 files -> 1 files" in capsys.readouterr().out
+
+
+def test_compact_over_a_long_range_wants_confirmation(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A mistyped --data-dir or --start otherwise rewrites a year unattended."""
+    _lake(tmp_path, "candles_1m", "2026-08-01", range(2))
+    argv = ["compact", "--start", "2026-08-01", "--end", "2026-08-31", "--data-dir", str(tmp_path)]
+
+    assert main(argv) == 1
+    assert "confirmation threshold" in capsys.readouterr().err
+    assert len(list((tmp_path / "parquet" / "candles_1m" / "date=2026-08-01").glob("*"))) == 2
+
+    assert main([*argv, "--dry-run"]) == 0  # looking is always allowed
+    assert main([*argv, "--yes"]) == 0
+    assert "3 files -> 2 files" not in capsys.readouterr().out
+
+
+def test_rederive_over_a_long_range_wants_confirmation(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    argv = [
+        "backfill",
+        "rederive",
+        "--start",
+        "2026-08-01",
+        "--end",
+        "2026-08-31",
+        "--data-dir",
+        str(tmp_path),
+    ]
+    assert main(argv) == 1
+    assert "confirmation threshold" in capsys.readouterr().err
+
+    assert main([*argv, "--dry-run"]) == 0
+    assert "Nothing was changed" in capsys.readouterr().out
+
+
 def test_compact_refuses_the_schemaless_side_tables(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
