@@ -406,3 +406,18 @@ def test_compact_honours_the_table_filter_and_rejects_unknown_tables(
     assert [p.name for p in (lake / "fills_full" / "date=2026-08-01").glob("*.parquet")] == [
         "hyperliquid_day.parquet"
     ]
+
+
+def test_compact_refuses_the_schemaless_side_tables(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Tardis side tables have no ts_ms to sort on and are already one file per day."""
+    (tmp_path / "parquet" / "tardis_book_snapshot_5" / "date=2026-08-01").mkdir(parents=True)
+    _lake(tmp_path, "candles_1m", "2026-08-01", range(2))
+    common = ["--start", "2026-08-01", "--end", "2026-08-01", "--data-dir", str(tmp_path)]
+
+    assert main(["compact", *common, "--tables", "tardis_book_snapshot_5"]) == 1
+    assert "no canonical schema" in capsys.readouterr().err
+    # And the default set leaves them out rather than blowing up on them.
+    assert main(["compact", *common]) == 0
+    assert "candles_1m" in capsys.readouterr().out

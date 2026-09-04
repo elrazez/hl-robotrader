@@ -121,6 +121,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
     import time
 
     from liqfade.data.ingest.common import BackfillError, day_range, parse_day
+    from liqfade.data.schemas import SCHEMAS
     from liqfade.log import setup_logging
     from liqfade.recorder.writer import compact_day
 
@@ -138,8 +139,19 @@ def cmd_compact(args: argparse.Namespace) -> int:
         if unknown:
             print(f"no such table in {root}: {', '.join(unknown)}", file=sys.stderr)
             return EXIT_ERROR
+        # The Tardis side tables have no canonical schema and no ts_ms to sort on, and
+        # the job already writes them one file per venue per day. Say so rather than
+        # failing halfway through the range with a SchemaError.
+        side = [t for t in tables if t not in SCHEMAS]
+        if side:
+            print(
+                f"{', '.join(side)}: no canonical schema, and already one file per venue "
+                "per day. Nothing to compact.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
     else:
-        tables = [t for t in present if t not in COMPACT_SKIP_BY_DEFAULT]
+        tables = [t for t in present if t in SCHEMAS and t not in COMPACT_SKIP_BY_DEFAULT]
 
     try:
         days = day_range(parse_day(args.start), parse_day(args.end), newest_first=False)
