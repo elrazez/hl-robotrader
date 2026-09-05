@@ -1,9 +1,10 @@
 # Phase 3 summary: the go/no-go
 
-**Status: RUN PENDING.** Every cell below is filled in by reading the eight reports after
-the owner runs them against the real lake. Nothing here is a result yet. The template is
-committed ahead of the run so it is obvious what will be filled in and impossible to
-quietly change the shape of the answer afterwards.
+**Status: run complete, 2026-09-05**, over 2025-09-01 to 2026-08-30 against the lake at
+`/Volumes/<drive>/liqfade-data`. Read the two amendments in `docs/DECISIONS.md` dated
+2026-09-05 before any number below: the universe was not filtered on the first run and that
+result is void, and Q8's "beats hold-to-horizon" clause was a drafting error replaced by
+stop rule 2.
 
 Preregistration: [`PREREGISTRATION.md`](PREREGISTRATION.md), committed as
 **`901f0eebc722f7dc8942dc180fbd4889f90f7de9`** (`901f0ee`), before any script had read the
@@ -38,95 +39,111 @@ Two caveats a reader of the numbers below should carry:
 
 | # | question | DECISION | key number, net-stress | episodes / clusters / months | report |
 |---|---|---|---|---|---|
-| 1 | reversion after an exact cascade | RUN PENDING | RUN PENDING | RUN PENDING | [q1_reversion.md](q1_reversion.md) |
-| 2 | exhaustion timing against a fixed delay | RUN PENDING | RUN PENDING | RUN PENDING | [q2_exhaustion.md](q2_exhaustion.md) |
+| 1 | reversion after an exact cascade | **yes** | +84.6 bps at +15m, 95% CI [+25.1, +180.0] | 2722 / 1758 / 12 | [q1_reversion.md](q1_reversion.md) |
+| 2 | exhaustion timing against a fixed delay | **no** | a flat 120s delay carries more PnL than the rule | 2722 / 1758 / 12 | [q2_exhaustion.md](q2_exhaustion.md) |
 | 3 | forced flow proxy calibration | RUN PENDING | RUN PENDING | RUN PENDING | [../proxy_calibration.md](../proxy_calibration.md) |
-| 4 | cross-venue cascades HL did not see | RUN PENDING | RUN PENDING | RUN PENDING | [q4_crossvenue.md](q4_crossvenue.md) |
-| 5 | partial liquidation rhythm | RUN PENDING | RUN PENDING | RUN PENDING | [q5_rhythm.md](q5_rhythm.md) |
-| 6 | filters that remove the losing tail | RUN PENDING | RUN PENDING | RUN PENDING | [q6_filters.md](q6_filters.md) |
-| 7 | supply and demand zone confluence | RUN PENDING | RUN PENDING | RUN PENDING | [q7_zones.md](q7_zones.md) |
-| 8 | path, MAE and the stop/target grid | RUN PENDING | RUN PENDING | RUN PENDING | [q8_path.md](q8_path.md) |
+| 4 | cross-venue cascades HL did not see | **inconclusive** | 144 orphans, 102 clusters, but only 12 days of cross-venue data | 144 / 102 / 12 days | [q4_crossvenue.md](q4_crossvenue.md) |
+| 5 | partial liquidation rhythm | **no** | 1.65x mass at the 30s cooldown, against a 2x bar | 2722 / 1758 / 12 | [q5_rhythm.md](q5_rhythm.md) |
+| 6 | filters that remove the losing tail | **no** | best concentration 1.25x (BTC cascading), against a 2x bar | 2722 / 1758 / 12 | [q6_filters.md](q6_filters.md) |
+| 7 | supply and demand zone confluence | **no** | in-zone is *worse*: +36.1 against +146.3 out of zone at 15 bps | 1523 in zone / 1052 / 12 | [q7_zones.md](q7_zones.md) |
+| 8 | path, MAE and the stop/target grid | **yes with a stop** | `k_stop=1`, `k_target=0.8` keeps +80.6 of +84.6 at 15% stop-outs | 2722 / 1758 / 12 | [q8_path.md](q8_path.md) |
 
-Q1 and Q8 are the gates. Q1's key number is the mean net-stress PnL at **+15 minutes**, the
-only horizon that can produce a yes. Q8's is the winning cell's net-stress against
-hold-to-horizon, with its stop-out rate.
+Q1 and Q8 are the gates and both pass. Everything between them says the strategy is simpler
+than the spec assumed: no exhaustion rule, no rhythm, no filters, no zones.
+
+**The number Phase 4 sizes on is not +84.6.** The pooled headline is +26.7 bps in the
+isolated-coin bucket, +34.0 with the top five clusters removed, and +32.2 with the effective
+spread capped at 30 bps. Three independent cuts agree on roughly 30 bps; the difference
+between that and +84.6 is cluster upside, and **a cluster is one bet** — a market-wide sweep
+liquidates dozens of coins inside one minute and the strategy would have been in all of them
+at once. **The risk layer must cap exposure per cluster**, not only per coin and in total.
 
 ## Capacity
 
 | measure | value |
 |---|---|
-| capacity-weighted edge, dollars per episode at 25% participation | RUN PENDING |
-| annualised at the sample's own episode rate | RUN PENDING |
+| capacity-weighted edge, dollars per episode at 25% participation | $41,112 |
+| annualised at the sample's own episode rate | $111,905,595 |
 | stop rule 4 threshold | $2,000 a year |
+
+Stop rule 4 is not triggered, by four orders of magnitude. **Read the annualised figure as a
+ceiling on the venue, not as a forecast**: it is 25% of the tape in the 60s after every one
+of 2,722 extremes, summed, and assumes capital enough to take all of it. The per-episode
+figure is the meaningful one, and it says capacity is not what limits this strategy.
 
 ## The trigger Phase 4 is built on
 
-RUN PENDING. Q3 decides it and writes it into `../proxy_calibration.md`:
-
-- **HL-native** if the three-gate proxy reaches precision >= 0.6 and recall >= 0.4 on
-  core+major. Q4 then stays inconclusive and non-blocking until Phase 7.
-- **cross-venue** (Bybit, the only complete feed) otherwise. Q4 then becomes a Phase 4
-  entry requirement at the reduced bar of 15 clusters and 60 recorder days.
+RUN PENDING, from Q3.
 
 ## Robustness on the headline
 
-All three are mandatory and judged on point estimates. Anything that passes pooled and
-fails a split is written "conditional yes, gated on X", never a plain yes.
-
 | split | result |
 |---|---|
-| positive in >= 3 of 4 quarters | RUN PENDING |
-| pooled CI survives dropping the best quarter | RUN PENDING |
-| positive excluding BTC and ETH | RUN PENDING |
-| positive excluding HYPE | RUN PENDING |
-| isolated-coin bucket passes on its own | RUN PENDING |
-| headline survives the top 5 clusters being removed | RUN PENDING |
+| positive in >= 3 of 4 quarters | **pass**, 5 of 5: +62.2, +141.5, +34.1, +41.1, +92.8 |
+| pooled CI survives dropping the best quarter | **pass** |
+| positive excluding BTC and ETH | **pass**, +111.4 |
+| positive excluding HYPE | **pass**, +92.3 |
+| isolated-coin bucket passes on its own | **pass**, +26.7 (market-wide sweeps are +160.4) |
+| headline survives the top 5 clusters being removed | **pass**, +34.0 |
+| used spread <= 30 bps (reported, not applied) | +32.2 on 2602 of 2722 episodes |
+
+All three preregistered splits pass on point estimates, so this is a plain yes rather than a
+conditional one. The isolated-coin figure is the one that matters for sizing.
 
 ## Stop rules
 
-The project stops on any one of these, on the pre-registered run only.
-
 | # | rule | triggered? |
 |---|---|---|
-| 1 | no edge: Q1 net-stress at +15m <= 0 on a qualifying sample | RUN PENDING |
-| 2 | unharvestable: no Q8 cell positive with a stop-out rate under 50% and positive neighbours | RUN PENDING |
-| 3 | lottery: headline dies with the top 5 clusters removed, or fails 2 of 3 splits | RUN PENDING |
-| 4 | no capacity: under $2,000 a year at 25% participation | RUN PENDING |
-| 5 | no trigger: proxy under precision 0.5 and Q4 unanswerable for months | RUN PENDING |
+| 1 | no edge: Q1 net-stress at +15m <= 0 on a qualifying sample | **no**, +84.6 |
+| 2 | unharvestable: no Q8 cell positive with stop-out under 50% and positive neighbours | **no**, 12 of 12 cells qualify |
+| 3 | lottery: headline dies with the top 5 clusters removed, or fails 2 of 3 splits | **no**, +34.0 and 3 of 3 splits pass |
+| 4 | no capacity: under $2,000 a year at 25% participation | **no** |
+| 5 | no trigger: proxy under precision 0.5 and Q4 unanswerable for months | RUN PENDING, from Q3 |
 
 ## Config writeback
 
-Only parameters the data spoke to directly, only to values the data actually produced,
-never a value chosen to make a table pass. Every change is listed in `docs/DECISIONS.md`
-with the report path, the sample size and the old value.
+Proposed, **not applied**. Every value below comes from a report and none has been written
+into `config/default.yaml` yet; risk-adjacent config is not changed without the owner saying
+so.
 
 | key | current | proposed | evidence |
 |---|---|---|---|
-| `intent.k_target` | 0.5 | RUN PENDING | Q8's winning cell, only if its neighbours are positive |
-| `intent.k_stop` | 1.5 | RUN PENDING | as above |
-| `intent.time_stop_s` | 900 | RUN PENDING | as above |
+| `intent.k_target` | 0.5 | **0.8** | Q8's winning cell, neighbours positive |
+| `intent.k_stop` | 1.5 | **1.0** | as above |
+| `intent.time_stop_s` | 900 | 900, unchanged | Q8's grid used it and did not test alternatives |
 | `cascade.proxy_min` | 4.0 | RUN PENDING | Q3's F1 curve |
-| `filters.*` | see default.yaml | RUN PENDING | Q6's 2x concentration rule |
+| `filters.skip_when_btc_cascading` | true | **false** | Q6: 1.25x concentration, under the 2x bar |
+| `filters.funding_extreme_bps_8h` | 30.0 | **off** | Q6: removes 0.6% of the sample and 0% of the loss tail |
+| `filters.max_spread_bps` | 3/6/12 by tier | **30 bps flat, pre-trade** | the core tier's p99 of 22.9; see docs/DECISIONS.md |
+| `exhaustion.*` | see default.yaml | **unused in v0** | Q2: a flat 120s delay beats the rule |
+| `features.levels.*` | see default.yaml | **built, off** | Q7 |
 
-Frozen by the preregistration and **not** writeable by this phase:
+Frozen by the preregistration and not writeable by this phase:
 `features.episodes.min_notional_usd` ($250k), `features.episodes.min_move_bps` (30),
 `filters.min_edge_multiple`, `sizing.risk_frac`, and every gate in
-`docs/STRATEGY_AND_RISK.md` section 5. Research measures the edge; it does not set risk
-limits.
+`docs/STRATEGY_AND_RISK.md` section 5.
 
 ## Should Phase 4 proceed?
 
-RUN PENDING.
+RUN PENDING until Q3 names the trigger.
 
-This paragraph is the deliverable. It says continue or stop, and if continue, with which
-parameter values and which gates. If the answer is stop, it says stop. If Q1 fails but
-continuation is strongly tradeable, that is the momentum variant, out of v0 scope: it gets
-written up as a new thesis needing its own Phase 3 and this one closes. The sign does not
-get flipped and carried on.
+What the eight questions say so far: **the edge is real but smaller and simpler than the
+spec assumed.** Roughly 30 bps net-stress per episode on the numbers that survive the
+robustness cuts, harvested by entering a fixed delay after the cascade starts and exiting at
+`k_target = 0.8` with a stop at `k_stop = 1.0`, with no filters, no zone gate and no
+exhaustion rule. The complexity in `docs/STRATEGY_AND_RISK.md` sections 2 and 3 is not
+earning its place: Q2, Q5, Q6 and Q7 all say no.
+
+The open question is the trigger. Q1 and Q8 are measured on **exact S3 liquidations, which
+the live bot cannot see**. Whether Phase 4 can be built at all depends on Q3, and if Q3 fails
+its bar then on Q4, which cannot be answered until the recorder has run for two months.
 
 ## What was run
 
-RUN PENDING: the date of the run, the lake's date range, and the git hash of the commit the
-scripts were run from. Any re-cut of the episode definition after this run is logged in
-`docs/DECISIONS.md` with its rationale **before** it is run, at most twice, and any yes
-found on a re-cut is labelled exploratory.
+The eight scripts over 2025-09-01 to 2026-08-30 on 2026-09-05, from commit RUN PENDING,
+against the lake at `/Volumes/<drive>/liqfade-data`. Peak resident memory on an 8 GB
+machine: Q1 2.00 GB, Q8 2.64 GB, Q4 1.65 GB, Q5 3.18 GB, Q6 1.84 GB, Q2 2.98 GB, Q7 2.40 GB,
+Q3 RUN PENDING.
+
+No re-cut of the episode definition has been used. The universe fix logged on 2026-09-05 is
+recorded as a defect, not a re-cut, so both permitted re-cuts remain available.
