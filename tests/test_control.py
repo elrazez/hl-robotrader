@@ -332,3 +332,36 @@ def test_state_json_is_not_world_readable(tmp_path: Path) -> None:
     finally:
         os.umask(previous)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+async def test_a_second_process_cannot_steal_a_live_control_socket(sock_dir: Path) -> None:
+    """`start()` unlinked whatever was there and the comment said a second process was
+    "already forbidden", but nothing enforced it. Recorder and live both run 24/7 under
+    systemd, so whichever started last took the socket and `/kill` landed on the wrong
+    process while the other kept trading."""
+    path = sock_dir / "control.sock"
+    first = ControlServer(NoopBackend(env="paper", proc="recorder"), path)
+    await first.start()
+    try:
+        second = ControlServer(NoopBackend(env="paper", proc="live"), path)
+        with pytest.raises(ControlError, match="already serving"):
+            await second.start()
+
+        # The loser must not take the winner's socket down on its way out.
+        await second.stop()
+        assert path.exists()
+        client = ControlClient(path, connect_timeout_s=2.0, request_timeout_s=5.0)
+        assert (await client.status()).proc == "recorder"
+    finally:
+        await first.stop()
+
+
+async def test_the_socket_is_free_again_once_the_holder_stops(sock_dir: Path) -> None:
+    """Otherwise a restart under systemd would never come back up."""
+    path = sock_dir / "control.sock"
+    first = ControlServer(NoopBackend(env="paper", proc="recorder"), path)
+    await first.start()
+    await first.stop()
+    second = ControlServer(NoopBackend(env="paper", proc="recorder"), path)
+    await second.start()
+    await second.stop()

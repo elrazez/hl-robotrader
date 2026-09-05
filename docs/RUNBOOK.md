@@ -74,6 +74,15 @@ Logs are one JSON object per line. To read them:
 `liqfade status` asks the control socket first and falls back to `data/state.json`, so it
 still answers when the loop is dead, which is when you will be asking.
 
+**One process per control socket.** The server holds an exclusive `flock` on
+`<socket>.lock` for its lifetime, so a second process on the same path refuses to start
+with `another liqfade process is already serving ...` instead of unlinking the socket and
+silently taking over (which would put `/kill` on the wrong process). `liqfade-live.service`
+therefore sets its own `LIQFADE_CONTROL__SOCKET_PATH=control-live.sock` and
+`LIQFADE_CONTROL__STATE_FILE=state-live.json`; the recorder keeps the defaults. If you see
+that refusal in the journal, the two units are pointed at one path: give the new one its
+own, do not stop the one that is holding a position.
+
 The panel shows the same thing plus charts. It binds loopback only:
 
     ssh -p <port> -L 8787:127.0.0.1:8787 <you>@<vps>

@@ -14,6 +14,12 @@ ExecStart=/home/liqfade/.local/bin/uv run --frozen liqfade live
 User=liqfade
 Group=liqfade
 EnvironmentFile=/srv/liqfade/.env
+# Its own control socket and state file. The recorder runs 24/7 on the same box and the
+# server takes an exclusive flock on its socket, so without these the second unit to
+# start refuses outright rather than stealing the first one's socket and answering /kill
+# for a process with nothing at risk.
+Environment=LIQFADE_CONTROL__SOCKET_PATH=control-live.sock
+Environment=LIQFADE_CONTROL__STATE_FILE=state-live.json
 WorkingDirectory=/srv/liqfade/app
 Restart=always
 RestartSec=3
