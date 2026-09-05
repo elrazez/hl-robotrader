@@ -5,7 +5,14 @@
 
 # Data lake and run artifacts
 /data/
-/reports/
+# Run outputs stay out. The two Phase 3 documents that are promises rather than
+# outputs are tracked: the preregistration has to be committed before the first run
+# for its hash to mean anything, and SUMMARY.md ships as a template.
+/reports/*
+!/reports/research/
+/reports/research/*
+!/reports/research/PREREGISTRATION.md
+!/reports/research/SUMMARY.md
 /logs/
 *.sqlite
 *.sqlite-wal
