@@ -297,3 +297,31 @@ def test_macos_sidecar_files_are_not_lake_data(tmp_path: Path) -> None:
     assert (directory / "._hyperliquid_10.parquet").exists()
     # And a second run still sees a compacted day.
     assert compact_day(tmp_path, DATE) == {}
+
+
+def test_a_short_write_never_replaces_the_file_it_would_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mount has truncated a Parquet mid-write before; the footer check catches it.
+
+    Every lake writer outside `compact_day` and `hl_s3._assemble` goes through
+    `write_atomic`, so the guard lives there rather than in each of them.
+    """
+    from liqfade.recorder import writer
+
+    path = partition_dir(tmp_path, "bbo", DATE) / "hyperliquid_10.parquet"
+    path.parent.mkdir(parents=True)
+    good = rows_to_table("bbo", [bbo(1), bbo(2)], "recorder")
+    write_atomic(good, path)
+
+    real = writer.pq.write_table
+
+    def short(table: pa.Table, where: object, **kwargs: object) -> None:
+        real(table.slice(0, table.num_rows - 1), where, **kwargs)
+
+    monkeypatch.setattr(writer.pq, "write_table", short)
+    with pytest.raises(RuntimeError, match="wrote 1 rows, expected 2"):
+        write_atomic(good, path)
+
+    assert read(path).num_rows == 2
+    assert not list(path.parent.glob(".*.tmp"))

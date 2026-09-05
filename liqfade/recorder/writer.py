@@ -67,10 +67,25 @@ def _free_path(directory: Path, venue: str, hour: int) -> Path:
 
 
 def write_atomic(table: pa.Table, path: Path) -> None:
-    """Write one Parquet file so a reader sees all of it or none of it."""
+    """Write one Parquet file so a reader sees all of it or none of it.
+
+    The temp file's footer is read back and its row count checked before the `os.replace`,
+    so a short write never lands. `compact_day` and `hl_s3._assemble` have carried that
+    check since they were written, for a reason that applies to every lake write: the
+    owner's drive is an NTFS mount that has timed out mid-write and left a Parquet with no
+    footer (docs/DECISIONS.md, 2026-09-04). Without it a truncated day file replaces a
+    good one and the job that wrote it records a full row count in its manifest, so the
+    loss is silent and the resume rule never revisits the day.
+    """
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         pq.write_table(table, tmp, compression=COMPRESSION)
+        written = int(pq.read_metadata(tmp).num_rows)
+        if written != table.num_rows:
+            raise RuntimeError(
+                f"{path}: wrote {written} rows, expected {table.num_rows}; leaving the "
+                "previous file in place"
+            )
         os.replace(tmp, path)
     finally:
         if tmp.exists():
