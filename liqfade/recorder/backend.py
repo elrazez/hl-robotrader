@@ -49,31 +49,40 @@ def _percentile(values: list[float], fraction: float) -> float | None:
 
 
 class LatencyTracker:
-    """Rolling WS ping and REST round trip times, in milliseconds."""
+    """Rolling WS ping and REST round trip times, in milliseconds, with their timestamps.
+
+    The timestamps are kept because the Phase 1 DoD asks for these as time series and a
+    p50 and a p95 cannot show a step change, a drift or a bad five minutes. `samples` is
+    still the total count, so nothing that reads the scalars changes.
+    """
 
     def __init__(self, window: int = LATENCY_WINDOW) -> None:
         self.window = window
-        self.ws_ping: list[float] = []
-        self.rest: list[float] = []
+        self.ws_ping: list[tuple[int, float]] = []
+        self.rest: list[tuple[int, float]] = []
 
-    def _add(self, series: list[float], value: float) -> None:
-        series.append(value)
+    def _add(self, series: list[tuple[int, float]], value: float, at_ms: int | None) -> None:
+        series.append((now_ms() if at_ms is None else at_ms, round(value, 3)))
         if len(series) > self.window:
             del series[: len(series) - self.window]
 
-    def add_ws_ping(self, ms: float) -> None:
-        self._add(self.ws_ping, ms)
+    def add_ws_ping(self, ms: float, at_ms: int | None = None) -> None:
+        self._add(self.ws_ping, ms, at_ms)
 
-    def add_rest(self, ms: float) -> None:
-        self._add(self.rest, ms)
+    def add_rest(self, ms: float, at_ms: int | None = None) -> None:
+        self._add(self.rest, ms, at_ms)
 
     def state(self) -> LatencyState:
+        ws_ping = [ms for _, ms in self.ws_ping]
+        rest = [ms for _, ms in self.rest]
         return LatencyState(
-            ws_ping_p50=_percentile(self.ws_ping, 0.5),
-            ws_ping_p95=_percentile(self.ws_ping, 0.95),
-            rest_p50=_percentile(self.rest, 0.5),
-            rest_p95=_percentile(self.rest, 0.95),
-            samples=len(self.ws_ping) + len(self.rest),
+            ws_ping_p50=_percentile(ws_ping, 0.5),
+            ws_ping_p95=_percentile(ws_ping, 0.95),
+            rest_p50=_percentile(rest, 0.5),
+            rest_p95=_percentile(rest, 0.95),
+            samples=len(ws_ping) + len(rest),
+            ws_ping_samples=list(self.ws_ping),
+            rest_samples=list(self.rest),
         )
 
 

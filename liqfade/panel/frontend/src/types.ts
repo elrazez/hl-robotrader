@@ -88,6 +88,16 @@ export interface DiskStats {
   used_pct: number;
 }
 
+/** GET /api/recorder/latency: the retained round trip samples as [ts_ms, ms] pairs. */
+export interface Latency {
+  ws_ping: [number, number][];
+  rest: [number, number][];
+  ws_ping_p50: number | null;
+  ws_ping_p95: number | null;
+  rest_p50: number | null;
+  rest_p95: number | null;
+}
+
 /** GET /api/recorder/liquidations: hourly notional per venue, aligned on hour_ms. */
 export interface Liquidations {
   hours: number;

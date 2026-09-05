@@ -1,4 +1,4 @@
-import type { DiskStats, Liquidations, StateSnapshot } from "./types";
+import type { DiskStats, Latency, Liquidations, StateSnapshot } from "./types";
 
 export interface StateResult {
   state: StateSnapshot | null;
@@ -58,6 +58,11 @@ export async function hasSession(): Promise<boolean> {
 export async function fetchDisk(): Promise<DiskStats | null> {
   const res = await fetch("/api/recorder/disk", { credentials: "same-origin" });
   return res.ok ? ((await res.json()) as DiskStats) : null;
+}
+
+export async function fetchLatency(): Promise<Latency | null> {
+  const res = await fetch("/api/recorder/latency", { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as Latency) : null;
 }
 
 export async function fetchLiquidations(hours = 24): Promise<Liquidations | null> {

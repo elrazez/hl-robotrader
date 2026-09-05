@@ -506,6 +506,7 @@ def _print_state(state: Any, origin: str, settings: Settings) -> None:
     if lat.samples:
         print(
             f"\nlatency (ms): ws_ping p50={lat.ws_ping_p50} p95={lat.ws_ping_p95}  "
+            f"rest p50={lat.rest_p50} p95={lat.rest_p95}  "
             f"submit_ack p50={lat.submit_ack_p50} p95={lat.submit_ack_p95}"
         )
     if state.universe:

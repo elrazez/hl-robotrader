@@ -161,7 +161,7 @@ def test_the_window_keeps_only_the_most_recent_samples() -> None:
     tracker = LatencyTracker(window=3)
     for value in (1.0, 2.0, 3.0, 4.0):
         tracker.add_rest(value)
-    assert tracker.rest == [2.0, 3.0, 4.0]
+    assert [ms for _, ms in tracker.rest] == [2.0, 3.0, 4.0]
 
 
 def test_no_samples_reads_as_unmeasured_rather_than_zero() -> None:
@@ -169,3 +169,18 @@ def test_no_samples_reads_as_unmeasured_rather_than_zero() -> None:
     assert state.ws_ping_p50 is None
     assert state.rest_p95 is None
     assert state.samples == 0
+
+
+def test_the_latency_tracker_keeps_the_samples_behind_the_percentiles() -> None:
+    """The Phase 1 DoD asks for time series; only p50 and p95 scalars were exposed."""
+    tracker = LatencyTracker(window=3)
+    for ms in (10.0, 12.0, 11.0, 40.0):
+        tracker.add_ws_ping(ms, at_ms=1788099600000 + int(ms))
+    tracker.add_rest(150.0, at_ms=1788099600000)
+
+    state = tracker.state()
+    assert [ms for _, ms in state.ws_ping_samples] == [12.0, 11.0, 40.0]  # window of 3
+    assert [ts for ts, _ in state.ws_ping_samples] == [1788099600012, 1788099600011, 1788099600040]
+    assert state.rest_samples == [(1788099600000, 150.0)]
+    assert state.ws_ping_p50 == 12.0
+    assert state.samples == 4

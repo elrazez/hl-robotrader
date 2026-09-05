@@ -115,7 +115,14 @@ class RiskState(Base):
 
 
 class LatencyState(Base):
-    """Every value is milliseconds. None means not measured yet in this process."""
+    """Every value is milliseconds. None means not measured yet in this process.
+
+    The `_samples` lists are the retained window behind the percentiles, as
+    `(ts_ms, ms)` pairs oldest first, so the panel can plot a series rather than two
+    numbers. They are the only large thing in the snapshot; `/api/state` strips them and
+    `/api/recorder/latency` serves them, because the page polls state every second and
+    the chart every thirty.
+    """
 
     ws_ping_p50: float | None = None
     ws_ping_p95: float | None = None
@@ -124,6 +131,12 @@ class LatencyState(Base):
     submit_ack_p50: float | None = None
     submit_ack_p95: float | None = None
     samples: int = Field(0, ge=0)
+    ws_ping_samples: list[tuple[int, float]] = Field(
+        default_factory=list, description="(ts_ms, ms) WS ping round trips, oldest first"
+    )
+    rest_samples: list[tuple[int, float]] = Field(
+        default_factory=list, description="(ts_ms, ms) REST round trips, oldest first"
+    )
 
 
 class StateSnapshot(Base):

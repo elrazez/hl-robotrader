@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from liqfade.config import load_settings
 from liqfade.config.models import Settings
-from liqfade.control.protocol import RiskState, StateSnapshot, now_ms
+from liqfade.control.protocol import LatencyState, RiskState, StateSnapshot, now_ms
 from liqfade.control.state import write_state
 from liqfade.panel.app import create_app, is_loopback, liquidations_by_venue, serve
 from liqfade.panel.auth import (
@@ -348,3 +348,69 @@ def test_the_window_is_capped_so_the_panel_cannot_scan_the_whole_lake(
     client.post("/api/login", json={"password": PASSWORD})
     assert client.get("/api/recorder/liquidations?hours=100000").json()["hours"] == 168
     assert client.get("/api/recorder/liquidations?hours=0").json()["hours"] == 1
+
+
+# --- latency samples ------------------------------------------------------------
+
+
+def _with_latency(ts_ms: int) -> StateSnapshot:
+    snapshot = _snapshot(ts_ms)
+    return snapshot.model_copy(
+        update={
+            "latency": LatencyState(
+                ws_ping_p50=8.0,
+                ws_ping_p95=21.0,
+                rest_p50=140.0,
+                rest_p95=210.0,
+                samples=3,
+                ws_ping_samples=[(ts_ms - 20_000, 8.0), (ts_ms, 9.5)],
+                rest_samples=[(ts_ms - 3_600_000, 140.0)],
+            )
+        }
+    )
+
+
+def test_latency_endpoint_serves_the_retained_samples(
+    client: TestClient, settings: Settings
+) -> None:
+    """The Phase 1 DoD asks for WS ping and REST RTT as time series, and LatencyState
+    only ever exposed p50 and p95 scalars."""
+    at = now_ms()
+    write_state(settings.state_path, _with_latency(at))
+    client.post("/api/login", json={"password": PASSWORD})
+
+    body = client.get("/api/recorder/latency").json()
+    assert body["ws_ping"] == [[at - 20_000, 8.0], [at, 9.5]]
+    assert body["rest"] == [[at - 3_600_000, 140.0]]
+    assert body["ws_ping_p95"] == 21.0
+    assert body["rest_p95"] == 210.0  # rendered nowhere before this
+
+
+def test_latency_needs_a_session(client: TestClient) -> None:
+    assert client.get("/api/recorder/latency").status_code == 401
+
+
+def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
+    client: TestClient,
+) -> None:
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/recorder/latency").json()
+    assert body == {
+        "ws_ping": [],
+        "rest": [],
+        "ws_ping_p50": None,
+        "ws_ping_p95": None,
+        "rest_p50": None,
+        "rest_p95": None,
+    }
+
+
+def test_the_state_poll_does_not_carry_the_sample_series(
+    client: TestClient, settings: Settings
+) -> None:
+    """/api/state is polled once a second; the samples are for the 30s chart poll."""
+    write_state(settings.state_path, _with_latency(now_ms()))
+    client.post("/api/login", json={"password": PASSWORD})
+    latency = client.get("/api/state").json()["latency"]
+    assert latency["ws_ping_p50"] == 8.0
+    assert "ws_ping_samples" not in latency

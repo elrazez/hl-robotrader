@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchDisk, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
 import Login from "./Login";
-import type { DiskStats, FeedState, Liquidations, StateSnapshot } from "./types";
+import type { DiskStats, FeedState, Latency, Liquidations, StateSnapshot } from "./types";
 
 const POLL_MS = 1000;
 // The lake does not move fast and duckdb has to read files for it, so poll it slowly.
@@ -84,6 +85,7 @@ export default function App() {
   const [problem, setProblem] = useState<string | null>(null);
   const [disk, setDisk] = useState<DiskStats | null>(null);
   const [liquidations, setLiquidations] = useState<Liquidations | null>(null);
+  const [latency, setLatency] = useState<Latency | null>(null);
 
   useEffect(() => {
     hasSession().then(setAuthed);
@@ -102,6 +104,7 @@ export default function App() {
   const pollRecorder = useCallback(async () => {
     setDisk(await fetchDisk());
     setLiquidations(await fetchLiquidations(LIQ_HOURS));
+    setLatency(await fetchLatency());
   }, []);
 
   useEffect(() => {
@@ -122,7 +125,7 @@ export default function App() {
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
 
   const risk = state?.risk;
-  const latency = state?.latency;
+  const scalars = state?.latency;
 
   return (
     <div className="min-h-screen bg-neutral-950 p-6 text-neutral-100">
@@ -182,17 +185,28 @@ export default function App() {
         </Section>
 
         <Section title="latency">
-          <Row label="ws ping p50" value={ms(latency?.ws_ping_p50 ?? null)} />
-          <Row label="ws ping p95" value={ms(latency?.ws_ping_p95 ?? null)} />
-          <Row label="rest p50" value={ms(latency?.rest_p50 ?? null)} />
-          <Row label="submit to ack p50" value={ms(latency?.submit_ack_p50 ?? null)} />
-          <Row label="submit to ack p95" value={ms(latency?.submit_ack_p95 ?? null)} />
-          <Row label="samples" value={String(latency?.samples ?? 0)} />
+          <Row label="ws ping p50" value={ms(scalars?.ws_ping_p50 ?? null)} />
+          <Row label="ws ping p95" value={ms(scalars?.ws_ping_p95 ?? null)} />
+          <Row label="rest p50" value={ms(scalars?.rest_p50 ?? null)} />
+          <Row label="rest p95" value={ms(scalars?.rest_p95 ?? null)} />
+          <Row label="submit to ack p50" value={ms(scalars?.submit_ack_p50 ?? null)} />
+          <Row label="submit to ack p95" value={ms(scalars?.submit_ack_p95 ?? null)} />
+          <Row label="samples" value={String(scalars?.samples ?? 0)} />
         </Section>
 
         <div className="md:col-span-3">
           <Section title="feeds">
             <Feeds feeds={state?.feeds ?? []} />
+          </Section>
+        </div>
+
+        <div className="md:col-span-3">
+          <Section title="round trip times to hyperliquid, ms">
+            {latency ? (
+              <LatencyChart data={latency} />
+            ) : (
+              <p className="text-sm text-neutral-500">loading</p>
+            )}
           </Section>
         </div>
 

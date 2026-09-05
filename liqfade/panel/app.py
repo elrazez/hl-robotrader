@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from liqfade.config import flatten, resolve
 from liqfade.config.models import Settings
-from liqfade.control.protocol import now_ms
+from liqfade.control.protocol import LatencyState, now_ms
 from liqfade.control.state import read_state
 from liqfade.log import get_logger, setup_logging
 from liqfade.panel.auth import COOKIE_NAME, LoginLimiter, SessionAuth
@@ -202,6 +202,13 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
         age_s = (now_ms() - snapshot.ts_ms) / 1000.0
         payload = snapshot.model_dump(mode="json") | {"age_s": age_s}
+        # The latency sample series belongs to /api/recorder/latency, which the page polls
+        # every thirty seconds. This one is polled every second, and several hundred
+        # points would be the whole payload, over an SSH tunnel, for a chart that has not
+        # moved.
+        payload["latency"] = {
+            key: value for key, value in payload["latency"].items() if not key.endswith("_samples")
+        }
         if age_s > settings.panel.state_stale_s:
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -223,6 +230,28 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
         from liqfade.recorder.health import disk_stats
 
         return disk_stats(settings.paths.data_dir)
+
+    @api.get("/recorder/latency", dependencies=[Depends(require_session)])
+    def recorder_latency() -> dict[str, Any]:
+        """WS ping and REST round trips as time series, plus the percentiles over them.
+
+        The retained window straight out of the snapshot, as `[ts_ms, ms]` pairs. Read
+        from `data/state.json` like everything else the panel shows, so a slow browser
+        can never make the recorder wait. No recorder running is an empty chart rather
+        than a 503: the page shows a gap, which is the honest picture.
+        """
+        try:
+            latency = read_state(settings.state_path).latency
+        except (FileNotFoundError, ValueError, OSError):
+            latency = LatencyState()
+        return {
+            "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
+            "rest": [list(sample) for sample in latency.rest_samples],
+            "ws_ping_p50": latency.ws_ping_p50,
+            "ws_ping_p95": latency.ws_ping_p95,
+            "rest_p50": latency.rest_p50,
+            "rest_p95": latency.rest_p95,
+        }
 
     @api.get("/recorder/liquidations", dependencies=[Depends(require_session)])
     def recorder_liquidations(hours: int = 24) -> dict[str, Any]:
