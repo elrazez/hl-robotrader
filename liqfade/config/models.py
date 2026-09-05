@@ -112,6 +112,15 @@ class Episodes(Base):
     participation_window_s: Pos = Field(..., description="seconds after the extreme for capacity")
 
 
+class Levels(Base):
+    """Supply and demand zones, Q7's inputs. Dumb by design: fractals and rolling extremes."""
+
+    fractal_n: int = Field(..., gt=0, description="bars each side a swing point must beat")
+    range_d: int = Field(..., gt=0, description="days behind the rolling range extremes")
+    max_dist_bps: Pos = Field(..., description="bps beyond which a level counts as absent")
+    zone_width_bps: Pos = Field(..., description="bps within which a price is inside the zone")
+
+
 class Features(Base):
     decision_cadence_ms: int = Field(..., gt=0, description="milliseconds between feature ticks")
     windows_s: tuple[int, ...] = Field(..., min_length=1, description="seconds: trailing windows")
@@ -124,6 +133,7 @@ class Features(Base):
     vwap_anchor_s: Pos = Field(..., description="seconds: pre-cascade VWAP anchor window")
     proxy: ForcedProxy
     episodes: Episodes
+    levels: Levels
 
 
 class Cascade(Base):

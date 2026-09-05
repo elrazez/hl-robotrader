@@ -91,6 +91,14 @@ features:
     peak_window_s: 15  # seconds: trailing window behind peak_liq_15s
     participation: 0.25  # fraction of post-extreme traded notional assumed takeable
     participation_window_s: 60  # seconds after the extreme over which capacity is measured
+  levels:
+    # Supply and demand zones for Q7, built from candles_1m. Deliberately dumb: fractals and
+    # rolling extremes only, so a level is one a trader could have drawn beforehand. A
+    # fractal is not knowable until fractal_n bars after it forms, which the feature enforces.
+    fractal_n: 12  # bars each side a swing high or low must strictly beat, so 25 bars in all
+    range_d: 5  # days behind the rolling highest high and lowest low
+    max_dist_bps: 200.0  # bps: a level further than this is reported absent, not far away
+    zone_width_bps: 15.0  # bps: how close the cascade extreme must be to count as in the zone
   proxy:
     # HL-native forced flow proxy, since the free feed does not flag liquidations.
     vol_median_lookback_s: 3600  # seconds of trailing aggressive volume used as the denominator
