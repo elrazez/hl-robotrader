@@ -42,6 +42,17 @@ def test_envvar_overrides_files_and_is_reported_as_the_source() -> None:
     assert sources["risk.max_concurrent_positions"] == "default.yaml"
 
 
+def test_an_empty_envvar_is_not_set_and_leaves_the_yaml_value_alone() -> None:
+    # .env.example ships `LIQFADE_SYNC_HOST=`; copied to a box as-is it must not
+    # become sync.host = None and refuse every process at startup.
+    environ = {"LIQFADE_SYNC_HOST": "", "LIQFADE_PANEL__PORT": "  "}
+    settings = load_settings("paper", environ=environ)
+    assert settings.sync.host == ""
+    assert settings.panel.port == load_settings("paper", environ={}).panel.port
+    _, sources = resolve("paper", environ=environ)
+    assert sources["panel.port"] == "default.yaml"
+
+
 def test_env_file_is_reported_as_the_source_when_it_wins() -> None:
     _, sources = resolve("mainnet", environ={})
     assert sources["sizing.risk_frac"] == "mainnet.yaml"

@@ -117,6 +117,10 @@ def _env_layer(environ: dict[str, str]) -> dict[str, Any]:
         else:
             # A single-level LIQFADE_FOO that is not an alias is not a config key.
             continue
+        if raw.strip() == "":
+            # `KEY=` in an env file copied from .env.example means "not set", not
+            # "set to nothing": yaml would read it as None and override the YAML value.
+            continue
         try:
             value = yaml.safe_load(raw)
         except yaml.YAMLError:
