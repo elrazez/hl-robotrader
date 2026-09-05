@@ -4,12 +4,13 @@ One subscription covers every SWAP, so the universe never changes the subscripti
 publishes at most one update per contract per second, so like Binance this is a lower
 bound and `complete` is false.
 
-Size caveat, worth knowing before using `notional_usd` from this venue: OKX quotes swap
-size in contracts, and one contract is `ctVal` of the coin (0.01 BTC, 0.1 ETH and so
-on), so `px * sz` is not USD. The raw `sz` and `venue_symbol` are recorded faithfully so
-the correction can be applied later from the instruments endpoint; see the note in
-docs/DATA_SOURCES.md. Inverse (coin margined) contracts map to `coin = null` for the
-same reason.
+Size caveat, and the reason `notional_usd` is null here: OKX quotes swap size in
+contracts, and one contract is `ctVal` of the coin (0.01 BTC, 0.1 ETH and so on), so
+`px * sz` is out by up to 100x and is not USD. `notional_usd` means USD or it means
+null, so this venue writes null until `ctVal` is joined from the instruments endpoint.
+The raw `px`, `sz` and `venue_symbol` are recorded faithfully, so that join is a backfill
+over the lake rather than a re-pull; see the note in docs/DATA_SOURCES.md. Inverse (coin
+margined) contracts map to `coin = null` for the same reason.
 """
 
 from __future__ import annotations
@@ -73,7 +74,8 @@ def _row(inst_id: str, detail: dict[str, Any], rx_ms: int, complete: bool) -> Pa
             "side": side,
             "px": px,
             "sz": sz,
-            "notional_usd": px * sz,
+            # sz is contracts of ctVal each, so px * sz is not USD. See the module note.
+            "notional_usd": None,
             "method": "unknown",
             "complete": complete,
         },

@@ -76,6 +76,10 @@ SIDE_TABLES = {
 HL_VENUE = "hyperliquid"
 HL_TABLES_OWNED_BY_S3 = ("liquidations", "trades")
 
+# The one venue whose size is in contracts rather than coin units, so its notional is not
+# USD and is written null. Same rule and same reason as recorder/streams/okx.py.
+OKX_VENUE = "okx"
+
 # Bybit has published every liquidation since this date (`allLiquidation`); before it,
 # and on Binance and OKX always, the public feed is throttled to one event per symbol per
 # second and the recorded history is a lower bound. Same flag the recorder sets.
@@ -140,10 +144,16 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
     was selling and a long was liquidated. Same convention as the Binance and Bybit live
     parsers, and the field name reads the opposite way on every venue, which is why it is
     spelled out here.
+
+    `notional_usd` is null for OKX, exactly as in `recorder/streams/okx.py`: Tardis passes
+    OKX's `amount` through as contracts of `ctVal` each, so `price * amount` is out by up
+    to 100x and is not USD. `notional_usd` means USD or it means null. `px` and `sz` are
+    kept intact so joining `ctVal` later is a backfill rather than a re-pull.
     """
     from liqfade.data.symbols import to_coin
 
     complete = is_complete(venue, day)
+    contracts = venue == OKX_VENUE
     out = []
     for row in rows:
         symbol = row["symbol"]
@@ -158,7 +168,7 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
                 "side": "long" if row["side"] == "sell" else "short",
                 "px": px,
                 "sz": sz,
-                "notional_usd": None if px is None or sz is None else px * sz,
+                "notional_usd": None if contracts or px is None or sz is None else px * sz,
                 "method": "unknown",
                 "complete": complete,
             }

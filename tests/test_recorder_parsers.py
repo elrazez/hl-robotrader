@@ -305,3 +305,10 @@ def test_okx_one_way_mode_falls_back_to_the_order_side() -> None:
 def test_okx_ack_and_pong_produce_no_rows() -> None:
     assert okx.make_parser(False)(OKX_ACK, RX) == []
     assert okx.make_parser(False)(b"pong", RX) == []
+
+
+def test_okx_notional_is_null_because_sz_counts_contracts_not_coins() -> None:
+    """`px * sz` on OKX is out by `ctVal`, up to 100x. Null beats a wrong currency."""
+    (row,) = rows_for(okx.make_parser(False)(OKX_LIQ, RX), "liquidations")
+    assert row["notional_usd"] is None
+    assert (row["px"], row["sz"]) == (0.05613, 10.0)

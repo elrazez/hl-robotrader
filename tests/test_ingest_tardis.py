@@ -137,6 +137,13 @@ def test_notional_is_price_times_amount() -> None:
     assert row["notional_usd"] == pytest.approx(78400.0 * 3.0)
 
 
+def test_okx_notional_is_null_because_sz_counts_contracts_not_coins() -> None:
+    """Same rule as the live OKX parser: `px * sz` is contracts, not USD."""
+    row = tardis_free.to_liquidations(rows_of(LIQ_CSV["okex-swap"]), "okx", DAY)[0]
+    assert row["notional_usd"] is None
+    assert (row["px"], row["sz"]) == (78400.0, 5.0)
+
+
 def test_completeness_follows_bybit_and_the_date_it_started_publishing_everything() -> None:
     assert tardis_free.is_complete("bybit", date(2025, 3, 1))
     assert not tardis_free.is_complete("bybit", date(2025, 1, 1))
