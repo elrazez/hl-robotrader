@@ -97,11 +97,39 @@ async def test_a_declared_stream_whose_socket_never_came_up_is_an_alert(
     tmp_path: Path,
 ) -> None:
     """`and stat.last_msg_ms` used to gate this, so a stream that never connected at all
-    was the one case nothing reported."""
+    was the one case nothing reported. It waits for the grace, like every other
+    never-delivered stream, but it is reported."""
     stat = StreamStats(name="okx.liquidations", continuous=False, connected=False)
     health, alerts = _health(tmp_path, stat)
+    health.started -= health.startup_grace_s + 1.0
     await health.check_streams(now_ms())
     assert alerts.sent == ["recorder: okx.liquidations disconnected"]
+
+
+async def test_a_fresh_process_does_not_alert_that_every_stream_is_disconnected(
+    tmp_path: Path,
+) -> None:
+    """Every stream is disconnected until its first connect returns, and the health loop
+    runs before any of them have. Unconditional, that was one Telegram message per
+    declared stream on every restart, each with a different text so `telegram._deduped`
+    could not collapse them."""
+    stats = [
+        StreamStats(name=name, continuous=name.startswith("hyperliquid"), connected=False)
+        for name in ("hyperliquid.trades", "hyperliquid.bbo", "binance.liquidations")
+    ]
+    health, alerts = _health(tmp_path, *stats)
+    await health.check_streams(now_ms())
+    assert alerts.sent == []
+
+
+async def test_a_stream_that_delivered_and_then_dropped_alerts_at_once(tmp_path: Path) -> None:
+    """The grace above must not delay a real outage on a feed that was working."""
+    stat = StreamStats(name="binance.liquidations", continuous=False, connected=False)
+    at = now_ms()
+    stat.record_message(at - 1000)
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == ["recorder: binance.liquidations disconnected"]
 
 
 async def test_a_stream_that_connects_and_never_delivers_is_quiet_during_the_grace(

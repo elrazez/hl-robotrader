@@ -11,7 +11,10 @@ up either silently losing data or paging its owner every ten minutes:
   subscription is invisible in a stream-level number that nineteen other coins keep fresh.
 - A *sparse* stream (Binance and OKX liquidations, both throttled and event driven) is
   quiet whenever the market is calm. Silence there means nothing, so only the connection
-  being down is alerted, which the ping/pong on the socket already tells us.
+  being down is alerted, which the ping/pong on the socket already tells us. A stream
+  that has not delivered yet is exempt until `startup_grace_s`: every stream is
+  disconnected for the first moments of a process, and alerting on that put one message
+  per declared stream into Telegram on every restart.
 
 A stream that has never delivered *anything* is a fourth case, and the one the other
 three miss: no gap is counted (there is no last message to measure from), no silence is
@@ -151,10 +154,15 @@ class Health:
                     f"recorder: {stat.name} silent for over {self.cfg.silence_alert_s:.0f}s"
                     + (f" (worst coin {worst})" if worst else "")
                 )
-            elif not stat.connected:
-                # Sparse feeds are quiet by nature, so only a dead socket is news. This
-                # used to also require `stat.last_msg_ms`, which excluded exactly the
-                # stream whose socket never came up at all.
+            elif not stat.connected and (stat.last_msg_ms or self._past_grace()):
+                # Sparse feeds are quiet by nature, so only a dead socket is news. A
+                # stream that has delivered before is reported the moment it drops; one
+                # that never has waits for the startup grace, because every stream is
+                # disconnected until its first connect returns and an unconditional alert
+                # here posted one Telegram message per declared stream on every restart.
+                # Nine different texts, so the alerter's dedupe could not collapse them.
+                # The grace is the same one the never-delivered branch below uses, and
+                # a socket that never comes up is still said out loud, just not at t=0.
                 sent.append(f"recorder: {stat.name} disconnected")
             elif (
                 stat.last_msg_ms == 0
