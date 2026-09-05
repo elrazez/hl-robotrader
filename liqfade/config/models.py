@@ -99,6 +99,19 @@ class ForcedProxy(Base):
     mark_mid_pct_threshold: Pct = Field(..., description="percentile of abs(mark-mid)/mid")
 
 
+class Episodes(Base):
+    """Research episode detection. The two absolute floors are fixed, not tuned."""
+
+    join_gap_s: Pos = Field(..., description="seconds between liquidations that end an episode")
+    min_notional_usd: Pos = Field(..., description="USD: absolute floor on episode notional")
+    min_move_bps: Pos = Field(..., description="bps: absolute floor on anchor to extreme move")
+    p95_lookback_d: int = Field(..., gt=0, description="days of prior episodes behind the p95")
+    liq_z_min: float = Field(..., description="z-score that qualifies regardless of the p95")
+    peak_window_s: Pos = Field(..., description="seconds: the window behind peak_liq")
+    participation: Frac = Field(..., description="fraction of post-extreme notional takeable")
+    participation_window_s: Pos = Field(..., description="seconds after the extreme for capacity")
+
+
 class Features(Base):
     decision_cadence_ms: int = Field(..., gt=0, description="milliseconds between feature ticks")
     windows_s: tuple[int, ...] = Field(..., min_length=1, description="seconds: trailing windows")
@@ -110,6 +123,7 @@ class Features(Base):
     depth_bps: Pos = Field(..., description="bps from the touch used for depth features")
     vwap_anchor_s: Pos = Field(..., description="seconds: pre-cascade VWAP anchor window")
     proxy: ForcedProxy
+    episodes: Episodes
 
 
 class Cascade(Base):

@@ -92,6 +92,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = [
     "liqfade.config.*",
+    "liqfade.features.*",
     "liqfade.control.*",
     "liqfade.strategy.*",
     "liqfade.sizing.*",

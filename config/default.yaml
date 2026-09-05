@@ -76,6 +76,21 @@ features:
   cvd_slope_window_s: 15  # seconds over which the CVD slope is measured
   depth_bps: 10.0  # basis points from the touch used for the depth features
   vwap_anchor_s: 300  # seconds: pre-cascade VWAP anchor for the displacement feature
+  episodes:
+    # Research ground truth for a liquidation cascade, docs/../PREREGISTRATION.md. Used by
+    # scripts/research/, never by the live loop, which has its own online detector.
+    join_gap_s: 60  # seconds: a longer silence than this between liquidations ends the episode
+    # The two absolute floors are fixed by the preregistration and are not tunable by
+    # Phase 3. Together they are roughly 2x the net-stress round trip, below which the
+    # trade cannot pay even at 100% reversion; they exist because a purely relative rule
+    # emits the same episode rate no matter how quiet the tape is.
+    min_notional_usd: 250000.0  # USD: total liquidated notional in the episode
+    min_move_bps: 30.0  # bps: abs(anchor_px - extreme_px) / anchor_px
+    p95_lookback_d: 30  # days of the coin's own prior episodes behind the relative threshold
+    liq_z_min: 3.0  # z-score: qualifies an episode regardless of the p95 rule
+    peak_window_s: 15  # seconds: trailing window behind peak_liq_15s
+    participation: 0.25  # fraction of post-extreme traded notional assumed takeable
+    participation_window_s: 60  # seconds after the extreme over which capacity is measured
   proxy:
     # HL-native forced flow proxy, since the free feed does not flag liquidations.
     vol_median_lookback_s: 3600  # seconds of trailing aggressive volume used as the denominator
