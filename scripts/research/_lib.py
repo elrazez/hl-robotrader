@@ -607,9 +607,16 @@ def _liquidation_z(
 def _grid_windows(episodes: pl.DataFrame) -> dict[str, dict[str, list[tuple[int, int]]]]:
     """Per UTC day, per coin, the `[from, to]` spans of tape an episode needs.
 
-    The lead-in covers the realized-vol window and the VWAP anchor; the trail covers the
-    extreme search, the capacity window and the +60 minute horizon. A window that crosses
-    midnight appears under both days, so each day's read is self-contained.
+    The lead-in covers the realized-vol window; the trail covers the extreme search, the
+    capacity window and the +60 minute horizon. A window that crosses midnight appears under
+    both days, so each day's read is self-contained.
+
+    Dense the whole way, deliberately. Materialising only a core plus narrow islands around
+    the five horizon timestamps saves about a gigabyte, and was measured to move the March
+    headline from +38.5 to +37.9 bps: `mid` is the last trade price forward filled, an
+    island cannot forward fill from a trade outside itself, and a row dropped for having no
+    price lets the horizon's asof reach the next row instead, which is a price from after
+    the horizon. A smaller footprint is not worth a lookahead.
     """
     windows: dict[str, dict[str, list[tuple[int, int]]]] = {}
     for row in episodes.iter_rows(named=True):
@@ -694,7 +701,20 @@ def _dense_windows(windows: dict[str, list[tuple[int, int]]]) -> pl.DataFrame:
     )
 
 
-def episode_grid(data_dir: str | Path, episodes: pl.DataFrame) -> pl.DataFrame:
+# The grid columns the episode pipeline actually reads. `volume`, `signed_notional` and
+# `n_trades` are only wanted by Q2's tick features, and a year of episode windows is tens of
+# millions of rows, so carrying three unused float columns is hundreds of megabytes of an
+# eight gigabyte machine.
+GRID_COLUMNS = ("coin", "ts_ms", "mid", "notional_usd")
+
+
+def episode_grid(
+    data_dir: str | Path,
+    episodes: pl.DataFrame,
+    *,
+    columns: Sequence[str] = GRID_COLUMNS,
+    spill: Path | None = None,
+) -> pl.DataFrame:
     """A 1s grid covering only the tape each episode needs, built one UTC day at a time.
 
     This is the whole of Stage B's memory story. A day of trades is fifty million rows; the
@@ -711,7 +731,12 @@ def episode_grid(data_dir: str | Path, episodes: pl.DataFrame) -> pl.DataFrame:
     """
     if episodes.is_empty():
         return pl.DataFrame()
-    parts = []
+    parts: list[pl.DataFrame] = []
+    spilled: list[Path] = []
+    if spill is not None:
+        spill.mkdir(parents=True, exist_ok=True)
+        for stale in spill.glob("*.parquet"):
+            stale.unlink()
     for day, coins in sorted(_grid_windows(episodes).items()):
         bars = _windowed_second_bars(data_dir, day, coins)
         if bars.is_empty():
@@ -732,12 +757,50 @@ def episode_grid(data_dir: str | Path, episodes: pl.DataFrame) -> pl.DataFrame:
             .drop("last_px")
             .filter(pl.col("mid").is_not_null())
         )
+        kept = kept.select(list(columns))
         if not kept.is_empty():
-            parts.append(kept)
-        del bars, dense
+            if spill is not None:
+                # Spilled to disk a day at a time and read back in one pass. Accumulating in
+                # memory and concatenating at the end holds the whole year twice over at the
+                # moment of the concat, which is the spike that killed the year run.
+                path = spill / f"{day}.parquet"
+                kept.write_parquet(path)
+                spilled.append(path)
+            else:
+                parts.append(kept)
+        del bars, dense, kept
+    if spilled:
+        parts = [pl.read_parquet(spilled)]
     if not parts:
         return pl.DataFrame()
-    return pl.concat(parts).unique(subset=["coin", "ts_ms"], keep="first").sort("coin", "ts_ms")
+    return (
+        pl.concat(parts, rechunk=False)
+        .unique(subset=["coin", "ts_ms"], keep="first")
+        .sort("coin", "ts_ms")
+    )
+
+
+def _candidate_liquidations(liquidations: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
+    """The liquidation events belonging to the candidate episodes, and no others.
+
+    Found with an asof join rather than a join on coin and side followed by an interval
+    filter: BTC alone is half a million events against hundreds of candidates, and that
+    product is the shape of mistake that killed two earlier runs. Each event is matched to
+    the latest candidate that started at or before it and kept when it also ends after it;
+    episodes on one coin and side are more than the join gap apart, so at most one can
+    contain any event.
+    """
+    if candidates.is_empty() or liquidations.is_empty():
+        return liquidations.head(0)
+    spans = candidates.select("coin", "side", "start_ts", "end_ts").sort("start_ts")
+    marked = (
+        liquidations.sort("ts_ms")
+        .join_asof(
+            spans, left_on="ts_ms", right_on="start_ts", by=["coin", "side"], strategy="backward"
+        )
+        .filter(pl.col("end_ts").is_not_null() & (pl.col("ts_ms") <= pl.col("end_ts")))
+    )
+    return marked.drop("start_ts", "end_ts")
 
 
 def build_episodes(
@@ -776,10 +839,10 @@ def build_episodes(
         "participation_window_s": cfg.participation_window_s,
     }
     window = (pl.col("start_ts") >= ms(start)) & (pl.col("start_ts") < ms(end) + 86_400_000)
-    candidates = group_episodes(liquidations, empty_bars, **detector).filter(window)
-    if candidates.is_empty():
+    all_episodes = group_episodes(liquidations, empty_bars, **detector).filter(window)
+    if all_episodes.is_empty():
         return pl.DataFrame()
-    candidates = _liquidation_z(liquidations, candidates, settings)
+    candidates = _liquidation_z(liquidations, all_episodes, settings)
     candidates = qualify_episodes(
         candidates.with_columns(
             # The move floor cannot be judged without a price, so it is left to Stage B; the
@@ -797,10 +860,21 @@ def build_episodes(
     )
 
     # Stage B: tape only where Stage A left something worth pricing.
-    grid = episode_grid(data_dir, candidates)
+    grid = episode_grid(data_dir, candidates, spill=cache.parent / "grid" if cache else None)
     if grid.is_empty():
         return pl.DataFrame()
-    episodes = group_episodes(liquidations, grid, **detector).filter(window)
+    # Priced over the candidates' own events, not the year's. The result is joined back on
+    # to the full episode list, so the unfiltered count stays the true one and the trailing
+    # p95 below is still built from every episode rather than from the survivors.
+    priced = group_episodes(_candidate_liquidations(liquidations, candidates), grid, **detector)
+    bar_columns = ["anchor_px", "extreme_px", "extreme_ts"] + [
+        column for column in priced.columns if column.startswith("notional_at_")
+    ]
+    episodes = all_episodes.drop(bar_columns, strict=False).join(
+        priced.select("coin", "side", "start_ts", *bar_columns),
+        on=["coin", "side", "start_ts"],
+        how="left",
+    )
     # The z was computed in Stage A from liquidations alone and is carried across rather
     # than recomputed: the same episode keys, the same numbers, no second pass.
     episodes = episodes.join(

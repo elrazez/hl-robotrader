@@ -153,8 +153,17 @@ def main() -> None:
     episodes = episodes.filter(pl.col("qualified"))
     rows: list[list[str]] = []
     means: dict[str, float] = {}
+    # The wider column set: the exhaustion rule reads the CVD slope, which needs the
+    # signed notional the episode pipeline itself has no use for.
     grid = lib.feature_grid(
-        args.data_dir, episodes, settings, lib.episode_grid(args.data_dir, episodes)
+        args.data_dir,
+        episodes,
+        settings,
+        lib.episode_grid(
+            args.data_dir,
+            episodes,
+            columns=("coin", "ts_ms", "mid", "notional_usd", "volume", "signed_notional"),
+        ),
     )
     entries = exhaustion_ticks(grid, episodes, settings) if not grid.is_empty() else pl.DataFrame()
     fired = entries.height
