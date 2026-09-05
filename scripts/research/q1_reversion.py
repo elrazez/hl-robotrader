@@ -40,6 +40,8 @@ from liqfade.config.loader import load_settings
 HEADLINE_MIN = 15  # minutes: the preregistered horizon, the only one that can produce a yes
 TRADEABLE_BPS = 24.0  # the spec's min_edge_multiple floor: 4x the 6 bps round trip
 MARGINAL_BPS = 15.0
+# Reported as a robustness slice only. Phase 4's pre-trade guard, from the core tier's p99.
+SPREAD_GUARD_BPS = 30.0
 
 
 def reversion_columns(episodes: pl.DataFrame) -> pl.DataFrame:
@@ -117,6 +119,14 @@ def split_table(episodes: pl.DataFrame) -> str:
         ("isolated coin (BTC quiet)", episodes.filter(~pl.col("btc_cascading"))),
         ("market-wide sweep", episodes.filter(pl.col("btc_cascading"))),
         ("top 5 clusters removed", lib.drop_top_clusters(episodes, column, count=5)),
+        # Reported, not applied. The effective spread inside the filtered universe has a
+        # p99 of 137 bps that lives entirely in major and minor; core's own p99 is 22.9.
+        # Phase 4 takes 30 bps as a pre-trade guard, chosen from that core p99. Q1 does not
+        # cap: it shows what the cap would have done. See docs/DECISIONS.md, 2026-09-05.
+        (
+            f"used spread <= {SPREAD_GUARD_BPS:g} bps",
+            episodes.filter(pl.col("spread_bps") <= SPREAD_GUARD_BPS),
+        ),
     ):
         rows.append([label, *slice_cells(kept, column)])
     return lib.table(["slice", "episodes", "clusters", "net-stress bps"], rows)
@@ -158,7 +168,7 @@ def verdict(episodes: pl.DataFrame, qualifying: bool, facts: str) -> str:
         f"clusters removed it is {trimmed_mean:+.1f} bps. Sample: {facts}."
     )
     if estimate.mean <= 0:
-        return lib.decision("no", f"Stop rule 1, no edge. {tail}")
+        return lib.decision("no", tail, stop_rule=1)
     if estimate.lo <= 0:
         return lib.decision(
             "inconclusive", f"The interval includes zero, so the edge is not established. {tail}"

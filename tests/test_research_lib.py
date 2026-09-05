@@ -296,3 +296,22 @@ def test_an_episode_in_a_coin_with_no_asset_ctx_is_dropped_not_nulled(
     )
     kept = lib._apply_universe(research_lake, episodes, "2026-03-01", "2026-03-01", settings)
     assert kept["coin"].to_list() == ["BTC"]
+
+
+def test_a_report_cannot_name_a_stop_rule_in_its_prose() -> None:
+    """Q8 once printed "Stop rule 2, unharvestable edge" on an outcome where stop rule 2's
+    condition was not met, because the sentence was prose and nothing connected it to the
+    rule."""
+    with pytest.raises(ValueError, match="stop_rule argument"):
+        lib.decision("no", "Stop rule 2, unharvestable edge. Nothing worked.")
+
+
+def test_a_cited_stop_rule_is_written_from_the_preregistration() -> None:
+    text = lib.decision("no", "Nothing worked.", stop_rule=2)
+    assert "**Stop rule 2**" in text
+    assert lib.STOP_RULES[2] in text
+
+
+def test_a_stop_rule_cannot_be_cited_on_a_yes() -> None:
+    with pytest.raises(ValueError, match="cited on a"):
+        lib.decision("yes", "It worked.", stop_rule=2)

@@ -17,9 +17,12 @@ exactly as `docs/STRATEGY_AND_RISK.md` section 3 defines them. When both levels 
 inside the same second the stop is assumed first, because the tape cannot say which came
 first and the pessimistic reading is the only honest one.
 
-DECISION yes only if some cell beats hold-to-horizon, has a stop-out rate under 50%, and
-its neighbours in the grid are also positive. An isolated positive cell is the
-multiple-comparison problem wearing a hat.
+DECISION yes if some cell has positive net-stress, a stop-out rate under 50%, and positive
+neighbours in the grid; an isolated positive cell is the multiple-comparison problem wearing
+a hat. The preregistration originally asked a cell to **beat** hold-to-horizon, which was a
+drafting error, since a stop is insurance and cannot beat no-stop in expectation on a
+reverting sample. Stop rule 2 governs. Amended 2026-09-05 after the numbers were seen; see
+docs/DECISIONS.md.
 
     uv run python scripts/research/q8_path.py --start 2025-09-01 --end 2026-08-31
 """
@@ -240,38 +243,50 @@ def neighbours(cell: tuple[float, float]) -> list[tuple[float, float]]:
 def verdict(
     cells: dict[tuple[float, float], dict[str, float]], hold: float, qualifying: bool, facts: str
 ) -> str:
+    """The preregistered bar, as amended on 2026-09-05.
+
+    The original wording asked a cell to **beat** hold-to-horizon. That was a drafting
+    error: a stop is insurance and cannot beat no-stop in expectation on a sample that
+    reverts, so no grid could ever have satisfied it and the question could only ever have
+    answered no. Stop rule 2 governs instead, which is the condition the project actually
+    cares about: is there a cell that is positive, does not stop out of half its trades, and
+    sits in a positive neighbourhood rather than alone. Decided by the owner after seeing
+    the numbers; recorded in docs/DECISIONS.md, 2026-09-05.
+    """
     if not qualifying:
         return lib.decision(
             "inconclusive",
             f"The sample does not clear the preregistered bar: {facts}. A stop-out rate "
             f"measured on a sample this size is a rate of nothing.",
         )
-    winners = [
+    harvestable = [
         (cell, stats)
         for cell, stats in cells.items()
-        if stats["net_stress"] > hold
+        if stats["net_stress"] > 0
         and stats["stop_rate"] < MAX_STOP_RATE
         and all(
             cells.get(other, {"net_stress": -1.0})["net_stress"] > 0 for other in neighbours(cell)
         )
     ]
-    if not winners:
+    if not harvestable:
         best = max(cells.values(), key=lambda stats: stats["net_stress"], default=None)
         detail = f"best cell {best['net_stress']:+.1f} bps" if best else "no cells"
         return lib.decision(
             "no",
-            f"Stop rule 2, unharvestable edge. No cell beats hold-to-horizon "
-            f"({hold:+.1f} bps) with a stop-out rate under {MAX_STOP_RATE:.0%} and positive "
+            f"No cell is positive with a stop-out rate under {MAX_STOP_RATE:.0%} and positive "
             f"neighbours ({detail}). The reversion may be real and still not be reachable "
             f"through a stop. {facts}.",
+            stop_rule=2,
         )
-    cell, stats = max(winners, key=lambda item: item[1]["net_stress"])
+    cell, stats = max(harvestable, key=lambda item: item[1]["net_stress"])
     stop_label = "none" if math.isinf(cell[0]) else f"{cell[0]:g}"
+    kept = f"{stats['net_stress']:+.1f} of {hold:+.1f}"
     return lib.decision(
         "yes",
-        f"k_stop {stop_label}, k_target {cell[1]:g}: {stats['net_stress']:+.1f} bps net-stress "
-        f"against {hold:+.1f} bps for holding to the horizon, stopping out "
-        f"{stats['stop_rate']:.0%} of the time, with every neighbouring cell positive. "
+        f"Yes with a stop. `k_stop={stop_label}`, `k_target={cell[1]:g}` keeps {kept} bps at "
+        f"{stats['stop_rate']:.0%} stop-outs, with every neighbouring cell positive. A stop "
+        f"is insurance: it is not expected to beat holding on a reverting sample, it is "
+        f"expected to cost little while bounding the loss on the ones that do not revert. "
         f"These are the values the config writeback takes. {facts}.",
     )
 
@@ -346,8 +361,10 @@ def main() -> None:
         "## The stop and target grid",
         "",
         f"Hold to the {TIME_STOP_S // 60} minute horizon with no stop and no target is "
-        f"**{hold:+.1f} bps** net-stress. A cell has to beat that, stop out less than "
-        f"{MAX_STOP_RATE:.0%} of the time, and have positive neighbours.",
+        f"**{hold:+.1f} bps** net-stress, and is reported as the reference rather than as a "
+        f"bar: a stop cannot beat no-stop in expectation on a reverting sample. A cell has "
+        f"to be positive, stop out less than {MAX_STOP_RATE:.0%} of the time, and have "
+        f"positive neighbours.",
         "",
         grid,
         verdict(cells, hold, qualifying, facts),

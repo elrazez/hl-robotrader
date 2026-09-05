@@ -389,10 +389,36 @@ def table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def decision(verdict: str, reason: str) -> str:
-    """The one line every report ends with. `verdict` is yes, no or inconclusive."""
+# The preregistration's stop rules, by number, so a report can only cite one it can name.
+STOP_RULES = {
+    1: "no edge: Q1 net-stress at +15 min is at or below zero on a qualifying sample",
+    2: (
+        "unharvestable edge: no Q8 cell has positive net-stress with a stop-out rate under "
+        "50% and positive neighbours"
+    ),
+    3: "lottery edge: the headline dies with the top 5 clusters removed, or fails 2 of 3 splits",
+    4: "no capacity: under $2,000 a year at 25% participation",
+    5: "no trigger: the proxy is under precision 0.5 and Q4 cannot be answered for months",
+}
+
+
+def decision(verdict: str, reason: str, *, stop_rule: int | None = None) -> str:
+    """The one line every report ends with. `verdict` is yes, no or inconclusive.
+
+    A stop rule may only be named through `stop_rule`, and the citation is written from
+    `STOP_RULES` rather than typed into the reason. Q8 once printed "Stop rule 2,
+    unharvestable edge" on an outcome where stop rule 2's condition was not met, because
+    the sentence was prose in the verdict text and nothing connected it to the rule. A
+    report that names a rule the data did not trigger is worse than one that names none.
+    """
     if verdict not in {"yes", "no", "inconclusive"}:
         raise ValueError(f"verdict must be yes, no or inconclusive, not {verdict!r}")
+    if "stop rule" in reason.lower():
+        raise ValueError("cite a stop rule through the stop_rule argument, not in the text")
+    if stop_rule is not None:
+        if verdict != "no":
+            raise ValueError(f"stop rule {stop_rule} cited on a {verdict!r} decision")
+        reason = f"**Stop rule {stop_rule}**, {STOP_RULES[stop_rule]}.\n\n{reason}"
     return f"\n## DECISION: {verdict}\n\n{reason}\n"
 
 

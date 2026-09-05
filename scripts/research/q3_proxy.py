@@ -40,6 +40,8 @@ THRESHOLDS = (2.0, 3.0, 4.0, 6.0)
 MATCH_WINDOW_MS = 120_000
 PRECISION_BAR = 0.6
 RECALL_BAR = 0.4
+# Below this, and with Q4 unanswerable, the preregistration parks the project (stop rule 5).
+PARK_PRECISION = 0.5
 PROXY_WINDOW_S = 60
 # A run of consecutive ticks over the threshold is one trigger, not one per tick, or the
 # precision denominator becomes "how many seconds did the cascade last".
@@ -152,12 +154,21 @@ def trigger_branch(headline: dict[float, Score]) -> tuple[str, str]:
         if best
         else "no thresholds scored"
     )
+    # The parking rule is only named when its own condition holds. It asks for precision
+    # under 0.5 as well as a Q4 that cannot be answered, and a report that names a rule the
+    # data did not trigger is worse than one that names none.
+    parked = best is not None and best.precision < PARK_PRECISION
+    tail = (
+        f" Precision is also under {PARK_PRECISION}, so if Q4 cannot be answered for months "
+        f"the project parks until the recorder has the data."
+        if parked
+        else ""
+    )
     return "cross-venue", (
         f"No threshold clears precision {PRECISION_BAR} and recall {RECALL_BAR} on core+major "
         f"({detail}). **The v0 trigger is cross-venue**, on Bybit, the only complete feed, "
         f"and Q4 becomes a Phase 4 entry requirement at the reduced bar of 15 clusters and 60 "
-        f"recorder days. If the proxy is also under precision 0.5 and Q4 cannot be answered "
-        f"for months, stop rule 5 applies: park the project until the recorder has the data."
+        f"recorder days.{tail}"
     )
 
 

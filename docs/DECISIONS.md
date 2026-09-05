@@ -998,8 +998,11 @@ figure that barely moves within a day. Every input to it is trailing: the snapsh
 the day it selects for. The per-coin floors are also checked at the episode's own trailing
 minute sample, so an episode in a coin that fell through the floor mid-day is still excluded.
 
-**Phase 3 research runs peak at 3.0 GB (Q1) and 3.3 GB (Q8) over a year, against a 3 GB
-budget on an 8 GB machine.** Accepted by the owner, 2026-09-05. A month runs at 1.6 GB.
+**Phase 3 research runs peak at 2.23 GB (Q1) and 2.57 GB (Q8) over a year, inside the 3 GB
+budget on an 8 GB machine.** Amended 2026-09-05: the figures accepted earlier that day were
+3.0 and 3.3 GB, measured before the universe filter below. Filtering the universe cut the
+episode count from 5,149 to 2,722 and brought both runs inside the budget on their own. A
+month runs at 1.6 GB.
 The change that would clear the year, materialising a dense core plus narrow islands around
 the five horizon timestamps instead of a dense 66 minutes, saves about a gigabyte and was
 measured to move the March headline from +38.5 to +37.9 bps: `mid` is a forward-filled last
@@ -1007,3 +1010,48 @@ trade price, an island cannot forward fill from a trade outside itself, and a ro
 having no price lets the horizon's asof reach a price from after the horizon. Reverted. A
 smaller footprint is not worth a lookahead. Reverse only with a design that keeps the
 forward fill correct across the gaps.
+
+## 2026-09-05 (Phase 3, decided after seeing the filtered year)
+
+Everything in this section was **decided after the numbers were seen**, which the
+preregistration requires to be said out loud. None of it moves a bar that a result was then
+read against; the Q8 change removes a clause that no result could ever have satisfied.
+
+**Q8's "beats hold-to-horizon" clause was a drafting error, and stop rule 2 governs the stop
+decision.** The preregistration said a cell must *beat* hold-to-horizon. A stop is insurance:
+on a sample selected for reverting, it cannot beat no-stop in expectation, because its only
+effect is to leave some reversion on the table in exchange for bounding the losses that do
+not revert. No grid could ever have satisfied that clause, so the question could only ever
+have answered no, which is not a measurement. Stop rule 2 is the condition the project
+actually cares about and is what Q8 now reads: is there a cell that is positive, does not
+stop out of half its trades, and sits in a positive neighbourhood rather than alone.
+
+On the filtered year all twelve cells satisfy it. **Q8's decision is yes with a stop:
+`k_stop = 1`, `k_target = 0.8` keeps +80.6 of the +84.6 bps that holding to the horizon
+returns, at a 15% stop-out rate.** Owner's decision, 2026-09-05. Hold-to-horizon stays in the
+report as the reference number, not as a bar.
+
+**A report may not name a stop rule whose condition is unmet.** Q8 printed "Stop rule 2,
+unharvestable edge" on an outcome where twelve of twelve cells met stop rule 2's condition,
+because the citation was prose in the verdict text and nothing connected it to the rule.
+`scripts/research/_lib.py:decision` now refuses a reason mentioning a stop rule, takes the
+rule by number, writes the citation from the preregistration's own wording, and refuses to
+cite one on anything but a `no`. Q3 carried the same defect for stop rule 5 and now names it
+only when precision is genuinely under 0.5.
+
+**Phase 4 sizes on the isolated-coin and top-5-removed numbers, not on the pooled headline.**
+Q1's pooled +84.6 bps is +26.7 in the isolated-coin bucket and +34.0 with the top five
+clusters removed. The difference is cluster upside, and a cluster is one bet: a market-wide
+sweep liquidates dozens of coins inside one minute and the strategy would have been in all of
+them at once. **The risk layer must therefore cap exposure per cluster**, not only per coin
+and in total, and Phase 4 sizes on 27 to 34 bps rather than on 85. Written into
+`reports/research/SUMMARY.md` beside the Q1 row.
+
+**30 bps becomes a pre-trade spread guard in Phase 4, and is not applied in Q1.** Inside the
+filtered universe the used effective spread is p50 4.1, p95 26.3, p99 137.5, max 5,107 bps,
+and the whole tail is in major and minor: the core tier's own p99 is 22.9 with a max of 322.
+Q1 reports a "used spread <= 30 bps" robustness row alongside the others rather than capping,
+so the effect of the guard is visible instead of assumed. The 30 comes from the core tier's
+p99 rounded up, which is the level at which a spread stops looking like a liquid perp's. It
+belongs in `filters.max_spread_bps` in Phase 4, evaluated pre-trade on live book data, not in
+the research sample.
