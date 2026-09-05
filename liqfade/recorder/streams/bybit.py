@@ -26,6 +26,10 @@ TOPIC = "allLiquidation"
 PING_FRAME = {"op": "ping"}
 PING_S = 20.0
 
+# `S` is the position side in Bybit's own wording: Sell means a long was liquidated.
+# Explicit rather than a two-branch default, for the same reason as every other venue.
+LIQ_SIDES = {"Sell": "long", "Buy": "short"}
+
 
 def _batched(op: str, symbols: Sequence[str], batch: int) -> list[dict[str, Any]]:
     topics = [f"{TOPIC}.{symbol}" for symbol in symbols]
@@ -60,6 +64,9 @@ def make_parser(complete: bool) -> Parser:
 
 
 def _row(entry: dict[str, Any], rx_ms: int, complete: bool) -> ParsedRow:
+    side = LIQ_SIDES.get(str(entry.get("S")))
+    if side is None:
+        return ("liquidations", None)
     symbol = entry["s"]
     px = float(entry["p"])
     sz = float(entry["v"])
@@ -71,7 +78,7 @@ def _row(entry: dict[str, Any], rx_ms: int, complete: bool) -> ParsedRow:
             "venue_symbol": symbol,
             "ts_ms": int(entry["T"]),
             "rx_ms": rx_ms,
-            "side": "long" if entry["S"] == "Sell" else "short",
+            "side": side,
             "px": px,
             "sz": sz,
             "notional_usd": px * sz,

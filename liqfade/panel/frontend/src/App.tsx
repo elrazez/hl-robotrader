@@ -47,6 +47,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
           <th className="pb-1 text-right font-medium">lag</th>
           <th className="pb-1 text-right font-medium">msgs/min</th>
           <th className="pb-1 text-right font-medium">gaps 1h</th>
+          <th className="pb-1 text-right font-medium">parse errors 1h</th>
         </tr>
       </thead>
       <tbody>
@@ -59,6 +60,13 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
             <td className="py-1 text-right tabular-nums">{feed.lag_ms} ms</td>
             <td className="py-1 text-right tabular-nums">{feed.msgs_1m}</td>
             <td className="py-1 text-right tabular-nums">{feed.gaps_1h}</td>
+            <td
+              className={`py-1 text-right tabular-nums ${
+                feed.parse_errors_1h > 0 ? "text-amber-300" : ""
+              }`}
+            >
+              {feed.parse_errors_1h}
+            </td>
           </tr>
         ))}
       </tbody>

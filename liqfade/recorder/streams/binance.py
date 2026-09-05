@@ -23,6 +23,11 @@ from liqfade.recorder.streams.base import ParsedRow, Parser
 VENUE = "binance"
 TABLES = ("liquidations",)
 
+# `o.S` is the side of the liquidation order, so SELL means the engine was selling to
+# close a long. Explicit rather than a two-branch default: a re-cased token would
+# otherwise write every long liquidation as a short.
+LIQ_SIDES = {"SELL": "long", "BUY": "short"}
+
 
 def on_connect(_symbols: Sequence[str]) -> list[Any]:
     """Nothing to send: the all-market stream is part of the URL."""
@@ -45,6 +50,9 @@ def make_parser(complete: bool) -> Parser:
 
 
 def _row(order: dict[str, Any], rx_ms: int, complete: bool) -> ParsedRow:
+    side = LIQ_SIDES.get(str(order.get("S")))
+    if side is None:
+        return ("liquidations", None)
     symbol = order["s"]
     # ap is the average fill price and is 0 until the order fills; p is the order price.
     px = float(order.get("ap") or 0.0) or float(order["p"])
@@ -57,7 +65,7 @@ def _row(order: dict[str, Any], rx_ms: int, complete: bool) -> ParsedRow:
             "venue_symbol": symbol,
             "ts_ms": int(order["T"]),
             "rx_ms": rx_ms,
-            "side": "long" if order["S"] == "SELL" else "short",
+            "side": side,
             "px": px,
             "sz": sz,
             "notional_usd": px * sz,

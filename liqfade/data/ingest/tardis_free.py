@@ -80,6 +80,12 @@ HL_TABLES_OWNED_BY_S3 = ("liquidations", "trades")
 # USD and is written null. Same rule and same reason as recorder/streams/okx.py.
 OKX_VENUE = "okx"
 
+# Tardis normalises both side columns to lower case buy/sell. Explicit maps rather than
+# a two-branch default: an unexpected token used to become the opposite side silently,
+# and a flipped sign in a validation set is worse than a missing row. Unknown drops.
+LIQ_SIDES = {"sell": "long", "buy": "short"}  # the liquidation order's side
+TRADE_SIDES = {"buy": "buy", "sell": "sell"}  # already the aggressor
+
 # Bybit has published every liquidation since this date (`allLiquidation`); before it,
 # and on Binance and OKX always, the public feed is throttled to one event per symbol per
 # second and the recorded history is a lower bound. Same flag the recorder sets.
@@ -137,7 +143,9 @@ def read_csv(payload: bytes) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(handle)
 
 
-def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> list[dict[str, Any]]:
+def to_liquidations(
+    rows: Iterable[dict[str, str]], venue: str, day: date
+) -> list[dict[str, Any] | None]:
     """Canonical `liquidations` rows.
 
     Tardis normalises `side` to the liquidation order's side, so `sell` means the engine
@@ -154,8 +162,12 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
 
     complete = is_complete(venue, day)
     contracts = venue == OKX_VENUE
-    out = []
+    out: list[dict[str, Any] | None] = []
     for row in rows:
+        side = LIQ_SIDES.get(row.get("side", ""))
+        if side is None:
+            out.append(None)
+            continue
         symbol = row["symbol"]
         px, sz = to_float(row["price"]), to_float(row["amount"])
         out.append(
@@ -165,7 +177,7 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
                 "venue_symbol": symbol,
                 "ts_ms": _us_to_ms(row["timestamp"]),
                 "rx_ms": 0,
-                "side": "long" if row["side"] == "sell" else "short",
+                "side": side,
                 "px": px,
                 "sz": sz,
                 "notional_usd": None if contracts or px is None or sz is None else px * sz,
@@ -176,19 +188,25 @@ def to_liquidations(rows: Iterable[dict[str, str]], venue: str, day: date) -> li
     return out
 
 
-def to_trades(rows: Iterable[dict[str, str]], venue: str) -> list[dict[str, Any]]:
-    """Canonical `trades` rows. Tardis `side` is already the aggressor side."""
+def to_trades(rows: Iterable[dict[str, str]], venue: str) -> list[dict[str, Any] | None]:
+    """Canonical `trades` rows. Tardis `side` is already the aggressor side.
+
+    A row whose side is neither `buy` nor `sell` is returned as None and dropped by the
+    caller, for the same reason as in `to_liquidations`.
+    """
     from liqfade.data.symbols import to_coin
 
     return [
-        {
+        None
+        if TRADE_SIDES.get(row.get("side", "")) is None
+        else {
             "venue": venue,
             "coin": to_coin(row["symbol"], venue),
             "ts_ms": _us_to_ms(row["timestamp"]),
             "rx_ms": 0,
             "px": to_float(row["price"]),
             "sz": to_float(row["amount"]),
-            "side": "buy" if row["side"] == "buy" else "sell",
+            "side": row["side"],
             "tid": _tid(row.get("id")),
         }
         for row in rows
@@ -280,6 +298,7 @@ def run(
     manifest = Manifest.load(data_dir, JOB)
     missing: list[str] = []
     totals: dict[str, int] = {}
+    dropped = 0  # rows refused by the side maps, counted rather than guessed at
 
     for exchange, venue, data_type, day, coin in targets:
         if venue == HL_VENUE and data_type in HL_TABLES_OWNED_BY_S3:
@@ -307,7 +326,9 @@ def run(
                 if data_type == "liquidations"
                 else to_trades(rows, venue)
             )
-            written = write_partitioned(root, table, venue, SOURCE_TARDIS, parsed)
+            keep = [row for row in parsed if row is not None]
+            dropped += len(parsed) - len(keep)
+            written = write_partitioned(root, table, venue, SOURCE_TARDIS, keep)
 
         manifest.record(url, len(payload), {table: written})
         totals[table] = totals.get(table, 0) + written
@@ -315,6 +336,8 @@ def run(
 
     for table, count in sorted(totals.items()):
         print(f"  {table}: {count} rows")
+    if dropped:
+        print(f"  {dropped} rows dropped: an unknown side token, which is a schema change")
     if missing:
         print(f"\n{len(missing)} files Tardis does not have (404, skipped):")
         for path in missing:

@@ -9,6 +9,7 @@ export interface FeedState {
   msgs_1m: number;
   gaps_1h: number;
   reconnects_1h: number;
+  parse_errors_1h: number;
 }
 
 export interface PositionState {

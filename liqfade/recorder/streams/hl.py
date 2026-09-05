@@ -10,7 +10,8 @@ Two things the schema doc does not say and the wire does:
 - `activeAssetCtx` carries no timestamp, so `ts_ms` is set to `rx_ms` for that table. It
   is a snapshot of a slowly moving context, not an event, so the receive time is the
   honest answer.
-- `side` on a trade is the aggressor: `B` is a buy, `A` is a sell.
+- `side` on a trade is the aggressor: `B` is a buy, `A` is a sell. Anything else drops
+  the row: this is the one field whose sign the whole strategy hangs on.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from collections.abc import Sequence
 from typing import Any
 
 import orjson
+
+from liqfade.recorder.streams.base import ParsedRow
 
 # channel -> canonical table it feeds
 CHANNEL_TABLES = {
@@ -35,6 +38,10 @@ L2_LEVELS = 20  # what the l2Book subscription returns per side
 
 PING_FRAME = {"method": "ping"}
 PONG_MARKER = b'"pong"'
+
+# The aggressor of a trade. Explicit rather than `"buy" if x == "B" else "sell"`: an
+# unknown token has to drop the row, because guessing it writes the opposite side.
+TRADE_SIDES = {"B": "buy", "A": "sell"}
 
 
 def _subscription(channel: str, coin: str) -> dict[str, Any]:
@@ -68,7 +75,7 @@ def _f(value: Any) -> float | None:
     return float(value)
 
 
-def parse(msg: bytes, rx_ms: int) -> list[tuple[str, dict[str, Any]]]:
+def parse(msg: bytes, rx_ms: int) -> list[ParsedRow]:
     """Turn one HL frame into canonical rows. Unknown channels yield nothing."""
     obj = orjson.loads(msg)
     channel = obj.get("channel")
@@ -88,7 +95,10 @@ def parse(msg: bytes, rx_ms: int) -> list[tuple[str, dict[str, Any]]]:
     return []
 
 
-def _trade(row: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
+def _trade(row: dict[str, Any], rx_ms: int) -> ParsedRow:
+    side = TRADE_SIDES.get(str(row.get("side")))
+    if side is None:
+        return ("trades", None)
     return (
         "trades",
         {
@@ -98,7 +108,7 @@ def _trade(row: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
             "rx_ms": rx_ms,
             "px": _f(row["px"]),
             "sz": _f(row["sz"]),
-            "side": "buy" if row.get("side") == "B" else "sell",
+            "side": side,
             "tid": int(row["tid"]),
         },
     )
@@ -112,7 +122,7 @@ def _level(levels: Any, index: int) -> dict[str, Any]:
     return level if isinstance(level, dict) else {}
 
 
-def _bbo(data: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
+def _bbo(data: dict[str, Any], rx_ms: int) -> ParsedRow:
     bid, ask = _level(data.get("bbo"), 0), _level(data.get("bbo"), 1)
     return (
         "bbo",
@@ -128,12 +138,12 @@ def _bbo(data: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
     )
 
 
-def _l2(data: dict[str, Any], rx_ms: int) -> list[tuple[str, dict[str, Any]]]:
+def _l2(data: dict[str, Any], rx_ms: int) -> list[ParsedRow]:
     levels = data.get("levels") or [[], []]
     bids, asks = [*levels, [], []][:2]
     depth = min(L2_LEVELS, max(len(bids), len(asks)))
     coin, ts_ms = data["coin"], int(data["time"])
-    rows = []
+    rows: list[ParsedRow] = []
     for index in range(depth):
         bid, ask = _level(bids, index), _level(asks, index)
         rows.append(
@@ -154,7 +164,7 @@ def _l2(data: dict[str, Any], rx_ms: int) -> list[tuple[str, dict[str, Any]]]:
     return rows
 
 
-def _candle(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _candle(row: dict[str, Any]) -> ParsedRow:
     return (
         "candles_1m",
         {
@@ -170,7 +180,7 @@ def _candle(row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     )
 
 
-def _asset_ctx(data: dict[str, Any], rx_ms: int) -> tuple[str, dict[str, Any]]:
+def _asset_ctx(data: dict[str, Any], rx_ms: int) -> ParsedRow:
     ctx = data.get("ctx") or {}
     # `impactPxs` is [bid, ask], the average fill price of a fixed notional against each
     # side of the book. A coin with an empty side sends a short list or none at all, so

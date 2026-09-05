@@ -61,6 +61,9 @@ class FeedState(Base):
     msgs_1m: int = Field(0, ge=0, description="count of messages in the trailing minute")
     gaps_1h: int = Field(0, ge=0, description="count of gaps over recorder.gap_alert_s in 1h")
     reconnects_1h: int = Field(0, ge=0, description="count of reconnects in the trailing hour")
+    parse_errors_1h: int = Field(
+        0, ge=0, description="count of rows the parser refused, plus unreadable messages, in 1h"
+    )
 
 
 class PositionState(Base):

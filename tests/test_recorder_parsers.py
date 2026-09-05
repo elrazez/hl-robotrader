@@ -94,9 +94,12 @@ OKX_ACK = (
 )
 
 
-def rows_for(parsed: list[tuple[str, dict[str, Any]]], table: str) -> list[dict[str, Any]]:
-    """Rows for one table, after proving they fit the canonical schema."""
-    rows = [row for name, row in parsed if name == table]
+def rows_for(parsed: list[tuple[str, dict[str, Any] | None]], table: str) -> list[dict[str, Any]]:
+    """Rows for one table, after proving they fit the canonical schema.
+
+    A `None` row is a row the parser refused, not a row; `_drops` is what asserts on those.
+    """
+    rows = [row for name, row in parsed if name == table and row is not None]
     if rows:
         validate_table(table, rows_to_table(table, rows, SOURCE_RECORDER))
     return rows
@@ -312,3 +315,45 @@ def test_okx_notional_is_null_because_sz_counts_contracts_not_coins() -> None:
     (row,) = rows_for(okx.make_parser(False)(OKX_LIQ, RX), "liquidations")
     assert row["notional_usd"] is None
     assert (row["px"], row["sz"]) == (0.05613, 10.0)
+
+
+# --- unknown side tokens are dropped, never flipped ----------------------------
+#
+# Every one of these used to be a two-branch default, so a venue re-casing or renaming
+# its side token silently wrote the opposite side. A flipped sign inverts the strategy
+# and survives into a backtest looking like signal, so the row is dropped and counted.
+
+
+def _drops(parsed: list[tuple[str, dict[str, Any] | None]]) -> list[str]:
+    """The tables a parser reported a dropped row for."""
+    return [table for table, row in parsed if row is None]
+
+
+def test_hl_drops_a_trade_whose_side_token_is_neither_b_nor_a() -> None:
+    payload = HL_TRADES.replace(b'"side":"A"', b'"side":"Ask"')
+    parsed = hl.parse(payload, RX)
+    assert _drops(parsed) == ["trades"]
+    assert [row["side"] for row in rows_for(parsed, "trades")] == ["buy"]
+
+
+def test_binance_drops_a_liquidation_whose_side_token_is_re_cased() -> None:
+    payload = BINANCE_LIQ.replace(b'"S":"SELL"', b'"S":"Sell"')
+    parsed = binance.make_parser(False)(payload, RX)
+    assert _drops(parsed) == ["liquidations"]
+    assert rows_for(parsed, "liquidations") == []
+
+
+def test_bybit_drops_a_liquidation_whose_side_token_is_re_cased() -> None:
+    payload = BYBIT_LONG_LIQ.replace(b'"S":"Sell"', b'"S":"SELL"')
+    parsed = bybit.make_parser(True)(payload, RX)
+    assert _drops(parsed) == ["liquidations"]
+    assert rows_for(parsed, "liquidations") == []
+
+
+def test_okx_drops_a_liquidation_whose_order_side_is_unknown() -> None:
+    payload = OKX_LIQ.replace(b'"posSide":"long"', b'"posSide":"net"').replace(
+        b'"side":"sell"', b'"side":"short"'
+    )
+    parsed = okx.make_parser(False)(payload, RX)
+    assert _drops(parsed) == ["liquidations"]
+    assert rows_for(parsed, "liquidations") == []

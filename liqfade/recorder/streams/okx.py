@@ -31,6 +31,12 @@ CHANNEL = "liquidation-orders"
 PING_FRAME = "ping"
 PING_S = 25.0
 
+# `posSide` is the liquidated position when OKX sends it. In one-way mode it is "net" and
+# the order side tells the story instead: the engine buys to close a short. Both maps are
+# explicit, so an unrecognised token drops the row rather than becoming its opposite.
+POS_SIDES = {"long": "long", "short": "short"}
+ORDER_SIDES = {"buy": "short", "sell": "long"}
+
 
 def on_connect(_symbols: Sequence[str]) -> list[Any]:
     return [{"op": "subscribe", "args": [{"channel": CHANNEL, "instType": "SWAP"}]}]
@@ -53,16 +59,11 @@ def make_parser(complete: bool) -> Parser:
 
 
 def _row(inst_id: str, detail: dict[str, Any], rx_ms: int, complete: bool) -> ParsedRow:
+    side = POS_SIDES.get(str(detail.get("posSide"))) or ORDER_SIDES.get(str(detail.get("side")))
+    if side is None:
+        return ("liquidations", None)
     px = float(detail["bkPx"])
     sz = float(detail["sz"])
-    # posSide is the liquidated position when OKX sends it; in one-way mode it is "net",
-    # and then the order side tells the story: the engine buys to close a short.
-    pos_side = detail.get("posSide")
-    side = (
-        pos_side
-        if pos_side in ("long", "short")
-        else ("short" if detail.get("side") == "buy" else "long")
-    )
     return (
         "liquidations",
         {

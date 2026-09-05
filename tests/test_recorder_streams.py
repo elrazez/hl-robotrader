@@ -193,3 +193,18 @@ def test_parsers_do_not_have_to_cope_with_junk_because_handle_does(payload: byte
     stream, rows = _stream(parse=lambda msg, rx: [("liquidations", {"n": len(msg)})])
     stream.handle(payload, NOW_MS)
     assert len(rows) == 1
+
+
+# --- dropped rows ---------------------------------------------------------------
+
+
+def test_a_dropped_row_is_counted_and_never_reaches_the_sink() -> None:
+    """A parser that refuses a row (unknown side, unusable unit) reports it as None."""
+    stream, rows = _stream(
+        parse=lambda msg, rx: [("liquidations", None), ("liquidations", {"rx_ms": rx})],
+        tables=("liquidations",),
+    )
+    stream.handle(b"{}", NOW_MS)
+    assert len(rows) == 1
+    (state,) = stream.feed_states(NOW_MS)
+    assert state.parse_errors_1h == 1

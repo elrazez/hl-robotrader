@@ -29,8 +29,14 @@ from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-# table, row
-ParsedRow = tuple[str, dict[str, Any]]
+# (table, row), or (table, None) for a row the parser refused.
+#
+# A parser drops a row rather than guessing when a value it must map is not one of the
+# values the venue documents: an unknown side token used to become the opposite side,
+# because every mapping was a two-branch default. A flipped sign inverts the strategy and
+# would survive into a backtest looking like signal, so the row is dropped and the drop is
+# counted against the stream, where the parse-error alert picks it up.
+ParsedRow = tuple[str, dict[str, Any] | None]
 Parser = Callable[[bytes, int], list[ParsedRow]]
 # table, venue, row
 RowSink = Callable[[str, str, dict[str, Any]], None]
@@ -80,6 +86,7 @@ class StreamStats:
     _buckets: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
     _gap_times: deque[float] = field(default_factory=deque)
     _reconnects: deque[float] = field(default_factory=deque)
+    _parse_errors: deque[float] = field(default_factory=deque)
     _gap_open: bool = False
 
     def record_message(self, rx_ms: int, now: float | None = None) -> None:
@@ -94,6 +101,15 @@ class StreamStats:
 
     def record_reconnect(self, now: float | None = None) -> None:
         self._reconnects.append(time.monotonic() if now is None else now)
+
+    def record_parse_error(self, now: float | None = None) -> None:
+        """One row the parser refused, or one message it could not read at all.
+
+        Both mean the same thing operationally: the wire stopped matching the parser, and
+        rows that should be in the lake are not. Counted over the trailing hour so a rate
+        can be alerted on rather than a lifetime total nobody can interpret.
+        """
+        self._parse_errors.append(time.monotonic() if now is None else now)
 
     def check_silence(self, gap_alert_s: float, now_ms: int, now: float | None = None) -> bool:
         """Count a gap when a continuous stream has been quiet too long. Idempotent.
@@ -119,7 +135,7 @@ class StreamStats:
         return int(sum(count for second, count in self._buckets if now - second < 60.0))
 
     def _prune(self, now: float) -> None:
-        for series in (self._gap_times, self._reconnects):
+        for series in (self._gap_times, self._reconnects, self._parse_errors):
             while series and now - series[0] > HOUR_S:
                 series.popleft()
 
@@ -134,6 +150,7 @@ class StreamStats:
             msgs_1m=self.msgs_1m(now),
             gaps_1h=len(self._gap_times),
             reconnects_1h=len(self._reconnects),
+            parse_errors_1h=len(self._parse_errors),
         )
 
 
@@ -327,7 +344,11 @@ class WSStream:
             )
             return
         for table, row in rows:
-            self._stat(table).record_message(rx_ms)
+            stat = self._stat(table)
+            if row is None:
+                stat.record_parse_error()
+                continue
+            stat.record_message(rx_ms)
             self.sink(table, self.venue, row)
 
     def _record_pong(self) -> None:

@@ -392,3 +392,20 @@ def test_a_completed_file_is_recorded_in_the_manifest(tmp_path: Path) -> None:
         data_types=("liquidations",),
     )
     assert Manifest.load(tmp_path, tardis_free.JOB).total_rows() == {"liquidations": 1}
+
+
+# --- unknown side tokens are dropped, never flipped ----------------------------
+
+
+def test_a_liquidation_with_an_unknown_side_token_is_dropped_not_flipped() -> None:
+    """Tardis normalises `side` to buy/sell. Anything else is a schema change, not a short."""
+    csv_text = LIQ_CSV["binance-futures"].replace(",sell,", ",SELL,")
+    parsed = tardis_free.to_liquidations(rows_of(csv_text), "binance", DAY)
+    assert parsed[0] is None
+    assert [row["side"] for row in parsed if row is not None] == ["short"]
+
+
+def test_a_trade_with_an_unknown_side_token_is_dropped_not_flipped() -> None:
+    parsed = tardis_free.to_trades(rows_of(TRADES_CSV.replace(",buy,", ",Buy,")), "bybit")
+    assert parsed[0] is None
+    assert [row["side"] for row in parsed if row is not None] == ["sell"]
