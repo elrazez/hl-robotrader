@@ -303,3 +303,32 @@ async def test_a_kill_that_cannot_write_the_flag_does_not_claim_success(tmp_path
     assert "NOT written" in result.reason
     # The in-process half ran regardless.
     assert (await backend.status()).risk.killed is True
+
+
+async def test_binding_the_socket_leaves_the_process_umask_alone(sock_dir: Path) -> None:
+    """The bind narrows the umask so the socket is never created world readable, even for
+    the instant before the chmod. The narrowing is process wide, so it has to be put back:
+    that half is what a test can see, and forgetting it would silently harden every file
+    the recorder writes afterwards."""
+    previous = os.umask(0o022)
+    try:
+        srv = ControlServer(NoopBackend(env="paper", proc="test"), sock_dir / "control.sock")
+        await srv.start()
+        try:
+            assert stat.S_IMODE(os.stat(srv.socket_path).st_mode) == 0o600
+        finally:
+            await srv.stop()
+        assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(previous)
+
+
+def test_state_json_is_not_world_readable(tmp_path: Path) -> None:
+    """It carries equity, positions and open orders, and lands in a shared data dir."""
+    path = tmp_path / "state.json"
+    previous = os.umask(0)
+    try:
+        write_state(path, StateSnapshot(proc="recorder", env="paper", risk=RiskState(paused=False)))
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600

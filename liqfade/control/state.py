@@ -4,6 +4,9 @@ Every reader (panel, CLI fallback, watchdog) reads this file rather than talking
 trading loop, so a slow or wedged reader can never stall a decision tick. The write is
 temp file plus os.replace, which is atomic within a filesystem, so a reader either sees
 the previous complete snapshot or the new complete one and never a partial file.
+
+Mode 0600, set on the temp file before the replace. The snapshot holds equity, open
+positions and resting orders, so it gets the same treatment as the control socket.
 """
 
 from __future__ import annotations
@@ -33,6 +36,11 @@ def write_state(path: Path, snapshot: StateSnapshot) -> None:
     payload = orjson.dumps(snapshot.model_dump(mode="json"), option=orjson.OPT_INDENT_2)
     try:
         with open(tmp, "wb") as handle:
+            # 0600 on the temp file, before the replace, so the snapshot is never readable
+            # by anything but the service user. It carries equity, open positions and
+            # resting orders and lands in a data dir the panel and rsync also see; the
+            # default umask made it 0644 on the box.
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())

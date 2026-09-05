@@ -3,7 +3,9 @@
 One line of JSON in, one line of JSON out, connections may be reused. The socket is
 created with mode 0600 and is owned by the service user, which together with the file
 system is the only access control: there is no authentication on the wire because
-anything that can open the socket already runs as the trading user.
+anything that can open the socket already runs as the trading user. Created 0600, not
+chmodded to it a line later: the difference is an instant during which `/kill` is open
+to anything on the box.
 
 The server never blocks the caller's event loop for long; backends are required to
 return promptly and start slow work in the background.
@@ -81,7 +83,15 @@ class ControlServer:
                 f"{MAX_SOCKET_PATH_BYTES} byte unix socket limit: {self.socket_path}"
             )
 
-        self._server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
+        # start_unix_server creates the socket at 0777 & ~umask and the chmod below only
+        # lands afterwards, so under the box's default umask it exists world readable for
+        # an instant. Narrow the umask across the bind instead; it is process wide, so it
+        # is restored immediately, and the chmod stays as the assertion of what we meant.
+        previous_umask = os.umask(0o177)
+        try:
+            self._server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
+        finally:
+            os.umask(previous_umask)
         os.chmod(self.socket_path, 0o600)
         log.info("control_listening", socket=str(self.socket_path))
 
