@@ -17,6 +17,7 @@ from liqfade.config import load_settings
 from liqfade.config.models import Settings
 from liqfade.control.protocol import now_ms
 from liqfade.recorder.main import Recorder, _seconds_until_utc_hour
+from liqfade.recorder.writer import write_rows
 
 
 @pytest.fixture
@@ -301,3 +302,72 @@ async def test_a_cancelled_shutdown_still_finishes_the_flush(settings: Settings)
 
     assert recorder.buffers.pending_rows() == 0
     assert len(sorted(recorder.root.glob("trades/date=*/*.parquet"))) == 1
+
+
+async def test_a_flush_that_cannot_write_quarantines_every_row_rather_than_losing_it(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Leaving rows buffered on a failed write is right mid-run, because the next tick
+    retries them. At shutdown there is no next tick: `flush_all` walked the partitions
+    once and whatever was still buffered went out with the process."""
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 1))
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 2))
+    recorder.buffers.add("bbo", "hyperliquid", {"coin": "BTC", "ts_ms": at, "rx_ms": at})
+
+    attempts = 0
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("no space left on device")
+
+    alerts: list[str] = []
+
+    async def capture(text: str) -> bool:
+        alerts.append(text)
+        return True
+
+    monkeypatch.setattr("liqfade.recorder.main.write_rows", explode)
+    monkeypatch.setattr(recorder.health, "alert", capture)
+
+    await recorder.flush_all(quarantine_leftovers=True)
+
+    assert attempts == 4  # two partitions, tried twice each before giving up
+    assert recorder.buffers.pending_rows() == 0
+    assert recorder.counters["quarantined_rows"] == 3
+
+    quarantined = sorted((settings.paths.data_dir / "quarantine").rglob("*.jsonl"))
+    rows = [orjson.loads(line) for path in quarantined for line in path.read_bytes().splitlines()]
+    assert len(rows) == 3
+    assert {row["reason"] for row in rows} == {"write_failed"}
+    assert sorted(row["tid"] for row in rows if "tid" in row) == [1, 2]
+    assert any("quarantine" in text for text in alerts)
+
+
+async def test_a_flush_retries_once_before_giving_up_on_a_partition(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails on a full buffer and succeeds on the retry must not quarantine."""
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 1))
+
+    real = write_rows
+    calls = 0
+
+    def once(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transient")
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("liqfade.recorder.main.write_rows", once)
+    await recorder.flush_all(quarantine_leftovers=True)
+
+    assert recorder.buffers.pending_rows() == 0
+    assert recorder.counters["quarantined_rows"] == 0
+    assert recorder.counters["rows_written"] == 1
+    assert not (settings.paths.data_dir / "quarantine").exists()

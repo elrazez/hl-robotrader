@@ -314,12 +314,37 @@ class Recorder:
         await self.drain_alerts()
         self.counters["flushes"] += 1
 
-    async def flush_all(self) -> None:
+    async def flush_all(self, *, quarantine_leftovers: bool = False) -> None:
+        """Drain every buffer. With `quarantine_leftovers`, lose nothing whatever happens.
+
+        `_write` leaves rows buffered when the write raises, so the next flush tick
+        retries them rather than destroying the partition. At shutdown there is no next
+        tick: this used to walk the partitions once and whatever was still buffered went
+        out with the process, behind a `log.error` and an alert that might not survive
+        the shutdown either. So the fix that stopped a failed write destroying rows
+        mid-run still lost them at the end of one.
+
+        Every partition is now tried twice, and anything that still will not write goes
+        to `data/quarantine/` with the rows a bad timestamp lands in, so there is one
+        place to look. Rows are never dropped. The retry is skipped for the flush that
+        runs while the streams are still closing, because the second flush a few seconds
+        later is the one that has to make the call.
+        """
         for key in self.buffers.partitions():
             await self._write(key)
+        if not quarantine_leftovers:
+            await self.drain_alerts()
+            return
+        for key in self.buffers.partitions():
+            await self._write(key)  # one retry: a full disk that just got space back
+        for key in self.buffers.partitions():
+            table, venue, date, hour = key
+            rows = self.buffers.take(key)
+            self.counters["quarantined_rows"] += len(rows)
+            self.quarantine("write_failed", table, venue, rows, f"{date} hour {hour:02d}")
         await self.drain_alerts()
 
-    async def _flush_shielded(self) -> None:
+    async def _flush_shielded(self, *, quarantine_leftovers: bool = False) -> None:
         """flush_all, run to completion even if this coroutine is cancelled.
 
         Shutdown happens inside `runtime.run_main`'s grace window, which cancels the main
@@ -328,7 +353,7 @@ class Recorder:
         there is no next flush tick to retry on, so those rows are simply gone. The loop
         re-awaits because a shield only protects the inner task, not the await on it.
         """
-        flush = asyncio.ensure_future(self.flush_all())
+        flush = asyncio.ensure_future(self.flush_all(quarantine_leftovers=quarantine_leftovers))
         while not flush.done():
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.shield(flush)
@@ -436,7 +461,8 @@ class Recorder:
             for task in [*tasks, state_task]:
                 task.cancel()
             await asyncio.gather(*tasks, state_task, return_exceptions=True)
-            await self._flush_shielded()
+            # The last chance any of these rows will get: retry, then quarantine.
+            await self._flush_shielded(quarantine_leftovers=True)
             await server.stop()
             log.info("recorder_stopped", **self.counters)
 
