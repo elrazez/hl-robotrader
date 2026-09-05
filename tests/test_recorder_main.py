@@ -5,6 +5,7 @@ Constructing a Recorder opens nothing, so these run offline.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -273,3 +274,30 @@ async def test_a_stream_that_raises_does_not_stop_the_others_or_mark_the_refresh
     assert took["bybit"] == ["1000PEPEUSDT", "BTCUSDT"]
     assert took["okx"] == ["1000PEPE-USDT-SWAP", "BTC-USDT-SWAP"]
     assert recorder.poller.coins == ["BTC", "kPEPE"]
+
+
+async def test_a_cancelled_shutdown_still_finishes_the_flush(settings: Settings) -> None:
+    """Shutdown runs inside runtime.run_main's grace window, which cancels the main
+    coroutine when it expires. A slow drain used to lose every partition it had not
+    reached yet, and there is no next flush tick at shutdown."""
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 1))
+
+    started, release = asyncio.Event(), asyncio.Event()
+    real_write = recorder._write
+
+    async def slow(key: tuple[str, str, str, int]) -> None:
+        started.set()
+        await release.wait()
+        await real_write(key)
+
+    recorder._write = slow  # type: ignore[method-assign]
+    task = asyncio.create_task(recorder._flush_shielded())
+    await started.wait()
+    task.cancel()  # the grace window expiring
+    release.set()
+    await task
+
+    assert recorder.buffers.pending_rows() == 0
+    assert len(sorted(recorder.root.glob("trades/date=*/*.parquet"))) == 1

@@ -319,6 +319,20 @@ class Recorder:
             await self._write(key)
         await self.drain_alerts()
 
+    async def _flush_shielded(self) -> None:
+        """flush_all, run to completion even if this coroutine is cancelled.
+
+        Shutdown happens inside `runtime.run_main`'s grace window, which cancels the main
+        coroutine when it expires. Without the shield that cancel lands on the flush and
+        every partition it had not reached yet goes out with the process: at shutdown
+        there is no next flush tick to retry on, so those rows are simply gone. The loop
+        re-awaits because a shield only protects the inner task, not the await on it.
+        """
+        flush = asyncio.ensure_future(self.flush_all())
+        while not flush.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.shield(flush)
+
     async def _flush_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             with contextlib.suppress(TimeoutError):
@@ -413,11 +427,16 @@ class Recorder:
         finally:
             log.info("recorder_stopping", buffered_rows=self.buffers.pending_rows())
             stop.set()
+            # Drain before the grace window, not only after it. The streams are already
+            # closing, and a flush that starts once the window has been spent is the one
+            # a cancel catches. The second pass picks up whatever arrived meanwhile;
+            # writing two files for the same hour is what compaction is for.
+            await self._flush_shielded()
             await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE_S)
             for task in [*tasks, state_task]:
                 task.cancel()
             await asyncio.gather(*tasks, state_task, return_exceptions=True)
-            await self.flush_all()
+            await self._flush_shielded()
             await server.stop()
             log.info("recorder_stopped", **self.counters)
 
