@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from liqfade.recorder.buffer import Buffers, partition_of
 
 
@@ -71,3 +73,19 @@ def test_take_all_drains_everything() -> None:
     assert len(buffers.take_all()) == 2
     assert buffers.pending_rows() == 0
     assert buffers.take_all() == []
+
+
+def test_a_row_with_no_usable_timestamp_is_refused_rather_than_filed_under_1970() -> None:
+    """`rx_ms or ts_ms or 0` used to bucket a fill whose `time` was missing into 1970."""
+    buffers = Buffers(max_rows=1000)
+    for row in ({}, {"rx_ms": 0}, {"rx_ms": 0, "ts_ms": None}, {"ts_ms": 0}):
+        with pytest.raises(ValueError, match="no usable timestamp"):
+            buffers.add("trades", "hyperliquid", dict(row))
+    assert buffers.pending_rows() == 0
+
+
+def test_a_historical_row_still_partitions_on_exchange_time() -> None:
+    """`rx_ms = 0` is how every backfilled row is marked; only both being absent is bad."""
+    buffers = Buffers(max_rows=1000)
+    buffers.add("trades", "hyperliquid", {"ts_ms": NOON, "rx_ms": 0})
+    assert next(iter(buffers.take_all()))[0] == ("trades", "hyperliquid", "2026-08-30", 12)

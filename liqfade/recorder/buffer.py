@@ -10,7 +10,8 @@ Flush happens when the hour has rolled over or the buffer reaches
 `recorder.ring_buffer_rows`, whichever comes first, and on shutdown. Partitioning uses
 `rx_ms` when the row has one, because that is when we learned about the event and it is
 what makes the file layout match wall clock; `candles_1m` has no `rx_ms` and falls back
-to `ts_ms`.
+to `ts_ms`, as does every backfilled row, which carries `rx_ms = 0` by design. A row with
+neither is refused rather than filed under 1970.
 """
 
 from __future__ import annotations
@@ -36,8 +37,20 @@ class Buffers:
         self._rows: dict[PartitionKey, list[dict[str, Any]]] = {}
 
     def add(self, table: str, venue: str, row: dict[str, Any]) -> None:
-        stamp = row.get("rx_ms") or row.get("ts_ms") or 0
-        date, hour = partition_of(int(stamp))
+        """Buffer one row into the file its timestamp belongs to.
+
+        Raises ValueError when the row carries neither a receive time nor an exchange
+        time. It used to fall back to 0, so a fill whose `time` was missing landed in
+        `date=1970-01-01` and stayed there, indistinguishable from a real row of a real
+        table. Backfilled rows legitimately carry `rx_ms = 0` and partition on `ts_ms`;
+        only both being absent is the bug this refuses. The recorder catches the raise
+        and quarantines the row (liqfade/recorder/main.py); the backfill jobs let it
+        surface, because a row with no time there is a parser bug worth stopping for.
+        """
+        stamp = int(row.get("rx_ms") or 0) or int(row.get("ts_ms") or 0)
+        if stamp <= 0:
+            raise ValueError(f"{table}/{venue}: row has no usable timestamp, refusing to bucket it")
+        date, hour = partition_of(stamp)
         self._rows.setdefault((table, venue, date, hour), []).append(row)
 
     def pending_rows(self) -> int:

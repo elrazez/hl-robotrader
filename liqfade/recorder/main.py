@@ -20,6 +20,7 @@ import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -36,7 +37,7 @@ from liqfade.recorder.streams import binance, bybit, hl, okx
 from liqfade.recorder.streams.base import WSStream, backoff_delay
 from liqfade.recorder.streams.coinalyze import CoinalyzePoller
 from liqfade.recorder.universe import UniverseManager
-from liqfade.recorder.writer import compact_day, write_rows
+from liqfade.recorder.writer import compact_day, quarantine_rows, write_rows
 
 log = get_logger(__name__)
 
@@ -66,9 +67,10 @@ class Recorder:
             "files_written": 0,
             "flushes": 0,
             "write_failures": 0,
+            "quarantined_rows": 0,
         }
         self.streams: list[WSStream] = self._build_streams()
-        self.poller = CoinalyzePoller(settings.venues.coinalyze, self.buffers.add)
+        self.poller = CoinalyzePoller(settings.venues.coinalyze, self.sink)
         self.universe = UniverseManager(
             settings.universe,
             settings.venues.hyperliquid.api_url,
@@ -81,6 +83,9 @@ class Recorder:
             [*self.streams, self.poller],
         )
         self._flat_config = flatten(resolve(settings.env)[0])
+        # Alerts raised from the receive loop, which is sync and cannot await. Drained on
+        # every flush tick and at shutdown.
+        self._alerts: list[str] = []
 
     # --- construction --------------------------------------------------------
 
@@ -95,7 +100,7 @@ class Recorder:
                     hl.VENUE,
                     venues.hyperliquid.ws_url,
                     parse=hl.parse,
-                    sink=self.buffers.add,
+                    sink=self.sink,
                     cfg=cfg,
                     tables=hl.TABLES,
                     on_connect=hl.on_connect,
@@ -112,7 +117,7 @@ class Recorder:
                     binance.VENUE,
                     venues.binance.ws_url,
                     parse=binance.make_parser(venues.binance.complete),
-                    sink=self.buffers.add,
+                    sink=self.sink,
                     cfg=cfg,
                     tables=binance.TABLES,
                     on_connect=binance.on_connect,
@@ -125,7 +130,7 @@ class Recorder:
                     bybit.VENUE,
                     venues.bybit.ws_url,
                     parse=bybit.make_parser(venues.bybit.complete),
-                    sink=self.buffers.add,
+                    sink=self.sink,
                     cfg=cfg,
                     tables=bybit.TABLES,
                     on_connect=on_connect,
@@ -140,7 +145,7 @@ class Recorder:
                     okx.VENUE,
                     venues.okx.ws_url,
                     parse=okx.make_parser(venues.okx.complete),
-                    sink=self.buffers.add,
+                    sink=self.sink,
                     cfg=cfg,
                     tables=okx.TABLES,
                     on_connect=okx.on_connect,
@@ -149,6 +154,45 @@ class Recorder:
                 )
             )
         return streams
+
+    # --- the row sink every stream writes through ----------------------------
+
+    def sink(self, table: str, venue: str, row: dict[str, Any]) -> None:
+        """Buffer one parsed row, or quarantine it when it cannot be filed.
+
+        Called from the WebSocket receive loop, so it must not raise: an exception here
+        takes the connection down. `Buffers.add` refuses a row carrying neither `rx_ms`
+        nor `ts_ms`, which used to land in `date=1970-01-01` and look like data forever;
+        those go to `data/quarantine/` instead, where a human can see them.
+        """
+        try:
+            self.buffers.add(table, venue, row)
+        except ValueError as exc:
+            self.counters["quarantined_rows"] += 1
+            self.quarantine("no_timestamp", table, venue, [row], f"{exc}")
+
+    def quarantine(
+        self, reason: str, table: str, venue: str, rows: list[dict[str, Any]], detail: str
+    ) -> None:
+        """Park rows outside the lake and queue one alert. Never raises into its caller."""
+        try:
+            quarantine_rows(self.settings.paths.data_dir, reason, table, venue, rows)
+        except Exception:
+            log.exception("quarantine_failed", reason=reason, table=table, venue=venue)
+            return
+        log.warning("rows_quarantined", reason=reason, table=table, venue=venue, detail=detail)
+        self._alerts.append(
+            f"recorder: {len(rows)} {table}/{venue} row(s) went to quarantine ({reason})"
+        )
+
+    async def drain_alerts(self) -> None:
+        """Send whatever the sink queued. The sink is sync and cannot await; this can.
+
+        Deduping is the alerter's job (liqfade/alerts/telegram.py), so a storm of bad rows
+        is one Telegram message per ten minutes rather than one per row.
+        """
+        while self._alerts:
+            await self.health.alert(self._alerts.pop(0))
 
     # --- state exposed to the control plane ----------------------------------
 
@@ -249,11 +293,13 @@ class Recorder:
     async def flush_ready(self) -> None:
         for key in self.buffers.ready(now_ms()):
             await self._write(key)
+        await self.drain_alerts()
         self.counters["flushes"] += 1
 
     async def flush_all(self) -> None:
         for key in self.buffers.partitions():
             await self._write(key)
+        await self.drain_alerts()
 
     async def _flush_loop(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

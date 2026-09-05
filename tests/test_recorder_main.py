@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import orjson
 import pyarrow.parquet as pq
 import pytest
 
@@ -90,6 +91,7 @@ async def test_shutdown_flushes_every_buffer_to_parquet(settings: Settings) -> N
         "files_written": 1,
         "flushes": 0,
         "write_failures": 0,
+        "quarantined_rows": 0,
     }
     assert recorder.buffers.pending_rows() == 0
 
@@ -227,3 +229,26 @@ def _partition(ms: int) -> tuple[str, int]:
     from liqfade.recorder.buffer import partition_of
 
     return partition_of(ms)
+
+
+async def test_a_row_with_no_timestamp_is_quarantined_and_never_reaches_1970(
+    settings: Settings,
+) -> None:
+    """The recorder cannot raise into the receive loop, so the row goes to a file."""
+    recorder = Recorder(settings)
+    alerts: list[str] = []
+
+    async def capture(text: str) -> bool:
+        alerts.append(text)
+        return True
+
+    recorder.health.alert = capture  # type: ignore[method-assign]
+    recorder.sink("trades", "hyperliquid", {"coin": "BTC", "px": 1.0, "ts_ms": None})
+    await recorder.flush_all()
+
+    assert recorder.buffers.pending_rows() == 0
+    assert list(recorder.root.glob("**/date=1970-01-01")) == []
+    assert recorder.counters["quarantined_rows"] == 1
+    (quarantined,) = sorted((settings.paths.data_dir / "quarantine").rglob("*.jsonl"))
+    assert orjson.loads(quarantined.read_bytes().splitlines()[0])["coin"] == "BTC"
+    assert alerts and "quarantine" in alerts[0]

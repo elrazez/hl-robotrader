@@ -137,6 +137,21 @@ After any halt, before resuming: `liqfade status`, then confirm positions and or
 Then remove old partitions only after they are safely on the laptop. Deleting recorded
 data is a one way door; per CLAUDE.md rule 8, do it deliberately.
 
+## Quarantined rows
+
+`/srv/liqfade/data/quarantine/date=YYYY-MM-DD/{table}_{venue}.jsonl` holds rows the lake
+refused, one JSON object per line with a `reason` field. Two reasons exist:
+
+- `no_timestamp`: the row carried neither `rx_ms` nor `ts_ms`, so it has no partition. It
+  used to land in `date=1970-01-01` and look like data forever.
+- `write_failed`: a shutdown flush could not write the partition even on a retry, and
+  there is no next flush tick to try again on.
+
+Either one is a Telegram alert and a `rows_quarantined` log line. Nothing in this repo
+deletes these files. A non-empty quarantine directory means a parser or the disk needs
+looking at; read a few lines, fix the cause, and the rows can be replayed by hand into
+the lake or written off deliberately.
+
 ## Pull data to the laptop
 
 From the laptop, not the VPS:

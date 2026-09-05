@@ -255,3 +255,10 @@ def test_rows_are_split_into_the_utc_hour_partitions_they_belong_to(tmp_path: Pa
 def test_writing_no_rows_writes_no_file(tmp_path: Path) -> None:
     assert write_partitioned(tmp_path, "trades", "hyperliquid", "hl_s3", []) == 0
     assert not tmp_path.exists() or not list(tmp_path.glob("**/*.parquet"))
+
+
+def test_write_partitioned_refuses_a_row_with_no_usable_timestamp(tmp_path: Path) -> None:
+    """A backfilled row with no time is a parser bug, and 1970 is not where it goes."""
+    with pytest.raises(ValueError, match="no usable timestamp"):
+        write_partitioned(tmp_path, "trades", "hyperliquid", "hl_s3", [{"coin": "BTC", "rx_ms": 0}])
+    assert list(tmp_path.rglob("*.parquet")) == []

@@ -19,9 +19,11 @@ would break the atomicity guarantee above.
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -40,6 +42,7 @@ log = get_logger(__name__)
 
 COMPRESSION = "zstd"
 DAY_SUFFIX = "_day.parquet"
+QUARANTINE_DIR = "quarantine"
 
 # How far an hour's first `ts_ms` may fall behind the previous hour's last before
 # compaction refuses to write the file. The recorder partitions by `rx_ms` and sorts by
@@ -122,6 +125,39 @@ def write_rows(
         hour=hour,
         rows=len(rows),
         path=str(path),
+    )
+    return path
+
+
+def quarantine_rows(
+    data_dir: Path, reason: str, table: str, venue: str, rows: list[dict[str, Any]]
+) -> Path | None:
+    """Append rows the lake cannot take to `data/quarantine/date=.../{table}_{venue}.jsonl`.
+
+    One place to look, whatever refused them: a row with no usable timestamp (which has no
+    partition to go in) and the rows a shutdown flush could not write (which have nowhere
+    left to be retried). JSON lines rather than Parquet on purpose, because the reason a
+    row is here may be that it does not fit the canonical schema at all, and a quarantine
+    file that itself fails to write would be the last thing anyone needs.
+
+    Appended, not replaced, and never deleted by anything in this repo. Returns the path,
+    or None for no rows.
+    """
+    if not rows:
+        return None
+    day = datetime.now(UTC).strftime("%Y-%m-%d")
+    directory = Path(data_dir) / QUARANTINE_DIR / f"date={day}"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{table}_{venue}.jsonl"
+    payload = b"".join(
+        orjson.dumps({"reason": reason, "at_ms": int(datetime.now(UTC).timestamp() * 1000), **row})
+        + b"\n"
+        for row in rows
+    )
+    with open(path, "ab") as handle:
+        handle.write(payload)
+    log.error(
+        "rows_quarantined", reason=reason, table=table, venue=venue, rows=len(rows), path=str(path)
     )
     return path
 
