@@ -3,14 +3,13 @@
 Two different questions get asked of a stream, and confusing them is how a recorder ends
 up either silently losing data or paging its owner every ten minutes:
 
-- A *continuous* stream (HL trades, bbo, l2Book, and Bybit liquidations, which are
-  complete rather than sampled) is expected to say something constantly. Silence past
-  `recorder.gap_alert_s` is a gap and is counted; silence past
+- A *continuous* stream (HL trades, bbo, l2Book) is expected to say something
+  constantly. Silence past `recorder.gap_alert_s` is a gap and is counted; silence past
   `recorder.silence_alert_s` is an outage and is alerted. On the Hyperliquid streams that
   question is asked per coin, because HL subscribes each coin separately and one dead
   subscription is invisible in a stream-level number that nineteen other coins keep fresh.
-- A *sparse* stream (Binance and OKX liquidations, both throttled and event driven) is
-  quiet whenever the market is calm. Silence there means nothing, so only the connection
+- A *sparse* stream (every liquidation feed, Bybit's complete one included; all event
+  driven) is quiet whenever the market is calm. Silence there means nothing, so only the connection
   being down is alerted, which the ping/pong on the socket already tells us. A stream
   that has not delivered yet is exempt until `startup_grace_s`: every stream is
   disconnected for the first moments of a process, and alerting on that put one message

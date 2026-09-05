@@ -107,7 +107,8 @@ def test_a_stream_that_has_never_delivered_is_not_a_gap() -> None:
 
 def test_which_streams_are_continuous() -> None:
     assert "hyperliquid.trades" in CONTINUOUS_STREAMS
-    assert "bybit.liquidations" in CONTINUOUS_STREAMS  # complete since 2025-02-25
+    # Complete since 2025-02-25, but event driven: a calm hour is silent, not broken.
+    assert "bybit.liquidations" not in CONTINUOUS_STREAMS
     assert "binance.liquidations" not in CONTINUOUS_STREAMS
     assert "okx.liquidations" not in CONTINUOUS_STREAMS
 

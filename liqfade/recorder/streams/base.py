@@ -44,15 +44,15 @@ FramesFn = Callable[[Sequence[str]], list[Any]]
 DiffFramesFn = Callable[[Sequence[str], Sequence[str]], list[Any]]
 
 # Streams that must never be quiet, so silence is a data gap. Everything else is event
-# driven (a liquidation feed on a calm venue, a 1m candle) and silence means nothing;
+# driven (a liquidation feed on any venue, a 1m candle) and silence means nothing;
 # for those, only the connection being up is monitored. Bybit publishes every
-# liquidation since 2025-02-25, which is why it is here and Binance and OKX are not.
+# liquidation since 2025-02-25, but complete is not the same as constant: on the first
+# live day it went over 60s without one 24 times in four hours, each a Telegram alert.
 CONTINUOUS_STREAMS = frozenset(
     {
         "hyperliquid.trades",
         "hyperliquid.bbo",
         "hyperliquid.l2",
-        "bybit.liquidations",
     }
 )
 
