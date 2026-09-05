@@ -141,7 +141,16 @@ class Health:
                 )
             silent_s = stat.silent_s(at_ms)
             if stat.continuous and silent_s > self.cfg.silence_alert_s:
-                sent.append(f"recorder: {stat.name} silent for {silent_s:.0f}s")
+                # The text carries the threshold, not the elapsed time. It used to say
+                # "silent for {n}s", and `telegram._deduped` keys on the exact string, so
+                # one ten minute outage sent about 120 messages and hit the rate limit.
+                # Constant per stream per outage, so the dedupe collapses it to one every
+                # DEDUPE_S, which is the "still down" reminder anyone would want.
+                worst = stat.worst_coin(at_ms)[0]
+                sent.append(
+                    f"recorder: {stat.name} silent for over {self.cfg.silence_alert_s:.0f}s"
+                    + (f" (worst coin {worst})" if worst else "")
+                )
             elif not stat.connected:
                 # Sparse feeds are quiet by nature, so only a dead socket is news. This
                 # used to also require `stat.last_msg_ms`, which excluded exactly the
@@ -170,9 +179,11 @@ class Health:
         stats = disk_stats(self.data_dir)
         log.info("disk_usage", **stats)
         if stats["used_pct"] >= self.cfg.disk_alert_pct:
+            # The threshold, not the current numbers: free bytes move every check, and a
+            # text that moves defeats the alerter's dedupe. The `disk_usage` log line and
+            # the panel both carry how full it actually is.
             sent.append(
-                f"recorder: disk {stats['used_pct']:.0f}% used on {stats['path']} "
-                f"({stats['free_bytes'] / 1e9:.1f} GB free)"
+                f"recorder: disk over {self.cfg.disk_alert_pct:.0f}% used on {stats['path']}"
             )
         flag = self.data_dir / DISK_FLAG
         if flag.exists():

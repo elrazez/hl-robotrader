@@ -12,6 +12,11 @@ Dedupe: the same text is sent at most once per ten minutes. Health checks run ev
 seconds and would otherwise repeat the same line hundreds of times for one outage. The
 timer starts when a send is attempted, not when it succeeds, so an unreachable Telegram
 does not turn into a retry loop against their rate limit.
+
+That puts a rule on the callers: an alert about an ongoing condition must read the same
+every tick it is raised. A number that moves (seconds silent, percent full) makes every
+repeat a new string and defeats this entirely, so those alerts carry the threshold that
+was crossed rather than the current value. See `recorder/health.py`.
 """
 
 from __future__ import annotations

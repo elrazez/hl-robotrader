@@ -40,7 +40,35 @@ async def test_a_continuous_stream_gone_quiet_alerts_and_counts_a_gap(tmp_path: 
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
     assert stat.gaps_1h == 1
-    assert alerts.sent == ["recorder: hyperliquid.trades silent for 120s"]
+    assert alerts.sent == [
+        f"recorder: hyperliquid.trades silent for over {CFG.silence_alert_s:.0f}s"
+    ]
+
+
+async def test_the_silence_alert_reads_the_same_all_through_one_outage(tmp_path: Path) -> None:
+    """The text used to carry `silent for {n}s`, and telegram._deduped keys on the exact
+    string, so a ten minute outage sent about 120 messages and got rate limited."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, connected=True)
+    at = now_ms()
+    stat.record_message(at - 120_000)
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    await health.check_streams(at + 5_000)
+    await health.check_streams(at + 600_000)
+    assert len(set(alerts.sent)) == 1
+
+
+async def test_the_silence_alert_names_the_coin_on_a_per_coin_stream(tmp_path: Path) -> None:
+    """One dead subscription out of twenty: the alert has to say which."""
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, connected=True, per_coin=True)
+    at = now_ms()
+    stat.record_message(at - 120_000, ["BTC"])
+    stat.record_message(at, ["ETH"])
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == [
+        f"recorder: hyperliquid.bbo silent for over {CFG.silence_alert_s:.0f}s (worst coin BTC)"
+    ]
 
 
 async def test_a_sparse_stream_being_quiet_is_not_an_alert(tmp_path: Path) -> None:
@@ -150,3 +178,12 @@ async def test_parse_errors_under_the_rate_are_not_worth_a_message(tmp_path: Pat
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
     assert alerts.sent == []
+
+
+async def test_the_disk_alert_reads_the_same_as_the_volume_keeps_filling(tmp_path: Path) -> None:
+    """Free bytes move every check, and a text that moves defeats the dedupe."""
+    health, alerts = _health(tmp_path)
+    health.cfg = CFG.model_copy(update={"disk_alert_pct": 0.0})
+    await health.check_disk()
+    await health.check_disk()
+    assert len(set(alerts.sent)) == 1
