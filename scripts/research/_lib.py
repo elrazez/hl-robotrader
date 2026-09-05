@@ -446,6 +446,23 @@ def month_chunks(start: str, end: str) -> list[tuple[str, str]]:
     return out
 
 
+def week_chunks(start: str, end: str, *, days: int = 7) -> list[tuple[str, str]]:
+    """Split a date range into fixed-length blocks, clipped to the range.
+
+    Finer than `month_chunks` for the questions whose per-chunk cost is the tape rather
+    than the episodes: Q8 reads fifteen minutes of prints per episode, and a month of that
+    on a liquid universe is over three gigabytes.
+    """
+    first, last = date.fromisoformat(start), date.fromisoformat(end)
+    out = []
+    cursor = first
+    while cursor <= last:
+        stop = min(cursor + timedelta(days=days - 1), last)
+        out.append((cursor.isoformat(), stop.isoformat()))
+        cursor = stop + timedelta(days=1)
+    return out
+
+
 def padded(start: str, end: str) -> tuple[str, str]:
     """The date range a chunk must actually load: warm-up in front, horizon behind."""
     before = date.fromisoformat(start) - timedelta(days=2)
@@ -813,8 +830,12 @@ def build_episodes(
     """
     if cache is not None and cache.exists():
         cached = pl.read_parquet(cache)
-        if not cached.is_empty():
-            return cached
+        # Keyed by the window it was built for. Without this a March run and a year run
+        # sharing an output directory silently answer each other's question: the second one
+        # reads the first one's episodes and reports them under its own dates.
+        built_for = cached.select("window").row(0)[0] if "window" in cached.columns else None
+        if not cached.is_empty() and built_for == f"{start}:{end}":
+            return cached.drop("window")
     cfg = settings.features.episodes  # type: ignore[attr-defined]
     load_start, load_end = padded(start, end)
     liquidations = load_table(data_dir, "liquidations", load_start, load_end, venue="hyperliquid")
@@ -896,7 +917,7 @@ def build_episodes(
     ).sort("start_ts")
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        episodes.write_parquet(cache)
+        episodes.with_columns(pl.lit(f"{start}:{end}").alias("window")).write_parquet(cache)
     return episodes
 
 
@@ -1192,19 +1213,29 @@ def episode_tape(data_dir: str | Path, episodes: pl.DataFrame, *, horizon_s: int
         trades = windowed_trades(data_dir, day, coins)
         if trades.is_empty():
             continue
-        part = (
-            spans.join(
-                trades.with_columns(effective_ts()).select(
-                    "coin", pl.col("known").alias("ts_ms"), "px"
-                ),
-                on="coin",
-            )
-            .filter((pl.col("ts_ms") >= pl.col("entry_ts")) & (pl.col("ts_ms") <= pl.col("until")))
-            .select("key", "ts_ms", "px")
+        marked = trades.with_columns(effective_ts()).select(
+            "coin", pl.col("known").alias("ts_ms"), "px"
         )
-        if not part.is_empty():
-            parts.append(part)
-        del trades
+        # One coin at a time. Joining every episode of the day to every print of the day on
+        # `coin` and filtering afterwards is a product: a liquid coin is half a million
+        # prints in a day and a dozen episodes multiply it. Per coin the product is that
+        # coin's own prints times its own two or three episodes.
+        for coin in sorted(coins):
+            coin_spans = spans.filter(pl.col("coin") == coin)
+            coin_prints = marked.filter(pl.col("coin") == coin)
+            if coin_spans.is_empty() or coin_prints.is_empty():
+                continue
+            part = (
+                coin_spans.join(coin_prints, on="coin")
+                .filter(
+                    (pl.col("ts_ms") >= pl.col("entry_ts")) & (pl.col("ts_ms") <= pl.col("until"))
+                )
+                .select("key", "ts_ms", "px")
+            )
+            if not part.is_empty():
+                parts.append(part)
+            del coin_prints, part
+        del trades, marked
     if not parts:
         return empty
     return pl.concat(parts).unique(subset=["key", "ts_ms"], keep="first").sort("key", "ts_ms")

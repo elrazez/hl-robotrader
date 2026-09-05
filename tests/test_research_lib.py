@@ -226,3 +226,20 @@ def test_the_tape_spread_does_not_grow_with_the_episode_count(research_lake: Pat
     spread = lib._tape_spread(grid, episodes)
     assert spread.height <= episodes.height
     assert spread["key"].n_unique() == spread.height
+
+
+def test_the_episode_cache_refuses_to_answer_a_different_window(
+    tmp_path: Path, research_lake: Path
+) -> None:
+    """A March run and a year run sharing an output directory used to answer each other's
+    question: the second read the first's episodes and reported them under its own dates."""
+    from liqfade.config.loader import load_settings
+
+    settings = load_settings()
+    cache = tmp_path / "episodes.parquet"
+    first = lib.build_episodes(research_lake, "2026-03-01", "2026-03-01", settings, cache=cache)
+    assert cache.exists()
+    again = lib.build_episodes(research_lake, "2026-03-01", "2026-03-01", settings, cache=cache)
+    assert again.height == first.height  # same window, cache reused
+    other = lib.build_episodes(research_lake, "2026-03-02", "2026-03-02", settings, cache=cache)
+    assert other.is_empty()  # different window, cache ignored and that day has no lake

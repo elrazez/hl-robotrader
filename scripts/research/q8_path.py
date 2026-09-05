@@ -103,7 +103,7 @@ def outcomes(episodes: pl.DataFrame, tape: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def excursion_table(episodes: pl.DataFrame, tape: pl.DataFrame) -> tuple[str, pl.DataFrame]:
+def excursions(episodes: pl.DataFrame, tape: pl.DataFrame) -> pl.DataFrame:
     """MAE from entry over the time stop window, in bps and in units of rv_5m.
 
     Floored at zero: a trade whose worst print was still better than its entry had no
@@ -140,10 +140,15 @@ def excursion_table(episodes: pl.DataFrame, tape: pl.DataFrame) -> tuple[str, pl
             .alias("mae_rv")
         )
     )
+    return worst
+
+
+def excursion_table(worst: pl.DataFrame) -> str:
+    """MAE quantiles over every episode, however many chunks they were measured in."""
     rows = []
     for quantile in (0.25, 0.5, 0.75, 0.9, 0.95):
-        bps = worst["mae_bps"].quantile(quantile)
-        rv = worst["mae_rv"].quantile(quantile)
+        bps = worst["mae_bps"].quantile(quantile) if not worst.is_empty() else None
+        rv = worst["mae_rv"].quantile(quantile) if not worst.is_empty() else None
         rows.append(
             [
                 f"p{quantile * 100:.0f}",
@@ -151,26 +156,43 @@ def excursion_table(episodes: pl.DataFrame, tape: pl.DataFrame) -> tuple[str, pl
                 f"{rv:.2f}" if rv is not None else "n/a",
             ]
         )
-    return lib.table(["quantile", "MAE bps", "MAE in rv_5m"], rows), worst
+    return lib.table(["quantile", "MAE bps", "MAE in rv_5m"], rows)
+
+
+def resolve_cells(
+    episodes: pl.DataFrame, tape: pl.DataFrame
+) -> dict[tuple[float, float], pl.DataFrame]:
+    """Every cell's per-episode outcome for one chunk of episodes.
+
+    Returned rather than tabled so the caller can walk the year a chunk at a time: the tape
+    behind 5,000 episodes is tens of millions of prints and does not fit, while the outcome
+    of each episode in each of the twelve cells is one small row.
+    """
+    return {
+        (k_stop, k_target): lib.with_cost_columns(
+            outcomes(levels(episodes, k_stop, k_target), tape)
+        )
+        for k_stop in K_STOPS
+        for k_target in K_TARGETS
+    }
 
 
 def grid_table(
-    episodes: pl.DataFrame, tape: pl.DataFrame
+    resolved: dict[tuple[float, float], pl.DataFrame],
 ) -> tuple[str, dict[tuple[float, float], dict[str, float]]]:
     """One row per cell: net-stress mean, stop-out rate and the hit/stop/timeout split."""
     rows = []
     cells: dict[tuple[float, float], dict[str, float]] = {}
     for k_stop in K_STOPS:
         for k_target in K_TARGETS:
-            resolved = outcomes(levels(episodes, k_stop, k_target), tape)
-            if resolved.is_empty():
+            priced = resolved.get((k_stop, k_target), pl.DataFrame())
+            if priced.is_empty():
                 continue
-            priced = lib.with_cost_columns(resolved)
             counts = {
-                name: resolved.filter(pl.col("outcome") == name).height
+                name: priced.filter(pl.col("outcome") == name).height
                 for name in ("target", "stop", "timeout")
             }
-            total = max(resolved.height, 1)
+            total = max(priced.height, 1)
             estimate = lib.cluster_bootstrap(
                 priced.drop_nulls("net_stress_bps")["net_stress_bps"].to_numpy(),
                 priced.drop_nulls("net_stress_bps")["cluster"].to_numpy(),
@@ -273,7 +295,32 @@ def main() -> None:
         )
         return
     episodes = lib.with_btc_regime(episodes.filter(pl.col("qualified")))
-    tape = lib.episode_tape(args.data_dir, episodes, horizon_s=TIME_STOP_S)
+    # A week at a time. The tape behind a year of episodes is tens of millions of prints and
+    # will not fit on the owner's machine; the outcome of each episode is one row, so the
+    # tape is read, reduced and released a chunk at a time and only the rows survive. A week
+    # rather than a month because the cost here is the tape, not the episode count.
+    chunks: list[dict[tuple[float, float], pl.DataFrame]] = []
+    maes: list[pl.DataFrame] = []
+    prints = 0
+    for first, last in lib.week_chunks(args.start, args.end):
+        window = (pl.col("start_ts") >= lib.ms(first)) & (
+            pl.col("start_ts") < lib.ms(last) + 86_400_000
+        )
+        part = episodes.filter(window)
+        if part.is_empty():
+            continue
+        tape = lib.episode_tape(args.data_dir, part, horizon_s=TIME_STOP_S)
+        if tape.is_empty():
+            continue
+        prints += tape.height
+        chunks.append(resolve_cells(part, tape))
+        maes.append(excursions(part, tape))
+        del tape
+    resolved = {
+        cell: pl.concat([chunk[cell] for chunk in chunks if not chunk[cell].is_empty()])
+        for cell in {cell for chunk in chunks for cell in chunk}
+    }
+    worst = pl.concat(maes) if maes else pl.DataFrame()
     qualifying, facts = lib.qualifies(episodes)
     hold = (
         lib.with_cost_columns(episodes.with_columns(pl.col("mid_plus_15m").alias("exit_px")))[
@@ -281,11 +328,11 @@ def main() -> None:
         ].mean()
         or 0.0
     )
-    excursion, _ = excursion_table(episodes, tape)
-    grid, cells = grid_table(episodes, tape)
+    excursion = excursion_table(worst)
+    grid, cells = grid_table(resolved)
     blocks = [
         f"Window: {args.start} to {args.end}. Qualifying episodes: **{episodes.height}**, "
-        f"clusters: **{episodes['cluster'].n_unique()}**. Prints read: **{tape.height}**. "
+        f"clusters: **{episodes['cluster'].n_unique()}**. Prints read: **{prints}**. "
         f"Entry is the first print after `extreme_ts + 1s`; the time stop is "
         f"{TIME_STOP_S // 60} minutes.",
         "",
