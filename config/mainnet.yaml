@@ -3,6 +3,14 @@
 # true only when LIQFADE_ENV=mainnet AND LIQFADE_LIVE_TRADING=1 AND data/KILL is absent.
 env: mainnet
 
+cascade:
+  # Not a risk limit and not tuning: the default `exact` reads S3 liquidations that arrive
+  # a day late, so Settings refuses it on mainnet and this file would not load without a
+  # value here. `crossvenue` is what Phase 5 runs if Q4 passes on 2026-11-04. Phase 5 is
+  # blocked until it does; this key existing does not unblock it.
+  # docs/DECISIONS.md, 2026-09-06.
+  trigger: crossvenue
+
 sizing:
   risk_frac: 0.0025  # 0.25% of equity per trade, half the research default (ROADMAP Phase 6)
   coin_exposure_frac: 0.15  # tighter than default while the live fill model is unproven

@@ -5,11 +5,15 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 import structlog
+
+from liqfade.config import resolve
+from liqfade.config.models import Settings
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +42,30 @@ def restore_structlog() -> Iterator[None]:
             structlog.reset_defaults()
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(**context)
+
+
+@pytest.fixture
+def settings_factory() -> Callable[..., Settings]:
+    """Build paper `Settings` with dotted-key overrides, for the strategy layer's tests.
+
+    `settings_factory(**{"exhaustion.mode": "rule", "cascade.liq_z_min": 2.0})`. The models
+    are frozen, so an override rebuilds the branch it touches rather than mutating it, and
+    every override still goes through the same validation a YAML file would. Tests that
+    want a different threshold must not hand-build a Settings: a model that skipped
+    validation is a config the loader would have refused.
+    """
+
+    def make(**dotted: Any) -> Settings:
+        merged, _ = resolve("paper")
+        for key, value in dotted.items():
+            node = merged
+            parts = key.split(".")
+            for part in parts[:-1]:
+                node = node[part]
+            node[parts[-1]] = value
+        return Settings.model_validate(merged)
+
+    return make
 
 
 @pytest.fixture(scope="session")

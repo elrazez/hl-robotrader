@@ -107,6 +107,18 @@ features:
 
 cascade:
   # Cascade start, per coin per side. All conditions must hold.
+  # Which feed the trigger reads. One detector and one engine behind all three, so the
+  # ceiling run and the eventual live run differ by this key rather than by a code path.
+  #   exact:      the lake's `liquidations` table, source hl_s3. Backtest only. Settings
+  #               refuses it on mainnet, because the live bot cannot see these events.
+  #   proxy:      hl_forced_proxy_60s over proxy_min, from public Hyperliquid data. Q3
+  #               measured precision 0.01 at the preregistered thresholds; a re-cut is
+  #               outstanding. Shipped and off.
+  #   crossvenue: aggregated liq_z_60s over the recorded Bybit and OKX feeds, weighted by
+  #               venues.*.liq_weight. What Phase 5 runs if Q4 passes on 2026-11-04. On the
+  #               historical year it has data on the twelve Tardis days only.
+  # See docs/DECISIONS.md, 2026-09-06.
+  trigger: exact  # exact | proxy | crossvenue
   liq_z_min: 3.0  # z-score of aggregated liquidation notional over 60s
   proxy_min: 4.0  # alternative trigger: hl_forced_proxy_60s multiple of median volume
   ret_over_rv_min: 2.0  # abs(ret_60s) / rv_5m, in the direction implied by the liquidated side
@@ -114,6 +126,15 @@ cascade:
   window_s: 60  # seconds: the window the three conditions above are evaluated over
 
 exhaustion:
+  # When the entry fires after a cascade starts.
+  #   fixed_delay: enter fixed_delay_s after cascade start, ignoring the rule below.
+  #   rule:        the spec's exhaustion rule, every condition for consecutive_ticks.
+  # Q2 compared them over 2,722 episodes and the flat delay carried more PnL on every
+  # month, so it is the default. The rule stays as code behind this switch rather than
+  # being deleted, so turning it on in a backtest config prints what it costs.
+  # reports/research/q2_exhaustion.md.
+  mode: fixed_delay  # fixed_delay | rule
+  fixed_delay_s: 120.0  # seconds after cascade start that mode=fixed_delay enters at (Q2)
   # All conditions must hold for consecutive_ticks in a row before an intent is emitted.
   consecutive_ticks: 3  # ticks at the 250ms cadence, so 750ms of confirmation
   liq_decay_frac: 0.25  # liq_15s must fall to this fraction of peak_liq_15s
@@ -155,6 +176,28 @@ filters:
   funding_extreme_bps_8h: null
   min_notional_usd: 10.0  # USD: the Hyperliquid exchange minimum order value
 
+strategy:
+  # The confluence rule layer: extra entry conditions the owner can switch on without
+  # touching engine code. Every ENABLED rule must pass after cascade and exhaustion fire
+  # or the intent is dropped and the rule names itself as the reason; every rule's values
+  # reach explain() either way, so a disabled rule still shows what it would have said.
+  # With every rule disabled the engine is bit identical to the bare spec behaviour, which
+  # is the configuration the golden test pins. A new rule is one class in
+  # strategy/rules.py, one section here, one model field and one test.
+  rules:
+    zone_proximity:
+      # Passes when the cascade extreme sits within zone_width_bps of a level that already
+      # existed, from features/levels.py. OFF because Q7 found in-zone episodes revert
+      # WORSE than out-of-zone: +36.1 bps against +146.3 at 15 bps over 1,523 in-zone
+      # episodes. The code stays built and tested. reports/research/q7_zones.md.
+      enabled: false
+      zone_width_bps: 15.0  # bps from the nearest level that counts as inside the zone
+    min_cascade_notional:
+      # Passes when the episode's liquidated notional exceeds the floor. Trivial on
+      # purpose: it is the rule that proves the mechanism with something anyone can check.
+      enabled: false
+      min_notional_usd: 250000.0  # USD of liquidated notional in the cascade so far
+
 sizing:
   risk_frac: 0.005  # fraction of equity risked at the stop, 0.5%
   vol_participation: 0.02  # fraction of the coin's trailing 5 minute HL notional volume
@@ -195,6 +238,13 @@ execution:
   order_db: orders.sqlite  # filename under data_dir
 
 backtest:
+  # Milliseconds between rows of the precomputed feature grid. Separate from
+  # features.decision_cadence_ms (250) on purpose: the spec's speed rule is to vectorize
+  # features on a 1s grid and keep fills event driven, so at the default three of every
+  # four decision ticks reread the row they saw before. That costs nothing under
+  # exhaustion.mode fixed_delay, which only reads the clock. Set 250 to match live exactly
+  # and expect four times the wall time and four times the memory.
+  feature_grid_ms: 1000
   latency_ms: 1000  # milliseconds from intent to an order visible to the market (docs/DECISIONS)
   taker_fee_frac: 0.00045  # 0.045% of notional per side, base tier 2026-08
   maker_fee_frac: 0.00015  # 0.015% of notional per side, base tier 2026-08

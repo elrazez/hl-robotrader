@@ -136,7 +136,16 @@ class Features(Base):
     levels: Levels
 
 
+CascadeTrigger = Literal["exact", "proxy", "crossvenue"]
+ExhaustionMode = Literal["fixed_delay", "rule"]
+
+
 class Cascade(Base):
+    # One detector behind all three values; the trigger picks which feed fills the
+    # liquidation columns and which condition the detector consults. `exact` is the
+    # historical ceiling and cannot be traded: Settings refuses it on mainnet and
+    # live_trading_block_reason names it. docs/DECISIONS.md, 2026-09-06.
+    trigger: CascadeTrigger = Field("exact", description="which liquidation feed the trigger reads")
     liq_z_min: float = Field(..., description="z-score: liquidation notional over window_s")
     proxy_min: NonNeg = Field(..., description="multiple: hl_forced_proxy alternative trigger")
     ret_over_rv_min: NonNeg = Field(..., description="ratio: abs(ret_w) / rv_5m")
@@ -145,6 +154,14 @@ class Cascade(Base):
 
 
 class Exhaustion(Base):
+    # Q2 found a flat delay carried more PnL than the rule on every month of the sample,
+    # so `fixed_delay` is the default and the rule stays as code behind the switch.
+    mode: ExhaustionMode = Field(
+        "fixed_delay", description="fixed_delay enters after fixed_delay_s; rule uses the below"
+    )
+    fixed_delay_s: Pos = Field(
+        120.0, description="seconds after cascade start that mode=fixed_delay enters"
+    )
     consecutive_ticks: int = Field(..., gt=0, description="ticks all conditions must hold for")
     liq_decay_frac: Frac = Field(..., description="fraction of peak_liq_15s liq_15s must fall to")
     require_flow_flip: bool = Field(..., description="require a CVD slope or book imbalance flip")
@@ -168,6 +185,37 @@ class Intent(Base):
     time_stop_s: Pos = Field(..., description="seconds before an unresolved position is flattened")
     urgency_liq_z: float = Field(..., description="z-score at or above which urgency is high")
     allow_taker_entry_high_urgency: bool = Field(..., description="allow taker entry when urgent")
+
+
+class ZoneProximityRule(Base):
+    """Q7 said no, so this ships disabled. `features/levels.py` stays built and tested."""
+
+    enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    zone_width_bps: Pos = Field(..., description="bps from the nearest level counted as in zone")
+
+
+class MinCascadeNotionalRule(Base):
+    """Trivial on purpose: it proves the rule mechanism with something easy to check."""
+
+    enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    min_notional_usd: Pos = Field(..., description="USD of liquidated notional the cascade needs")
+
+
+class StrategyRules(Base):
+    """One field per rule in `strategy.rules.RULES`.
+
+    `extra="forbid"` from Base is what makes an unknown rule name in a config file fail
+    loudly instead of being silently ignored, which would leave the owner reading a report
+    for a rule that never ran. `tests/test_strategy_rules.py` pins that this model and the
+    RULES registry name exactly the same set.
+    """
+
+    zone_proximity: ZoneProximityRule
+    min_cascade_notional: MinCascadeNotionalRule
+
+
+class Strategy(Base):
+    rules: StrategyRules
 
 
 class SpreadTiers(Base):
@@ -245,6 +293,9 @@ class Execution(Base):
 
 
 class Backtest(Base):
+    feature_grid_ms: int = Field(
+        1000, gt=0, description="milliseconds between precomputed feature grid rows"
+    )
     latency_ms: int = Field(..., ge=0, description="milliseconds from intent to visible order")
     taker_fee_frac: NonNeg = Field(..., description="fraction of notional per taker side")
     maker_fee_frac: NonNeg = Field(..., description="fraction of notional per maker side")
@@ -256,6 +307,16 @@ class Backtest(Base):
     holdout_frac: Frac = Field(..., description="fraction of the chronological tail held out")
     walk_forward_refit_days: int = Field(..., gt=0, description="days between walk forward refits")
     bootstrap_samples: int = Field(..., gt=0, description="trade level bootstrap draws")
+
+    @model_validator(mode="after")
+    def _grid_is_a_multiple_of_nothing_finer(self) -> Backtest:
+        """A grid finer than the decision cadence would compute rows nobody ever reads."""
+        if self.feature_grid_ms % 250 and 250 % self.feature_grid_ms:
+            raise ValueError(
+                "backtest.feature_grid_ms and the 250ms decision cadence must divide one "
+                "another, so every decision tick lands on or after a grid row"
+            )
+        return self
 
 
 class Control(Base):
@@ -306,6 +367,7 @@ class Settings(Base):
     features: Features
     cascade: Cascade
     exhaustion: Exhaustion
+    strategy: Strategy
     intent: Intent
     filters: Filters
     sizing: Sizing
@@ -317,6 +379,25 @@ class Settings(Base):
     telegram: Telegram
     sync: Sync
     logging: Logging
+
+    @model_validator(mode="after")
+    def _exact_trigger_is_not_tradeable(self) -> Settings:
+        """`cascade.trigger: exact` reads S3 liquidations the live bot cannot see.
+
+        Refused on mainnet outright rather than at the point of use, because the failure
+        it prevents is silent: the engine would run, emit intents and look correct, on a
+        trigger whose events arrive a day late. The backtest ceiling this trigger produces
+        is a measurement of an edge nobody can reach in real time; see
+        `docs/DECISIONS.md`, 2026-09-06. Phase 5's loop also has to consult
+        `live_trading_block_reason`, which names it, so neither route can start on it.
+        """
+        if self.env == "mainnet" and self.cascade.trigger == "exact":
+            raise ValueError(
+                "cascade.trigger 'exact' reads hl_s3 liquidations, which are not visible "
+                "in real time, so it is a backtest-only trigger and mainnet refuses it. "
+                "Use 'proxy' or 'crossvenue', or run this config under --env paper."
+            )
+        return self
 
     # Paths derived from paths.data_dir, so there is one definition of each.
 
@@ -384,4 +465,9 @@ class Settings(Base):
             return "LIQFADE_LIVE_TRADING is not set to 1"
         if self.kill_switch_present:
             return f"kill switch file present at {self.kill_file}"
+        if self.cascade.trigger == "exact":
+            # Unreachable while the validator above stands, and kept anyway: it is the
+            # check Phase 5's loop calls, and it must not depend on another module having
+            # already refused. Two independent refusals of the same untradeable trigger.
+            return "cascade.trigger is 'exact', which is a backtest-only liquidation feed"
         return None
