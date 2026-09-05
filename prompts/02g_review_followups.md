@@ -211,3 +211,9 @@ anyway, not as a refactor of its own.
     of the venue. Deliberate and documented, but it means `parse_error_alert_1h: 100` fires
     on HL at twenty bad frames an hour, not a hundred. Either state that in the config
     comment or count it once against the venue.
+29. **Coinalyze is rate-limited to death on the VPS.** Seen on the first live run,
+    2026-09-05: `coinalyze.xchg_ctx` polls 1,243 markets in chunks of 20 every cycle, the
+    free tier allows 40 requests a minute, and every cycle dies at the first `429`, so the
+    stream never connects. Poll only the recorder's universe (the coins HL actually
+    subscribes), spread the chunks across the interval, and back off on `429` instead of
+    abandoning the cycle. Until then the cross-venue context table is empty.
