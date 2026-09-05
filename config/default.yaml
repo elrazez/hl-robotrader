@@ -216,6 +216,17 @@ risk:
   coin_cooldown_after_exit_min: 5  # minutes before re-entering a coin after any exit
   max_concurrent_positions: 4  # count
   max_positions_per_direction: 3  # count
+  # The per-cluster exposure cap. A cluster is every entry on the same side, across all
+  # coins, inside cluster_window_s. A market-wide sweep liquidates dozens of coins in one
+  # minute and the strategy would be in all of them at once, which is one bet however many
+  # tickets it is written on. Phase 3 measured the difference: Q1's pooled +84.6 bps per
+  # episode is +26.7 in the isolated-coin bucket and +34.0 with the top five clusters
+  # removed, and the gap is cluster upside. Sizing on the pooled figure would size one bet
+  # as if it were fifty. Neither the per-coin nor the total exposure cap catches this: forty
+  # coins at 2% of equity each is inside both and is 80% of the account on one view.
+  # docs/DECISIONS.md, 2026-09-05 and 2026-09-06.
+  cluster_window_s: 300  # seconds: entries this close together on one side are one cluster
+  max_cluster_exposure_frac: 0.25  # fraction of equity: gross notional entered per cluster
   stale_coin_s: 5.0  # seconds without an HL trade or bbo for a coin: no new entries in it
   stale_global_cancel_s: 15.0  # seconds of global feed silence: cancel all resting entries
   stale_global_flatten_s: 60.0  # seconds of global feed silence: flatten everything and halt

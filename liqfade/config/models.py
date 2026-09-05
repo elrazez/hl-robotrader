@@ -257,6 +257,12 @@ class Risk(Base):
     coin_cooldown_after_exit_min: NonNeg = Field(..., description="minutes per coin after any exit")
     max_concurrent_positions: int = Field(..., gt=0, description="count")
     max_positions_per_direction: int = Field(..., gt=0, description="count")
+    cluster_window_s: Pos = Field(
+        300.0, description="seconds: entries on one side this close together are one cluster"
+    )
+    max_cluster_exposure_frac: Frac = Field(
+        0.25, description="fraction of equity: gross notional entered inside one cluster"
+    )
     stale_coin_s: Pos = Field(..., description="seconds without HL data before a coin is blocked")
     stale_global_cancel_s: Pos = Field(..., description="seconds of silence before cancel all")
     stale_global_flatten_s: Pos = Field(..., description="seconds of silence before flatten all")
