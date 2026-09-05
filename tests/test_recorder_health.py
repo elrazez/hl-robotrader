@@ -63,13 +63,43 @@ async def test_a_sparse_stream_with_a_dead_socket_is_an_alert(tmp_path: Path) ->
     assert alerts.sent == ["recorder: binance.liquidations disconnected"]
 
 
-async def test_a_stream_that_has_never_delivered_does_not_alert_on_startup(
+async def test_a_declared_stream_whose_socket_never_came_up_is_an_alert(
     tmp_path: Path,
 ) -> None:
+    """`and stat.last_msg_ms` used to gate this, so a stream that never connected at all
+    was the one case nothing reported."""
     stat = StreamStats(name="okx.liquidations", continuous=False, connected=False)
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(now_ms())
+    assert alerts.sent == ["recorder: okx.liquidations disconnected"]
+
+
+async def test_a_stream_that_connects_and_never_delivers_is_quiet_during_the_grace(
+    tmp_path: Path,
+) -> None:
+    """Binance can go a genuinely quiet hour, so the grace has to be generous."""
+    stat = StreamStats(name="binance.liquidations", continuous=False, connected=True)
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(now_ms())
     assert alerts.sent == []
+
+
+async def test_a_stream_that_connects_and_never_delivers_alerts_once_after_the_grace(
+    tmp_path: Path,
+) -> None:
+    """The Binance regional block docs/DATA_SOURCES.md warns about: socket accepted,
+    connection held open, and not one message, ever. Nothing reported it."""
+    stat = StreamStats(name="binance.liquidations", continuous=False, connected=True)
+    health, alerts = _health(tmp_path, stat)
+    health.started -= health.startup_grace_s + 1.0
+    await health.check_streams(now_ms())
+    assert alerts.sent == [
+        "recorder: binance.liquidations is connected but has never delivered a message, "
+        f"{health.startup_grace_s / 3600:.0f}h after start"
+    ]
+    # Once. A feed that will never deliver must not page the owner every check.
+    await health.check_streams(now_ms())
+    assert len(alerts.sent) == 1
 
 
 async def test_disk_over_the_threshold_alerts(tmp_path: Path) -> None:

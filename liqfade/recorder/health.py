@@ -11,6 +11,11 @@ up either silently losing data or paging its owner every ten minutes:
   quiet whenever the market is calm. Silence there means nothing, so only the connection
   being down is alerted, which the ping/pong on the socket already tells us.
 
+A stream that has never delivered *anything* is a fourth case, and the one the other
+three miss: no gap is counted (there is no last message to measure from), no silence is
+alerted (same reason), and the socket is up. After `startup_grace_s` that is a fact about
+the feed, not a quiet market, and it is said once.
+
 Parse errors are the third question, and the one neither of the others can answer. A
 venue renaming a field leaves the socket connected and the message rate normal while
 every row is dropped, so the only evidence is the count of rows the parser refused. Past
@@ -26,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shutil
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -41,6 +47,11 @@ log = get_logger(__name__)
 CHECK_INTERVAL_S = 5.0
 DISK_INTERVAL_S = 300.0
 DISK_FLAG = "ALERT_DISK"
+# How long a declared stream may deliver nothing before that is treated as a fact rather
+# than a quiet market. An hour is generous even for Binance's throttled liquidation feed,
+# which is the point: the failure this catches is permanent, so a slow answer is fine and
+# a false alarm on a genuinely calm hour is not.
+STARTUP_GRACE_S = 3600.0
 
 Alerter = Callable[[str], Awaitable[bool]]
 
@@ -83,6 +94,7 @@ class Health:
         alert: Alerter = send_alert,
         check_s: float = CHECK_INTERVAL_S,
         disk_s: float = DISK_INTERVAL_S,
+        startup_grace_s: float = STARTUP_GRACE_S,
     ) -> None:
         self.cfg = cfg
         self.data_dir = Path(data_dir)
@@ -90,10 +102,18 @@ class Health:
         self.alert = alert
         self.check_s = check_s
         self.disk_s = disk_s
+        self.startup_grace_s = startup_grace_s
+        self.started = time.monotonic()
         self._next_disk_check = 0.0
+        # Streams already reported as never having delivered. A feed that will never
+        # deliver is one discovery, not a condition worth paging about every five seconds.
+        self._never_delivered: set[str] = set()
 
     def apply_config(self, cfg: Recorder) -> None:
         self.cfg = cfg
+
+    def _past_grace(self, now: float | None = None) -> bool:
+        return (time.monotonic() if now is None else now) - self.started > self.startup_grace_s
 
     def _all_stats(self) -> list[StreamStats]:
         return [stat for source in self.sources for stat in source.stats.values()]
@@ -114,9 +134,24 @@ class Health:
             silent_s = stat.silent_s(at_ms)
             if stat.continuous and silent_s > self.cfg.silence_alert_s:
                 sent.append(f"recorder: {stat.name} silent for {silent_s:.0f}s")
-            elif not stat.connected and stat.last_msg_ms:
-                # Sparse feeds are quiet by nature, so only a dead socket is news.
+            elif not stat.connected:
+                # Sparse feeds are quiet by nature, so only a dead socket is news. This
+                # used to also require `stat.last_msg_ms`, which excluded exactly the
+                # stream whose socket never came up at all.
                 sent.append(f"recorder: {stat.name} disconnected")
+            elif (
+                stat.last_msg_ms == 0
+                and self._past_grace()
+                and stat.name not in (self._never_delivered)
+            ):
+                # Connected, held open, and not one message since the process started.
+                # That is the Binance regional block docs/DATA_SOURCES.md warns about,
+                # and nothing else here can see it: no gap, no silence, no disconnect.
+                self._never_delivered.add(stat.name)
+                sent.append(
+                    f"recorder: {stat.name} is connected but has never delivered a message, "
+                    f"{self.startup_grace_s / 3600:.0f}h after start"
+                )
         for text in sent:
             await self.alert(text)
         return sent
