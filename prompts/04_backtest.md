@@ -1,8 +1,12 @@
 # Prompt 04: Phase 4 backtester and strategy v0
 
-Owner notes: only run this if `reports/research/SUMMARY.md` said continue. Everything
-runs on the laptop against the Parquet lake. This is the phase you will re-run dozens of
-times; speed and determinism matter as much as correctness.
+Owner notes: Phase 3 said the edge is real (Q1, Q8) and the live trigger is not visible
+yet (Q3 no, Q4 inconclusive until 2026-11-04), and parked on stop rule 5. The owner decided
+on 2026-09-06 to build this phase anyway, with the trigger source as a config switch: the
+year is backtested on the archive's exact liquidations as the ceiling, and the live-visible
+triggers plug into the same engine when Q3's re-cut or Q4 produces one. Everything runs on
+the laptop against the Parquet lake. This is the phase you will re-run dozens of times;
+speed and determinism matter as much as correctness.
 
 ---
 
@@ -17,6 +21,53 @@ Panel v2 (report browser). Do NOT build execution/ (except `rounding.py`, below)
 or alerts/. The single most important constraint from CLAUDE.md: strategy code must run
 against a Parquet replay with zero changes; if you feel the need for a live-only branch
 in `strategy/` or `features/`, stop and put it in `live/`'s future scope instead.
+
+## Phase 3 outcomes that change this prompt
+
+Read `reports/research/SUMMARY.md` first. These override anything below that disagrees.
+
+1. **The owner is overriding stop rule 5 to build the engine now.** Log that in
+   `docs/DECISIONS.md` as your first commit: dated 2026-09-06, owner decision, the year is
+   backtested on the exact trigger as a ceiling, no live trading path is built here, and
+   Phase 5 stays blocked until a live-visible trigger passes its bar.
+2. **The trigger source is a config switch, `cascade.trigger`**, with three values, all
+   feeding the same detector and the same engine:
+   - `exact`: the lake's `liquidations` table, source `hl_s3`. Backtest only. The live loop
+     (Phase 5) must refuse to start with it; write that refusal now as a settings validator
+     so nobody forgets.
+   - `proxy`: `hl_forced_proxy_60s` from public Hyperliquid data, threshold
+     `cascade.proxy_min`. Q3 says precision 0.01 at the preregistered thresholds; a re-cut
+     is running. Ship it, default off.
+   - `crossvenue`: aggregated liquidation z-score from the recorded Bybit and OKX feeds
+     (`liq_z_60s` with `venues.*.liq_weight`), which is what Phase 5 will run if Q4 passes.
+     On the historical year this has data on the twelve Tardis days only; the report must
+     print the days it had data for.
+   Default for the year run: `exact`. Every report's first page names the trigger.
+3. **Nothing research said no to is deleted.** Every rule stays as code and as a config
+   switch, default off, so the owner can turn it on in a backtest config and see the cost:
+   - exhaustion: `exhaustion.mode: rule | fixed_delay`, `fixed_delay_s: 120`, default
+     `fixed_delay` (Q2: the flat delay carried more PnL than the rule). The rule code stays.
+   - `filters.skip_when_btc_cascading` off, `filters.funding_extreme_bps_8h` null (Q6),
+     already in config. Keep them as filters.
+   - `zone_proximity` ships disabled (Q7: in-zone was worse). `features/levels.py` stays.
+   - the partial-liquidation rhythm (Q5) is not a rule in the spec; do not add one.
+   The all-rules-off, `fixed_delay` configuration is the golden baseline.
+4. **Size on 30 bps, not 85.** The expected-edge filter and every sizing example use the
+   isolated-coin number. And **the risk layer gets a per-cluster exposure cap**: a cluster
+   is every intent on the same side across all coins inside `risk.cluster_window_s`
+   (default 300); `risk.max_cluster_exposure_frac` (default 0.25 of equity, unit and
+   rationale in the YAML comment) caps the gross notional entered inside one cluster. A
+   sweep that liquidates forty coins in a minute is one bet. Test it: forty intents in one
+   minute, the cap binds after the first few, the reason names the cluster.
+5. **Stop and target come from config** (`intent.k_target 0.8`, `k_stop 1.0`), never from
+   the docs' old 0.5 / 1.5.
+6. **The holdout.** The last 25% of the window is held out by episode count, not by days,
+   so the split lands where the sample says. The l2 snapshot cadence drops tenfold from
+   2026-06-21 (`docs/DATA_SOURCES.md`); on the historical year almost every fill goes
+   through the no-book model anyway, so the report prints the `no_book_fills` share per
+   split and flags any split where it differs by more than 10 points.
+7. **Funding** is the `HH:59` `asset_ctx` sample, per spec section 6; do not pull a
+   second series.
 
 ## Decisions already made
 

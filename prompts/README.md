@@ -16,7 +16,9 @@ exceptions are noted below.
 | `02f_lake_hardening.md` | 2 | Ingestion and lake fixes from the 2026-09-04 review | 02d committed, both its runs finished |
 | `02e_quality_gate.md` | 2 | Full data quality report, side rule by month, cleanup checklist | 02d, 02f |
 | `03_research.md` | 3 | Feature functions + the six research questions | 02e says no unexplained holes |
-| `04_backtest.md` | 4 | Backtester, strategy v0, sizing, risk + Panel v2 | Phase 3 said "yes" |
+| `03b_q3_recut.md` | 3 | Q3 re-cut 1: the proxy trigger gets the episode floors, thresholds to 40 | 03 done |
+| `03c_realtime_liquidations.md` | 3 | Research only: can the live bot see HL liquidations in real time, and at what cost | 03 done |
+| `04_backtest.md` | 4 | Backtester, strategy v0, sizing, risk + Panel v2; trigger source is a config switch | Phase 3 done; owner overrode stop rule 5 on 2026-09-06 |
 | `05_execution.md` | 5 | Live loop, paper mode, testnet execution, Telegram bot + Panel v3 | Phase 4 done, testnet keys |
 | `06_mainnet.md` | 6 | Mainnet go-live at minimum size, reporting | Phase 5 ran clean 1 week |
 | `07_iterate.md` | 7 | The process for every change after go-live | Phase 6 live |
