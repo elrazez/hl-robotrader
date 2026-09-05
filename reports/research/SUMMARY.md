@@ -41,7 +41,7 @@ Two caveats a reader of the numbers below should carry:
 |---|---|---|---|---|---|
 | 1 | reversion after an exact cascade | **yes** | +84.6 bps at +15m, 95% CI [+25.1, +180.0] | 2722 / 1758 / 12 | [q1_reversion.md](q1_reversion.md) |
 | 2 | exhaustion timing against a fixed delay | **no** | a flat 120s delay carries more PnL than the rule | 2722 / 1758 / 12 | [q2_exhaustion.md](q2_exhaustion.md) |
-| 3 | forced flow proxy calibration | RUN PENDING | RUN PENDING | RUN PENDING | [../proxy_calibration.md](../proxy_calibration.md) |
+| 3 | forced flow proxy calibration | **no** | precision 0.01 at recall 0.68; 429,227 triggers against 2,617 episodes | 2617 / n/a / 12 | [../proxy_calibration.md](../proxy_calibration.md) |
 | 4 | cross-venue cascades HL did not see | **inconclusive** | 144 orphans, 102 clusters, but only 12 days of cross-venue data | 144 / 102 / 12 days | [q4_crossvenue.md](q4_crossvenue.md) |
 | 5 | partial liquidation rhythm | **no** | 1.65x mass at the 30s cooldown, against a 2x bar | 2722 / 1758 / 12 | [q5_rhythm.md](q5_rhythm.md) |
 | 6 | filters that remove the losing tail | **no** | best concentration 1.25x (BTC cascading), against a 2x bar | 2722 / 1758 / 12 | [q6_filters.md](q6_filters.md) |
@@ -73,7 +73,22 @@ figure is the meaningful one, and it says capacity is not what limits this strat
 
 ## The trigger Phase 4 is built on
 
-RUN PENDING, from Q3.
+**Cross-venue, on Bybit** — and that makes Q4 a Phase 4 entry requirement, which Q4 cannot
+meet for two months.
+
+The three-gate proxy reaches recall 0.68 but precision 0.01 on core+major, at every
+threshold from 2 to 6. The gates are working: both are open on only 1.0% of ticks and gating
+cuts qualifying ticks 38-fold, from 786,000 to 20,600 on a sample day, and it is that gating
+which lifts recall from 0.30 ungated to 0.68 gated. The problem is the trigger rate. The
+proxy fires **429,227 times a year** across roughly thirty coins, one every 37 minutes per
+coin, against 2,617 episodes to find. **Precision is capped at 0.6% by construction** at that
+rate, whatever the proxy is correlated with, so "precision 0.01" says the proxy is not
+selective, not that it is uninformative.
+
+That distinction matters for Phase 7 and not for now: the preregistered thresholds were
+2/3/4/6 and threshold 6 still produces 303,490 triggers, so the useful threshold, if one
+exists, is far above the range this phase agreed to test. Extending it is a re-cut and has
+not been done.
 
 ## Robustness on the headline
 
@@ -98,7 +113,7 @@ conditional one. The isolated-coin figure is the one that matters for sizing.
 | 2 | unharvestable: no Q8 cell positive with stop-out under 50% and positive neighbours | **no**, 12 of 12 cells qualify |
 | 3 | lottery: headline dies with the top 5 clusters removed, or fails 2 of 3 splits | **no**, +34.0 and 3 of 3 splits pass |
 | 4 | no capacity: under $2,000 a year at 25% participation | **no** |
-| 5 | no trigger: proxy under precision 0.5 and Q4 unanswerable for months | RUN PENDING, from Q3 |
+| 5 | no trigger: proxy under precision 0.5 and Q4 unanswerable for months | **YES, TRIGGERED** |
 
 ## Config writeback
 
@@ -111,7 +126,7 @@ so.
 | `intent.k_target` | 0.5 | **0.8** | Q8's winning cell, neighbours positive |
 | `intent.k_stop` | 1.5 | **1.0** | as above |
 | `intent.time_stop_s` | 900 | 900, unchanged | Q8's grid used it and did not test alternatives |
-| `cascade.proxy_min` | 4.0 | RUN PENDING | Q3's F1 curve |
+| `cascade.proxy_min` | 4.0 | **no change** | Q3's F1 curve is flat at 0.01 across 2/3/4/6; the data did not choose a value |
 | `filters.skip_when_btc_cascading` | true | **false** | Q6: 1.25x concentration, under the 2x bar |
 | `filters.funding_extreme_bps_8h` | 30.0 | **off** | Q6: removes 0.6% of the sample and 0% of the loss tail |
 | `filters.max_spread_bps` | 3/6/12 by tier | **30 bps flat, pre-trade** | the core tier's p99 of 22.9; see docs/DECISIONS.md |
@@ -125,25 +140,53 @@ Frozen by the preregistration and not writeable by this phase:
 
 ## Should Phase 4 proceed?
 
-RUN PENDING until Q3 names the trigger.
+**No. The project parks, on stop rule 5.**
 
-What the eight questions say so far: **the edge is real but smaller and simpler than the
+Q1 and Q8 both pass on exact S3 liquidations, so the edge is real. But the live bot cannot
+see S3 liquidations. The HL-native proxy that was supposed to stand in for them reaches
+precision 0.01, far under the 0.5 that stop rule 5 names, so the v0 trigger falls to
+cross-venue Bybit; and Q4, which then becomes a Phase 4 entry requirement, is inconclusive
+and stays that way until the VPS recorder has run for sixty days. **It has not run at all.**
+Stop rule 5 is exactly this situation, and its instruction is to park until the recorder has
+the data rather than build Phase 4 blind.
+
+This is a park, not a stop. Nothing here says the thesis is wrong; it says the thesis cannot
+be traded yet because the trigger cannot be seen. What unblocks it is a running recorder, and
+that is a deployment task, not a research one.
+
+What the eight questions say meanwhile: **the edge is real but smaller and simpler than the
 spec assumed.** Roughly 30 bps net-stress per episode on the numbers that survive the
 robustness cuts, harvested by entering a fixed delay after the cascade starts and exiting at
 `k_target = 0.8` with a stop at `k_stop = 1.0`, with no filters, no zone gate and no
 exhaustion rule. The complexity in `docs/STRATEGY_AND_RISK.md` sections 2 and 3 is not
 earning its place: Q2, Q5, Q6 and Q7 all say no.
 
-The open question is the trigger. Q1 and Q8 are measured on **exact S3 liquidations, which
-the live bot cannot see**. Whether Phase 4 can be built at all depends on Q3, and if Q3 fails
-its bar then on Q4, which cannot be answered until the recorder has run for two months.
+What to do next, in order: **start the recorder on the VPS**, because every remaining
+question needs it and nothing else moves until it has run; then rerun Q3 and Q4 at sixty
+recorder days, where the proxy's gates read live block-level values instead of the archive's
+one-a-minute sampling and Q4 has a real sample. If Q4 then shows Bybit-only cascades revert
+on Hyperliquid, Phase 4 is built on a cross-venue trigger with the parameters in the
+writeback table. If it does not, this thesis has an edge nobody can reach and the momentum
+variant deserves its own Phase 3.
 
 ## What was run
 
-The eight scripts over 2025-09-01 to 2026-08-30 on 2026-09-05, from commit RUN PENDING,
-against the lake at `/Volumes/<drive>/liqfade-data`. Peak resident memory on an 8 GB
-machine: Q1 2.00 GB, Q8 2.64 GB, Q4 1.65 GB, Q5 3.18 GB, Q6 1.84 GB, Q2 2.98 GB, Q7 2.40 GB,
-Q3 RUN PENDING.
+The eight scripts over 2025-09-01 to 2026-08-30 on 2026-09-05, from commit `70d0092`,
+against the lake at `/Volumes/<drive>/liqfade-data`. Wall time and peak resident memory on an 8 GB machine:
+
+| question | wall | peak RSS |
+|---|---|---|
+| Q1 | 12.5 min | 2.00 GB |
+| Q2 | 5.6 min | 2.98 GB |
+| Q3 | 73.6 min | 3.66 GB |
+| Q4 | 6.4 min | 1.65 GB |
+| Q5 | 0.5 min | 3.18 GB |
+| Q6 | 3.9 min | 1.84 GB |
+| Q7 | 7.1 min | 2.40 GB |
+| Q8 | 2.9 min | 2.64 GB |
+
+Q3, Q5 and Q2 exceed the 3 GB working budget; the others are inside it. Q3 checkpoints one
+file a day under `q3_days/`, so a rerun resumes rather than restarting.
 
 No re-cut of the episode definition has been used. The universe fix logged on 2026-09-05 is
 recorded as a defect, not a re-cut, so both permitted re-cuts remain available.
