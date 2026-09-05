@@ -23,6 +23,7 @@ LAKE_END = "2026-03-01"
 # script stem -> the report it must write under the out dir.
 QUESTIONS = {
     "q1_reversion": "q1_reversion.md",
+    "q3_proxy": "q3_proxy.md",
     "q8_path": "q8_path.md",
 }
 
