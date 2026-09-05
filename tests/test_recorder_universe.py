@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import orjson
+
 from liqfade.config import load_settings
 from liqfade.config.models import Universe
-from liqfade.recorder.universe import select_universe
+from liqfade.recorder.universe import UniverseManager, select_universe
 
 CFG: Universe = load_settings(
     "paper", environ={}
@@ -79,3 +81,60 @@ def test_the_result_is_sorted_so_a_reorder_is_not_a_universe_change() -> None:
     cfg = CFG.model_copy(update={"core_coins": ("SOL", "BTC"), "top_n_by_volume": 1})
     chosen = select_universe(payload(("ETH", BIG, OI, 100.0)), cfg)
     assert chosen == sorted(chosen) == ["BTC", "ETH", "SOL"]
+
+
+# --- applying a refresh --------------------------------------------------------
+
+NO_CORE = CFG.model_copy(update={"core_coins": ()})  # so the payload alone is the universe
+
+
+class FakeInfo:
+    """An httpx.AsyncClient stand-in that answers /info with one canned payload."""
+
+    def __init__(self, coins: list[str]) -> None:
+        self.coins = coins
+
+    async def post(self, *_args: Any, **_kwargs: Any) -> Any:
+        body = payload(*[(coin, BIG, OI, 100.0) for coin in self.coins])
+
+        class Reply:
+            @staticmethod
+            def raise_for_status() -> None: ...
+
+            content = orjson.dumps(body)
+
+            @staticmethod
+            def json() -> Any:
+                return body
+
+        return Reply()
+
+
+async def test_a_refusal_to_apply_leaves_the_universe_unchanged_so_it_is_retried() -> None:
+    """`self.coins` used to advance before on_change ran, so a half applied refresh
+    looked done and the next tick returned False without re-trying the venues that
+    missed it. They then under-recorded that coin until a restart."""
+    taken: list[list[str]] = []
+
+    async def refuse(coins: list[str]) -> bool:
+        taken.append(list(coins))
+        return False
+
+    manager = UniverseManager(NO_CORE, "https://example.invalid", on_change=refuse)
+    client = FakeInfo(["BTC", "ETH"])
+    assert await manager.refresh(client) is False
+    assert manager.coins == []
+    # Still not applied, so the next refresh tries again rather than reporting no change.
+    assert await manager.refresh(client) is False
+    assert taken == [["BTC", "ETH"], ["BTC", "ETH"]]
+
+
+async def test_a_refresh_every_stream_took_advances_the_shared_state() -> None:
+    async def accept(_coins: list[str]) -> bool:
+        return True
+
+    manager = UniverseManager(NO_CORE, "https://example.invalid", on_change=accept)
+    client = FakeInfo(["BTC", "ETH"])
+    assert await manager.refresh(client) is True
+    assert manager.coins == ["BTC", "ETH"]
+    assert await manager.refresh(client) is False  # nothing changed, nothing to send

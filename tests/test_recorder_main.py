@@ -55,7 +55,7 @@ async def test_the_universe_reaches_every_venue_in_its_own_spelling(
     settings: Settings,
 ) -> None:
     recorder = Recorder(settings)
-    await recorder._apply_universe(["BTC", "kPEPE"])
+    assert await recorder._apply_universe(["BTC", "kPEPE"]) is True
     symbols = {stream.venue: stream.symbols for stream in recorder.streams}
     assert symbols["hyperliquid"] == ["BTC", "kPEPE"]
     assert symbols["bybit"] == ["1000PEPEUSDT", "BTCUSDT"]
@@ -252,3 +252,24 @@ async def test_a_row_with_no_timestamp_is_quarantined_and_never_reaches_1970(
     (quarantined,) = sorted((settings.paths.data_dir / "quarantine").rglob("*.jsonl"))
     assert orjson.loads(quarantined.read_bytes().splitlines()[0])["coin"] == "BTC"
     assert alerts and "quarantine" in alerts[0]
+
+
+async def test_a_stream_that_raises_does_not_stop_the_others_or_mark_the_refresh_done(
+    settings: Settings,
+) -> None:
+    """Streams were resubscribed serially, so a ConnectionClosed on stream 2 left 3 and 4
+    on the old universe, and the next refresh saw no change and never retried them."""
+    recorder = Recorder(settings)
+    binance_stream = next(s for s in recorder.streams if s.venue == "binance")
+
+    async def closed(_symbols: object) -> None:
+        raise ConnectionError("connection closed mid-send")
+
+    binance_stream.set_symbols = closed  # type: ignore[method-assign]
+    assert await recorder._apply_universe(["BTC", "kPEPE"]) is False
+
+    took = {s.venue: s.symbols for s in recorder.streams if s.venue != "binance"}
+    assert took["hyperliquid"] == ["BTC", "kPEPE"]
+    assert took["bybit"] == ["1000PEPEUSDT", "BTCUSDT"]
+    assert took["okx"] == ["1000PEPE-USDT-SWAP", "BTC-USDT-SWAP"]
+    assert recorder.poller.coins == ["BTC", "kPEPE"]

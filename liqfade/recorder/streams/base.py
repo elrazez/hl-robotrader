@@ -233,15 +233,25 @@ class WSStream:
     # --- universe ------------------------------------------------------------
 
     async def set_symbols(self, symbols: Sequence[str]) -> None:
-        """Point the stream at a new symbol set, subscribing the diff if connected."""
+        """Point the stream at a new symbol set, subscribing the diff if connected.
+
+        `self.symbols` advances only after every frame has gone out, so a send that
+        raises leaves the stream on its old set and the caller can retry the whole diff.
+        Re-sending a subscribe the venue already has is harmless on all three venues;
+        recording a coin twice is not the failure worth guarding against here, and
+        silently not recording it is.
+        """
         new = sorted(symbols)
         added = [s for s in new if s not in self.symbols]
         removed = [s for s in self.symbols if s not in new]
-        self.symbols = new
-        if not (added or removed) or self._ws is None:
+        if not (added or removed):
+            return
+        if self._ws is None:
+            self.symbols = new  # nothing to send; on_connect subscribes the whole set
             return
         for frame in self.on_universe_change(added, removed):
             await self._send(frame)
+        self.symbols = new
 
     # --- connection ----------------------------------------------------------
 

@@ -232,10 +232,28 @@ class Recorder:
 
     # --- universe ------------------------------------------------------------
 
-    async def _apply_universe(self, coins: Sequence[str]) -> None:
+    async def _apply_universe(self, coins: Sequence[str]) -> bool:
+        """Point every stream at the new universe. True only when all of them took it.
+
+        Each stream is applied under its own try/except, so a `ConnectionClosed` in the
+        middle of one venue's subscribe frames no longer stops the venues after it. The
+        caller keeps the old universe on a False, which is what makes the next refresh
+        retry rather than see `coins == self.coins` and report no change; that is how a
+        venue used to under-record a coin permanently behind one warning line.
+        """
+        applied = True
         for stream in self.streams:
-            await stream.set_symbols([to_venue_symbol(coin, stream.venue) for coin in coins])
-        self.poller.set_universe(list(coins))
+            try:
+                await stream.set_symbols([to_venue_symbol(coin, stream.venue) for coin in coins])
+            except Exception as exc:
+                applied = False
+                log.warning(
+                    "universe_apply_failed",
+                    venue=stream.venue,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        self.poller.set_universe(list(coins))  # no socket, so nothing here can fail
+        return applied
 
     async def _bootstrap_universe(self) -> None:
         """One refresh before the streams connect, so the first subscribe is complete."""
@@ -249,8 +267,8 @@ class Recorder:
         fallback = sorted(
             set(self.settings.universe.core_coins) - set(self.settings.universe.exclude)
         )
-        self.universe.coins = fallback
-        await self._apply_universe(fallback)
+        if await self._apply_universe(fallback):
+            self.universe.coins = fallback
 
     # --- flushing ------------------------------------------------------------
 

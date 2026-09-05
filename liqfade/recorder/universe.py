@@ -73,7 +73,7 @@ class UniverseManager:
         cfg: Universe,
         api_url: str,
         *,
-        on_change: Callable[[list[str]], Awaitable[None]],
+        on_change: Callable[[list[str]], Awaitable[bool]],
         on_rtt_ms: Callable[[float], None] | None = None,
         refresh_min: int | None = None,
     ) -> None:
@@ -90,6 +90,13 @@ class UniverseManager:
         self.refresh_s = cfg.refresh_min * 60.0
 
     async def refresh(self, client: httpx.AsyncClient) -> bool:
+        """Re-select the universe and hand it to the streams. True when it was applied.
+
+        `self.coins` advances only after `on_change` reports that every stream took the
+        new set. It used to advance first, so a stream that raised mid-subscribe left the
+        venues after it on the old universe while the next refresh compared equal and
+        returned False: those venues then under-recorded that coin until a restart.
+        """
         payload, rtt_ms = await fetch_meta_and_ctxs(client, self.api_url)
         if self.on_rtt_ms is not None:
             self.on_rtt_ms(rtt_ms)
@@ -98,9 +105,11 @@ class UniverseManager:
             return False
         added = [c for c in coins if c not in self.coins]
         removed = [c for c in self.coins if c not in coins]
-        self.coins = coins
         log.info("universe_change", added=added, removed=removed, universe=coins, size=len(coins))
-        await self.on_change(coins)
+        if not await self.on_change(coins):
+            log.warning("universe_partly_applied", universe=coins, size=len(coins))
+            return False
+        self.coins = coins
         return True
 
     async def run(self, stop: asyncio.Event) -> None:
