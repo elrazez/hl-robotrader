@@ -9,19 +9,30 @@ Preregistration: [`PREREGISTRATION.md`](PREREGISTRATION.md), committed as
 **`901f0eebc722f7dc8942dc180fbd4889f90f7de9`** (`901f0ee`), before any script had read the
 real lake. Every bar in the table below is the one written in that commit.
 
-## Step 0: does `asset_ctx` cover the year?
+## Step 0: does `asset_ctx` cover the year? Yes.
 
-RUN PENDING. Fill in from
+Confirmed by the owner on 2026-09-05 from
 
     uv run python scripts/research/data_quality.py --footers-only --data-dir <lake>
 
-reading the `asset_ctx` row: days present, days expected, the cadence recorded in
-`docs/DATA_SOURCES.md`, and `source = hl_archive`. **If it is missing or short, the phase
-stops here and says so.** No trades-only workaround is built, per the preregistration.
+- **days present / expected: 363 of 365.** Both absences are the ones
+  `docs/DATA_SOURCES.md` already predicted rather than anything new.
+- **cadence: one row per coin per minute**, 1440 per coin per day, across 229 to 232 perps.
+- **source: `hl_archive`, `rx_ms = 0`**, from `s3://hyperliquid-archive/asset_ctxs/`.
 
-- days present / days expected: RUN PENDING
-- cadence: RUN PENDING
-- source: RUN PENDING
+So `features/context.py` is real for the year at that cadence, Q6's funding filter is
+evaluable, and all three of the proxy's gates are calibrated on the year rather than on the
+twelve Tardis days. The phase proceeds.
+
+Two caveats a reader of the numbers below should carry:
+
+- `asset_ctxs/20260708.csv.lz4` does not exist in Hyperliquid's bucket. It is their gap,
+  and it was left empty rather than filled from another source, which would have put a row
+  in the lake that `source` could not honestly label.
+- **2026-08-27 and 2026-08-30 are short rather than absent**: 155,440 and 119,248 rows
+  against a full day's 334,080. They count as present in the 363 and are not a hole in the
+  day count, but they are a hole in those two days. Anything reading the spread or the
+  proxy gates on those dates is reading a partial day.
 
 ## The eight questions
 
