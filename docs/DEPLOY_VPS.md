@@ -113,8 +113,9 @@ Leave it running. Check back the next day and confirm there are no gaps.
 
 ### 6. Open the dashboard
 
-Through an SSH tunnel, which runs over Tailscale once step 2 is done. Tailscale on its
-own does not reach the dashboard: it listens on the server's own loopback address and
+Through an SSH tunnel, over Tailscale once step 2 is done, or over the public address
+if a VPN firewall on your laptop blocks the tailnet (the wizard detects this and says
+so). Tailscale on its own does not reach the dashboard: it listens on the server's own loopback address and
 nowhere else, so there is nothing on the tailnet address to connect to.
 
 ```bash

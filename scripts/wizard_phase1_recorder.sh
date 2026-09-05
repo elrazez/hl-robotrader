@@ -220,8 +220,9 @@ die() {
 
 # ── talking to the box ─────────────────────────────────────────────────────
 # Always as root, always on the current ssh port, always to the public address.
-# Tailscale is used for the panel tunnel in stage 12, which is what "the panel
-# over Tailscale" means: the panel itself only ever binds 127.0.0.1 on the VPS.
+# The panel tunnel in stage 12 goes over Tailscale when this Mac can reach the
+# tailnet, and over the public address when a VPN firewall blocks it (stage 4
+# decides). The panel itself only ever binds 127.0.0.1 on the VPS.
 
 ssh_at() { local port="$1" host="$2"; shift 2; ssh -p "$port" "${SSH_OPTS[@]}" "root@$host" "$@"; }
 RSH()  { ssh_at "$SSH_PORT" "$VPS_HOST" "$@"; }
@@ -428,9 +429,9 @@ def cmd_tailscale() -> None:
         fail("tailscale: not up yet (" + (result.stderr.strip() or "no output") + ")")
     status = json.loads(result.stdout)
     backend = status.get("BackendState", "?")
-    self_node = status.get("Self", {})
-    name = self_node.get("DNSName", "").rstrip(".")
-    ips = [ip for ip in self_node.get("TailscaleIPs", []) if ":" not in ip]
+    self_node = status.get("Self") or {}
+    name = (self_node.get("DNSName") or "").rstrip(".")
+    ips = [ip for ip in (self_node.get("TailscaleIPs") or []) if ":" not in ip]
     print(f"state={backend} name={name} ip={ips[0] if ips else ''}")
     if backend != "Running" or not ips:
         fail("tailscale: not connected")
@@ -810,9 +811,19 @@ if "$TS_BIN" status | grep -q "$TS_IP"; then
 else
   die "the VPS is not in this Mac's tailnet. Same account on both?"
 fi
-say "Proving ssh works over the tailnet, which is how the panel tunnel will run."
-ssh_at "$SSH_PORT" "$TS_IP" true || die "ssh to $TS_IP:$SSH_PORT failed"
-ok "ssh over Tailscale works"
+say "Proving ssh works over the tailnet, which is how the panel tunnel prefers to run."
+if ssh_at "$SSH_PORT" "$TS_IP" true; then
+  TUNNEL_HOST="$TS_IP"; TUNNEL_VIA="Tailscale"
+  ok "ssh over Tailscale works"
+else
+  # A VPN firewall on this Mac drops every packet that is not its
+  # own, tailnet included. The public address is the same key-only ssh on the same
+  # port behind the same fail2ban; the tunnel just has no private network in front.
+  TUNNEL_HOST="$VPS_HOST"; TUNNEL_VIA="the public address"
+  warn "ssh over the tailnet is blocked on this Mac, most likely by a VPN firewall."
+  warn "Falling back to the public address $VPS_HOST for the tunnel and the sync."
+fi
+write_env TUNNEL_HOST "$TUNNEL_HOST"
 pause "Press Enter for the next stage."
 
 # ── 5 ──────────────────────────────────────────────────────────────────────
@@ -978,29 +989,29 @@ ok "every stream connected"
 pause "Press Enter for the next stage."
 
 # ── 12 ─────────────────────────────────────────────────────────────────────
-stage "The panel, over Tailscale"
+stage "The panel, through the ssh tunnel"
 say "The panel binds 127.0.0.1 on the VPS and nothing else, so you reach it"
-say "through an ssh tunnel that runs over the tailnet. Nothing is exposed."
+say "through an ssh tunnel over $TUNNEL_VIA. Nothing is exposed."
 rm -f "$TUNNEL_SOCKET"
 ssh -f -N -M -S "$TUNNEL_SOCKET" -o ExitOnForwardFailure=yes -p "$SSH_PORT" "${SSH_OPTS[@]}" \
-  -L "$PANEL_PORT:127.0.0.1:$PANEL_PORT" "root@$TS_IP" \
+  -L "$PANEL_PORT:127.0.0.1:$PANEL_PORT" "root@$TUNNEL_HOST" \
   || die "could not open the tunnel. Is local port $PANEL_PORT already in use?"
-close_tunnel() { ssh -S "$TUNNEL_SOCKET" -O exit "root@$TS_IP" >/dev/null 2>&1 || true; }
+close_tunnel() { ssh -S "$TUNNEL_SOCKET" -O exit "root@$TUNNEL_HOST" >/dev/null 2>&1 || true; }
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PANEL_PORT/api/health" || true)"
 if [[ "$CODE" != "200" ]]; then close_tunnel; die "the tunnel is up but /api/health answered $CODE"; fi
-ok "panel reachable at http://127.0.0.1:$PANEL_PORT through the tailnet"
+ok "panel reachable at http://127.0.0.1:$PANEL_PORT over $TUNNEL_VIA"
 open_url "http://127.0.0.1:$PANEL_PORT"
 step "Log in with the password you just chose, and open the recorder page."
 step "You should see every stream connected, lag in milliseconds, and the disk gauge."
 if confirm "Does the panel show all of that?"; then
-  ok "panel verified over Tailscale"
+  ok "panel verified over $TUNNEL_VIA"
 else
   SKIPPED+=("the panel did not look right: journalctl -u liqfade-panel -n 50")
   warn "noted. The recorder keeps running either way."
 fi
 close_tunnel
 note "reopen it any time with:"
-note "  ssh -p $SSH_PORT -L $PANEL_PORT:127.0.0.1:$PANEL_PORT root@$TS_IP"
+note "  ssh -p $SSH_PORT -L $PANEL_PORT:127.0.0.1:$PANEL_PORT root@$TUNNEL_HOST"
 pause "Press Enter for the next stage."
 
 # ── 13 ─────────────────────────────────────────────────────────────────────
@@ -1070,8 +1081,8 @@ finish
 printf '  %sThe recorder is now the only thing running that matters. Phase 1 is done\n' "$DIM"
 printf '  when it has been up 48 hours with no gap over 5s. What is left is waiting,\n'
 printf '  and then, from this Mac:%s\n\n' "$RESET"
-printf '    LIQFADE_SYNC_HOST=root@%s make sync\n' "$TS_IP"
+printf '    LIQFADE_SYNC_HOST=root@%s make sync\n' "$TUNNEL_HOST"
 printf '    duckdb -c "select venue, count(*) from '"'"'data/parquet/liquidations/**/*.parquet'"'"' group by 1"\n\n'
-printf '  %sPanel:    ssh -p %s -L %s:127.0.0.1:%s root@%s\n' "$DIM" "$SSH_PORT" "$PANEL_PORT" "$PANEL_PORT" "$TS_IP"
+printf '  %sPanel:    ssh -p %s -L %s:127.0.0.1:%s root@%s\n' "$DIM" "$SSH_PORT" "$PANEL_PORT" "$PANEL_PORT" "$TUNNEL_HOST"
 printf '  Journal:  ssh -p %s root@%s journalctl -u liqfade-recorder -f\n' "$SSH_PORT" "$VPS_HOST"
 printf '  Telegram: alerts arrive on their own when a stream goes quiet.%s\n\n' "$RESET"
