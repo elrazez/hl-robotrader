@@ -575,6 +575,30 @@ def _trade(**overrides: object) -> dict[str, object]:
     return row | overrides
 
 
+def _write_raw(
+    root: Path, table: str, rows: list[dict[str, object]], *, source: str | None
+) -> None:
+    """One partition file with `source` written verbatim, nulls included.
+
+    `write_partitioned` stamps a literal, so it cannot produce the null this exercises.
+    """
+    import pyarrow as pa
+
+    from liqfade.data.schemas import schema_for
+    from liqfade.recorder.writer import partition_dir, write_atomic
+
+    schema = schema_for(table)
+    columns = [
+        pa.array([source] * len(rows), pa.string())
+        if field.name == "source"
+        else pa.array([row[field.name] for row in rows], field.type)
+        for field in schema
+    ]
+    directory = partition_dir(root, table, DAY.isoformat())
+    directory.mkdir(parents=True, exist_ok=True)
+    write_atomic(pa.Table.from_arrays(columns, schema=schema), directory / "other_23.parquet")
+
+
 def test_rederive_drops_every_hyperliquid_row_that_is_not_ours(
     client: FakeS3, tmp_path: Path
 ) -> None:
@@ -593,6 +617,9 @@ def test_rederive_drops_every_hyperliquid_row_that_is_not_ours(
     write_partitioned(root, "trades", "hyperliquid", "tardis", [_trade(venue="hyperliquid")])
     write_partitioned(root, "trades", "hyperliquid", "recorder", [_trade(venue="hyperliquid")])
     write_partitioned(root, "trades", "binance", "tardis", [_trade()])
+    # A foreign row with no `source`. The rule is about the venue, so this one stays:
+    # the filter used to AND in `source != hl_s3`, and a null compares to neither.
+    _write_raw(root, "trades", [_trade(coin="ETH", tid=9_002)], source=None)
 
     hl_s3.rederive(tmp_path, DAY, DAY, workers=1)
 
@@ -600,6 +627,7 @@ def test_rederive_drops_every_hyperliquid_row_that_is_not_ours(
     assert {(row["venue"], row["source"]) for row in rows} == {
         ("hyperliquid", SOURCE_HL_S3),
         ("binance", "tardis"),
+        ("binance", None),
     }
 
 

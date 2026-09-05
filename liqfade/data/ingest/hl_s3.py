@@ -615,9 +615,12 @@ def _assemble(root: Path, table: str, day: str, derived: Any) -> tuple[int, int]
 
     kept = []
     for path in existing:
-        others = pl.read_parquet(path).filter(
-            (pl.col("venue") != VENUE) & (pl.col("source") != SOURCE_HL_S3)
-        )
+        # Keep every row of another venue and nothing else. The extra `source != hl_s3`
+        # this used to carry looked redundant, and is, for the rows that exist today; but
+        # it is an AND where the documented rule is an OR, so a Binance row whose `source`
+        # was null vanished from the partition without a word. `ne_missing` keeps a row
+        # whose `venue` is null for the same reason: unclassifiable is not ours to delete.
+        others = pl.read_parquet(path).filter(pl.col("venue").ne_missing(VENUE))
         if others.height:
             kept.append(others.select(columns))
 
