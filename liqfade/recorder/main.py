@@ -68,6 +68,10 @@ class Recorder:
             "flushes": 0,
             "write_failures": 0,
             "quarantined_rows": 0,
+            # Rows the quarantine file itself refused. The shutdown quarantine's usual
+            # cause is a full disk, which is also what stops a JSONL append, so this is
+            # the counter that says the lake is short and by how much.
+            "lost_rows": 0,
         }
         self.streams: list[WSStream] = self._build_streams()
         self.poller = CoinalyzePoller(settings.venues.coinalyze, self.sink)
@@ -168,18 +172,33 @@ class Recorder:
         try:
             self.buffers.add(table, venue, row)
         except ValueError as exc:
-            self.counters["quarantined_rows"] += 1
             self.quarantine("no_timestamp", table, venue, [row], f"{exc}")
 
     def quarantine(
         self, reason: str, table: str, venue: str, rows: list[dict[str, Any]], detail: str
     ) -> None:
-        """Park rows outside the lake and queue one alert. Never raises into its caller."""
+        """Park rows outside the lake and queue one alert. Never raises into its caller.
+
+        The rows are counted where they actually ended up. They used to be counted as
+        quarantined before the file was written, so the one case that loses data (the
+        quarantine append fails too, which a full disk causes along with the write that
+        sent the rows here) reported itself as a clean save. Rows that get no file are
+        counted as lost and alerted as lost, because a number nobody can trust is worse
+        than no number when the question is whether the lake is complete.
+        """
         try:
             quarantine_rows(self.settings.paths.data_dir, reason, table, venue, rows)
-        except Exception:
-            log.exception("quarantine_failed", reason=reason, table=table, venue=venue)
+        except Exception as exc:
+            self.counters["lost_rows"] += len(rows)
+            log.exception(
+                "quarantine_failed", reason=reason, table=table, venue=venue, rows=len(rows)
+            )
+            self._alerts.append(
+                f"recorder: {len(rows)} {table}/{venue} row(s) are LOST, quarantine "
+                f"({reason}) could not be written either: {type(exc).__name__}"
+            )
             return
+        self.counters["quarantined_rows"] += len(rows)
         log.warning("rows_quarantined", reason=reason, table=table, venue=venue, detail=detail)
         self._alerts.append(
             f"recorder: {len(rows)} {table}/{venue} row(s) went to quarantine ({reason})"
@@ -348,7 +367,6 @@ class Recorder:
         for key in self.buffers.partitions():
             table, venue, date, hour = key
             rows = self.buffers.take(key)
-            self.counters["quarantined_rows"] += len(rows)
             self.quarantine("write_failed", table, venue, rows, f"{date} hour {hour:02d}")
         await self.drain_alerts()
 

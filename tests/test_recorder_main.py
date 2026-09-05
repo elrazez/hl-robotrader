@@ -94,6 +94,7 @@ async def test_shutdown_flushes_every_buffer_to_parquet(settings: Settings) -> N
         "flushes": 0,
         "write_failures": 0,
         "quarantined_rows": 0,
+        "lost_rows": 0,
     }
     assert recorder.buffers.pending_rows() == 0
 
@@ -344,6 +345,36 @@ async def test_a_flush_that_cannot_write_quarantines_every_row_rather_than_losin
     assert {row["reason"] for row in rows} == {"write_failed"}
     assert sorted(row["tid"] for row in rows if "tid" in row) == [1, 2]
     assert any("quarantine" in text for text in alerts)
+
+
+async def test_rows_the_quarantine_file_also_refuses_are_counted_lost_not_saved(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk is the usual cause of the shutdown quarantine, and it is also what
+    stops the JSONL append. Those rows used to be counted as quarantined before the file
+    was written, so the one case that loses data reported itself as a clean save."""
+    recorder = Recorder(settings)
+    at = now_ms()
+    recorder.buffers.add("trades", "hyperliquid", _trade(at, 1))
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise OSError("no space left on device")
+
+    alerts: list[str] = []
+
+    async def capture(text: str) -> bool:
+        alerts.append(text)
+        return True
+
+    monkeypatch.setattr("liqfade.recorder.main.write_rows", explode)
+    monkeypatch.setattr("liqfade.recorder.main.quarantine_rows", explode)
+    monkeypatch.setattr(recorder.health, "alert", capture)
+
+    await recorder.flush_all(quarantine_leftovers=True)
+
+    assert recorder.counters["quarantined_rows"] == 0
+    assert recorder.counters["lost_rows"] == 1
+    assert any("are LOST" in text for text in alerts)
 
 
 async def test_a_flush_retries_once_before_giving_up_on_a_partition(
