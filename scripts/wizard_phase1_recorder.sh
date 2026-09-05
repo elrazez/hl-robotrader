@@ -768,60 +768,42 @@ ok "check helper installed at $REMOTE_HELPER"
 pause "Press Enter for the next stage."
 
 # ── 3 ──────────────────────────────────────────────────────────────────────
-stage "Tailscale on the VPS"
-say "The private network your laptop reaches the panel over. The box exposes"
-say "nothing to the internet but ssh."
-if rpy tailscale; then
-  ok "already up"
+stage "Tailscale on the VPS (optional)"
+say "A private network between the laptop and the box, used for the panel tunnel"
+say "when it is available. Never required: the tunnel is the same key-only ssh"
+say "over the public address otherwise."
+TS_IP=""; TS_NAME=""
+if TS_LINE="$(rpy tailscale 2>/dev/null)"; then
+  TS_IP="${TS_LINE##*ip=}"
+  TS_NAME="${TS_LINE#*name=}"; TS_NAME="${TS_NAME%% *}"
+  write_env TS_IP "$TS_IP"
+  write_env TS_NAME "$TS_NAME"
+  ok "VPS on the tailnet as $TS_NAME ($TS_IP)"
 else
-  step "A login URL is about to be printed. Open it and authenticate."
-  RSHT "tailscale up --ssh=false" || die "tailscale up failed"
-  rpy tailscale || die "Tailscale still is not connected"
+  warn "the box is not on a tailnet; skipping. To add it later: ssh in and run"
+  warn "  tailscale up --ssh=false"
 fi
-TS_LINE="$(rpy tailscale)" || die "could not read the box's Tailscale status"
-TS_IP="${TS_LINE##*ip=}"
-TS_NAME="${TS_LINE#*name=}"; TS_NAME="${TS_NAME%% *}"
-[[ -n "$TS_IP" ]] || die "could not read the box's Tailscale IP"
-write_env TS_IP "$TS_IP"
-write_env TS_NAME "$TS_NAME"
-ok "VPS on the tailnet as $TS_NAME ($TS_IP)"
 pause "Press Enter for the next stage."
 
 # ── 4 ──────────────────────────────────────────────────────────────────────
-stage "Tailscale on this Mac"
+stage "Which address the tunnel uses"
+# Tailscale is preferred when both ends have it and this Mac can actually push
+# packets through it. A VPN firewall on the Mac drops every
+# packet that is not its own, tailnet included; a closed Tailscale app is the same
+# outcome. Every failure lands on the public address: the same key-only ssh on the
+# same port behind the same fail2ban, just with no private network in front.
+TUNNEL_HOST="$VPS_HOST"; TUNNEL_VIA="the public address"
 TS_BIN="$(command -v tailscale || true)"
 if [[ -z "$TS_BIN" && -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
   TS_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 fi
-if [[ -z "$TS_BIN" ]]; then
-  say "Tailscale is not installed here yet."
-  open_url "https://tailscale.com/download/mac"
-  step "Install it, open the app, and sign in with the SAME account you just used"
-  step "on the VPS. Both machines must be on the one tailnet."
-  pause "Press Enter once you are signed in."
-  TS_BIN="$(command -v tailscale || true)"
-  if [[ -z "$TS_BIN" && -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
-    TS_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
-  fi
-  [[ -n "$TS_BIN" ]] || die "still no tailscale command on this Mac"
-fi
-"$TS_BIN" status >/dev/null 2>&1 || die "tailscale is installed but not signed in on this Mac"
-if "$TS_BIN" status | grep -q "$TS_IP"; then
-  ok "this Mac sees the VPS at $TS_IP"
-else
-  die "the VPS is not in this Mac's tailnet. Same account on both?"
-fi
-say "Proving ssh works over the tailnet, which is how the panel tunnel prefers to run."
-if ssh_at "$SSH_PORT" "$TS_IP" true; then
+if [[ -n "$TS_IP" && -n "$TS_BIN" ]] && "$TS_BIN" status 2>/dev/null | grep -q "$TS_IP" \
+   && ssh_at "$SSH_PORT" "$TS_IP" true 2>/dev/null; then
   TUNNEL_HOST="$TS_IP"; TUNNEL_VIA="Tailscale"
-  ok "ssh over Tailscale works"
+  ok "ssh over Tailscale works; the tunnel will use $TS_IP"
 else
-  # A VPN firewall on this Mac drops every packet that is not its
-  # own, tailnet included. The public address is the same key-only ssh on the same
-  # port behind the same fail2ban; the tunnel just has no private network in front.
-  TUNNEL_HOST="$VPS_HOST"; TUNNEL_VIA="the public address"
-  warn "ssh over the tailnet is blocked on this Mac, most likely by a VPN firewall."
-  warn "Falling back to the public address $VPS_HOST for the tunnel and the sync."
+  ok "the tunnel and the sync will use the public address $VPS_HOST"
+  note "key-only ssh on port $SSH_PORT behind fail2ban; Tailscale is not needed"
 fi
 write_env TUNNEL_HOST "$TUNNEL_HOST"
 pause "Press Enter for the next stage."
