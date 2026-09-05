@@ -235,3 +235,16 @@ async def test_the_key_is_sent_as_a_header_and_not_in_the_url() -> None:
     for request in fake.requests:
         assert request.headers["api_key"] == KEY
         assert KEY not in str(request.url)
+
+
+@pytest.mark.parametrize("enabled, key", [(False, KEY), (True, "")])
+async def test_a_poller_that_will_not_poll_declares_no_stream(enabled: bool, key: str) -> None:
+    # Declared-but-idle would read as disconnected and page Telegram every ten minutes.
+    import asyncio
+
+    cfg = CFG.model_copy(update={"enabled": enabled})
+    poller = CoinalyzePoller(cfg, lambda table, venue, row: None, api_key=key)
+    assert poller.stats == {}
+    assert poller.feed_states(0) == []
+    stop = asyncio.Event()
+    await asyncio.wait_for(poller.run(stop), timeout=1.0)  # returns at once, polls nothing

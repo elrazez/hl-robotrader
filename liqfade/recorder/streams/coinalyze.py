@@ -59,7 +59,13 @@ class CoinalyzePoller:
         self.coins: list[str] = []
         # symbol -> (coin, exchange name). Fetched once from future-markets.
         self.markets: dict[str, tuple[str, str]] = {}
-        self.stats = {f"{VENUE}.xchg_ctx": StreamStats(name=f"{VENUE}.xchg_ctx")}
+        # A poller that will never poll declares no stream: a declared-but-idle stream
+        # reads as "disconnected" to the health check and pages Telegram every ten
+        # minutes for a feed the owner switched off.
+        self.active = bool(cfg.enabled and self.api_key)
+        self.stats = (
+            {f"{VENUE}.xchg_ctx": StreamStats(name=f"{VENUE}.xchg_ctx")} if self.active else {}
+        )
 
     @property
     def _stat(self) -> StreamStats:
@@ -146,8 +152,13 @@ class CoinalyzePoller:
         return len(merged)
 
     async def run(self, stop: asyncio.Event) -> None:
-        if not self.api_key:
-            log.warning("coinalyze_disabled", reason=f"{API_KEY_ENV} is not set")
+        if not self.active:
+            reason = (
+                "venues.coinalyze.enabled is false"
+                if not self.cfg.enabled
+                else f"{API_KEY_ENV} is not set"
+            )
+            log.warning("coinalyze_disabled", reason=reason)
             return
         async with httpx.AsyncClient(base_url=self.cfg.base_url, timeout=20.0) as client:
             while not stop.is_set():

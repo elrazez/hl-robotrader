@@ -26,8 +26,10 @@ def settings(tmp_path: Path) -> Settings:
 
 
 def test_every_enabled_venue_gets_a_stream_and_shows_up_in_the_feeds(
-    settings: Settings,
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Coinalyze declares its stream only when it will actually poll: enabled and keyed.
+    monkeypatch.setenv("COINALYZE_API_KEY", "test-key")
     recorder = Recorder(settings)
     assert [stream.venue for stream in recorder.streams] == [
         "hyperliquid",
