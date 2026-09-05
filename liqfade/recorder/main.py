@@ -201,17 +201,21 @@ class Recorder:
         states.extend(self.poller.feed_states(at_ms))
         return sorted(states, key=lambda state: state.name)
 
-    def reload(self) -> ReloadResult:
+    async def reload(self) -> ReloadResult:
         """Re-resolve config and apply what can change without a restart.
 
         Universe selection and the health thresholds take effect at the next tick.
         Venue URLs, enabled flags and paths need a restart, because they define the tasks
         that are already running; the returned `changed` list names them anyway so the
         operator can see the reload did not cover them.
+
+        The YAML layers are read on a thread: they are three or four file reads plus
+        pydantic validation, on an event loop that is also stamping `rx_ms` on every
+        message that arrives. Applying the result stays on the loop, where it is a few
+        attribute assignments.
         """
         try:
-            settings = load_settings(self.settings.env)
-            merged, _ = resolve(self.settings.env)
+            settings, (merged, _) = await asyncio.to_thread(self._resolve_config)
         except ConfigError as exc:
             log.warning("reload_failed", error=str(exc))
             return ReloadResult(error=str(exc))
@@ -229,6 +233,10 @@ class Recorder:
         self.health.apply_config(settings.recorder)
         log.info("config_reloaded", changed=changed)
         return ReloadResult(changed=changed)
+
+    def _resolve_config(self) -> tuple[Settings, tuple[dict[str, Any], dict[str, str]]]:
+        """The blocking half of `reload`: read and validate the YAML layers."""
+        return load_settings(self.settings.env), resolve(self.settings.env)
 
     # --- universe ------------------------------------------------------------
 

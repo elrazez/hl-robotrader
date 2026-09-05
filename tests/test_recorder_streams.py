@@ -82,11 +82,11 @@ def test_a_continuous_stream_counts_one_gap_per_silence() -> None:
     assert stat.check_silence(5.0, NOW_MS + 6_000) == [""]
     # Still silent ten minutes later: the same outage, not sixty more gaps.
     assert stat.check_silence(5.0, NOW_MS + 600_000) == []
-    assert stat.gaps_1h == 1
+    assert stat.feed_state(NOW_MS + 600_000).gaps_1h == 1
     # A message ends the silence, so the next one counts again.
     stat.record_message(NOW_MS + 600_001)
     assert stat.check_silence(5.0, NOW_MS + 610_000) == [""]
-    assert stat.gaps_1h == 2
+    assert stat.feed_state(NOW_MS + 610_000).gaps_1h == 2
 
 
 def test_a_sparse_stream_never_counts_a_gap() -> None:
@@ -94,7 +94,7 @@ def test_a_sparse_stream_never_counts_a_gap() -> None:
     stat = StreamStats(name="binance.liquidations", continuous=False)
     stat.record_message(NOW_MS)
     assert stat.check_silence(5.0, NOW_MS + 3_600_000) == []
-    assert stat.gaps_1h == 0
+    assert stat.feed_state(NOW_MS + 3_600_000).gaps_1h == 0
 
 
 def test_a_stream_that_has_never_delivered_is_not_a_gap() -> None:

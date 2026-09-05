@@ -37,7 +37,9 @@ from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-MAX_LINE_BYTES = 64 * 1024  # a request is a command name and a few arguments, never more
+# A request is a command name and a few arguments, never more. The cap is enforced by
+# asyncio's StreamReader limit, which is 64 KiB by default and raises LimitOverrunError
+# out of `readuntil`; a length check after the read could never fire.
 # sockaddr_un.sun_path is 104 bytes on macOS and 108 on Linux. A socket_path from config
 # that is too long otherwise fails with a bare "AF_UNIX path too long" at bind time.
 MAX_SOCKET_PATH_BYTES = 100
@@ -180,9 +182,6 @@ class ControlServer:
                     return
                 if not line.strip():
                     continue
-                if len(line) > MAX_LINE_BYTES:
-                    await self._write(writer, Response.failure("", "request too large"))
-                    return
                 await self._write(writer, await self._respond(line))
         finally:
             writer.close()

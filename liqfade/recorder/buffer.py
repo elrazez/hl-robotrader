@@ -95,7 +95,11 @@ class Buffers:
             del self._rows[key]
 
     def take_all(self) -> list[tuple[PartitionKey, list[dict[str, Any]]]]:
-        """Drain everything, for shutdown."""
-        taken = sorted(self._rows.items())
+        """Drain everything, for shutdown. Ordered by partition key, and only by it.
+
+        The sort key is explicit so a tie can never fall through to comparing two lists
+        of row dicts, which raises rather than orders.
+        """
+        taken = sorted(self._rows.items(), key=lambda item: item[0])
         self._rows = {}
         return taken

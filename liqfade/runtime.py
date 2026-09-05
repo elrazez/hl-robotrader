@@ -63,25 +63,30 @@ async def _run[T](
     task = asyncio.ensure_future(coro)
     waiter = asyncio.ensure_future(_shutdown.wait())
 
-    done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
-    waiter.cancel()
-
-    if task in done:
-        return task.result()
-
-    # A signal arrived first: give the main coroutine grace_s to unwind cleanly.
-    log.info("shutdown_begin", grace_s=grace_s)
     try:
-        return await asyncio.wait_for(task, timeout=grace_s)
-    except TimeoutError:
-        log.warning("shutdown_forced", grace_s=grace_s)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        raise
+        done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        waiter.cancel()
+
+        if task in done:
+            return task.result()
+
+        # A signal arrived first: give the main coroutine grace_s to unwind cleanly.
+        log.info("shutdown_begin", grace_s=grace_s)
+        try:
+            return await asyncio.wait_for(task, timeout=grace_s)
+        except TimeoutError:
+            log.warning("shutdown_forced", grace_s=grace_s)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise
+        finally:
+            log.info("shutdown_done")
     finally:
+        # The reset used to sit on the signal path only, which the normal return above
+        # never reaches, so a second run_main in the same process (the test suite, and
+        # anything that ever embeds this) inherited a stale event.
         _shutdown = None
-        log.info("shutdown_done")
 
 
 def run_main[T](

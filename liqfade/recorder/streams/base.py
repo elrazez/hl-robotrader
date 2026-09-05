@@ -97,7 +97,6 @@ class StreamStats:
     connected: bool = False
     per_coin: bool = False
     last_msg_ms: int = 0
-    gaps_1h: int = 0
     _buckets: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
     _gap_times: deque[float] = field(default_factory=deque)
     _reconnects: deque[float] = field(default_factory=deque)
@@ -177,7 +176,6 @@ class StreamStats:
         return [""]
 
     def _count_gap(self, now: float | None) -> None:
-        self.gaps_1h += 1
         self._gap_times.append(time.monotonic() if now is None else now)
 
     def worst_coin(self, now_ms: int) -> tuple[str | None, float]:

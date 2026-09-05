@@ -13,7 +13,7 @@ more than the recorder being a special case.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from liqfade.config.models import Settings
@@ -98,7 +98,7 @@ class RecorderBackend:
         latency: LatencyTracker,
         counters: dict[str, int],
         stop: asyncio.Event,
-        reload: Callable[[], ReloadResult],
+        reload: Callable[[], Awaitable[ReloadResult]],
         alert: Alerter | None = None,
         started_ms: int | None = None,
     ) -> None:
@@ -155,7 +155,7 @@ class RecorderBackend:
         return KillResult(killed=False, reason=failed)
 
     async def reload_config(self) -> ReloadResult:
-        return self._reload()
+        return await self._reload()
 
     async def get_metrics(self) -> MetricsResult:
         return MetricsResult(

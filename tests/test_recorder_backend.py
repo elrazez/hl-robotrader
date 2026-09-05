@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,16 @@ from liqfade.config import load_settings
 from liqfade.control import ControlClient, ControlError, ControlServer
 from liqfade.control.protocol import FeedState, ReloadResult, StateSnapshot
 from liqfade.recorder.backend import LatencyTracker, RecorderBackend
+
+
+def _reloaded(result: ReloadResult) -> Callable[[], Awaitable[ReloadResult]]:
+    """A reload that answers immediately. The real one reads YAML on a thread."""
+
+    async def reload() -> ReloadResult:
+        return result
+
+    return reload
+
 
 FEEDS = [
     FeedState(
@@ -37,7 +47,7 @@ async def wired(sock_dir: Path) -> AsyncIterator[tuple[RecorderBackend, ControlC
         latency=latency,
         counters={"rows_written": 5},
         stop=asyncio.Event(),
-        reload=lambda: ReloadResult(changed=["recorder.gap_alert_s"]),
+        reload=_reloaded(ReloadResult(changed=["recorder.gap_alert_s"])),
     )
     server = ControlServer(backend, sock_dir / "control.sock")
     await server.start()
@@ -116,7 +126,7 @@ async def test_a_kill_that_cannot_write_the_flag_reports_failure_and_alerts(
         latency=LatencyTracker(),
         counters={},
         stop=stop,
-        reload=lambda: ReloadResult(),
+        reload=_reloaded(ReloadResult()),
         alert=capture,
     )
 

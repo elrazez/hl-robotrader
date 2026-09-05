@@ -46,12 +46,14 @@ venues:
     enabled: true
     base_url: https://api.coinalyze.net/v1/
     poll_s: 60  # seconds between OI and funding polls; free tier allows 40 calls/min
-    rate_limit_per_min: 40
 
 recorder:
-  flush_min: 60  # minutes: Parquet flush cadence, one file per table per venue per hour
   compaction_hour_utc: 3  # UTC hour for nightly compaction into one file per table per day
-  ring_buffer_rows: 200000  # rows per coin per stream held in memory between flushes
+  # Rows buffered per output file, which is one (table, venue, date, hour), not per coin
+  # per stream: a buffer full before the hour is out writes an extra file for that hour.
+  # The memory ceiling is this times the number of files being filled at once, which is
+  # roughly the number of tables times venues, and does not grow with the universe.
+  ring_buffer_rows: 200000
   gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap (Phase 1 DoD)
   silence_alert_s: 60.0  # seconds of silence that raises a Telegram alert
   # Rows the parser refused plus messages it could not read, per stream per hour, above

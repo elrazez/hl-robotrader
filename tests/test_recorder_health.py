@@ -39,7 +39,7 @@ async def test_a_continuous_stream_gone_quiet_alerts_and_counts_a_gap(tmp_path: 
     stat.record_message(at - 120_000)
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
-    assert stat.gaps_1h == 1
+    assert stat.feed_state(at).gaps_1h == 1
     assert alerts.sent == [
         f"recorder: hyperliquid.trades silent for over {CFG.silence_alert_s:.0f}s"
     ]
@@ -78,7 +78,7 @@ async def test_a_sparse_stream_being_quiet_is_not_an_alert(tmp_path: Path) -> No
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
     assert alerts.sent == []
-    assert stat.gaps_1h == 0
+    assert stat.feed_state(at).gaps_1h == 0
 
 
 async def test_a_sparse_stream_with_a_dead_socket_is_an_alert(tmp_path: Path) -> None:

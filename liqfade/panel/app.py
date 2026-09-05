@@ -77,6 +77,10 @@ def liquidations_by_venue(
 
     end_hour = ((now_ms() if now is None else now) // HOUR_MS) * HOUR_MS
     since_ms = end_hour - (hours - 1) * HOUR_MS
+    # Bounded at both ends. A row with a timestamp past the window (a venue clock ahead of
+    # ours, a bad parse) has no bucket in the grid below, and looking it up used to raise
+    # a KeyError and 500 the panel's main chart.
+    until_ms = end_hour + HOUR_MS - 1
     hour_list = [since_ms + step * HOUR_MS for step in range(hours)]
     empty: dict[str, Any] = {
         "hours": hours,
@@ -100,10 +104,10 @@ def liquidations_by_venue(
             select venue, (ts_ms // ?) * ? as hour_ms,
                    sum(notional_usd) as notional, count(*) as events
             from read_parquet(?, union_by_name = true)
-            where ts_ms >= ?
+            where ts_ms between ? and ?
             group by 1, 2
             """,
-            [HOUR_MS, HOUR_MS, [str(path) for path in partitions], since_ms],
+            [HOUR_MS, HOUR_MS, [str(path) for path in partitions], since_ms, until_ms],
         )
         .fetchall()
     )
@@ -301,7 +305,7 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
     return app
 
 
-def serve(settings: Settings, *, reload: bool = False) -> None:
+def serve(settings: Settings) -> None:
     """Start uvicorn. Refuses to bind a non loopback address without an explicit opt in."""
     import uvicorn
 
@@ -318,4 +322,6 @@ def serve(settings: Settings, *, reload: bool = False) -> None:
     auth = SessionAuth.from_env(settings.panel.session_ttl_s)
     app = create_app(settings, auth)
     log.info("panel_serving", host=host, port=settings.panel.port, env=settings.env)
-    uvicorn.run(app, host=host, port=settings.panel.port, reload=reload, log_config=None)
+    # No reload flag: uvicorn ignores it when it is handed an app object rather than an
+    # import string, so the option only ever promised something it did not do.
+    uvicorn.run(app, host=host, port=settings.panel.port, log_config=None)

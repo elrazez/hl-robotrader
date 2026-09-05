@@ -575,7 +575,7 @@ def cmd_panel(args: argparse.Namespace) -> int:
 
     from liqfade.panel.app import serve
 
-    serve(settings, reload=args.reload)
+    serve(settings)
     return 0
 
 
@@ -731,7 +731,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("serve", "hash-password"),
         help="serve the panel, or print a bcrypt hash for LIQFADE_PANEL_PASSWORD_HASH",
     )
-    panel.add_argument("--reload", action="store_true", help="uvicorn autoreload, development only")
 
     status = sub.add_parser(
         "status", parents=[common], help="print positions, orders, risk, feeds and latency"

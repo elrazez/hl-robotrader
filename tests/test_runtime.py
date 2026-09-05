@@ -51,6 +51,42 @@ def test_secrets_are_redacted() -> None:
     assert lines[0]["coin"] == "ETH"
 
 
+def test_a_secret_field_nobody_listed_is_still_redacted() -> None:
+    """The list used to be exact names, so every spelling nobody thought of went through."""
+    lines = _capture(
+        lambda: get_logger().info(
+            "probe",
+            secret="s",
+            signature="sig",
+            privateKey="0xdead",
+            aws_secret_access_key="a",
+            x_api_key="k",
+            passphrase="p",
+        )
+    )
+    fields = ("secret", "signature", "privateKey", "aws_secret_access_key", "x_api_key")
+    assert {lines[0][field] for field in (*fields, "passphrase")} == {"***"}
+
+
+def test_a_secret_nested_under_an_innocent_field_is_redacted_too() -> None:
+    lines = _capture(
+        lambda: get_logger().info(
+            "config_reloaded",
+            values={"telegram": {"bot_token": "123:xyz", "enabled": True}},
+            args=[{"api_key": "k"}],
+        )
+    )
+    assert lines[0]["values"]["telegram"] == {"bot_token": "***", "enabled": True}
+    assert lines[0]["args"] == [{"api_key": "***"}]
+
+
+def test_an_s3_object_key_is_not_a_secret() -> None:
+    """The backfill logs `key=` for the object it just pulled, which is how a resume is
+    read. A bare "key" substring would have taken that away."""
+    lines = _capture(lambda: get_logger().info("backfill_object", key="node_fills/20260101/3"))
+    assert lines[0]["key"] == "node_fills/20260101/3"
+
+
 def test_stdlib_logging_is_rendered_as_json_too() -> None:
     lines = _capture(lambda: logging.getLogger("uvicorn").warning("ws closed"))
     assert lines[0]["event"] == "ws closed"

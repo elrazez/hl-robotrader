@@ -19,22 +19,30 @@ import structlog
 if TYPE_CHECKING:
     from typing import TextIO
 
-# Keys that must never appear in a log line even if a caller passes them. CLAUDE.md rule
-# 6: the agent private key is read once in execution/signer.py and never travels further.
-_REDACT = frozenset(
-    {
-        "private_key",
-        "secret_key",
-        "agent_private_key",
-        "api_key",
-        "password",
-        "password_hash",
-        "token",
-        "bot_token",
-        "authorization",
-        "cookie",
-    }
+# Substrings that make a field name a secret. CLAUDE.md rule 6: the agent private key is
+# read once in execution/signer.py and never travels further, and nothing else with a
+# credential in it reaches a log line either.
+#
+# Substrings rather than exact names, because the exact list only covered the eight
+# spellings someone thought of: `secret`, `signature`, `private` and every future
+# variation went straight through. A bare "key" is deliberately not here: the backfill
+# logs `key=` for an S3 object key, which is a path and the thing you need when a pull
+# resumes. `_key` catches `api_key`, `secret_key` and `agent_private_key` without it.
+_REDACT = (
+    "private",
+    "secret",
+    "_key",
+    "password",
+    "token",
+    "authorization",
+    "cookie",
+    "signature",
+    "credential",
+    "passphrase",
 )
+# Nested structures are walked too, because a redacted top level key said nothing about
+# the dict underneath it. Bounded, so a logging path can never recurse away on a cycle.
+_MAX_REDACT_DEPTH = 6
 
 
 class _Stdout:
@@ -58,10 +66,28 @@ class _Stdout:
 _STDOUT = _Stdout()
 
 
+def _is_secret(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _REDACT)
+
+
+def _scrub(value: Any, depth: int = 0) -> Any:
+    """Replace every secret-looking field inside `value`, however deep it sits."""
+    if depth >= _MAX_REDACT_DEPTH:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: "***" if isinstance(key, str) and _is_secret(key) else _scrub(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_scrub(item, depth + 1) for item in value]
+    return value
+
+
 def _redact(_logger: Any, _name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     for key in list(event_dict):
-        if key.lower() in _REDACT:
-            event_dict[key] = "***"
+        event_dict[key] = "***" if _is_secret(key) else _scrub(event_dict[key])
     return event_dict
 
 

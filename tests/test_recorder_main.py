@@ -107,28 +107,28 @@ async def test_flush_ready_leaves_the_current_hour_alone(settings: Settings) -> 
     assert list(recorder.root.glob("**/*.parquet")) == []
 
 
-def test_reload_reports_what_changed_and_applies_it(
+async def test_reload_reports_what_changed_and_applies_it(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     recorder = Recorder(settings)
-    assert recorder.reload().changed == []
+    assert (await recorder.reload()).changed == []
 
     monkeypatch.setenv("LIQFADE_RECORDER__RING_BUFFER_ROWS", "1234")
     monkeypatch.setenv("LIQFADE_UNIVERSE__TOP_N_BY_VOLUME", "5")
-    result = recorder.reload()
+    result = await recorder.reload()
     assert result.error is None
     assert set(result.changed) == {"recorder.ring_buffer_rows", "universe.top_n_by_volume"}
     assert recorder.buffers.max_rows == 1234
     assert recorder.universe.cfg.top_n_by_volume == 5
 
 
-def test_a_broken_config_is_refused_and_the_running_one_is_kept(
+async def test_a_broken_config_is_refused_and_the_running_one_is_kept(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     recorder = Recorder(settings)
     before = recorder.buffers.max_rows
     monkeypatch.setenv("LIQFADE_RECORDER__RING_BUFFER_ROWS", "-1")
-    result = recorder.reload()
+    result = await recorder.reload()
     assert result.error is not None
     assert recorder.buffers.max_rows == before
 

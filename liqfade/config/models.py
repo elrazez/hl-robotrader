@@ -61,7 +61,6 @@ class Coinalyze(Base):
     enabled: bool
     base_url: str = Field(..., description="url: REST base")
     poll_s: Pos = Field(..., description="seconds between OI and funding polls")
-    rate_limit_per_min: int = Field(..., gt=0, description="calls per minute allowed by the tier")
 
 
 class Venues(Base):
@@ -73,9 +72,10 @@ class Venues(Base):
 
 
 class Recorder(Base):
-    flush_min: int = Field(..., gt=0, description="minutes between Parquet flushes")
     compaction_hour_utc: int = Field(..., ge=0, le=23, description="UTC hour of nightly compaction")
-    ring_buffer_rows: int = Field(..., gt=0, description="rows held in memory per coin per stream")
+    ring_buffer_rows: int = Field(
+        ..., gt=0, description="rows buffered per output file before an early flush"
+    )
     gap_alert_s: Pos = Field(..., description="seconds of stream silence counted as a gap")
     silence_alert_s: Pos = Field(..., description="seconds of silence that alerts Telegram")
     parse_error_alert_1h: int = Field(

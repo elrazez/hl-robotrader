@@ -414,3 +414,13 @@ def test_the_state_poll_does_not_carry_the_sample_series(
     latency = client.get("/api/state").json()["latency"]
     assert latency["ws_ping_p50"] == 8.0
     assert "ws_ping_samples" not in latency
+
+
+def test_a_row_timestamped_in_the_future_does_not_break_the_chart(settings: Settings) -> None:
+    """A venue clock ahead of ours, or a bad parse: the row has no bucket in the grid,
+    and looking one up used to raise a KeyError and 500 the panel's main chart."""
+    root = settings.paths.data_dir / "parquet"
+    _write_liquidations(
+        root, [_liq("bybit", FIXED_HOUR, 2.0), _liq("okx", FIXED_HOUR + 48 * 3_600_000, 9.0)]
+    )
+    assert liquidations_by_venue(root, 24, now=FIXED_HOUR + 60_000)["totals"] == {"bybit": 2.0}
