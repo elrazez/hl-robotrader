@@ -106,3 +106,108 @@ unrelated code while doing a task.
   usable on a slow mount. Keep.
 - The test suite runs in about 23 s of the 30 s budget in CLAUDE.md section 4. Not over,
   but the next 2,500 lines of tests will be.
+
+---
+
+# The 01b recorder-hardening review, 2026-09-05
+
+A second two-axis review, of the 19 commits since `f8ade43` (the recorder hardening chat)
+against `CLAUDE.md`, `docs/DATA_SOURCES.md` and `prompts/01b_recorder_hardening.md`. All
+17 spec items landed; 14 of them cleanly. Three findings were fixed the same day in
+`main`, one commit each:
+
+- `0199bf9` a fresh process no longer alerts that every stream is disconnected. Dropping
+  `and stat.last_msg_ms` (item 7) made the never-connected stream visible and also made
+  every stream visible for the moment before its first connect returns. The health loop's
+  first tick runs before any socket is up, so every restart posted nine Telegram messages,
+  each with a different text, so the ten minute dedupe collapsed none of them.
+- `967ddfe` a restart's candle snapshot seeds the open bar instead of being folded. The
+  held-bar rule (item 5) makes the snapshot harmless across a *reconnect*, because a bar
+  is held to compare against. Across a *restart* there is none, so every bar the snapshot
+  carried was written again into a table with no `rx_ms` and no dedupe, and a day summed
+  over `v` or `n` counted each restart twice.
+- `ad0c95e` rows the quarantine file also refuses are counted lost, not saved.
+  `quarantined_rows` was incremented before `quarantine_rows` ran, so the one path that
+  actually loses data (item 17's full disk, which stops the JSONL append too) reported
+  itself as a clean save behind a bare `quarantine_failed` line.
+
+Everything below is style, structure or a resilience gap. Nothing here is losing data
+today. Same rule as the 02g list above: run it when the surrounding code is being touched
+anyway, not as a refactor of its own.
+
+## Hard, in the sense that a documented rule says otherwise
+
+14. **One quarantine, two log lines.** `recorder/writer.py:159` emits
+    `log.error("rows_quarantined", ..., rows=, path=)` and `recorder/main.py` emits
+    `log.warning("rows_quarantined", ..., detail=)` for the same event, at two severities
+    with two field sets. CLAUDE.md section 4: one JSON line per event. Counting the lines
+    double-counts, and a grep for the ERROR misses `detail`. Pick one site.
+15. **The Tardis dropped-row count is printed, not logged.** `data/ingest/tardis_free.py`
+    ends a run with `print(f"  {dropped} rows dropped: an unknown side token...")`. Same
+    rule and same reason as item 1 above: an unknown side token is a venue schema change,
+    which is exactly what you want in the journal rather than in scrollback that is gone.
+16. **`ControlError`'s docstring is now wrong.** `control/protocol.py` says "Raised by the
+    client when the socket is unreachable"; `ControlServer._take_lock` raises it too.
+17. **`write_partitioned` gained a raise it does not document.** It routes through
+    `Buffers.add`, which now raises `ValueError` on a row with no usable timestamp, and
+    `buffer.py` deliberately lets the backfill jobs see it. The buffer says so; the public
+    entry point every ingest job actually calls does not.
+
+## Spec gaps, partial rather than wrong
+
+18. **Item 8 is per-coin gaps for `bbo` only.** The item asked to key gap stats by
+    `(venue, table, coin)` "for the HL continuous streams"; `PER_COIN_GAP_STREAMS` holds
+    only `hyperliquid.bbo` (commit `61def00`, measured: all three counting per coin made
+    one quiet minute produce twenty warnings). `trades` and `l2` carry `worst_coin` but
+    count gaps at stream level, so the Phase 1 DoD "no gap over 5s on HL trades and BBO
+    for the core coins" still is not evidenced per coin for trades. The reasoning is in
+    the code; it is recorded here so it does not read as done later.
+
+## Resilience gaps, worth deciding before the box runs for months
+
+19. **The quarantine write is synchronous, inside the WebSocket receive loop.**
+    `sink` -> `quarantine` -> `quarantine_rows` opens, appends and closes a file inline.
+    One malformed row is nothing. A venue rename that strips the timestamp off every row
+    makes it one blocking `open`/`write`/`close` per row on the event loop, plus one entry
+    per row on `self._alerts` until the flush tick five seconds later drains it. The sink's
+    own docstring says it must not block. Batch the quarantine, or bound the alert list.
+20. **`state.json` grew by two 300-sample series and is still rewritten every second.**
+    Item 14 put `ws_ping_samples` and `rest_samples` in `LatencyState`, so the snapshot the
+    `StateWriter` serialises with `OPT_INDENT_2` and `fsync`s once a second is now tens of
+    KB rather than a couple. `/api/state` strips them, which fixes the wire cost, not the
+    disk cost. Either write the samples on a slower cadence into their own file, or drop
+    the indent.
+21. **A refused control socket is a silent restart loop.** `_take_lock` raising
+    `ControlError` is right, but it happens before anything is running, so the recorder
+    exits with a journal line and no Telegram alert, and `Restart=always` retries it every
+    three seconds forever. The refusal should say so out loud once.
+
+## Judgement calls
+
+22. **`to_trades` decides on its map and then bypasses it.** `tardis_free.py` gates on
+    `TRADE_SIDES.get(...)` and writes `row["side"]` raw. Identical today only because the
+    map is `{"buy": "buy", "sell": "sell"}`. Same twins rule as item 12 above.
+23. **Three parallel frozensets keyed on the same `venue.table` string.**
+    `streams/base.py` `CONTINUOUS_STREAMS`, `PER_COIN_STREAMS` and `PER_COIN_GAP_STREAMS`
+    are all consulted in `_stat` to build one `StreamStats`, and
+    `PER_COIN_GAP_STREAMS` being a subset of `PER_COIN_STREAMS` is asserted in a test
+    rather than made true by construction. One `dict[str, StreamKind]` collapses all three.
+24. **Venue symbol and canonical coin, same `str`.** `WSStream._forget` passes venue
+    symbols from `set_symbols` into `StreamStats.forget_coin`, while `record_message`
+    populates `_coin_msg_ms` with canonical `row["coin"]`. Correct only because HL's symbol
+    equals its coin and HL is the only per-coin venue. Nothing in the types says so.
+25. **`""` means "the whole stream".** `StreamStats.check_silence` returns `list[str]` with
+    an empty string for the stream-level case, which `health.py` then untranslates twice
+    with `label or None`. A primitive standing in for a domain concept.
+26. **`STARTUP_GRACE_S` is the one health threshold that is not configurable.** Its three
+    siblings (`gap_alert_s`, `silence_alert_s`, `parse_error_alert_1h`) are config fields
+    with unit comments; this one is a module constant, and it now gates two branches.
+27. **`Health.check_streams` holds no state but thresholds.** It reads `check_silence`,
+    `parse_errors_1h`, `silent_s`, `worst_coin`, `last_msg_ms`, `connected` and `name` off
+    every `StreamStats`. Feature Envy: "what is wrong with this stream" wants to live on
+    the stats object, leaving `Health` the timer and the dispatch.
+28. **One unreadable HL frame counts as five parse errors.** `WSStream.handle` cannot
+    attribute a message that will not parse to a table, so it counts it against every table
+    of the venue. Deliberate and documented, but it means `parse_error_alert_1h: 100` fires
+    on HL at twenty bad frames an hour, not a hundred. Either state that in the config
+    comment or count it once against the venue.
