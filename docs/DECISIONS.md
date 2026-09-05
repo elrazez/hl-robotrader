@@ -822,13 +822,36 @@ half of that file was written twice: a first attempt died after hour 11 without 
 a manifest entry, the retry wrote all 24 hours, and compaction folded both into
 `all_day.parquet`. The manifest's 483,737 is the true count.
 
-Not repaired here, because deleting recorded data is the owner's call (CLAUDE.md rule 8).
-Blast radius is small and known: `candles_1m` filters `venue == "hyperliquid"` before it
-does anything, so the bars are untouched, and Tardis is the cross-venue validation set
-rather than a training set. Anything that counts Bybit trades or volume on 2026-01-01 is
-double until it is fixed. The fix is to keep one row of each pair for
-`venue = 'bybit' AND source = 'tardis' AND coin = 'ETH'` in hours 0 to 11 of that
-partition, or to re-pull that one free file and rewrite those rows.
+**Repaired the same day, on the owner's explicit approval under rule 8.**
+`scripts/research/drop_doubled_bybit_eth.py` keeps the first half of every group in that
+slice in file order and touches nothing else; the day went from 11,823,695 rows to
+11,649,827. Three guards, because this deletes recorded data: an odd group anywhere in
+the slice aborts the run, since "keep half" is undefined on an odd count and a wrong
+parity would mean the diagnosis is wrong (all 140,841 were even); the write is refused
+unless it drops exactly 173,868 rows and leaves exactly the manifest's 483,737; and the
+rewrite is atomic with the file re-opened and counted afterwards. The filter is applied
+to the pyarrow table rather than a polars frame so the schema survives, and the partition
+still carries its `liqfade_rederive` stamp, so the resume rule will not redo the day.
+
+The check that matters is the parity flipping the right way: hours 00 to 11 were 0% odd
+groups before and are **88.4%** after, against 87.8% in the untouched hours 12 to 23. The
+repaired half is now indistinguishable from the half that was always right. All four
+Bybit coins match the manifest to the row, and the lake's Tardis `trades` total is now
+exactly the Tardis manifest's 361,914,311, which closes 02b's residual to zero. The
+year's `trades` total is **1,790,576,438**, not the 1,790,750,306 in the table above; the
+repair is recorded in an appendix to `reports/data_quality/counts.md` rather than by
+regenerating it, so the report stays the record of what the gate actually found.
+
+Blast radius was small and known before the fix ran: `candles_1m` filters
+`venue == "hyperliquid"` before it does anything, so no bar moved, and Tardis is the
+cross-venue validation set rather than a training set.
+
+Chose to repair rather than re-pull. The re-pull would have been free and is the more
+obvious fix, but it rewrites rows in a partition that also holds 8.0M Binance, OKX and
+Hyperliquid rows and carries a stamp that a naive rewrite would drop, so it has more ways
+to go wrong than deleting a copy that is provably a copy. Reverse if a second doubled
+slice ever turns up: at that point the general fix belongs in `tardis_free`, which should
+be recording its manifest entry before the write rather than after it.
 
 The wider lesson is the one the year keeps teaching: **`tid` is null on Tardis Bybit
 rows**, so `(coin, tid)` cannot deduplicate them, and the duplicate-key heuristic that
