@@ -124,21 +124,35 @@ exhaustion:
   max_age_s: 900.0  # seconds: older cascades are a different regime, drop them
 
 intent:
-  k_target: 0.5  # fraction of (anchor_px - extreme_px) retraced; target = extreme + k*(anchor-extreme)
-  k_stop: 1.5  # stop distance beyond the extreme in units of rv_5m * mid, vol scaled
-  time_stop_s: 900  # seconds: flatten if neither target nor stop hit. Horizon is 1 to 60 minutes
+  # k_target and k_stop are Phase 3 results, not starting points: Q8's winning grid cell
+  # over 2,722 episodes, chosen because every neighbouring cell is also positive. It keeps
+  # +80.6 of the +84.6 bps that holding to the horizon returns, at a 15% stop-out rate.
+  # See reports/research/q8_path.md and docs/DECISIONS.md, 2026-09-05.
+  k_target: 0.8  # fraction of (anchor_px - extreme_px) retraced; target = extreme + k*(anchor-extreme)
+  k_stop: 1.0  # stop distance beyond the extreme in units of rv_5m * mid, vol scaled
+  time_stop_s: 900  # seconds: flatten if neither target nor stop hit. Q8's grid used this and tested no other
   urgency_liq_z: 5.0  # liq_z_60s at or above this marks the intent high urgency
   allow_taker_entry_high_urgency: true  # only high urgency intents may fall back to a taker entry
 
 filters:
   max_spread_bps:
-    # Basis points. Per liquidity tier; a wide spread eats the whole reversion.
-    core: 3.0  # BTC, ETH, SOL, HYPE
-    major: 6.0
-    minor: 12.0
+    # Basis points. Flat 30 across tiers, not the old 3/6/12: Q6 measured the tiered caps
+    # removing 51.9% of the sample to remove 36.3% of the loss tail, a concentration of
+    # 0.70x against a 2x bar, so they were a signal filter that only shrank the book. 30 is
+    # the core tier's own p99 effective spread (22.9 bps) rounded up: above it a quote has
+    # stopped looking like a liquid perp's, and it is a sanity guard rather than a filter.
+    # Q1 reports the slice it would have removed. docs/DECISIONS.md, 2026-09-05.
+    core: 30.0
+    major: 30.0
+    minor: 30.0
   min_edge_multiple: 4.0  # expected edge must exceed this multiple of the round trip fee
-  skip_when_btc_cascading: true  # market-wide sweeps behave differently; research question 4
-  funding_extreme_bps_8h: 30.0  # bps per 8h: skip when funding this far against the trade
+  # Dropped by Q6's 2x rule: removes 26.7% of the sample to remove 33.3% of the loss tail,
+  # a concentration of 1.25x. The market-wide bucket is where the pooled edge lives, so
+  # skipping it also skips the upside. The exposure cap per cluster is what handles sweeps.
+  skip_when_btc_cascading: false
+  # Dropped by Q6: removes 0.6% of the sample and 0.0% of the loss tail. null means the
+  # gate is not applied.
+  funding_extreme_bps_8h: null
   min_notional_usd: 10.0  # USD: the Hyperliquid exchange minimum order value
 
 sizing:

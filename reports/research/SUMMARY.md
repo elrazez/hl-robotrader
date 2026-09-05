@@ -117,21 +117,23 @@ conditional one. The isolated-coin figure is the one that matters for sizing.
 
 ## Config writeback
 
-Proposed, **not applied**. Every value below comes from a report and none has been written
-into `config/default.yaml` yet; risk-adjacent config is not changed without the owner saying
-so.
+**Applied 2026-09-05**, with every change and every deliberate non-change recorded in
+`docs/DECISIONS.md`.
 
-| key | current | proposed | evidence |
+| key | was | now | evidence |
 |---|---|---|---|
 | `intent.k_target` | 0.5 | **0.8** | Q8's winning cell, neighbours positive |
 | `intent.k_stop` | 1.5 | **1.0** | as above |
-| `intent.time_stop_s` | 900 | 900, unchanged | Q8's grid used it and did not test alternatives |
-| `cascade.proxy_min` | 4.0 | **no change** | Q3's F1 curve is flat at 0.01 across 2/3/4/6; the data did not choose a value |
+| `intent.time_stop_s` | 900 | 900, unchanged | Q8's grid used it and tested no alternative |
+| `cascade.proxy_min` | 4.0 | 4.0, unchanged | Q3's F1 curve is flat at 0.01 across 2/3/4/6; the data chose no value |
 | `filters.skip_when_btc_cascading` | true | **false** | Q6: 1.25x concentration, under the 2x bar |
-| `filters.funding_extreme_bps_8h` | 30.0 | **off** | Q6: removes 0.6% of the sample and 0% of the loss tail |
-| `filters.max_spread_bps` | 3/6/12 by tier | **30 bps flat, pre-trade** | the core tier's p99 of 22.9; see docs/DECISIONS.md |
-| `exhaustion.*` | see default.yaml | **unused in v0** | Q2: a flat 120s delay beats the rule |
-| `features.levels.*` | see default.yaml | **built, off** | Q7 |
+| `filters.funding_extreme_bps_8h` | 30.0 | **null, gate off** | Q6: removes 0.6% of the sample and 0.0% of the loss tail |
+| `filters.max_spread_bps` | 3/6/12 by tier | **30 flat** | Q6 drops the tiered caps at 0.70x; 30 is the core tier's p99 of 22.9 rounded up, as a sanity guard |
+| `exhaustion.*` | unchanged | unchanged | Q2 says a flat 120s delay beats the rule, but swapping them needs a new key and is a Phase 4 decision |
+| `features.levels.*` | unchanged | unchanged | Q7: built, tested, off |
+
+**Phase 4 must also add a per-cluster exposure cap**, which no key covers yet. Sizing on the
+pooled +84.6 rather than the +26.7 isolated figure would size one bet as if it were fifty.
 
 Frozen by the preregistration and not writeable by this phase:
 `features.episodes.min_notional_usd` ($250k), `features.episodes.min_move_bps` (30),
@@ -140,7 +142,9 @@ Frozen by the preregistration and not writeable by this phase:
 
 ## Should Phase 4 proceed?
 
-**No. The project parks, on stop rule 5.**
+**No. The project parks, on stop rule 5.** Recorded in `docs/ROADMAP.md`; the recorder
+started on the VPS 2026-09-05 12:38 UTC and sixty recorder days land on **2026-11-04**, which
+is the earliest Q3 and Q4 can be rerun.
 
 Q1 and Q8 both pass on exact S3 liquidations, so the edge is real. But the live bot cannot
 see S3 liquidations. The HL-native proxy that was supposed to stand in for them reaches

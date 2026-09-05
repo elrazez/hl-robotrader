@@ -36,7 +36,35 @@ DoD: each research question has a written yes/no decision with sample sizes; the
 
 This is the phase where the project can legitimately stop. If the edge is not there, say so.
 
-## Phase 4: Backtester and strategy v0 (1 week)
+**Parked 2026-09-05, on stop rule 5.** All eight questions answered on 2025-09-01 to
+2026-08-30 over 2,722 episodes in 1,758 clusters across 42 coins; see
+`reports/research/SUMMARY.md` and the preregistration it cites, committed before the first
+run. Q1 yes, Q8 yes with a stop, Q2/Q3/Q5/Q6/Q7 no, Q4 inconclusive.
+
+**The edge is real and cannot be traded yet.** Q1 and Q8 measured it on exact S3
+liquidations, which the live bot cannot see. The HL-native proxy meant to stand in reaches
+precision 0.01 at recall 0.68, so the v0 trigger falls to cross-venue Bybit, which makes Q4 a
+Phase 4 entry requirement, and Q4 cannot be answered until the recorder has sixty days.
+Stop rule 5 says park rather than build Phase 4 blind.
+
+**Unblocking dates.** The recorder started on the VPS **2026-09-05 12:38 UTC**. Sixty
+recorder days land on **2026-11-04**, which is the earliest Q3 and Q4 can be rerun: Q3 with
+its gates reading live block-level `activeAssetCtx` instead of the archive's one-a-minute
+sampling, Q4 with a real cross-venue sample instead of twelve Tardis first-of-month days. If
+Q4 then shows Bybit-only cascades revert on Hyperliquid, Phase 4 proceeds on a cross-venue
+trigger with the parameters already written into `config/default.yaml`. If it does not, this
+thesis has an edge nobody can reach and the momentum variant needs its own Phase 3.
+
+Config writeback applied the same day: `intent.k_target` 0.8, `intent.k_stop` 1.0,
+`filters.max_spread_bps` 30 flat, `skip_when_btc_cascading` off, the funding gate off. Every
+change and every deliberate non-change is in `docs/DECISIONS.md`, 2026-09-05. Phase 4 must
+also add a **per-cluster exposure cap**, which no config key covers yet: the pooled +84.6 bps
+is +26.7 isolated and +34.0 with the top five clusters removed, and a cluster is one bet.
+
+Nothing in Phase 3 consumed either of the two re-cuts the preregistration allows. The
+universe defect found mid-phase is logged as a defect, not a re-cut.
+
+## Phase 4: Backtester and strategy v0 (1 week) - blocked until 2026-11-04
 
 Build: `backtest/` engine per spec, `strategy/` and `sizing/` and `risk/` per spec, `liqfade backtest`, report generator, walk-forward and bootstrap validation, parameter surface plots. All of this runs on the local machine over synced Parquet; the VPS is not involved. **Panel v2**: backtest report browser (runs list, metrics table, equity curve, trade list with per-trade chart replay showing the cascade, entry, exit and liquidation markers), runnable locally with `liqfade panel --local`.
 

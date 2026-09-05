@@ -180,7 +180,11 @@ class Filters(Base):
     max_spread_bps: SpreadTiers
     min_edge_multiple: Pos = Field(..., description="multiple of the round trip fee required")
     skip_when_btc_cascading: bool = Field(..., description="skip alts during market-wide sweeps")
-    funding_extreme_bps_8h: NonNeg = Field(..., description="bps per 8h against the trade")
+    # None means the gate is not applied at all. Phase 3 measured it as inert, and a
+    # threshold set so high it can never fire is a config that lies about what runs.
+    funding_extreme_bps_8h: NonNeg | None = Field(
+        None, description="bps per 8h against the trade; null disables the gate"
+    )
     min_notional_usd: Pos = Field(..., description="USD: exchange minimum order value")
 
 

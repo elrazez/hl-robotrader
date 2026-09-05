@@ -1055,3 +1055,62 @@ so the effect of the guard is visible instead of assumed. The 30 comes from the 
 p99 rounded up, which is the level at which a spread stops looking like a liquid perp's. It
 belongs in `filters.max_spread_bps` in Phase 4, evaluated pre-trade on live book data, not in
 the research sample.
+
+## 2026-09-05 (Phase 3 config writeback)
+
+Applied to `config/default.yaml` after the owner read `reports/research/SUMMARY.md`. Every
+change below names the report it came from, the sample it was measured on and the value it
+replaced. Nothing outside the preregistration's writeback list was touched.
+
+**`intent.k_target` 0.5 -> 0.8 and `intent.k_stop` 1.5 -> 1.0.** From Q8's winning grid cell
+over 2,722 episodes in 1,758 clusters, taken only because every neighbouring cell is also
+positive, which is the condition the preregistration attaches to this writeback. The cell
+keeps +80.6 of the +84.6 bps that holding to the horizon returns, at a 15% stop-out rate.
+`reports/research/q8_path.md`. Reverse if a Phase 4 backtest on the held-out last 25%
+disagrees.
+
+**`intent.time_stop_s` unchanged at 900.** Q8's grid used a 15 minute time stop throughout
+and tested no alternative, so the data did not speak to it and the preregistration forbids
+moving a value the data did not choose.
+
+**`cascade.proxy_min` unchanged at 4.0.** Q3's F1 curve is flat at 0.01 across every
+preregistered threshold (2, 3, 4, 6), so there is no minimum to read off it. The number
+stays where it was rather than being moved to a value the data did not produce.
+
+**`filters.max_spread_bps` 3/6/12 by tier -> 30 flat.** Two findings, not one. Q6 measured
+the tiered caps removing 51.9% of the sample to remove 36.3% of the loss tail, a
+concentration of 0.70x against a 2x bar: as a signal filter they only shrank the book.
+Separately, the effective spread inside the filtered universe is p50 4.1, p95 26.3, p99
+137.5 bps, and the whole tail sits in major and minor while the core tier's own p99 is 22.9
+with a max of 322. 30 is that core p99 rounded up. It is a **sanity guard, not a filter**:
+above it a quote has stopped looking like a liquid perp's. Q1 reports the slice it would have
+removed (`used spread <= 30 bps`, +32.2 bps on 2,602 of 2,722 episodes) rather than applying
+it, so the effect is visible instead of assumed.
+
+**`filters.skip_when_btc_cascading` true -> false.** Q6: removes 26.7% of the sample to
+remove 33.3% of the loss tail, a concentration of 1.25x, under the 2x bar. The market-wide
+bucket is also where the pooled edge lives (+160.4 bps against +26.7 isolated), so skipping
+it skips the upside as well as the risk. What handles sweeps instead is the per-cluster
+exposure cap, below.
+
+**`filters.funding_extreme_bps_8h` 30.0 -> null, and the field is now nullable.** Q6: the
+gate removes 0.6% of the sample and 0.0% of the loss tail. `null` means the gate is not
+applied; the alternative, a threshold set so high it can never fire, is a config that lies
+about what runs.
+
+**Not written back, and why.** `exhaustion.*` keeps its values although Q2 found a flat 120s
+delay beats the rule on every month: replacing the rule with a delay is a Phase 4 strategy
+decision and would need a new config key, which is outside the writeback list this phase
+agreed to. `features.levels.*` keeps its values although Q7 found in-zone episodes revert
+*worse* than out-of-zone (+36.1 against +146.3 at 15 bps): the code stays built, tested and
+unused. `filters.min_edge_multiple`, `sizing.risk_frac` and every gate in
+`docs/STRATEGY_AND_RISK.md` section 5 are untouched, as the preregistration requires:
+research measures the edge, it does not set risk limits.
+
+**Phase 4 must add a per-cluster exposure cap.** Not a writeback, because no such key
+exists yet. Q1's pooled +84.6 bps is +26.7 in the isolated-coin bucket and +34.0 with the top
+five clusters removed; the difference is cluster upside, and a cluster is one bet, since a
+market-wide sweep liquidates dozens of coins inside one minute and the strategy would be in
+all of them at once. Sizing on the pooled number would size one bet as if it were fifty.
+`sizing/` and `risk/` need a cap on concurrent exposure within a five minute window across
+all coins on the same side, and Phase 4 sizes on 27 to 34 bps rather than on 85.
