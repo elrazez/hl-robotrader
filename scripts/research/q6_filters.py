@@ -47,13 +47,29 @@ def q8() -> object:
 
 
 def loss_tail(args: object, episodes: pl.DataFrame, settings: object) -> pl.DataFrame:
-    """Mark each episode with whether the configured stop would have taken it out."""
+    """Mark each episode with whether the configured stop would have taken it out.
+
+    A week at a time, for the reason Q8 is: the tape behind a year of episodes is tens of
+    millions of prints and does not fit, while each episode's outcome is one row.
+    """
     path = q8()
     intent = settings.intent  # type: ignore[attr-defined]
-    tape = lib.episode_tape(args.data_dir, episodes, horizon_s=int(intent.time_stop_s))  # type: ignore[attr-defined]
-    if tape.is_empty():
+    parts = []
+    for first, last in lib.week_chunks(args.start, args.end):  # type: ignore[attr-defined]
+        window = (pl.col("start_ts") >= lib.ms(first)) & (
+            pl.col("start_ts") < lib.ms(last) + 86_400_000
+        )
+        part = episodes.filter(window)
+        if part.is_empty():
+            continue
+        tape = lib.episode_tape(args.data_dir, part, horizon_s=int(intent.time_stop_s))  # type: ignore[attr-defined]
+        if tape.is_empty():
+            continue
+        parts.append(path.outcomes(path.levels(part, intent.k_stop, intent.k_target), tape))
+        del tape
+    if not parts:
         return episodes.with_columns(pl.lit(False).alias("stopped_out"))
-    resolved = path.outcomes(path.levels(episodes, intent.k_stop, intent.k_target), tape)
+    resolved = pl.concat(parts)
     return resolved.with_columns((pl.col("outcome") == "stop").alias("stopped_out"))
 
 

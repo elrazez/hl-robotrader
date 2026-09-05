@@ -153,33 +153,43 @@ def main() -> None:
     episodes = episodes.filter(pl.col("qualified"))
     rows: list[list[str]] = []
     means: dict[str, float] = {}
-    # The wider column set: the exhaustion rule reads the CVD slope, which needs the
-    # signed notional the episode pipeline itself has no use for.
-    grid = lib.feature_grid(
-        args.data_dir,
-        episodes,
-        settings,
-        lib.episode_grid(
+    fired = 0
+    # A month at a time. The grid for a year of episode windows is tens of millions of rows
+    # and the tick features triple its width; per month it is a twelfth of that and the
+    # per-entry-rule totals below are all that survives the chunk.
+    for first, last in lib.month_chunks(args.start, args.end):
+        window = (pl.col("start_ts") >= lib.ms(first)) & (
+            pl.col("start_ts") < lib.ms(last) + 86_400_000
+        )
+        month = episodes.filter(window)
+        if month.is_empty():
+            continue
+        # The wider column set: the exhaustion rule reads the CVD slope, which needs the
+        # signed notional the episode pipeline itself has no use for.
+        bars = lib.episode_grid(
             args.data_dir,
-            episodes,
+            month,
             columns=("coin", "ts_ms", "mid", "notional_usd", "volume", "signed_notional"),
-        ),
-    )
-    entries = exhaustion_ticks(grid, episodes, settings) if not grid.is_empty() else pl.DataFrame()
-    fired = entries.height
-    for label, table in [("exhaustion", entries)] + [
-        (f"fixed {delay}s", fixed_entries(episodes, delay)) for delay in FIXED_DELAYS_S
-    ]:
-        if grid.is_empty() or table.is_empty():
+        )
+        grid = lib.feature_grid(args.data_dir, month, settings, bars)
+        if grid.is_empty():
             continue
-        result = priced(episodes, table, grid)
-        if result.is_empty():
-            continue
-        values = result.drop_nulls("net_stress_bps")
-        if values.is_empty():
-            continue
-        means[label] = float(values["net_stress_bps"].sum())
-        rows.append([label, str(values.height), f"{values['net_stress_bps'].mean():+.1f}"])
+        entries = exhaustion_ticks(grid, month, settings)
+        fired += entries.height
+        for label, table in [("exhaustion", entries)] + [
+            (f"fixed {delay}s", fixed_entries(month, delay)) for delay in FIXED_DELAYS_S
+        ]:
+            if table.is_empty():
+                continue
+            result = priced(month, table, grid)
+            if result.is_empty():
+                continue
+            values = result.drop_nulls("net_stress_bps")
+            if values.is_empty():
+                continue
+            means[label] = means.get(label, 0.0) + float(values["net_stress_bps"].sum())
+            rows.append([label, str(values.height), f"{values['net_stress_bps'].mean():+.1f}"])
+        del bars, grid, entries
     summary = dict(means)
     qualifying, facts = lib.qualifies(episodes)
     best = max(summary, key=lambda label: summary[label]) if summary else None
