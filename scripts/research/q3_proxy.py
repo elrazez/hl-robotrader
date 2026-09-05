@@ -68,14 +68,19 @@ class Score:
         ]
 
 
-def triggers_of(scored: pl.DataFrame, threshold: float) -> pl.DataFrame:
-    """Collapse each run of ticks over the threshold into one trigger at its first tick."""
+def triggers_of(scored: pl.DataFrame, threshold: float, *, presorted: bool = False) -> pl.DataFrame:
+    """Collapse each run of ticks over the threshold into one trigger at its first tick.
+
+    `presorted` says the frame is already ordered by (coin, ts_ms); filtering keeps that
+    order, so the sort is skipped. The sort was 8 of the day's seconds when run per
+    threshold on the year sweep.
+    """
     rows = []
     for side in ("long", "short"):
         column = f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s"
-        over = (
-            scored.filter(pl.col(column) >= threshold).select("coin", "ts_ms").sort("coin", "ts_ms")
-        )
+        over = scored.filter(pl.col(column) >= threshold).select("coin", "ts_ms")
+        if not presorted:
+            over = over.sort("coin", "ts_ms")
         if over.is_empty():
             continue
         fresh = pl.col("ts_ms").diff().over("coin").fill_null(TRIGGER_GAP_MS + 1) > TRIGGER_GAP_MS
@@ -106,7 +111,7 @@ def score(triggers: pl.DataFrame, episodes: pl.DataFrame) -> Score:
 
 
 def calibration_table(
-    scored: pl.DataFrame, episodes: pl.DataFrame
+    triggers_all: pl.DataFrame, episodes: pl.DataFrame, *, gated: bool
 ) -> tuple[str, dict[float, Score]]:
     """One row per threshold per tier group, plus the core+major row the bar is read from."""
     rows = []
@@ -118,7 +123,9 @@ def calibration_table(
         "minor": episodes.filter(pl.col("tier") == "minor"),
     }
     for threshold in THRESHOLDS:
-        triggers = triggers_of(scored, threshold)
+        triggers = triggers_all.filter(
+            (pl.col("threshold") == threshold) & (pl.col("gated") == gated)
+        ).select("coin", "ts_ms", "side")
         for label, part in groups.items():
             coins = part.select("coin").unique()
             tier_triggers = (
@@ -179,7 +186,8 @@ def build_scores(args: object, settings: object, episodes: pl.DataFrame) -> pl.D
     precision counts the triggers that found nothing, so the sweep has to cover the tape
     rather than the episodes. It still never holds a day of trades. `lib.daily_grid`
     aggregates each day to a 1s grid inside the Parquet scan, the proxy runs on that, and
-    only the triggers survive the day, which are a few hundred rows.
+    only the triggers survive the day, which are a few hundred rows. The result is one row
+    per trigger: coin, ts_ms, side, threshold, gated.
 
     Restricted to the coins that carry an episode in the window. Those are the tradeable
     universe by definition, and a coin the strategy would never trade contributes only
@@ -203,11 +211,36 @@ def build_scores(args: object, settings: object, episodes: pl.DataFrame) -> pl.D
     columns = [f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s" for side in ("long", "short")]
     parts: list[pl.DataFrame] = []
     previous: pl.DataFrame | None = None
+    # One small file per finished day, so a three-hour sweep on a USB drive that has
+    # dropped twice today resumes instead of restarting. A day with no triggers writes an
+    # empty file, which is still "done".
+    checkpoints = Path(args.out_dir) / "q3_days"  # type: ignore[attr-defined]
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    schema = {
+        "coin": pl.Utf8,
+        "ts_ms": pl.Int64,
+        "side": pl.Utf8,
+        "threshold": pl.Float64,
+        "gated": pl.Boolean,
+    }
     for day in lib.dates(args.start, args.end):  # type: ignore[attr-defined]
+        done = checkpoints / f"{day}.parquet"
+        if done.exists():
+            saved = pl.read_parquet(done)
+            if not saved.is_empty():
+                parts.append(saved)
+            previous = None  # the next day rebuilds its own lookback
+            continue
         today = lib.daily_grid(args.data_dir, day, coins)  # type: ignore[attr-defined]
         if today.is_empty():
             previous = None
             continue
+        if previous is None and day != args.start:  # type: ignore[attr-defined]
+            # Resuming after a checkpoint: rebuild yesterday so the lookbacks are full.
+            yesterday = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            previous = lib.daily_grid(args.data_dir, yesterday, coins)  # type: ignore[attr-defined]
+            if previous.is_empty():
+                previous = None
         grid = pl.concat([previous, today]) if previous is not None else today
         ctx = lib._ctx_for(
             args.data_dir,  # type: ignore[attr-defined]
@@ -222,32 +255,38 @@ def build_scores(args: object, settings: object, episodes: pl.DataFrame) -> pl.D
             step_ms=lib.GRID_STEP_MS,
             quantile=proxy_cfg.mark_mid_pct_threshold / 100.0,
         )
-        gated = hl_forced_proxy(grid, gated=True, **common)
-        ungated = hl_forced_proxy(grid, gated=False, **common)
         scored_day = pl.col("ts_ms") >= lib.ms(day)  # type: ignore[attr-defined]
-        kept = gated.filter(scored_day).select("coin", "ts_ms", *columns)
-        kept = kept.join(
-            ungated.filter(scored_day).select(
-                "coin",
-                "ts_ms",
-                *[
-                    pl.col(f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s").alias(f"ungated_{side}")
-                    for side in ("long", "short")
-                ],
-            ),
-            on=["coin", "ts_ms"],
-        )
-        # Only ticks that could ever be a trigger survive the day; the rest of the grid is
-        # dropped here and never accumulates across the year.
-        floor = min(THRESHOLDS)
-        interesting = pl.any_horizontal(
-            [pl.col(column) >= floor for column in [*columns, "ungated_long", "ungated_short"]]
-        )
-        kept = kept.filter(interesting)
-        if not kept.is_empty():
-            parts.append(kept)
+        # Only triggers survive the day. Keeping every tick at or over the lowest
+        # threshold was 2.4M rows a day on 67 coins, which is what ran the year out of
+        # memory at day ~230. Runs are collapsed on the two-day frame, so a run that began
+        # before midnight already triggered yesterday and does not trigger again today.
+        day_parts: list[pl.DataFrame] = []
+        for gated_flag in (True, False):
+            # One pass over the grid keeps the ticks at or over the lowest threshold; the
+            # per-threshold run collapse then works on that slice, not on the whole grid.
+            frame = hl_forced_proxy(grid, gated=gated_flag, **common)
+            candidates = (
+                frame.filter(
+                    pl.any_horizontal([pl.col(column) >= min(THRESHOLDS) for column in columns])
+                )
+                .select("coin", "ts_ms", *columns)
+                .sort("coin", "ts_ms")
+            )
+            del frame
+            for threshold in THRESHOLDS:
+                found = triggers_of(candidates, threshold, presorted=True).filter(scored_day)
+                if not found.is_empty():
+                    day_parts.append(
+                        found.with_columns(
+                            pl.lit(threshold).alias("threshold"), pl.lit(gated_flag).alias("gated")
+                        )
+                    )
+        day_frame = pl.concat(day_parts) if day_parts else pl.DataFrame(schema=schema)
+        day_frame.write_parquet(done)
+        if not day_frame.is_empty():
+            parts.append(day_frame)
         previous = today
-        del today, grid, gated, ungated
+        del today, grid
     return pl.concat(parts) if parts else pl.DataFrame()
 
 
@@ -271,19 +310,8 @@ def main() -> None:
         lib.write_report(calibration, title, blocks)
         return
 
-    table, headline = calibration_table(scored, episodes)
-    ungated_view = scored.rename(
-        {
-            f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s": f"_gated_{side}"
-            for side in ("long", "short")
-        }
-    ).rename(
-        {
-            f"ungated_{side}": f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s"
-            for side in ("long", "short")
-        }
-    )
-    lift_table, _ = calibration_table(ungated_view, episodes)
+    table, headline = calibration_table(scored, episodes, gated=True)
+    lift_table, _ = calibration_table(scored, episodes, gated=False)
     branch, sentence = trigger_branch(headline)
     verdict = "yes" if branch == "HL-native" else "no"
     blocks = [
