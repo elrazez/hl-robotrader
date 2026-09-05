@@ -409,3 +409,34 @@ def test_a_partition_holding_both_becomes_compactable(tmp_path: Path) -> None:
 
     assert candles.run(tmp_path, DAY, DAY, force=True) == 0
     assert compact_day(root, DAY.isoformat(), tables=["candles_1m"]) == {}
+
+
+def test_a_dry_run_counts_the_api_bars_it_would_delete_and_changes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLAUDE.md rule 8: this deletes recorded bars, so there is a way to look first.
+
+    The count comes out of `drop_hl_api` itself rather than out of a second reading of
+    the same rule, so the number printed is the number that would go.
+    """
+    write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
+    api_file = write_api_bars(tmp_path, DAY)
+
+    assert candles.plan(tmp_path, DAY, DAY) == 0
+    out = capsys.readouterr().out
+    assert "delete         1 hl_api bars" in out
+    assert "Nothing was changed" in out
+    assert api_file.exists()
+    assert not (api_file.parent / candles.OUTPUT_NAME).exists()
+
+
+def test_a_dry_run_reports_the_days_it_would_skip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plan reads the same stamp `run` does, so it cannot promise work that is done."""
+    write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
+    assert candles.run(tmp_path, DAY, DAY) == 0
+    capsys.readouterr()
+
+    assert candles.plan(tmp_path, DAY, DAY) == 0
+    assert "skipped (bars match the trades they came from)" in capsys.readouterr().out

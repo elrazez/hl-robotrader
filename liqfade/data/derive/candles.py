@@ -209,7 +209,7 @@ def stamp_of(path: Path) -> bytes | None:
     return (pq.read_metadata(path).metadata or {}).get(SOURCE_STAMP)
 
 
-def drop_hl_api(directory: Path, output: Path) -> int:
+def drop_hl_api(directory: Path, output: Path, *, dry_run: bool = False) -> int:
     """Remove the `hl_api` bars of a partition this derivation has just written.
 
     `liqfade backfill candles` writes `hyperliquid_HH.parquet` with `source = hl_api`
@@ -223,6 +223,10 @@ def drop_hl_api(directory: Path, output: Path) -> int:
     One file is one job's output, so in practice this unlinks whole files. The filter is
     still written row-wise because a compaction that folded an `hl_api` file together
     with a recorded one would leave a file that is not.
+
+    `dry_run` counts the same rows and writes nothing, which is what `plan` reports. It is
+    a flag rather than a second function so the number a dry run prints comes out of the
+    code that does the deleting, not out of a second reading of the same rule.
     """
     dropped = 0
     for path in lake_files(directory):
@@ -233,11 +237,53 @@ def drop_hl_api(directory: Path, output: Path) -> int:
         if keep.height == frame.height:
             continue
         dropped += frame.height - keep.height
+        if dry_run:
+            continue
         if keep.height == 0:
             path.unlink()
         else:
             write_atomic(keep.to_arrow().cast(schema_for(TABLE)), path)
     return dropped
+
+
+def plan(data_dir: Path, start: date, end: date, *, force: bool = False) -> int:
+    """Print what a derivation would read, write and delete per day. Changes nothing.
+
+    The same shape as `hl_s3.rederive_plan`, and for the same reason: this writes a day
+    file into `candles_1m` and deletes the `hl_api` bars it finds beside it, so CLAUDE.md
+    rule 8 wants a way to look first. Sizes come from `stat` rather than the Parquet
+    footers, because the question is how much is about to be rewritten.
+    """
+    from liqfade.data.ingest.common import day_range
+
+    root = Path(data_dir) / "parquet"
+    read_gib = 0.0
+    writing = doomed = 0
+    for day in day_range(start, end, newest_first=False):
+        stamp = day.isoformat()
+        directory = partition_dir(root, TABLE, stamp)
+        output = directory / OUTPUT_NAME
+        files = lake_files(partition_dir(root, SOURCE_TABLE, stamp))
+        if not files:
+            print(f"{day}  no trades, nothing to derive")
+            continue
+        if not force and stamp_of(output) == trades_stamp(files):
+            print(f"{day}  skipped (bars match the trades they came from)")
+            continue
+        gib = sum(path.stat().st_size for path in files) / 1024**3
+        dropping = drop_hl_api(directory, output, dry_run=True)
+        read_gib += gib
+        writing += 1
+        doomed += dropping
+        print(
+            f"{day}  read {len(files):>4} trades files ({gib:6.2f} GiB)  "
+            f"-> write 1 day file, delete {dropping:>9,} hl_api bars"
+        )
+    print(
+        f"\nwould read {read_gib:.1f} GiB of trades, write {writing} day files and delete "
+        f"{doomed:,} hl_api bars. Nothing was changed."
+    )
+    return 0
 
 
 def read_trades(files: list[Path], coins: list[str] | None = None) -> pl.DataFrame:

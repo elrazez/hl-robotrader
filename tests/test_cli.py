@@ -499,3 +499,24 @@ def test_compact_refuses_the_schemaless_side_tables(
     # And the default set leaves them out rather than blowing up on them.
     assert main(["compact", *common]) == 0
     assert "candles_1m" in capsys.readouterr().out
+
+
+def test_derive_over_a_long_range_wants_confirmation(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """It writes a day file into every partition in the range and deletes the api bars."""
+    argv = [
+        "derive",
+        "candles",
+        "--start",
+        "2026-08-01",
+        "--end",
+        "2026-08-31",
+        "--data-dir",
+        str(tmp_path),
+    ]
+    assert main(argv) == 1
+    assert "confirmation threshold" in capsys.readouterr().err
+
+    assert main([*argv, "--dry-run"]) == 0
+    assert "Nothing was changed" in capsys.readouterr().out

@@ -406,6 +406,16 @@ def cmd_derive(args: argparse.Namespace) -> int:
 
     try:
         start, end = _dates(args)
+        if args.dry_run:
+            return candles.plan(settings.paths.data_dir, start, end, force=args.force)
+        # It writes a day file into every candles_1m partition in the range and deletes
+        # the hl_api bars it finds beside it, so the same confirmation `compact` and
+        # `backfill rederive` ask for applies. CLAUDE.md rule 8.
+        from liqfade.data.ingest.common import day_range
+
+        refuse = needs_confirmation(day_range(start, end), yes=args.yes, dry_run=False)
+        if refuse:
+            raise BackfillError(refuse)
         return candles.run(
             settings.paths.data_dir, start, end, coins=coins or None, force=args.force
         )
@@ -672,6 +682,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     derive.add_argument(
         "--force", action="store_true", help="rewrite days whose output file already exists"
+    )
+    derive.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be read, written and deleted per day",
+    )
+    derive.add_argument(
+        "--yes", action="store_true", help=f"required over {CONFIRM_ABOVE_DAYS} days"
     )
     derive.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
