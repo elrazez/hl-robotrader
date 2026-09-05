@@ -26,12 +26,14 @@ from typing import NamedTuple
 import numpy as np
 import polars as pl
 
+from liqfade.config.models import Universe
 from liqfade.features.context import with_ctx
 from liqfade.features.episodes import group_episodes, qualify_episodes
 from liqfade.features.flow import cvd, realized_vol
 from liqfade.features.grid import effective_ts
 from liqfade.features.intensity import liq_intensity
 from liqfade.features.zscore import robust_z
+from liqfade.recorder.universe import select_universe
 
 # 0.045% taker per side, base tier 2026-08, both ways. config/default.yaml backtest.*_fee_frac.
 FEES_BPS = 9.0
@@ -470,6 +472,92 @@ def padded(start: str, end: str) -> tuple[str, str]:
     return before.isoformat(), after.isoformat()
 
 
+def daily_universe(
+    data_dir: str | Path, start: str, end: str, cfg: Universe
+) -> tuple[dict[str, frozenset[str]], dict[str, int]]:
+    """The tradeable universe for each UTC day, by the recorder's own rule.
+
+    `liqfade/recorder/universe.py:select_universe` is the one implementation of "which
+    coins are we in", and it is called here rather than restated: volume and open interest
+    floors, top N by volume, union the core coins, minus the exclude list. It wants a raw
+    `metaAndAssetCtxs` payload, so the last `asset_ctx` sample strictly before the day began
+    is shaped into one.
+
+    Trailing only: the snapshot precedes the day it selects for, so no day's universe can
+    know its own volume. The ranking is evaluated once a day rather than once a minute
+    because it is a cross-sectional rank over three hundred coins and half a million minutes
+    of it does not compute; the recorder itself refreshes hourly and `day_ntl_vlm` is a
+    rolling 24h figure. `build_episodes` also checks the per-coin floors at each episode's
+    own trailing minute, so a coin that falls through the floor mid-day is still excluded.
+
+    Coins whose name contains a colon never appear: those are builder-deployed HIP-3 markets
+    (`cash:AMZN`, `flx:GOLD`, `xyz:TSM`, `hyna:ETH`) and are not the venue this strategy
+    trades. See docs/DECISIONS.md, 2026-09-05.
+
+    Also returns the first `asset_ctx` timestamp seen for each coin, which is what
+    `min_listing_days` is measured from. The history walked in front of `start` is
+    `min_listing_days` deep for exactly that reason: reading listing age off the two days of
+    padding the rest of the pipeline uses would make every coin two days old and exclude the
+    entire universe. A coin already present at the start of that history is at least
+    `min_listing_days` old, which is all the rule asks.
+    """
+    universes: dict[str, frozenset[str]] = {}
+    listings: dict[str, int] = {}
+    latest: dict[str, tuple[float, float, float]] = {}
+    history = [
+        (date.fromisoformat(start) - timedelta(days=back)).isoformat()
+        for back in range(cfg.min_listing_days + 2, 0, -1)
+    ]
+    for day in [*history, *dates(start, end)]:
+        if day not in history:
+            payload = [
+                {"universe": [{"name": coin, "isDelisted": False} for coin in latest]},
+                [
+                    {"dayNtlVlm": volume, "markPx": mark, "openInterest": interest}
+                    for volume, mark, interest in latest.values()
+                ],
+            ]
+            universes[day] = frozenset(select_universe(payload, cfg))
+        frame = scan_day(
+            data_dir,
+            "asset_ctx",
+            day,
+            columns=("coin", "ts_ms", "mark_px", "open_interest", "day_ntl_vlm"),
+        )
+        if frame is None:
+            continue
+        closing = (
+            frame.filter(~pl.col("coin").str.contains(":"))
+            .sort("ts_ms")
+            .group_by("coin")
+            .agg(
+                pl.col("day_ntl_vlm").last(),
+                pl.col("mark_px").last(),
+                pl.col("open_interest").last(),
+                pl.col("ts_ms").min().alias("first_ts"),
+            )
+            .collect()
+        )
+        for row in closing.iter_rows(named=True):
+            latest[row["coin"]] = (
+                row["day_ntl_vlm"] or 0.0,
+                row["mark_px"] or 0.0,
+                row["open_interest"] or 0.0,
+            )
+            listings.setdefault(row["coin"], row["first_ts"])
+    return universes, listings
+
+
+def universe_frame(universes: dict[str, frozenset[str]]) -> pl.DataFrame:
+    """The (day, coin) pairs the universe rule admits, as a frame to semi-join against.
+
+    A frame rather than a per-row lambda: the year has 279,307 episodes and a Python
+    callback per row is minutes of interpreter time for a set membership test.
+    """
+    rows = [(day, coin) for day, coins in universes.items() for coin in sorted(coins)]
+    return pl.DataFrame(rows, schema={"day": pl.String, "coin": pl.String}, orient="row")
+
+
 def coin_tiers(data_dir: str | Path, start: str, end: str, core: tuple[str, ...]) -> dict[str, str]:
     """core, major or minor per coin, by median daily notional volume over the window.
 
@@ -797,6 +885,60 @@ def episode_grid(
     )
 
 
+def _apply_universe(
+    data_dir: str | Path, episodes: pl.DataFrame, start: str, end: str, settings: object
+) -> pl.DataFrame:
+    """Keep only episodes in coins the recorder's own universe rule would have subscribed to.
+
+    Two conditions, both trailing. The coin has to be in the day's universe, which is the
+    recorder's ranking over the last snapshot before that day began; and its own
+    `asset_ctx` sample immediately before the episode started has to clear the volume and
+    open interest floors, so a coin that fell through them mid-day is excluded from that
+    moment rather than from the next midnight.
+    """
+    cfg = settings.universe  # type: ignore[attr-defined]
+    load_start, load_end = padded(start, end)
+    universes, listings = daily_universe(data_dir, start, end, cfg)
+    ctx = load_table(
+        data_dir,
+        "asset_ctx",
+        load_start,
+        load_end,
+        columns=("coin", "ts_ms", "mark_px", "open_interest", "day_ntl_vlm"),
+    )
+    if ctx.is_empty() or not universes:
+        return episodes.head(0)
+    floors = ctx.select(
+        "coin",
+        pl.col("ts_ms").alias("_u_ts"),
+        pl.col("day_ntl_vlm").alias("_vol"),
+        (pl.col("open_interest") * pl.col("mark_px")).alias("_oi_usd"),
+    ).sort("_u_ts")
+    listed = pl.col("coin").replace_strict(listings, default=None, return_dtype=pl.Int64)
+    with_floors = (
+        episodes.with_columns(
+            (pl.col("start_ts") - 1).alias("_before"),
+            pl.col("start_ts").cast(pl.Datetime("ms")).dt.strftime("%Y-%m-%d").alias("day"),
+            ((pl.col("start_ts") - listed) / 86_400_000).alias("_age_days"),
+        )
+        .sort("_before")
+        .join_asof(floors, left_on="_before", right_on="_u_ts", by="coin", strategy="backward")
+        .drop("_before", "_u_ts")
+    )
+    clears = (
+        (pl.col("_vol") >= cfg.min_day_ntl_vlm_usd)
+        & (pl.col("_oi_usd") >= cfg.min_open_interest_usd)
+        & (pl.col("_age_days") >= cfg.min_listing_days)
+        & ~pl.col("coin").str.contains(":")
+    )
+    return (
+        with_floors.filter(clears.fill_null(False))
+        .join(universe_frame(universes), on=["day", "coin"], how="semi")
+        .drop("day", "_vol", "_oi_usd", "_age_days")
+        .sort("coin", "side", "start_ts")
+    )
+
+
 def _candidate_liquidations(liquidations: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
     """The liquidation events belonging to the candidate episodes, and no others.
 
@@ -861,6 +1003,12 @@ def build_episodes(
     }
     window = (pl.col("start_ts") >= ms(start)) & (pl.col("start_ts") < ms(end) + 86_400_000)
     all_episodes = group_episodes(liquidations, empty_bars, **detector).filter(window)
+    if all_episodes.is_empty():
+        return pl.DataFrame()
+    # The universe, applied at detection. An episode in a coin this strategy would never
+    # trade is not an episode, so it is not in the unfiltered count either. See
+    # docs/DECISIONS.md, 2026-09-05: the first year of results was void without this.
+    all_episodes = _apply_universe(data_dir, all_episodes, start, end, settings)
     if all_episodes.is_empty():
         return pl.DataFrame()
     candidates = _liquidation_z(liquidations, all_episodes, settings)

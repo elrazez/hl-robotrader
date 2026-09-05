@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,11 @@ from liqfade.data.schemas import SOURCE_HL_S3, SOURCE_TARDIS
 from liqfade.recorder.writer import write_rows
 
 DATE = "2026-03-01"
+# Days of thin asset_ctx history written before the capture day. The universe rule needs a
+# trailing snapshot to rank from and `universe.min_listing_days` is 14, so a lake that began
+# on the capture day would have every coin excluded for being too young and the smoke tests
+# would exercise the empty path instead of the pipeline.
+HISTORY_DAYS = 20
 START_MS = 1_772_323_200_000  # 2026-03-01T00:00:00Z
 HOURS = 4
 SPAN_MS = HOURS * 3_600_000
@@ -213,6 +219,40 @@ def _candles(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _history(rng: random.Random) -> dict[str, list[dict[str, Any]]]:
+    """One asset_ctx row an hour for the days before the capture, per UTC day.
+
+    Enough for the universe rule to have a trailing snapshot and for the coins to be old
+    enough to trade; far too thin to be mistaken for real context data.
+    """
+    days: dict[str, list[dict[str, Any]]] = {}
+    for back in range(HISTORY_DAYS, 0, -1):
+        day_start = START_MS - back * 86_400_000
+        day = datetime.fromtimestamp(day_start / 1000, UTC).strftime("%Y-%m-%d")
+        rows = []
+        for coin, (base, _, _) in COINS.items():
+            for hour in range(24):
+                mid = base * (1 + rng.gauss(0.0, 0.002))
+                rows.append(
+                    {
+                        "coin": coin,
+                        "ts_ms": day_start + hour * 3_600_000,
+                        "rx_ms": 0,
+                        "mark_px": mid,
+                        "oracle_px": mid,
+                        "mid_px": mid,
+                        "funding": rng.gauss(0.0, 1.2e-5),
+                        "open_interest": rng.uniform(2e7, 6e7) / mid,
+                        "day_ntl_vlm": rng.uniform(5e7, 9e8),
+                        "premium": rng.gauss(0.0, 0.0002),
+                        "impact_bid_px": mid * 0.9999,
+                        "impact_ask_px": mid * 1.0001,
+                    }
+                )
+        days[day] = rows
+    return days
+
+
 def build(root: Path) -> Path:
     """Write the whole fixture lake under `root` and return the parquet directory."""
     rng = random.Random(SEED)
@@ -227,6 +267,8 @@ def build(root: Path) -> Path:
         ("asset_ctx", "hyperliquid"): (_asset_ctx(cascades, rng), SOURCE_HL_S3),
         ("candles_1m", "hyperliquid"): (_candles(trades), SOURCE_HL_S3),
     }
+    for day, rows in _history(rng).items():
+        write_rows(parquet, ("asset_ctx", "hyperliquid", day, 0), rows, source=SOURCE_HL_S3)
     for (table, venue), (rows, source) in written.items():
         for hour in range(HOURS):
             window = range(START_MS + hour * 3_600_000, START_MS + (hour + 1) * 3_600_000)

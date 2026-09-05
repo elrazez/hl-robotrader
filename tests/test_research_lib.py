@@ -243,3 +243,56 @@ def test_the_episode_cache_refuses_to_answer_a_different_window(
     assert again.height == first.height  # same window, cache reused
     other = lib.build_episodes(research_lake, "2026-03-02", "2026-03-02", settings, cache=cache)
     assert other.is_empty()  # different window, cache ignored and that day has no lake
+
+
+def test_the_universe_admits_the_lakes_perps_and_nothing_with_a_colon(
+    research_lake: Path,
+) -> None:
+    """Builder-deployed HIP-3 markets are not the venue this strategy trades.
+
+    29% of the first year's qualifying episodes were `cash:AMZN`, `flx:GOLD`, `xyz:TSM` and
+    the like, none of which has an asset_ctx row. See docs/DECISIONS.md, 2026-09-05.
+    """
+    from liqfade.config.loader import load_settings
+
+    settings = load_settings()
+    universes, listings = lib.daily_universe(
+        research_lake, "2026-03-01", "2026-03-01", settings.universe
+    )
+    admitted = universes["2026-03-01"]
+    assert {"BTC", "ETH", "PEPE"} <= admitted
+    assert not any(":" in coin for coin in admitted)
+    assert set(listings) == {"BTC", "ETH", "PEPE"}
+
+
+def test_listing_age_is_measured_from_the_lake_and_not_from_the_padding(
+    research_lake: Path,
+) -> None:
+    """The bug this test exists for: reading listing age off the two days of padding the
+    rest of the pipeline uses made every coin two days old, which excluded the entire
+    universe and would have silently emptied the year."""
+    from liqfade.config.loader import load_settings
+
+    settings = load_settings()
+    _, listings = lib.daily_universe(research_lake, "2026-03-01", "2026-03-01", settings.universe)
+    start = lib.ms("2026-03-01")
+    ages = {coin: (start - first) / 86_400_000 for coin, first in listings.items()}
+    assert min(ages.values()) >= settings.universe.min_listing_days
+
+
+def test_an_episode_in_a_coin_with_no_asset_ctx_is_dropped_not_nulled(
+    research_lake: Path,
+) -> None:
+    from liqfade.config.loader import load_settings
+
+    settings = load_settings()
+    episodes = pl.DataFrame(
+        {
+            "coin": ["BTC", "xyz:TSM"],
+            "side": ["long", "long"],
+            "start_ts": [lib.ms("2026-03-01") + 3_600_000] * 2,
+            "end_ts": [lib.ms("2026-03-01") + 3_630_000] * 2,
+        }
+    )
+    kept = lib._apply_universe(research_lake, episodes, "2026-03-01", "2026-03-01", settings)
+    assert kept["coin"].to_list() == ["BTC"]
