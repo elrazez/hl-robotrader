@@ -546,19 +546,18 @@ lake. The script stays for the day a partition with no `fills_full` does land, w
 rederive returns `"empty"` for and therefore never cleans.
 
 **The year of asset contexts, measured.** `liqfade backfill asset-ctxs --start 2025-09-01
---end 2026-08-30`: **362 day files, 116,554,818 rows, 3.75 GiB, $0.34** of egress. A full
+--end 2026-08-30`: **363 day files, 116,884,578 rows, 3.76 GiB, $0.34** of egress. A full
 day is 1440 minutes per coin, 334,080 rows at 232 coins. Every file was re-opened
 afterwards and checked for a readable footer against the canonical schema: none truncated,
 none with a stray second file.
 
-364 days were requested and three are not there, all for different reasons, none of them
-worth filling from another source:
-
-| day | why | fix |
-|---|---|---|
-| 2025-08-31 | outside the requested range; it exists in the report because `fills_full` and `trades` start a day earlier | none, expected |
-| 2026-07-08 | **the archive has no such object.** July 2026 lists 30 files and 2026-07-07 and 2026-07-09 are both present at 10.5 and 10.3 MB | none; Hyperliquid's hole |
-| 2026-02-15 | a broken NTFS directory entry from the drive drop below, not a missing pull | chkdsk, then re-pull the one day |
+364 days were requested and one is not there, and it is not worth filling from another
+source: **2026-07-08 has no object in the bucket.** July 2026 lists 30 files, and
+2026-07-07 and 2026-07-09 are both present at 10.5 and 10.3 MB. It is Hyperliquid's hole,
+and a row invented for it would carry a `source` that is not true. `asset_ctx` is
+therefore 363 days, and `scripts/research/data_quality.py` reports exactly two zero-row
+days for it: that one, and 2025-08-31, which is outside the requested range and appears
+only because `fills_full` and `trades` start a day earlier.
 
 Several days are short rather than absent, because the archive's own file is truncated:
 2026-08-27 ends 14:39 UTC at 155,440 rows and 2026-08-30 ends 12:03 at 119,248, and in
@@ -622,9 +621,21 @@ an O_TRUNC write lands and reads back. Two consequences worth knowing before the
 the manifest silently recorded nothing for all 167 days of the resumed pull, so it was
 rebuilt from the lake's own footers plus one S3 listing; and a `date=*` glob dies on the
 partition, which is why `scripts/research/data_quality.py` now reports an unopenable
-partition as a hole instead of crashing. The kernel's own advice, `ntfs3(vda): It is
-recommened to use chkdsk`, is the fix, and it needs Windows. Lesson: a write to this mount
-is not believed until it reads back, and every repair here verifies.
+partition as a hole instead of crashing.
+
+chkdsk on Windows cleared it, and **the repair itself cost four more day files**:
+2026-02-16 to 2026-02-19 were cross-linked with the manifest, which is how Parquet bytes
+got into its head, and resolving a cross-link means deleting one side. Those four
+partitions came back holding only the crashed run's `.hyperliquid_day.parquet.60209.tmp`
+and no real file. Caught by re-sweeping every footer after the repair rather than by
+trusting the earlier sweep, which had been true when it ran; re-pulled for nothing, since
+the archive charges by the byte and four days is 44 MB.
+
+Two lessons, both now habits in the scripts here. A write to this mount is not believed
+until it reads back: the manifest rebuild verifies by re-reading, and the one that did not
+failed silently and cost 35 retry attempts. And a verification sweep is only true for the
+moment it ran, so it is re-run after anything touches the volume, including a repair meant
+to help.
 
 **The panel's liquidation chart is uPlot, not `lightweight-charts`.** CLAUDE.md section 4
 names `lightweight-charts` for price, liquidation and trade-marker charts and uPlot for
