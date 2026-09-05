@@ -10,6 +10,8 @@ export interface FeedState {
   gaps_1h: number;
   reconnects_1h: number;
   parse_errors_1h: number;
+  worst_coin: string | null;
+  worst_lag_ms: number;
 }
 
 export interface PositionState {

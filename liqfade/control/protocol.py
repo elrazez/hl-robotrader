@@ -64,6 +64,10 @@ class FeedState(Base):
     parse_errors_1h: int = Field(
         0, ge=0, description="count of rows the parser refused, plus unreadable messages, in 1h"
     )
+    worst_coin: str | None = Field(
+        None, description="the coin quiet longest on a per-coin stream, None when not tracked"
+    )
+    worst_lag_ms: int = Field(0, ge=0, description="ms since worst_coin's last message")
 
 
 class PositionState(Base):

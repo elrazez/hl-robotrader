@@ -126,9 +126,9 @@ class CoinalyzePoller:
                     row["ts_ms"] = max(int(entry.get("update") or 0), int(row.get("ts_ms") or 0))
 
         rx_ms = int(time.time() * 1000)
+        self._stat.record_message(rx_ms)  # one poll is one message, whatever it returned
         for symbol, values in merged.items():
             coin, exchange = self.markets[symbol]
-            self._stat.record_message(rx_ms)
             self.sink(
                 "xchg_ctx",
                 VENUE,

@@ -78,14 +78,14 @@ def test_zero_jitter_is_exact() -> None:
 def test_a_continuous_stream_counts_one_gap_per_silence() -> None:
     stat = StreamStats(name="hyperliquid.trades", continuous=True)
     stat.record_message(NOW_MS)
-    assert stat.check_silence(5.0, NOW_MS + 4_000) is False
-    assert stat.check_silence(5.0, NOW_MS + 6_000) is True
+    assert stat.check_silence(5.0, NOW_MS + 4_000) == []
+    assert stat.check_silence(5.0, NOW_MS + 6_000) == [""]
     # Still silent ten minutes later: the same outage, not sixty more gaps.
-    assert stat.check_silence(5.0, NOW_MS + 600_000) is False
+    assert stat.check_silence(5.0, NOW_MS + 600_000) == []
     assert stat.gaps_1h == 1
     # A message ends the silence, so the next one counts again.
     stat.record_message(NOW_MS + 600_001)
-    assert stat.check_silence(5.0, NOW_MS + 610_000) is True
+    assert stat.check_silence(5.0, NOW_MS + 610_000) == [""]
     assert stat.gaps_1h == 2
 
 
@@ -93,13 +93,13 @@ def test_a_sparse_stream_never_counts_a_gap() -> None:
     """Binance and OKX only publish when someone is liquidated. Quiet is not broken."""
     stat = StreamStats(name="binance.liquidations", continuous=False)
     stat.record_message(NOW_MS)
-    assert stat.check_silence(5.0, NOW_MS + 3_600_000) is False
+    assert stat.check_silence(5.0, NOW_MS + 3_600_000) == []
     assert stat.gaps_1h == 0
 
 
 def test_a_stream_that_has_never_delivered_is_not_a_gap() -> None:
     stat = StreamStats(name="hyperliquid.trades", continuous=True)
-    assert stat.check_silence(5.0, NOW_MS) is False
+    assert stat.check_silence(5.0, NOW_MS) == []
     assert stat.silent_s(NOW_MS) == 0.0
 
 
@@ -221,3 +221,62 @@ def test_an_unreadable_message_counts_against_every_table_of_that_venue() -> Non
         "hyperliquid.trades": 1,
         "hyperliquid.bbo": 1,
     }
+
+
+# --- per coin gaps on the HL continuous streams --------------------------------
+
+
+def test_one_dead_coin_subscription_is_a_gap_even_while_the_others_keep_flowing() -> None:
+    """Stats keyed `venue.table` alone: if BTC's bbo died while ETH and SOL kept the
+    stream alive, `lag_ms` stayed near zero and the Phase 1 DoD could not be evidenced."""
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC", "ETH"])
+    stat.record_message(NOW_MS + 10_000, ["ETH"])  # BTC's subscription is gone
+
+    assert stat.check_silence(5.0, NOW_MS + 10_000) == ["BTC"]
+    assert stat.silent_s(NOW_MS + 10_000) == 10.0  # the worst coin, not the stream
+    state = stat.feed_state(NOW_MS + 10_000)
+    assert (state.worst_coin, state.worst_lag_ms) == ("BTC", 10_000)
+    assert state.gaps_1h == 1
+    # The same coin still silent is the same gap, and ETH is not one yet.
+    assert stat.check_silence(5.0, NOW_MS + 12_000) == []
+
+
+def test_a_coin_dropped_from_the_universe_stops_being_a_gap() -> None:
+    """Otherwise an unsubscribed coin is silent forever and alerts forever."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC", "WIF"])
+    stat.forget_coin("WIF")
+    stat.record_message(NOW_MS + 10_000, ["BTC"])
+    assert stat.check_silence(5.0, NOW_MS + 10_000) == []
+    assert stat.feed_state(NOW_MS + 10_000).worst_coin == "BTC"
+
+
+def test_a_stream_that_is_not_per_coin_still_counts_one_gap_for_the_whole_stream() -> None:
+    stat = StreamStats(name="bybit.liquidations", continuous=True)
+    stat.record_message(NOW_MS)
+    assert stat.check_silence(5.0, NOW_MS + 6_000) == [""]
+    assert stat.feed_state(NOW_MS + 6_000).worst_coin is None
+
+
+def test_one_message_counts_once_however_many_rows_it_carried() -> None:
+    """`hyperliquid.l2` emits twenty rows per message, so msgs_1m read twenty times the
+    real message rate."""
+    stream, rows = _stream(
+        venue="hyperliquid",
+        parse=lambda msg, rx: [("l2", {"coin": "BTC", "level": n, "rx_ms": rx}) for n in range(20)],
+        tables=("l2",),
+    )
+    stream.handle(b"{}", NOW_MS)
+    assert len(rows) == 20
+    (state,) = stream.feed_states(NOW_MS)
+    assert state.msgs_1m == 1
+
+
+async def test_dropping_a_coin_from_the_universe_reaches_its_stream_stats() -> None:
+    stream, _ = _stream(venue="hyperliquid", tables=("trades",), symbols=["BTC", "WIF"])
+    stat = stream.stats["hyperliquid.trades"]
+    stat.record_message(NOW_MS, ["BTC", "WIF"])
+    await stream.set_symbols(["BTC"])
+    stat.record_message(NOW_MS + 10_000, ["BTC"])
+    assert stat.check_silence(5.0, NOW_MS + 10_000) == []  # WIF is unsubscribed, not silent

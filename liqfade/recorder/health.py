@@ -6,7 +6,9 @@ up either silently losing data or paging its owner every ten minutes:
 - A *continuous* stream (HL trades, bbo, l2Book, and Bybit liquidations, which are
   complete rather than sampled) is expected to say something constantly. Silence past
   `recorder.gap_alert_s` is a gap and is counted; silence past
-  `recorder.silence_alert_s` is an outage and is alerted.
+  `recorder.silence_alert_s` is an outage and is alerted. On the Hyperliquid streams that
+  question is asked per coin, because HL subscribes each coin separately and one dead
+  subscription is invisible in a stream-level number that nineteen other coins keep fresh.
 - A *sparse* stream (Binance and OKX liquidations, both throttled and event driven) is
   quiet whenever the market is calm. Silence there means nothing, so only the connection
   being down is alerted, which the ping/pong on the socket already tells us.
@@ -123,8 +125,14 @@ class Health:
         at_ms = now_ms() if at_ms is None else at_ms
         sent: list[str] = []
         for stat in self._all_stats():
-            if stat.check_silence(self.cfg.gap_alert_s, at_ms):
-                log.warning("stream_gap", stream=stat.name, silent_s=round(stat.silent_s(at_ms), 1))
+            for label in stat.check_silence(self.cfg.gap_alert_s, at_ms):
+                # `label` is a coin on a per-coin stream and "" for the stream as a whole.
+                log.warning(
+                    "stream_gap",
+                    stream=stat.name,
+                    coin=label or None,
+                    silent_s=round(stat.silent_s(at_ms, coin=label or None), 1),
+                )
             errors = stat.parse_errors_1h()
             if errors >= self.cfg.parse_error_alert_1h:
                 sent.append(

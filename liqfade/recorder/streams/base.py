@@ -56,6 +56,20 @@ CONTINUOUS_STREAMS = frozenset(
     }
 )
 
+# Streams whose silence has to be measured per coin, not per stream. Hyperliquid
+# subscribes each coin separately, so one coin's subscription can die while the others
+# keep the stream's last-message time fresh: `lag_ms` stays near zero, no gap is counted,
+# and the Phase 1 DoD ("no gap over 5s on HL trades and BBO for the core coins") cannot be
+# evidenced from the metrics. Bybit is not here: one topic per symbol, but its silence is
+# already meaningful at the stream level and the venue is a single liquidation feed.
+PER_COIN_STREAMS = frozenset(
+    {
+        "hyperliquid.trades",
+        "hyperliquid.bbo",
+        "hyperliquid.l2",
+    }
+)
+
 HOUR_S = 3600.0
 STABLE_CONNECTION_S = 60.0  # a connection alive this long resets the backoff ladder
 MAX_LOGGED_PAYLOAD = 500  # bytes of a bad message kept in the log line
@@ -81,6 +95,7 @@ class StreamStats:
     name: str
     continuous: bool = False
     connected: bool = False
+    per_coin: bool = False
     last_msg_ms: int = 0
     gaps_1h: int = 0
     _buckets: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
@@ -88,16 +103,40 @@ class StreamStats:
     _reconnects: deque[float] = field(default_factory=deque)
     _parse_errors: deque[float] = field(default_factory=deque)
     _gap_open: bool = False
+    # coin -> ms of its last message, and the coins whose gap is already counted. Only
+    # populated for PER_COIN_STREAMS; every other stream reads its silence off last_msg_ms.
+    _coin_msg_ms: dict[str, int] = field(default_factory=dict)
+    _coin_gap_open: set[str] = field(default_factory=set)
 
-    def record_message(self, rx_ms: int, now: float | None = None) -> None:
+    def record_message(
+        self, rx_ms: int, coins: Iterable[str] = (), now: float | None = None
+    ) -> None:
+        """One received message for this stream, and the coins it carried rows for.
+
+        Counted once however many rows the message held: it used to be called per row, so
+        `msgs_1m` for `hyperliquid.l2` read twenty times the real message rate.
+        """
         now = time.monotonic() if now is None else now
         self.last_msg_ms = rx_ms
         self._gap_open = False
+        if self.per_coin:
+            for coin in coins:
+                if coin:
+                    self._coin_msg_ms[coin] = rx_ms
+                    self._coin_gap_open.discard(coin)
         second = float(int(now))
         if self._buckets and self._buckets[-1][0] == second:
             self._buckets[-1][1] += 1
         else:
             self._buckets.append([second, 1.0])
+
+    def forget_coin(self, coin: str) -> None:
+        """Stop measuring a coin, because the universe no longer subscribes it.
+
+        Without this an unsubscribed coin is silent forever and gaps forever.
+        """
+        self._coin_msg_ms.pop(coin, None)
+        self._coin_gap_open.discard(coin)
 
     def record_reconnect(self, now: float | None = None) -> None:
         self._reconnects.append(time.monotonic() if now is None else now)
@@ -111,23 +150,55 @@ class StreamStats:
         """
         self._parse_errors.append(time.monotonic() if now is None else now)
 
-    def check_silence(self, gap_alert_s: float, now_ms: int, now: float | None = None) -> bool:
-        """Count a gap when a continuous stream has been quiet too long. Idempotent.
+    def check_silence(self, gap_alert_s: float, now_ms: int, now: float | None = None) -> list[str]:
+        """Count the gaps this stream has just opened. Idempotent.
 
-        One silence counts once, however long it lasts, so a stream that is down for an
-        hour reads as one gap rather than 720. Returns True when this call counted one.
+        One silence counts once, however long it lasts, so a subscription that is down for
+        an hour reads as one gap rather than 720. Returns the labels that newly gapped: a
+        coin name for a per-coin stream, and `""` for the stream as a whole otherwise.
         """
-        if not self.continuous or self.last_msg_ms == 0:
-            return False
-        if self._gap_open or (now_ms - self.last_msg_ms) / 1000.0 <= gap_alert_s:
-            return False
+        if not self.continuous:
+            return []
+        if self.per_coin:
+            opened = []
+            for coin, last in sorted(self._coin_msg_ms.items()):
+                if coin in self._coin_gap_open or (now_ms - last) / 1000.0 <= gap_alert_s:
+                    continue
+                self._coin_gap_open.add(coin)
+                self._count_gap(now)
+                opened.append(coin)
+            return opened
+        if self.last_msg_ms == 0 or self._gap_open:
+            return []
+        if (now_ms - self.last_msg_ms) / 1000.0 <= gap_alert_s:
+            return []
         self._gap_open = True
+        self._count_gap(now)
+        return [""]
+
+    def _count_gap(self, now: float | None) -> None:
         self.gaps_1h += 1
         self._gap_times.append(time.monotonic() if now is None else now)
-        return True
 
-    def silent_s(self, now_ms: int) -> float:
-        """Seconds since the last message. 0 when the stream has never delivered one."""
+    def worst_coin(self, now_ms: int) -> tuple[str | None, float]:
+        """The coin that has been quiet longest, and for how many seconds."""
+        if not self._coin_msg_ms:
+            return None, 0.0
+        coin, last = min(self._coin_msg_ms.items(), key=lambda pair: (pair[1], pair[0]))
+        return coin, max(0.0, (now_ms - last) / 1000.0)
+
+    def silent_s(self, now_ms: int, coin: str | None = None) -> float:
+        """Seconds since the last message. 0 when nothing has ever been delivered.
+
+        For a per-coin stream with no coin named, this is the *worst* coin's silence, not
+        the stream's: one dead subscription out of twenty is what the number has to show,
+        because the stream as a whole is never quiet while any coin still ticks.
+        """
+        if coin is not None:
+            last = self._coin_msg_ms.get(coin, 0)
+            return 0.0 if last == 0 else (now_ms - last) / 1000.0
+        if self.per_coin and self._coin_msg_ms:
+            return self.worst_coin(now_ms)[1]
         return 0.0 if self.last_msg_ms == 0 else (now_ms - self.last_msg_ms) / 1000.0
 
     def parse_errors_1h(self, now: float | None = None) -> int:
@@ -148,6 +219,7 @@ class StreamStats:
     def feed_state(self, now_ms: int, now: float | None = None) -> FeedState:
         now = time.monotonic() if now is None else now
         self._prune(now)
+        worst, worst_s = self.worst_coin(now_ms)
         return FeedState(
             name=self.name,
             connected=self.connected,
@@ -157,6 +229,8 @@ class StreamStats:
             gaps_1h=len(self._gap_times),
             reconnects_1h=len(self._reconnects),
             parse_errors_1h=len(self._parse_errors),  # already pruned above
+            worst_coin=worst,
+            worst_lag_ms=int(worst_s * 1000.0),
         )
 
 
@@ -225,7 +299,11 @@ class WSStream:
         name = f"{self.venue}.{table}"
         stat = self.stats.get(name)
         if stat is None:
-            stat = StreamStats(name=name, continuous=name in CONTINUOUS_STREAMS)
+            stat = StreamStats(
+                name=name,
+                continuous=name in CONTINUOUS_STREAMS,
+                per_coin=name in PER_COIN_STREAMS,
+            )
             self.stats[name] = stat
         return stat
 
@@ -254,10 +332,18 @@ class WSStream:
             return
         if self._ws is None:
             self.symbols = new  # nothing to send; on_connect subscribes the whole set
+            self._forget(removed)
             return
         for frame in self.on_universe_change(added, removed):
             await self._send(frame)
         self.symbols = new
+        self._forget(removed)
+
+    def _forget(self, removed: Sequence[str]) -> None:
+        """Stop measuring per-coin silence for symbols the universe just dropped."""
+        for stat in self.stats.values():
+            for symbol in removed:
+                stat.forget_coin(symbol)
 
     # --- connection ----------------------------------------------------------
 
@@ -366,13 +452,20 @@ class WSStream:
                 raw=raw[:MAX_LOGGED_PAYLOAD].decode("utf-8", "replace"),
             )
             return
+        # Grouped by table so one message counts as one message, whatever it carried:
+        # `hyperliquid.l2` emits twenty rows per frame and used to report twenty messages.
+        # The coins go with it, because per-coin silence is what tells you which
+        # subscription died on a venue that subscribes each coin separately.
+        coins: dict[str, list[str]] = {}
         for table, row in rows:
             stat = self._stat(table)
             if row is None:
                 stat.record_parse_error()
                 continue
-            stat.record_message(rx_ms)
+            coins.setdefault(table, []).append(str(row.get("coin") or ""))
             self.sink(table, self.venue, row)
+        for table, seen in coins.items():
+            self._stat(table).record_message(rx_ms, seen)
 
     def _record_pong(self) -> None:
         if self._ping_sent is None:

@@ -48,6 +48,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
           <th className="pb-1 text-right font-medium">msgs/min</th>
           <th className="pb-1 text-right font-medium">gaps 1h</th>
           <th className="pb-1 text-right font-medium">parse errors 1h</th>
+          <th className="pb-1 text-right font-medium">worst coin</th>
         </tr>
       </thead>
       <tbody>
@@ -66,6 +67,9 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
               }`}
             >
               {feed.parse_errors_1h}
+            </td>
+            <td className="py-1 text-right tabular-nums">
+              {feed.worst_coin ? `${feed.worst_coin} ${feed.worst_lag_ms} ms` : "-"}
             </td>
           </tr>
         ))}
