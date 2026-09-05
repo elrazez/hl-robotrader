@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 # Deliberately independent of liqfade-live.service: a watchdog that dies with the process
 # it watches is not a watchdog. Built in Phase 5.
-ExecStart=/home/liqfade/.local/bin/uv run --frozen python -m liqfade.execution.watchdog
+ExecStart=/srv/liqfade/app/.venv/bin/python -m liqfade.execution.watchdog
 User=liqfade
 Group=liqfade
 EnvironmentFile=/srv/liqfade/.env
@@ -18,11 +18,11 @@ RestartSec=3
 LimitNOFILE=65536
 
 # Hardening. The code directory stays read only; only data and logs are writable.
-# ProtectHome is read-only rather than yes because ExecStart lives under /home: yes empties
-# /home inside the namespace, so systemd cannot execute uv and the unit dies at 203/EXEC.
+# The unit runs the venv deploy.sh synced, not `uv run`: uv wants a writable cache under
+# /home at every start, and nothing under /home is writable here.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

@@ -26,8 +26,7 @@ REQUIRED_SERVICE_KEYS = {
     "RestartSec": "3",
     "NoNewPrivileges": "yes",
     "ProtectSystem": "strict",
-    # read-only, not yes: yes empties /home in the namespace and uv lives there.
-    "ProtectHome": "read-only",
+    "ProtectHome": "yes",
     "PrivateTmp": "yes",
     "ReadWritePaths": "/srv/liqfade/data /srv/liqfade/logs",
     "LimitNOFILE": "65536",
@@ -58,9 +57,11 @@ def test_unit_has_the_required_hardening(unit: Path) -> None:
 
 
 @pytest.mark.parametrize("unit", UNITS, ids=lambda p: p.name)
-def test_unit_starts_through_uv_from_the_service_user_home(unit: Path) -> None:
+def test_unit_starts_from_the_synced_venv_not_through_uv(unit: Path) -> None:
+    # uv run needs a writable cache under /home on every start; the sandbox has none.
     exec_start = _parse(unit)["Service"]["ExecStart"]
-    assert exec_start.startswith("/home/liqfade/.local/bin/uv run --frozen")
+    assert exec_start.startswith("/srv/liqfade/app/.venv/bin/")
+    assert "uv run" not in exec_start
 
 
 def test_live_unit_refuses_to_start_while_the_kill_flag_exists() -> None:
@@ -75,8 +76,10 @@ def test_watchdog_does_not_depend_on_the_process_it_watches() -> None:
     assert "liqfade-live" not in joined
 
 
-def test_panel_unit_installs_the_panel_extra() -> None:
-    assert "--extra panel" in _parse(UNIT_DIR / "liqfade-panel.service")["Service"]["ExecStart"]
+def test_deploy_syncs_the_panel_extra_the_panel_unit_relies_on() -> None:
+    # The unit no longer passes --extra panel itself, so the sync has to.
+    deploy = (UNIT_DIR.parent / "deploy.sh").read_text()
+    assert "sync --frozen --extra panel" in deploy
 
 
 @pytest.mark.parametrize(
