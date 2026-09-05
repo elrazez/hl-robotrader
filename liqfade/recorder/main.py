@@ -99,7 +99,7 @@ class Recorder:
                 WSStream(
                     hl.VENUE,
                     venues.hyperliquid.ws_url,
-                    parse=hl.parse,
+                    parse=hl.make_parser(),
                     sink=self.sink,
                     cfg=cfg,
                     tables=hl.TABLES,

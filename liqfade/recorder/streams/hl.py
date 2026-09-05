@@ -5,6 +5,10 @@ feeding the `trades`, `bbo`, `l2`, `candles_1m` and `asset_ctx` tables. Payload 
 were captured live with `scripts/probe/ws_payloads.py` on 2026-08-30, not taken from a
 doc, and the parser tests embed those exact bytes.
 
+`make_parser()` rather than a module level `parse`, as on every other venue: the candle
+channel needs one piece of per connection state, the open bar of each coin. See its
+docstring for why.
+
 Two things the schema doc does not say and the wire does:
 
 - `activeAssetCtx` carries no timestamp, so `ts_ms` is set to `rx_ms` for that table. It
@@ -21,7 +25,7 @@ from typing import Any
 
 import orjson
 
-from liqfade.recorder.streams.base import ParsedRow
+from liqfade.recorder.streams.base import ParsedRow, Parser
 
 # channel -> canonical table it feeds
 CHANNEL_TABLES = {
@@ -75,24 +79,47 @@ def _f(value: Any) -> float | None:
     return float(value)
 
 
-def parse(msg: bytes, rx_ms: int) -> list[ParsedRow]:
-    """Turn one HL frame into canonical rows. Unknown channels yield nothing."""
-    obj = orjson.loads(msg)
-    channel = obj.get("channel")
-    data = obj.get("data")
-    if channel == "trades":
-        return [_trade(row, rx_ms) for row in data]
-    if channel == "bbo":
-        return [_bbo(data, rx_ms)]
-    if channel == "l2Book":
-        return _l2(data, rx_ms)
-    if channel == "candle":
-        # A snapshot on subscribe arrives as a list, live updates as one object.
-        rows = data if isinstance(data, list) else [data]
-        return [_candle(row) for row in rows]
-    if channel == "activeAssetCtx":
-        return [_asset_ctx(data, rx_ms)]
-    return []
+def make_parser() -> Parser:
+    """A parser bound to one connection, holding the open 1m bar of each coin.
+
+    Only the candle channel needs state, and it needs it because HL pushes the
+    in-progress bar over and over: the recorder used to write every push, so a partition
+    held many rows per `(coin, ts_ms)`. `candles_1m` has no `rx_ms` by design and
+    compaction re-sorts by `ts_ms`, so afterwards nothing could tell which of them was
+    the closed bar, and the wrong one has partial `c`, `v` and `n`.
+
+    So a bar is held per coin and emitted when `t` advances, which is the only signal HL
+    gives that the previous bar is done. The version emitted is the last one seen, which
+    is the closed bar; the prompt's alternative (keep the first, drop the repeats) would
+    have kept an in-progress bar instead. A bar older than the one held is dropped, which
+    is what makes the subscribe snapshot after a reconnect stop rewriting bars already in
+    the lake. Costs: the newest bar per coin is written up to a minute late and is lost
+    if the process stops before the next one opens. `candles_1m` is derivable from
+    `trades` (`liqfade derive candles`), and an in-progress bar in the lake is worse than
+    a missing one.
+    """
+    open_bars: dict[str, tuple[int, dict[str, Any]]] = {}
+
+    def parse(msg: bytes, rx_ms: int) -> list[ParsedRow]:
+        """Turn one HL frame into canonical rows. Unknown channels yield nothing."""
+        obj = orjson.loads(msg)
+        channel = obj.get("channel")
+        data = obj.get("data")
+        if channel == "trades":
+            return [_trade(row, rx_ms) for row in data]
+        if channel == "bbo":
+            return [_bbo(data, rx_ms)]
+        if channel == "l2Book":
+            return _l2(data, rx_ms)
+        if channel == "candle":
+            # A snapshot on subscribe arrives as a list, live updates as one object.
+            rows = data if isinstance(data, list) else [data]
+            return [row for update in rows for row in _candle(update, open_bars)]
+        if channel == "activeAssetCtx":
+            return [_asset_ctx(data, rx_ms)]
+        return []
+
+    return parse
 
 
 def _trade(row: dict[str, Any], rx_ms: int) -> ParsedRow:
@@ -164,20 +191,35 @@ def _l2(data: dict[str, Any], rx_ms: int) -> list[ParsedRow]:
     return rows
 
 
-def _candle(row: dict[str, Any]) -> ParsedRow:
-    return (
-        "candles_1m",
-        {
-            "coin": row["s"],
-            "ts_ms": int(row["t"]),
-            "o": _f(row["o"]),
-            "h": _f(row["h"]),
-            "l": _f(row["l"]),
-            "c": _f(row["c"]),
-            "v": _f(row["v"]),
-            "n": int(row.get("n") or 0),
-        },
-    )
+def _candle(
+    update: dict[str, Any], open_bars: dict[str, tuple[int, dict[str, Any]]]
+) -> list[ParsedRow]:
+    """Fold one candle push into the coin's open bar. Emits the previous bar, if any.
+
+    Four cases, in the order they happen: the first bar of a coin is held; a repeat of
+    the held bar replaces it, because the latest push is the most complete; a newer `t`
+    closes the held bar and emits it; an older `t` is a snapshot replay of a bar already
+    written and is dropped.
+    """
+    coin = update["s"]
+    bar_ms = int(update["t"])
+    row = {
+        "coin": coin,
+        "ts_ms": bar_ms,
+        "o": _f(update["o"]),
+        "h": _f(update["h"]),
+        "l": _f(update["l"]),
+        "c": _f(update["c"]),
+        "v": _f(update["v"]),
+        "n": int(update.get("n") or 0),
+    }
+    held = open_bars.get(coin)
+    if held is not None and bar_ms < held[0]:
+        return []
+    open_bars[coin] = (bar_ms, row)
+    if held is None or bar_ms == held[0]:
+        return []
+    return [("candles_1m", held[1])]
 
 
 def _asset_ctx(data: dict[str, Any], rx_ms: int) -> ParsedRow:

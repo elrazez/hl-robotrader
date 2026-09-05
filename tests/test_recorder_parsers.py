@@ -109,7 +109,7 @@ def rows_for(parsed: list[tuple[str, dict[str, Any] | None]], table: str) -> lis
 
 
 def test_hl_trades_carry_the_aggressor_side() -> None:
-    rows = rows_for(hl.parse(HL_TRADES, RX), "trades")
+    rows = rows_for(hl.make_parser()(HL_TRADES, RX), "trades")
     assert len(rows) == 2
     assert rows[0] == {
         "venue": "hyperliquid",
@@ -125,7 +125,7 @@ def test_hl_trades_carry_the_aggressor_side() -> None:
 
 
 def test_hl_bbo() -> None:
-    (row,) = rows_for(hl.parse(HL_BBO, RX), "bbo")
+    (row,) = rows_for(hl.make_parser()(HL_BBO, RX), "bbo")
     assert row == {
         "coin": "BTC",
         "ts_ms": 1788098889667,
@@ -138,7 +138,7 @@ def test_hl_bbo() -> None:
 
 
 def test_hl_l2_emits_one_row_per_level() -> None:
-    rows = rows_for(hl.parse(HL_L2, RX), "l2")
+    rows = rows_for(hl.make_parser()(HL_L2, RX), "l2")
     assert [row["level"] for row in rows] == [0, 1, 2]
     assert rows[0]["bid_px"] == 78862.0
     assert rows[0]["ask_px"] == 78863.0
@@ -151,13 +151,16 @@ def test_hl_l2_tolerates_one_empty_side() -> None:
         b'{"channel":"l2Book","data":{"coin":"BTC","time":1,'
         b'"levels":[[{"px":"1","sz":"2","n":1}],[]]}}'
     )
-    (row,) = rows_for(hl.parse(thin, RX), "l2")
+    (row,) = rows_for(hl.make_parser()(thin, RX), "l2")
     assert row["bid_px"] == 1.0
     assert row["ask_px"] is None
 
 
 def test_hl_candle_uses_the_symbol_field_for_the_coin() -> None:
-    (row,) = rows_for(hl.parse(HL_CANDLE, RX), "candles_1m")
+    parse = hl.make_parser()
+    assert parse(HL_CANDLE, RX) == []  # held until the next bar proves this one closed
+    next_bar = HL_CANDLE.replace(b'"t":1788098880000', b'"t":1788098940000')
+    (row,) = rows_for(parse(next_bar, RX), "candles_1m")
     assert row == {
         "coin": "BTC",
         "ts_ms": 1788098880000,
@@ -171,7 +174,7 @@ def test_hl_candle_uses_the_symbol_field_for_the_coin() -> None:
 
 
 def test_hl_asset_ctx_stamps_receive_time_because_the_venue_sends_none() -> None:
-    (row,) = rows_for(hl.parse(HL_ASSET_CTX, RX), "asset_ctx")
+    (row,) = rows_for(hl.make_parser()(HL_ASSET_CTX, RX), "asset_ctx")
     assert row["ts_ms"] == RX == row["rx_ms"]
     assert row["mark_px"] == 78862.0
     assert row["oracle_px"] == 78882.6
@@ -182,7 +185,7 @@ def test_hl_asset_ctx_stamps_receive_time_because_the_venue_sends_none() -> None
 
 def test_hl_asset_ctx_carries_the_impact_prices_the_archive_also_has() -> None:
     """`impactPxs` is [bid, ask]: the same spread signal live and for the year."""
-    (row,) = rows_for(hl.parse(HL_ASSET_CTX, RX), "asset_ctx")
+    (row,) = rows_for(hl.make_parser()(HL_ASSET_CTX, RX), "asset_ctx")
     assert (row["impact_bid_px"], row["impact_ask_px"]) == (78862.0, 78863.0)
 
 
@@ -192,13 +195,13 @@ def test_hl_asset_ctx_leaves_a_missing_impact_price_null_rather_than_zero(
 ) -> None:
     """A coin with an empty side sends a short list or none at all."""
     payload = HL_ASSET_CTX.replace(b'"impactPxs":["78862.0","78863.0"],', impact)
-    (row,) = rows_for(hl.parse(payload, RX), "asset_ctx")
+    (row,) = rows_for(hl.make_parser()(payload, RX), "asset_ctx")
     assert row["impact_ask_px"] is None
 
 
 @pytest.mark.parametrize("payload", [HL_SUB_ACK, HL_PONG])
 def test_hl_control_frames_produce_no_rows(payload: bytes) -> None:
-    assert hl.parse(payload, RX) == []
+    assert hl.make_parser()(payload, RX) == []
 
 
 def test_hl_subscribes_every_channel_for_every_coin() -> None:
@@ -331,7 +334,7 @@ def _drops(parsed: list[tuple[str, dict[str, Any] | None]]) -> list[str]:
 
 def test_hl_drops_a_trade_whose_side_token_is_neither_b_nor_a() -> None:
     payload = HL_TRADES.replace(b'"side":"A"', b'"side":"Ask"')
-    parsed = hl.parse(payload, RX)
+    parsed = hl.make_parser()(payload, RX)
     assert _drops(parsed) == ["trades"]
     assert [row["side"] for row in rows_for(parsed, "trades")] == ["buy"]
 
@@ -357,3 +360,62 @@ def test_okx_drops_a_liquidation_whose_order_side_is_unknown() -> None:
     parsed = okx.make_parser(False)(payload, RX)
     assert _drops(parsed) == ["liquidations"]
     assert rows_for(parsed, "liquidations") == []
+
+
+# --- candles: one row per bar, and it is the closed one ------------------------
+
+
+def _candle_frame(t: int, close: float, volume: float) -> bytes:
+    return (
+        b'{"channel":"candle","data":{"t":%d,"T":%d,"s":"BTC","i":"1m",'
+        b'"o":"78862.0","c":"%s","h":"78900.0","l":"78800.0","v":"%s","n":21}}'
+        % (t, t + 59_999, str(close).encode(), str(volume).encode())
+    )
+
+
+def test_a_bar_pushed_repeatedly_yields_one_row_and_it_is_the_closed_one() -> None:
+    """HL pushes the in-progress bar over and over. `candles_1m` has no `rx_ms`, and
+    compaction re-sorts by `ts_ms`, so afterwards nothing could tell which row was the
+    closed bar. The parser now holds a bar until `t` advances and emits the last version."""
+    parse = hl.make_parser()
+    assert parse(_candle_frame(1788098880000, 78863.0, 0.1), RX) == []
+    assert parse(_candle_frame(1788098880000, 78870.0, 0.5), RX) == []
+    assert parse(_candle_frame(1788098880000, 78880.0, 0.8), RX) == []
+
+    # The next bar opening is what proves the previous one closed.
+    (row,) = rows_for(parse(_candle_frame(1788098940000, 78881.0, 0.01), RX), "candles_1m")
+    assert row["ts_ms"] == 1788098880000
+    assert (row["c"], row["v"]) == (78880.0, 0.8)
+
+
+def test_a_snapshot_replayed_after_a_reconnect_does_not_rewrite_bars_already_emitted() -> None:
+    """The subscribe snapshot is a list of recent bars, so a reconnect resends them."""
+    parse = hl.make_parser()
+    parse(_candle_frame(1788098880000, 1.0, 1.0), RX)
+    (row,) = rows_for(parse(_candle_frame(1788098940000, 2.0, 2.0), RX), "candles_1m")
+    assert row["ts_ms"] == 1788098880000
+    # Reconnect: the snapshot repeats the bar that has already been written.
+    assert parse(_candle_frame(1788098880000, 1.0, 1.0), RX) == []
+
+
+def test_the_candle_snapshot_list_emits_every_closed_bar_but_not_the_open_one() -> None:
+    snapshot = (
+        b'{"channel":"candle","data":['
+        b'{"t":1788098760000,"T":1788098819999,"s":"BTC","i":"1m","o":"1","c":"2",'
+        b'"h":"3","l":"0","v":"9","n":1},'
+        b'{"t":1788098820000,"T":1788098879999,"s":"BTC","i":"1m","o":"2","c":"3",'
+        b'"h":"4","l":"1","v":"8","n":2},'
+        b'{"t":1788098880000,"T":1788098939999,"s":"BTC","i":"1m","o":"3","c":"4",'
+        b'"h":"5","l":"2","v":"7","n":3}]}'
+    )
+    rows = rows_for(hl.make_parser()(snapshot, RX), "candles_1m")
+    assert [row["ts_ms"] for row in rows] == [1788098760000, 1788098820000]
+
+
+def test_candles_are_held_per_coin() -> None:
+    parse = hl.make_parser()
+    parse(_candle_frame(1788098880000, 1.0, 1.0), RX)
+    eth = _candle_frame(1788098880000, 2.0, 2.0).replace(b'"s":"BTC"', b'"s":"ETH"')
+    assert parse(eth, RX) == []  # a different coin's first bar, not BTC's advance
+    (row,) = rows_for(parse(_candle_frame(1788098940000, 3.0, 3.0), RX), "candles_1m")
+    assert row["coin"] == "BTC"
