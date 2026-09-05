@@ -31,61 +31,68 @@ import _lib as lib
 
 from liqfade.config.loader import load_settings
 from liqfade.features.episodes import group_episodes
-from liqfade.features.grid import build_grid
 
 MATCH_WINDOW_MS = 120_000
 REDUCED_CLUSTER_BAR = 15
 
 
 def bybit_episodes(args: object, settings: object) -> pl.DataFrame:
-    """Bybit cascades, detected with the same rules and the same HL tape for prices."""
+    """Bybit cascades, detected with the same rules and priced on Hyperliquid's own tape.
+
+    Two stages for the same reason `build_episodes` has two: the gap joining is pure
+    liquidation data, and the tape is only read in a window around what survives it.
+    """
     cfg = settings.features.episodes  # type: ignore[attr-defined]
-    parts = []
-    for first, last in lib.month_chunks(args.start, args.end):  # type: ignore[attr-defined]
-        load_start, load_end = lib.padded(first, last)
-        liquidations = lib.load_table(  # type: ignore[attr-defined]
-            args.data_dir, "liquidations", load_start, load_end, venue="bybit"
+    load_start, load_end = lib.padded(args.start, args.end)  # type: ignore[attr-defined]
+    liquidations = lib.load_table(  # type: ignore[attr-defined]
+        args.data_dir, "liquidations", load_start, load_end, venue="bybit"
+    )
+    if liquidations.is_empty():
+        return pl.DataFrame()
+    detector = {
+        "join_gap_s": cfg.join_gap_s,
+        "peak_window_s": cfg.peak_window_s,
+        "participation": cfg.participation,
+        "participation_window_s": cfg.participation_window_s,
+    }
+    empty_bars = pl.DataFrame(
+        schema={
+            "coin": pl.String,
+            "ts_ms": pl.Int64,
+            "mid": pl.Float64,
+            "notional_usd": pl.Float64,
+        }
+    )
+    window = (pl.col("start_ts") >= lib.ms(args.start)) & (  # type: ignore[attr-defined]
+        pl.col("start_ts") < lib.ms(args.end) + 86_400_000  # type: ignore[attr-defined]
+    )
+    # Only the absolute notional floor here: the trailing p95 is a per-coin rule built from
+    # a venue's own episode history, and Bybit's history in this lake is twelve days.
+    candidates = (
+        group_episodes(liquidations, empty_bars, **detector)
+        .filter(window)
+        .filter(pl.col("total_notional") >= cfg.min_notional_usd)
+    )
+    if candidates.is_empty():
+        return pl.DataFrame()
+    grid = lib.episode_grid(args.data_dir, candidates)  # type: ignore[attr-defined]
+    if grid.is_empty():
+        return pl.DataFrame()
+    move = 1e4 * (pl.col("anchor_px") - pl.col("extreme_px")).abs() / pl.col("anchor_px")
+    kept = (
+        group_episodes(liquidations, grid, **detector)
+        .filter(window)
+        .with_columns(move.alias("move_bps"))
+        .filter(
+            (pl.col("total_notional") >= cfg.min_notional_usd)
+            & (pl.col("move_bps") >= cfg.min_move_bps)
         )
-        trades = lib.load_table(  # type: ignore[attr-defined]
-            args.data_dir, "trades", load_start, load_end, venue="hyperliquid"
-        )
-        if liquidations.is_empty() or trades.is_empty():
-            continue
-        grid = build_grid(
-            trades,
-            None,
-            start_ms=lib.ms(load_start),
-            end_ms=lib.ms(load_end) + 86_400_000,
-            step_ms=lib.GRID_STEP_MS,
-        )
-        episodes = group_episodes(
-            liquidations,
-            grid,
-            join_gap_s=cfg.join_gap_s,
-            peak_window_s=cfg.peak_window_s,
-            participation=cfg.participation,
-            participation_window_s=cfg.participation_window_s,
-        )
-        window = (pl.col("start_ts") >= lib.ms(first)) & (
-            pl.col("start_ts") < lib.ms(last) + 86_400_000
-        )
-        # Only the absolute floors: the trailing p95 is a per-coin rule built from a venue's
-        # own episode history, and Bybit's history is twelve days, not a year.
-        move = 1e4 * (pl.col("anchor_px") - pl.col("extreme_px")).abs() / pl.col("anchor_px")
-        kept = (
-            episodes.filter(window)
-            .with_columns(move.alias("move_bps"))
-            .filter(
-                (pl.col("total_notional") >= cfg.min_notional_usd)
-                & (pl.col("move_bps") >= cfg.min_move_bps)
-            )
-        )
-        if kept.is_empty():
-            continue
-        # Outcomes come from Hyperliquid's tape, not Bybit's: the question is whether HL
-        # reverts, and the same function Q1 uses answers it so the cost model has one home.
-        parts.append(lib.attach_outcomes(kept, grid, trades, args.data_dir, load_start, load_end))
-    return pl.concat(parts) if parts else pl.DataFrame()
+    )
+    if kept.is_empty():
+        return pl.DataFrame()
+    # Outcomes come from Hyperliquid's tape, not Bybit's: the question is whether HL
+    # reverts, and the same function Q1 uses answers it so the cost model has one home.
+    return lib.attach_outcomes(kept, grid, args.data_dir, load_start, load_end)  # type: ignore[attr-defined]
 
 
 def orphans(bybit: pl.DataFrame, hl: pl.DataFrame) -> pl.DataFrame:

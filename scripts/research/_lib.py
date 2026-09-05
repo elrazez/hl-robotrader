@@ -18,6 +18,7 @@ and far inside the spread estimate. Every report says so.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -28,7 +29,7 @@ import polars as pl
 from liqfade.features.context import with_ctx
 from liqfade.features.episodes import group_episodes, qualify_episodes
 from liqfade.features.flow import cvd, realized_vol
-from liqfade.features.grid import build_grid, effective_ts
+from liqfade.features.grid import effective_ts
 from liqfade.features.intensity import liq_intensity
 from liqfade.features.zscore import robust_z
 
@@ -82,30 +83,164 @@ def ms(day: str) -> int:
     return int(datetime.fromisoformat(day).replace(tzinfo=UTC).timestamp() * 1000)
 
 
-def load_table(
-    data_dir: str | Path, table: str, start: str, end: str, *, venue: str | None = None
-) -> pl.DataFrame:
-    """Read one table's partitions over a date range into polars.
+# Columns each table is read with. Every read prunes: `trades` carries nine columns and a
+# single day of it is fifty million rows, so reading `venue`, `source` and `tid` costs a
+# gigabyte of resident memory to throw them away. See docs/DECISIONS.md, 2026-09-05.
+COLUMNS = {
+    "trades": ("coin", "ts_ms", "rx_ms", "px", "sz", "side"),
+    "liquidations": ("venue", "coin", "ts_ms", "rx_ms", "side", "px", "sz", "notional_usd"),
+    "asset_ctx": (
+        "coin",
+        "ts_ms",
+        "rx_ms",
+        "mark_px",
+        "oracle_px",
+        "mid_px",
+        "funding",
+        "open_interest",
+        "day_ntl_vlm",
+        "impact_bid_px",
+        "impact_ask_px",
+    ),
+    "candles_1m": ("coin", "ts_ms", "o", "h", "l", "c", "v", "n"),
+}
+# Tables small enough to hold a year of in memory. `trades` is not one of them: the lake
+# holds 1.79 billion rows of it and a single busy day is fifty million. Anything wanting
+# trades goes through `windowed_trades`, one day at a time.
+DENSE_TABLES = frozenset({"liquidations", "asset_ctx", "candles_1m"})
 
-    Missing days are not an error: a lake that never recorded a day has no directory for
-    it, and a question that needs a day it does not have says inconclusive rather than
-    crashing. Returns an empty frame with no columns when the table is absent entirely,
-    which callers check with `.is_empty()`. Every file of a table shares one schema, which
-    `data/schemas.py` enforces on write, so the whole list reads in one call.
+
+def day_files(data_dir: str | Path, table: str, day: str, venue: str | None = None) -> list[Path]:
+    """The Parquet files for one table on one UTC day.
+
+    Skips names beginning with a dot. macOS writes an AppleDouble `._all_day.parquet`
+    beside every file on an exFAT drive, `Path.glob` returns it, and it is four kilobytes
+    of resource fork that no Parquet reader can open. That is a crash on the owner's disk
+    and on no developer's.
     """
-    root = Path(data_dir) / "parquet" / table
-    files = [
-        str(path)
-        for day in dates(start, end)
-        for path in sorted((root / f"date={day}").glob("*.parquet"))
-        if venue is None or path.name.startswith(f"{venue}_") or path.name.startswith("all_")
-    ]
+    directory = Path(data_dir) / "parquet" / table / f"date={day}"
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path
+        for path in directory.glob("*.parquet")
+        if not path.name.startswith(".")
+        and (venue is None or path.name.startswith((f"{venue}_", "all_")))
+    )
+
+
+def scan_day(
+    data_dir: str | Path,
+    table: str,
+    day: str,
+    *,
+    venue: str | None = None,
+    columns: Sequence[str] | None = None,
+) -> pl.LazyFrame | None:
+    """A lazy frame over one day of one table, projected to the columns that matter.
+
+    Lazy so that the filter a caller adds is pushed into the Parquet reader and whole row
+    groups are skipped rather than read and discarded. Returns None when the day is absent,
+    which is not an error: a lake with a hole in it answers "inconclusive", not a traceback.
+    """
+    files = day_files(data_dir, table, day, venue)
     if not files:
-        return pl.DataFrame()
-    frame = pl.read_parquet(files)
-    if venue is not None and "venue" in frame.columns:
+        return None
+    wanted = tuple(columns) if columns is not None else COLUMNS.get(table)
+    frame = pl.scan_parquet(files)
+    if wanted:
+        frame = frame.select(list(wanted))
+    if venue is not None and "venue" in (wanted or ()):
         frame = frame.filter(pl.col("venue") == venue)
     return frame
+
+
+def load_table(
+    data_dir: str | Path,
+    table: str,
+    start: str,
+    end: str,
+    *,
+    venue: str | None = None,
+    columns: Sequence[str] | None = None,
+    coins: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    """Read a whole table over a date range, one day at a time, pruned to the columns used.
+
+    Only for the tables in `DENSE_TABLES`. A year of liquidations is 5.8 million rows and a
+    year of `asset_ctx` is 117 million, of which the eleven columns here are a fraction; a
+    year of trades is 1.79 billion and asking for it is what killed the first run. Trades go
+    through `windowed_trades` instead, and asking for them here raises rather than swaps the
+    machine to death.
+
+    Missing days are skipped rather than raised on. Returns an empty frame when nothing in
+    the range exists, which callers check with `.is_empty()`.
+    """
+    if table not in DENSE_TABLES:
+        raise ValueError(
+            f"{table!r} is too large to load over a date range; use windowed_trades or "
+            f"scan_day one day at a time"
+        )
+    parts = []
+    for day in dates(start, end):
+        frame = scan_day(data_dir, table, day, venue=venue, columns=columns)
+        if frame is None:
+            continue
+        if coins is not None:
+            frame = frame.filter(pl.col("coin").is_in(list(coins)))
+        collected = frame.collect()
+        if not collected.is_empty():
+            parts.append(collected)
+    return pl.concat(parts) if parts else pl.DataFrame()
+
+
+def merge_windows(windows: list[tuple[int, int]], *, join_ms: int = 0) -> list[tuple[int, int]]:
+    """Collapse overlapping `[from, to]` spans so a filter has as few branches as possible.
+
+    A busy day carries dozens of episodes whose padded windows overlap; expressing them as
+    one predicate per episode makes a filter polars evaluates dozens of times over fifty
+    million rows.
+    """
+    if not windows:
+        return []
+    merged = [list(span) for span in sorted(windows)]
+    out = [merged[0]]
+    for start, end in merged[1:]:
+        if start <= out[-1][1] + join_ms:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([start, end])
+    return [(start, end) for start, end in out]
+
+
+def windowed_trades(
+    data_dir: str | Path, day: str, windows: dict[str, list[tuple[int, int]]]
+) -> pl.DataFrame:
+    """One day's trades, only for the named coins and only inside the named time spans.
+
+    `windows` maps a coin to its `[from_ms, to_ms]` spans. Both filters are pushed into the
+    scan, so a day whose episodes cover a tenth of the tape reads roughly a tenth of the
+    rows rather than all fifty million of them and throwing the rest away.
+
+    The whole memory budget of this phase rests on this function: it is the only place the
+    lake's largest table is read, and it never reads more than one day of it.
+    """
+    if not windows:
+        return pl.DataFrame()
+    frame = scan_day(data_dir, "trades", day, venue="hyperliquid")
+    if frame is None:
+        return pl.DataFrame()
+    branches = [
+        (pl.col("coin") == coin)
+        & pl.any_horizontal(
+            [
+                (pl.col("ts_ms") >= start) & (pl.col("ts_ms") <= end)
+                for start, end in merge_windows(spans)
+            ]
+        )
+        for coin, spans in sorted(windows.items())
+    ]
+    return frame.filter(pl.any_horizontal(branches)).collect()
 
 
 def with_clusters(episodes: pl.DataFrame, *, window_s: int) -> pl.DataFrame:
@@ -262,24 +397,24 @@ def decision(verdict: str, reason: str) -> str:
 # ---------------------------------------------------------------------------------------
 # The shared pipeline: lake to a frame of episodes with their outcomes attached.
 #
-# Chunked by coin and calendar month, because a year of one coin's 1s grid is 31 million
-# rows and twenty coins of it is not going to fit in memory. Each chunk is loaded with a
-# 24h warm-up in front, so the z-score's trailing distribution is full before the first
-# episode of the month is judged, and a 65 minute pad behind, so the +60 minute horizon of
-# an episode on the last day of the month has tape to read.
+# Two stages, because the lake's tables differ in size by three orders of magnitude.
 #
-# ponytail: a year of one coin costs about 275s through the whole feature set, against the
-# 60s budget in prompts/03_research.md, so a year of a twenty coin universe is a few hours
-# rather than twenty minutes. Nothing loops over rows; the cost is that a year at 1s is 31.5
-# million rows and every rolling op with `.over("coin")` re-partitions and re-materialises
-# them. The upgrade path, if the owner ever needs the run to be interactive, is to fold the
-# four flow functions into one pass over one sort instead of four, which measurement puts at
-# roughly a 3x win. Not taken now: it would merge four tested seams into one to speed up a
-# job that runs once.
+# Stage A reads liquidations only, 5.8 million rows for the year, and needs no trades at
+# all: gap joining is pure liquidation data, and so is the trailing p95, and so is the
+# z-score, whose distribution is a one-minute grid of liquidation notional. It ends with
+# the episodes that could still qualify once a price is attached.
+#
+# Stage B reads trades, and reads them only in a window around each surviving episode, one
+# UTC day at a time, aggregating each day to a 1s grid and releasing the raw rows before
+# the next day is opened. The grid for a year of episodes is a few million rows; the trades
+# behind it are 1.79 billion and would need 23 GB of the owner's 8 GB machine.
+#
+# The science is unchanged by any of this. `group_episodes` is still called on the full set
+# of liquidations, so the unfiltered episode count is the true one; episodes that Stage A
+# ruled out simply have no bars under them, which leaves their anchor and extreme null and
+# fails them on the move floor, exactly as a dense run would.
 # ---------------------------------------------------------------------------------------
 
-WARMUP_MS = 25 * 3_600_000  # the 24h z lookback plus an hour of slack for the longest window
-HORIZON_PAD_MS = 65 * 60_000  # the +60 minute horizon plus slack
 GRID_STEP_MS = 1000
 HORIZONS_MIN = (1, 5, 15, 30, 60)
 CLUSTER_WINDOW_S = 300
@@ -287,6 +422,13 @@ CLUSTER_WINDOW_S = 300
 Z_WINDOW_S = 60
 # rv_5m: the vol the stop distance is measured in (config intent.k_stop).
 RV_WINDOW_S = 300
+# Seconds of grid in front of an episode. It has to cover the realized-vol window, because
+# `realized_vol` counts rows rather than time and a shorter lead-in would let the window
+# reach back into whatever grid rows precede it. 360 > 300 with a minute to spare.
+LEAD_IN_S = 360
+# Seconds of grid behind an episode: the +60 minute horizon plus the capacity window plus
+# the join gap the extreme search runs to, and slack.
+TRAIL_S = 66 * 60
 
 
 def month_chunks(start: str, end: str) -> list[tuple[str, str]]:
@@ -314,65 +456,358 @@ def padded(start: str, end: str) -> tuple[str, str]:
 def coin_tiers(data_dir: str | Path, start: str, end: str, core: tuple[str, ...]) -> dict[str, str]:
     """core, major or minor per coin, by median daily notional volume over the window.
 
-    Reads `asset_ctx.day_ntl_vlm`, which is Hyperliquid's own rolling 24h figure, so the
-    median over the window is the coin's typical day. Coins with no `asset_ctx` rows are
-    minor: an unranked coin is not a top-20 coin.
+    Reads `asset_ctx.day_ntl_vlm`, Hyperliquid's own rolling 24h figure, one day at a time
+    and reduced to one row per coin per day before the next day is opened: the raw column is
+    117 million rows for the year and the answer is 229 numbers. Coins with no `asset_ctx`
+    rows are minor, since an unranked coin is not a top-20 coin.
     """
-    ctx = load_table(data_dir, "asset_ctx", start, end)
-    if ctx.is_empty():
+    daily = []
+    for day in dates(start, end):
+        frame = scan_day(data_dir, "asset_ctx", day, columns=("coin", "day_ntl_vlm"))
+        if frame is None:
+            continue
+        daily.append(frame.group_by("coin").agg(pl.col("day_ntl_vlm").median()).collect())
+    if not daily:
         return {}
     ranked = (
-        ctx.group_by("coin")
+        pl.concat(daily)
+        .group_by("coin")
         .agg(pl.col("day_ntl_vlm").median().alias("volume"))
         .sort("volume", descending=True)
     )
-    tiers = {}
     majors = [coin for coin in ranked["coin"].to_list() if coin not in core][:20]
-    for coin in ranked["coin"].to_list():
-        tiers[coin] = "core" if coin in core else ("major" if coin in majors else "minor")
-    return tiers
+    return {
+        coin: "core" if coin in core else ("major" if coin in majors else "minor")
+        for coin in ranked["coin"].to_list()
+    }
 
 
-def _chunk_episodes(
-    data_dir: str | Path, start: str, end: str, settings: object
-) -> pl.DataFrame | None:
-    """Detect and qualify every episode starting inside [start, end], with its outcomes."""
+def _liquidation_z(
+    liquidations: pl.DataFrame, episodes: pl.DataFrame, settings: object
+) -> pl.DataFrame:
+    """The highest `liq_z_60s` reached inside each episode, from liquidations alone.
+
+    No trades are involved. The z-score's distribution is the trailing 24h of one-minute
+    liquidation notional and the value being scored is the same quantity at the tick, so
+    both come from the liquidation table.
+
+    Two grids per coin, because `liq_intensity` measures its window in rows and a
+    mixed-resolution frame would make one window mean two things:
+
+    - a one-minute grid over the coin's span, which supplies the trailing distribution;
+    - a 1s grid over the episode windows, each carrying 60 seconds of lead-in so the 60s
+      rolling window at the episode's first tick is full and reaches back only into that
+      episode's own lead-in. Episodes on one coin are more than the join gap apart, so
+      those windows never overlap.
+
+    Membership is tagged rather than joined. The previous version joined episodes to scored
+    ticks on coin and side and filtered by time afterwards, which is a cross product: a
+    month is 22,000 episodes against 15 million scored rows, and it is what killed the
+    first full run.
+    """
     features = settings.features  # type: ignore[attr-defined]
-    cfg = features.episodes
-    load_start, load_end = padded(start, end)
-    trades = load_table(data_dir, "trades", load_start, load_end, venue="hyperliquid")
-    liquidations = load_table(data_dir, "liquidations", load_start, load_end, venue="hyperliquid")
-    if trades.is_empty() or liquidations.is_empty():
-        return None
+    blank = episodes.with_columns(pl.lit(None, dtype=pl.Float64).alias("max_liq_z"))
+    if liquidations.is_empty() or episodes.is_empty():
+        return blank
+    minute_ms = Z_WINDOW_S * 1000
+    spans = episodes.select("coin", "side", "start_ts", "end_ts")
+    # One row per episode per second it covers. This is what says which ticks belong to
+    # which episode, and it is the only thing that ever carries the episode key.
+    membership = spans.with_columns(
+        pl.int_ranges(
+            (pl.col("start_ts") // GRID_STEP_MS) * GRID_STEP_MS,
+            pl.col("end_ts") + GRID_STEP_MS,
+            GRID_STEP_MS,
+            dtype=pl.Int64,
+        ).alias("ts_ms")
+    ).explode("ts_ms")
+    peaks = []
+    for coin in sorted(episodes["coin"].unique().to_list()):
+        coin_liqs = liquidations.filter(pl.col("coin") == coin)
+        if coin_liqs.is_empty():
+            continue
+        first = int(coin_liqs["ts_ms"].min()) // minute_ms * minute_ms
+        last = int(coin_liqs["ts_ms"].max()) // minute_ms * minute_ms + minute_ms
+        minutes = pl.DataFrame(
+            {"coin": coin, "ts_ms": range(first, last + minute_ms, minute_ms)},
+            schema={"coin": pl.String, "ts_ms": pl.Int64},
+        )
+        distribution = liq_intensity(
+            coin_liqs,
+            minutes,
+            windows_s=[Z_WINDOW_S],
+            step_ms=minute_ms,
+            weights={"hyperliquid": 1.0},
+        )
+        windows = spans.filter(pl.col("coin") == coin).select(
+            "coin",
+            (pl.col("start_ts") - minute_ms).alias("from"),
+            pl.col("end_ts").alias("to"),
+        )
+        ticks = (
+            windows.with_columns(
+                pl.int_ranges(
+                    (pl.col("from") // GRID_STEP_MS) * GRID_STEP_MS,
+                    pl.col("to") + GRID_STEP_MS,
+                    GRID_STEP_MS,
+                    dtype=pl.Int64,
+                ).alias("ts_ms")
+            )
+            .explode("ts_ms")
+            .select("coin", "ts_ms")
+            .unique()
+            .sort("ts_ms")
+        )
+        inside = liq_intensity(
+            coin_liqs,
+            ticks,
+            windows_s=[Z_WINDOW_S],
+            step_ms=GRID_STEP_MS,
+            weights={"hyperliquid": 1.0},
+        )
+        # A tick landing exactly on a minute carries the same trailing sum as the minute
+        # grid row there, so dropping the duplicate is lossless and keeps one sample per
+        # minute in the distribution the rolling median is built from.
+        both = pl.concat([distribution, inside]).unique(subset=["coin", "ts_ms"], keep="first")
+        columns = [f"liq_{side}_usd_{Z_WINDOW_S}s" for side in ("long", "short")]
+        z = robust_z(
+            both.sort("ts_ms"),
+            columns,
+            lookback_h=features.z_lookback_h,
+            sample_s=Z_WINDOW_S,
+            robust=features.z_robust,
+        ).select("coin", "ts_ms", *[f"{column}_z" for column in columns])
+        # Reduced to one row per episode before the next coin is started. Keeping each
+        # coin's whole minute grid instead is what took a month of this to 2.2 GB: the
+        # grids are the year, and the answer is one number per episode.
+        per_side = pl.concat(
+            [
+                z.select(
+                    "coin",
+                    "ts_ms",
+                    pl.lit(side).alias("side"),
+                    pl.col(f"liq_{side}_usd_{Z_WINDOW_S}s_z").alias("z"),
+                )
+                for side in ("long", "short")
+            ]
+        )
+        peaks.append(
+            membership.filter(pl.col("coin") == coin)
+            .join(per_side, on=["coin", "side", "ts_ms"], how="left")
+            .group_by("coin", "side", "start_ts")
+            .agg(pl.col("z").max().alias("max_liq_z"))
+        )
+        del distribution, inside, both, z, per_side
+    if not peaks:
+        return blank
+    peak = pl.concat(peaks)
+    return episodes.join(peak, on=["coin", "side", "start_ts"], how="left")
 
-    grid_start = ms(load_start)
-    grid_end = ms(load_end) + 86_400_000
-    grid = build_grid(trades, None, start_ms=grid_start, end_ms=grid_end, step_ms=GRID_STEP_MS)
-    intensity = liq_intensity(
-        liquidations,
-        grid,
-        windows_s=list(features.windows_s),
-        step_ms=GRID_STEP_MS,
-        weights={"hyperliquid": 1.0},
+
+def _grid_windows(episodes: pl.DataFrame) -> dict[str, dict[str, list[tuple[int, int]]]]:
+    """Per UTC day, per coin, the `[from, to]` spans of tape an episode needs.
+
+    The lead-in covers the realized-vol window and the VWAP anchor; the trail covers the
+    extreme search, the capacity window and the +60 minute horizon. A window that crosses
+    midnight appears under both days, so each day's read is self-contained.
+    """
+    windows: dict[str, dict[str, list[tuple[int, int]]]] = {}
+    for row in episodes.iter_rows(named=True):
+        first = int(row["start_ts"]) - LEAD_IN_S * 1000
+        last = int(row["end_ts"]) + TRAIL_S * 1000
+        for day_ms in range(first // 86_400_000 * 86_400_000, last + 86_400_000, 86_400_000):
+            day = datetime.fromtimestamp(day_ms / 1000, UTC).strftime("%Y-%m-%d")
+            windows.setdefault(day, {}).setdefault(row["coin"], []).append((first, last))
+    return windows
+
+
+def _windowed_second_bars(
+    data_dir: str | Path, day: str, windows: dict[str, list[tuple[int, int]]]
+) -> pl.DataFrame:
+    """Per-second aggregates for one day, filtered to the windows inside the Parquet scan.
+
+    The filter and the aggregation are one lazy query, so a day of fifty million prints is
+    never a frame: rows outside the windows are skipped by the reader, and the rows inside
+    are reduced to one per coin per second as they stream. This is the single hottest place
+    in the phase for memory, and everything else in Stage B is small because of it.
+    """
+    scan = scan_day(data_dir, "trades", day, venue="hyperliquid")
+    if scan is None or not windows:
+        return pl.DataFrame()
+    branches = [
+        (pl.col("coin") == coin)
+        & pl.any_horizontal(
+            [
+                (pl.col("ts_ms") >= start) & (pl.col("ts_ms") <= end)
+                for start, end in merge_windows(spans)
+            ]
+        )
+        for coin, spans in sorted(windows.items())
+    ]
+    known = pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
+    return (
+        scan.filter(pl.any_horizontal(branches))
+        .with_columns(known.alias("known"))
+        .with_columns(
+            ((pl.col("known") // GRID_STEP_MS) * GRID_STEP_MS + GRID_STEP_MS).alias("ts_ms")
+        )
+        .group_by("coin", "ts_ms")
+        .agg(
+            pl.col("px").sort_by("known").last().alias("last_px"),
+            (pl.col("px") * pl.col("sz")).sum().alias("notional_usd"),
+            pl.col("sz").sum().alias("volume"),
+            (
+                pl.when(pl.col("side") == "buy")
+                .then(pl.col("px") * pl.col("sz"))
+                .otherwise(-pl.col("px") * pl.col("sz"))
+            )
+            .sum()
+            .alias("signed_notional"),
+            pl.len().alias("n_trades"),
+        )
+        .collect(engine="streaming")
     )
-    if Z_WINDOW_S not in features.windows_s:
-        raise SystemExit(f"features.windows_s must contain {Z_WINDOW_S}, the z window")
-    scored = robust_z(
-        intensity,
-        [f"liq_long_usd_{Z_WINDOW_S}s", f"liq_short_usd_{Z_WINDOW_S}s"],
-        lookback_h=features.z_lookback_h,
-        sample_s=int(features.z_grid_s),
-        robust=features.z_robust,
+
+
+def _dense_windows(windows: dict[str, list[tuple[int, int]]]) -> pl.DataFrame:
+    """Every 1s grid timestamp inside the windows, as a (coin, ts_ms) frame."""
+    rows = [
+        {"coin": coin, "from": start, "to": end}
+        for coin, spans in windows.items()
+        for start, end in merge_windows(spans)
+    ]
+    if not rows:
+        return pl.DataFrame(schema={"coin": pl.String, "ts_ms": pl.Int64})
+    frame = pl.DataFrame(rows, schema={"coin": pl.String, "from": pl.Int64, "to": pl.Int64})
+    return (
+        frame.with_columns(
+            pl.int_ranges(
+                (pl.col("from") // GRID_STEP_MS) * GRID_STEP_MS,
+                pl.col("to") + GRID_STEP_MS,
+                GRID_STEP_MS,
+                dtype=pl.Int64,
+            ).alias("ts_ms")
+        )
+        .explode("ts_ms")
+        .select("coin", "ts_ms")
+        .unique()
     )
-    episodes = group_episodes(
-        liquidations,
-        grid,
-        join_gap_s=cfg.join_gap_s,
-        peak_window_s=cfg.peak_window_s,
-        participation=cfg.participation,
-        participation_window_s=cfg.participation_window_s,
+
+
+def episode_grid(data_dir: str | Path, episodes: pl.DataFrame) -> pl.DataFrame:
+    """A 1s grid covering only the tape each episode needs, built one UTC day at a time.
+
+    This is the whole of Stage B's memory story. A day of trades is fifty million rows; the
+    grid it reduces to, for the handful of coins with an episode that day and only inside
+    their windows, is tens of thousands. The raw rows are never materialised: the coin and
+    time filters are pushed into the Parquet scan and the aggregation to seconds happens as
+    the rows stream past.
+
+    Windows are dense at 1s within themselves and have gaps between them. `realized_vol`
+    counts rows rather than seconds, so a window's first `RV_WINDOW_S` rows would read back
+    into the previous window; every window carries `LEAD_IN_S` seconds of lead-in in front
+    of the episode precisely so that the extreme, which is the only place rv is ever read,
+    is past that reach. Nothing may read rv inside the lead-in.
+    """
+    if episodes.is_empty():
+        return pl.DataFrame()
+    parts = []
+    for day, coins in sorted(_grid_windows(episodes).items()):
+        bars = _windowed_second_bars(data_dir, day, coins)
+        if bars.is_empty():
+            continue
+        dense = _dense_windows(coins).filter(
+            (pl.col("ts_ms") >= ms(day)) & (pl.col("ts_ms") < ms(day) + 86_400_000)
+        )
+        kept = (
+            dense.join(bars, on=["coin", "ts_ms"], how="left")
+            .sort("coin", "ts_ms")
+            .with_columns(
+                pl.col("last_px").forward_fill().over("coin").alias("mid"),
+                pl.col("notional_usd").fill_null(0.0),
+                pl.col("volume").fill_null(0.0),
+                pl.col("signed_notional").fill_null(0.0),
+                pl.col("n_trades").fill_null(0),
+            )
+            .drop("last_px")
+            .filter(pl.col("mid").is_not_null())
+        )
+        if not kept.is_empty():
+            parts.append(kept)
+        del bars, dense
+    if not parts:
+        return pl.DataFrame()
+    return pl.concat(parts).unique(subset=["coin", "ts_ms"], keep="first").sort("coin", "ts_ms")
+
+
+def build_episodes(
+    data_dir: str | Path, start: str, end: str, settings: object, *, cache: Path | None = None
+) -> pl.DataFrame:
+    """Every episode in the window, with outcomes, tier and cluster on the ones that qualify.
+
+    Written to `cache` as Parquet so the eight scripts do not each rebuild a year, and read
+    back from it when it exists. Delete the file to force a rebuild.
+    """
+    if cache is not None and cache.exists():
+        cached = pl.read_parquet(cache)
+        if not cached.is_empty():
+            return cached
+    cfg = settings.features.episodes  # type: ignore[attr-defined]
+    load_start, load_end = padded(start, end)
+    liquidations = load_table(data_dir, "liquidations", load_start, load_end, venue="hyperliquid")
+    if liquidations.is_empty():
+        return pl.DataFrame()
+
+    # Stage A: every episode there is, from liquidations alone, then the ones a price could
+    # still qualify. `group_episodes` tolerates an empty bars frame and leaves the anchor
+    # and extreme null, which is exactly the shape this stage wants.
+    empty_bars = pl.DataFrame(
+        schema={
+            "coin": pl.String,
+            "ts_ms": pl.Int64,
+            "mid": pl.Float64,
+            "notional_usd": pl.Float64,
+        }
     )
-    episodes = _attach_max_z(episodes, scored)
+    detector = {
+        "join_gap_s": cfg.join_gap_s,
+        "peak_window_s": cfg.peak_window_s,
+        "participation": cfg.participation,
+        "participation_window_s": cfg.participation_window_s,
+    }
+    window = (pl.col("start_ts") >= ms(start)) & (pl.col("start_ts") < ms(end) + 86_400_000)
+    candidates = group_episodes(liquidations, empty_bars, **detector).filter(window)
+    if candidates.is_empty():
+        return pl.DataFrame()
+    candidates = _liquidation_z(liquidations, candidates, settings)
+    candidates = qualify_episodes(
+        candidates.with_columns(
+            # The move floor cannot be judged without a price, so it is left to Stage B; the
+            # notional and relative rules are pure liquidation data and cut the list here.
+            pl.lit(None, dtype=pl.Float64).alias("anchor_px"),
+            pl.lit(None, dtype=pl.Float64).alias("extreme_px"),
+        ),
+        min_notional_usd=cfg.min_notional_usd,
+        min_move_bps=cfg.min_move_bps,
+        p95_lookback_d=cfg.p95_lookback_d,
+        liq_z_min=cfg.liq_z_min,
+    ).filter(
+        (pl.col("total_notional") >= cfg.min_notional_usd)
+        & (pl.col("passes_p95") | pl.col("passes_z"))
+    )
+
+    # Stage B: tape only where Stage A left something worth pricing.
+    grid = episode_grid(data_dir, candidates)
+    if grid.is_empty():
+        return pl.DataFrame()
+    episodes = group_episodes(liquidations, grid, **detector).filter(window)
+    # The z was computed in Stage A from liquidations alone and is carried across rather
+    # than recomputed: the same episode keys, the same numbers, no second pass.
+    episodes = episodes.join(
+        candidates.select("coin", "side", "start_ts", "max_liq_z"),
+        on=["coin", "side", "start_ts"],
+        how="left",
+    )
     episodes = qualify_episodes(
         episodes,
         min_notional_usd=cfg.min_notional_usd,
@@ -380,44 +815,33 @@ def _chunk_episodes(
         p95_lookback_d=cfg.p95_lookback_d,
         liq_z_min=cfg.liq_z_min,
     )
-    window = (pl.col("start_ts") >= ms(start)) & (pl.col("start_ts") < ms(end) + 86_400_000)
-    return attach_outcomes(episodes.filter(window), grid, trades, data_dir, load_start, load_end)
-
-
-def _attach_max_z(episodes: pl.DataFrame, scored: pl.DataFrame) -> pl.DataFrame:
-    """The highest liq z of the liquidated side reached anywhere inside the episode."""
-    window_s = Z_WINDOW_S
-    per_side = pl.concat(
-        [
-            scored.select(
-                "coin",
-                "ts_ms",
-                pl.lit(side).alias("side"),
-                pl.col(f"liq_{side}_usd_{window_s}s_z").alias("z"),
-            )
-            for side in ("long", "short")
-        ]
-    )
-    joined = episodes.join(per_side, on=["coin", "side"], how="left").filter(
-        (pl.col("ts_ms") >= pl.col("start_ts")) & (pl.col("ts_ms") <= pl.col("end_ts"))
-    )
-    peak = joined.group_by("coin", "side", "start_ts").agg(pl.col("z").max().alias("max_liq_z"))
-    return episodes.join(peak, on=["coin", "side", "start_ts"], how="left")
+    episodes = attach_outcomes(episodes, grid, data_dir, load_start, load_end)
+    tiers = coin_tiers(data_dir, start, end, tuple(settings.universe.core_coins))  # type: ignore[attr-defined]
+    episodes = episodes.with_columns(
+        pl.col("coin").replace_strict(tiers, default="minor").alias("tier")
+    ).sort("start_ts")
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        episodes.write_parquet(cache)
+    return episodes
 
 
 def attach_outcomes(
     episodes: pl.DataFrame,
     grid: pl.DataFrame,
-    trades: pl.DataFrame,
     data_dir: str | Path,
-    load_start: str,
-    load_end: str,
+    start: str,
+    end: str,
 ) -> pl.DataFrame:
     """Entry prices, horizon mids, spread and the filter inputs, read forward from the extreme.
 
     Public because Q4 measures Bybit-detected episodes on Hyperliquid's own tape, which is
-    the same measurement on a different set of episodes, and a second copy of it would be
-    a second chance to get the cost model wrong.
+    the same measurement on a different set of episodes, and a second copy of it would be a
+    second chance to get the cost model wrong.
+
+    Everything here reads the grid rather than the tape. The entry price is the grid's own
+    mid at the first step at or after the delay, which for the historical year is the last
+    print in that second, since `grid.mid` is the last trade price where no bbo exists.
     """
     if episodes.is_empty():
         return episodes
@@ -429,25 +853,10 @@ def attach_outcomes(
         pl.concat_str(["coin", "side", pl.col("start_ts").cast(pl.String)], separator="/").alias(
             "key"
         ),
+        (pl.col("extreme_ts") + int(ENTRY_DELAY_S * 1000)).alias("entry_ts"),
     )
-    entry_at = (pl.col("extreme_ts") + int(ENTRY_DELAY_S * 1000)).alias("entry_ts")
-    prints = (
-        trades.with_columns(effective_ts())
-        .select("coin", pl.col("known").alias("_print_ts"), pl.col("px").alias("entry_px_delayed"))
-        .sort("_print_ts")
-    )
-    # The first actual print at or after the delay, not the next grid mid. The two differ by
-    # up to a step, and Q8 measures excursions against this price, so a grid mid would show
-    # a trade going against itself before it was ever opened.
-    out = (
-        out.with_columns(entry_at)
-        .sort("entry_ts")
-        .join_asof(prints, left_on="entry_ts", right_on="_print_ts", by="coin", strategy="forward")
-        .drop("_print_ts")
-    )
-    out = _mid_at(out, mids, "end_ts", "mid_at_end")
-    # rv at the extreme, which reads only the five minutes before it. This is the unit
-    # k_stop is expressed in, so Q8 needs it on every episode.
+    out = _mid_at(out, mids, "entry_ts", "entry_px_delayed", strategy="forward")
+    out = _mid_at(out, mids, "end_ts", "mid_at_end", strategy="forward")
     out = (
         out.sort("extreme_ts")
         .join_asof(
@@ -465,50 +874,17 @@ def attach_outcomes(
     )
     for minutes in HORIZONS_MIN:
         out = out.with_columns((pl.col("extreme_ts") + minutes * 60_000).alias(f"_h{minutes}"))
-        out = _mid_at(out, mids, f"_h{minutes}", f"mid_plus_{minutes}m")
+        out = _mid_at(out, mids, f"_h{minutes}", f"mid_plus_{minutes}m", strategy="forward")
     out = out.drop([f"_h{minutes}" for minutes in HORIZONS_MIN])
-    out = _attach_spread(out, trades, data_dir, load_start, load_end)
-    out = _attach_filter_inputs(out, trades, data_dir, load_start, load_end)
+    out = _attach_spread(out, grid, data_dir, start, end)
+    out = _attach_filter_inputs(out, grid, data_dir, start, end)
     return with_clusters(out, window_s=CLUSTER_WINDOW_S)
 
 
-def _attach_filter_inputs(
-    frame: pl.DataFrame, trades: pl.DataFrame, data_dir: str | Path, start: str, end: str
+def _mid_at(
+    frame: pl.DataFrame, mids: pl.DataFrame, when: str, alias: str, *, strategy: str
 ) -> pl.DataFrame:
-    """The columns Q6 splits the sample by: funding, session hour and listing age.
-
-    `since_listing_days` is measured from the coin's first print inside the loaded window,
-    so a coin listed before the lake starts reads as old as the lake and no older. Q6 says
-    so, because the filter it feeds is "listed under 14 days" and the lake is a year.
-    """
-    ctx = load_table(data_dir, "asset_ctx", start, end)
-    if ctx.is_empty():
-        frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("funding_at_start"))
-    else:
-        samples = ctx.select(
-            "coin", pl.col("ts_ms").alias("_f_ts"), pl.col("funding").alias("funding_at_start")
-        ).sort("_f_ts")
-        frame = (
-            frame.with_columns((pl.col("start_ts") - 1).alias("_before"))
-            .sort("_before")
-            .join_asof(samples, left_on="_before", right_on="_f_ts", by="coin", strategy="backward")
-            .drop("_before", "_f_ts")
-        )
-    first_print = trades.group_by("coin").agg(pl.col("ts_ms").min().alias("_first_print"))
-    return (
-        frame.join(first_print, on="coin", how="left")
-        .with_columns(
-            ((pl.col("start_ts") - pl.col("_first_print")) / 86_400_000).alias(
-                "since_listing_days"
-            ),
-            pl.col("start_ts").cast(pl.Datetime("ms")).dt.hour().alias("session_hour"),
-        )
-        .drop("_first_print")
-    )
-
-
-def _mid_at(frame: pl.DataFrame, mids: pl.DataFrame, when: str, alias: str) -> pl.DataFrame:
-    """The first grid mid at or after `when`, which is the first price a fill could use."""
+    """The grid mid at or after `when`, which is the first price a fill could have used."""
     return (
         frame.sort(when)
         .join_asof(
@@ -516,24 +892,54 @@ def _mid_at(frame: pl.DataFrame, mids: pl.DataFrame, when: str, alias: str) -> p
             left_on=when,
             right_on=f"_{alias}_ts",
             by="coin",
-            strategy="forward",
+            strategy=strategy,  # type: ignore[arg-type]
         )
         .drop(f"_{alias}_ts")
     )
 
 
-def _attach_spread(
-    frame: pl.DataFrame, trades: pl.DataFrame, data_dir: str | Path, start: str, end: str
-) -> pl.DataFrame:
-    """The wider of Hyperliquid's own impact spread and the tape's flip-to-flip move.
+def _ctx_for(data_dir: str | Path, start: str, end: str, coins: list[str]) -> pl.DataFrame:
+    """The asset context for the coins in play, one day at a time, columns pruned.
 
-    The archive sample used is the last one at or before the entry, so it precedes the
-    trade it prices. The tape estimator is the mean absolute price change between
-    consecutive prints whose aggressor side flips, over the 60s after the extreme, which is
-    the classic effective spread and reads the cascade minute itself rather than the calm
-    minute before it.
+    The union of what `features/context.py` reads and what the spread and funding joins
+    read, which is everything but `day_ntl_vlm`. `asset_ctx` is 117 million rows for the
+    year; a coin filter and a day at a time keep that to what the episodes need.
     """
-    ctx = load_table(data_dir, "asset_ctx", start, end)
+    return load_table(
+        data_dir,
+        "asset_ctx",
+        start,
+        end,
+        columns=(
+            "coin",
+            "ts_ms",
+            "rx_ms",
+            "mark_px",
+            "oracle_px",
+            "mid_px",
+            "funding",
+            "premium",
+            "open_interest",
+            "impact_bid_px",
+            "impact_ask_px",
+        ),
+        coins=coins,
+    )
+
+
+def _attach_spread(
+    frame: pl.DataFrame, grid: pl.DataFrame, data_dir: str | Path, start: str, end: str
+) -> pl.DataFrame:
+    """The wider of Hyperliquid's own impact spread and the tape's own move, per episode.
+
+    The archive sample used is the last one at or before the entry, so it precedes the trade
+    it prices. The tape estimator reads the grid's 1s mid changes over the 60s after the
+    extreme rather than the raw prints: the raw prints are the table this phase cannot hold,
+    and a mean absolute 1s move over a cascade minute is the same order of magnitude and
+    errs wide, which is the direction the cost model is supposed to err in.
+    """
+    coins = frame["coin"].unique().to_list()
+    ctx = _ctx_for(data_dir, start, end, coins)
     if ctx.is_empty():
         frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("archive_spread_bps"))
     else:
@@ -555,61 +961,85 @@ def _attach_spread(
             )
             .drop("_ctx_ts")
         )
-    return effective_spread_bps(frame.join(_tape_spread(trades, frame), on="key", how="left"))
+    return effective_spread_bps(frame.join(_tape_spread(grid, frame), on="key", how="left"))
 
 
-def _tape_spread(trades: pl.DataFrame, episodes: pl.DataFrame) -> pl.DataFrame:
-    """Mean absolute move between consecutive prints that flip aggressor side, per episode."""
-    flips = (
-        trades.sort("coin", "ts_ms")
+def _tape_spread(grid: pl.DataFrame, episodes: pl.DataFrame) -> pl.DataFrame:
+    """Mean absolute 1s mid move over the 60s after the extreme, in bps, per episode.
+
+    Membership is tagged, not joined on. Joining episodes to the grid on `coin` and
+    filtering by time afterwards is a cross product: a month is 22,000 episodes against a
+    grid of millions, and that join is what killed the run after the z-score one was fixed.
+    Here each episode expands to the sixty second-stamps it cares about and the join is an
+    equality join on `(coin, ts_ms)`.
+    """
+    windows = episodes.select("key", "coin", "extreme_ts").drop_nulls("extreme_ts")
+    if windows.is_empty() or grid.is_empty():
+        return pl.DataFrame(schema={"key": pl.String, "trade_spread_bps": pl.Float64})
+    membership = windows.with_columns(
+        pl.int_ranges(
+            pl.col("extreme_ts") + GRID_STEP_MS,
+            pl.col("extreme_ts") + 60_000 + GRID_STEP_MS,
+            GRID_STEP_MS,
+            dtype=pl.Int64,
+        ).alias("ts_ms")
+    ).explode("ts_ms")
+    moves = (
+        grid.sort("coin", "ts_ms")
         .with_columns(
-            (pl.col("side") != pl.col("side").shift(1).over("coin")).alias("flipped"),
-            (pl.col("px") - pl.col("px").shift(1).over("coin")).abs().alias("move"),
-            pl.col("px").alias("at"),
+            (pl.col("mid") - pl.col("mid").shift(1).over("coin")).abs().alias("move"),
+            pl.col("mid").alias("at"),
         )
-        .filter(pl.col("flipped"))
+        .filter(pl.col("move") > 0)
         .select("coin", "ts_ms", "move", "at")
     )
-    windows = episodes.select(
-        "key", "coin", "extreme_ts", (pl.col("extreme_ts") + 60_000).alias("_until")
-    )
-    joined = windows.join(flips, on="coin", how="left").filter(
-        (pl.col("ts_ms") > pl.col("extreme_ts")) & (pl.col("ts_ms") <= pl.col("_until"))
-    )
-    return joined.group_by("key").agg(
-        (1e4 * (pl.col("move") / pl.col("at")).mean()).alias("trade_spread_bps")
+    return (
+        membership.join(moves, on=["coin", "ts_ms"], how="inner")
+        .group_by("key")
+        .agg((1e4 * (pl.col("move") / pl.col("at")).mean()).alias("trade_spread_bps"))
     )
 
 
-def build_episodes(
-    data_dir: str | Path, start: str, end: str, settings: object, *, cache: Path | None = None
+def _attach_filter_inputs(
+    frame: pl.DataFrame, grid: pl.DataFrame, data_dir: str | Path, start: str, end: str
 ) -> pl.DataFrame:
-    """Every qualifying episode in the window, with outcomes, tier and cluster attached.
+    """The columns Q6 splits the sample by: funding, session hour and listing age.
 
-    Written to `cache` as Parquet so the eight scripts do not each rebuild a year, and read
-    back from it when it already covers the window. Delete the file to force a rebuild.
+    `since_listing_days` is measured from the coin's first `asset_ctx` sample in the window,
+    so a coin listed before the lake starts reads as old as the lake and no older. Q6 says
+    so, because the filter it feeds is "listed under 14 days" and the lake is a year.
     """
-    if cache is not None and cache.exists():
-        cached = pl.read_parquet(cache)
-        if not cached.is_empty():
-            return cached
-    parts = [
-        chunk
-        for first, last in month_chunks(start, end)
-        if (chunk := _chunk_episodes(data_dir, first, last, settings)) is not None
-        and not chunk.is_empty()
-    ]
-    if not parts:
-        return pl.DataFrame()
-    episodes = pl.concat(parts, how="diagonal_relaxed").sort("start_ts")
-    tiers = coin_tiers(data_dir, start, end, tuple(settings.universe.core_coins))  # type: ignore[attr-defined]
-    episodes = episodes.with_columns(
-        pl.col("coin").replace_strict(tiers, default="minor").alias("tier")
+    coins = frame["coin"].unique().to_list()
+    ctx = _ctx_for(data_dir, start, end, coins)
+    if ctx.is_empty():
+        frame = frame.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("funding_at_start"),
+            pl.lit(None, dtype=pl.Float64).alias("since_listing_days"),
+        )
+    else:
+        samples = ctx.select(
+            "coin",
+            pl.col("ts_ms").alias("_f_ts"),
+            pl.col("funding").alias("funding_at_start"),
+        ).sort("_f_ts")
+        frame = (
+            frame.with_columns((pl.col("start_ts") - 1).alias("_before"))
+            .sort("_before")
+            .join_asof(samples, left_on="_before", right_on="_f_ts", by="coin", strategy="backward")
+            .drop("_before", "_f_ts")
+        )
+        first_seen = ctx.group_by("coin").agg(pl.col("ts_ms").min().alias("_first"))
+        frame = (
+            frame.join(first_seen, on="coin", how="left")
+            .with_columns(
+                ((pl.col("start_ts") - pl.col("_first")) / 86_400_000).alias("since_listing_days")
+            )
+            .drop("_first")
+        )
+    _ = grid
+    return frame.with_columns(
+        pl.col("start_ts").cast(pl.Datetime("ms")).dt.hour().alias("session_hour")
     )
-    if cache is not None:
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        episodes.write_parquet(cache)
-    return episodes
 
 
 def qualifies(episodes: pl.DataFrame) -> tuple[bool, str]:
@@ -662,88 +1092,159 @@ def episode_tape(data_dir: str | Path, episodes: pl.DataFrame, *, horizon_s: int
     """Every print from each episode's entry to `horizon_s` later, keyed by episode.
 
     What Q8 needs and no other question does: terminal prices cannot say whether a stop was
-    hit before a target, so the path has to come from trades rather than from bars. Loaded
-    a month at a time for the same reason the episodes are.
+    hit before a target, so the path has to come from trades rather than from bars. Read one
+    UTC day at a time and only inside the entry windows, so the raw rows of one day are the
+    most that is ever resident.
 
-    Returns `key`, `ts_ms`, `px`, sorted by key then time. Empty when the lake has no
-    trades over the episodes' window.
+    Returns `key`, `ts_ms`, `px`, sorted by key then time. Empty when the lake has no trades
+    over the episodes' windows.
     """
     empty = pl.DataFrame(schema={"key": pl.String, "ts_ms": pl.Int64, "px": pl.Float64})
     if episodes.is_empty():
         return empty
-    windows = episodes.select(
-        "key",
-        "coin",
-        "entry_ts",
-        (pl.col("entry_ts") + horizon_s * 1000).alias("_until"),
-        pl.col("entry_ts").cast(pl.Datetime("ms")).dt.strftime("%Y-%m").alias("_month"),
-    )
+    spans = episodes.select(
+        "key", "coin", "entry_ts", (pl.col("entry_ts") + horizon_s * 1000).alias("until")
+    ).drop_nulls("entry_ts")
+    if spans.is_empty():
+        return empty
+    per_day: dict[str, dict[str, list[tuple[int, int]]]] = {}
+    for row in spans.iter_rows(named=True):
+        first, last = int(row["entry_ts"]), int(row["until"])
+        for day_ms in range(first // 86_400_000 * 86_400_000, last + 86_400_000, 86_400_000):
+            day = datetime.fromtimestamp(day_ms / 1000, UTC).strftime("%Y-%m-%d")
+            per_day.setdefault(day, {}).setdefault(row["coin"], []).append((first, last))
     parts = []
-    for month in sorted(windows["_month"].unique().to_list()):
-        first = date.fromisoformat(f"{month}-01")
-        last = (first + timedelta(days=32)).replace(day=1)
-        trades = load_table(
-            data_dir, "trades", first.isoformat(), last.isoformat(), venue="hyperliquid"
-        )
+    for day, coins in sorted(per_day.items()):
+        trades = windowed_trades(data_dir, day, coins)
         if trades.is_empty():
             continue
         part = (
-            windows.filter(pl.col("_month") == month)
-            .join(
+            spans.join(
                 trades.with_columns(effective_ts()).select(
                     "coin", pl.col("known").alias("ts_ms"), "px"
                 ),
                 on="coin",
             )
-            .filter((pl.col("ts_ms") >= pl.col("entry_ts")) & (pl.col("ts_ms") <= pl.col("_until")))
+            .filter((pl.col("ts_ms") >= pl.col("entry_ts")) & (pl.col("ts_ms") <= pl.col("until")))
             .select("key", "ts_ms", "px")
         )
         if not part.is_empty():
             parts.append(part)
-    return pl.concat(parts).sort("key", "ts_ms") if parts else empty
+        del trades
+    if not parts:
+        return empty
+    return pl.concat(parts).unique(subset=["key", "ts_ms"], keep="first").sort("key", "ts_ms")
 
 
-def feature_grid(data_dir: str | Path, first: str, last: str, settings: object) -> pl.DataFrame:
-    """One month of the grid with the tick features an entry rule needs, plus its pads.
+def feature_grid(
+    data_dir: str | Path, episodes: pl.DataFrame, settings: object, grid: pl.DataFrame
+) -> pl.DataFrame:
+    """The episode grid with the tick features an entry rule needs.
 
     Q2 evaluates the exhaustion rule tick by tick, which needs the liquidation intensity,
-    the CVD slope, the mark divergence percentile and the running extreme all on the same
-    frame. Built here rather than in the script so the windows come from config in one
-    place. Returns an empty frame when the month has no trades.
+    the CVD slope and the mark divergence percentile on the same frame. It reads the grid
+    Stage B already built rather than the tape, because the tape is the table that does not
+    fit and every one of these features is an aggregate the grid already carries.
     """
     features = settings.features  # type: ignore[attr-defined]
     exhaustion = settings.exhaustion  # type: ignore[attr-defined]
-    load_start, load_end = padded(first, last)
-    trades = load_table(data_dir, "trades", load_start, load_end, venue="hyperliquid")
-    if trades.is_empty():
+    if grid.is_empty() or episodes.is_empty():
         return pl.DataFrame()
-    liquidations = load_table(data_dir, "liquidations", load_start, load_end, venue="hyperliquid")
-    ctx = load_table(data_dir, "asset_ctx", load_start, load_end)
-    grid = build_grid(
-        trades,
-        None,
-        start_ms=ms(load_start),
-        end_ms=ms(load_end) + 86_400_000,
-        step_ms=GRID_STEP_MS,
+    coins = episodes["coin"].unique().to_list()
+    days = (
+        episodes.select(
+            pl.col("start_ts").cast(pl.Datetime("ms")).dt.strftime("%Y-%m-%d").alias("day")
+        )["day"]
+        .unique()
+        .sort()
+        .to_list()
     )
+    first, last = days[0], days[-1]
+    load_start, load_end = padded(first, last)
+    liquidations = load_table(
+        data_dir, "liquidations", load_start, load_end, venue="hyperliquid", coins=coins
+    )
+    out = grid
     if not liquidations.is_empty():
-        grid = liq_intensity(
+        out = liq_intensity(
             liquidations,
-            grid,
+            out,
             windows_s=list(features.windows_s),
             step_ms=GRID_STEP_MS,
             weights={"hyperliquid": 1.0},
         )
-    grid = cvd(
-        grid,
+    out = cvd(
+        out,
         windows_s=[int(features.cvd_slope_window_s)],
         slope_window_s=int(features.cvd_slope_window_s),
         step_ms=GRID_STEP_MS,
     )
+    ctx = _ctx_for(data_dir, load_start, load_end, coins)
     return with_ctx(
-        grid,
+        out,
         ctx,
         windows_s=[int(features.proxy.oi_delta_window_s)],
         step_ms=GRID_STEP_MS,
         quantile=exhaustion.mark_mid_pct_threshold / 100.0,
+    )
+
+
+def daily_grid(data_dir: str | Path, day: str, coins: Sequence[str]) -> pl.DataFrame:
+    """One UTC day's 1s grid for the named coins, aggregated without ever holding the tape.
+
+    `build_grid` is the definition of a bar and this has to agree with it exactly; the
+    difference is only that the aggregation happens inside the Parquet scan, so a day of
+    fifty million prints never becomes fifty million rows in memory. `tests/test_research_lib.py`
+    asserts the two produce identical frames.
+
+    A question that only needs tape around known episodes should use `episode_grid`, which
+    reads far less. This exists for Q3, which has to sweep the whole year to count the
+    proxy's false positives and cannot restrict itself to where the answer already is.
+    """
+    scan = scan_day(data_dir, "trades", day, venue="hyperliquid")
+    if scan is None or not coins:
+        return pl.DataFrame()
+    known = pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
+    per_second = (
+        scan.filter(pl.col("coin").is_in(list(coins)))
+        .with_columns(known.alias("known"))
+        .with_columns(
+            ((pl.col("known") // GRID_STEP_MS) * GRID_STEP_MS + GRID_STEP_MS).alias("ts_ms")
+        )
+        .group_by("coin", "ts_ms")
+        .agg(
+            pl.col("px").sort_by("known").last().alias("last_px"),
+            (pl.col("px") * pl.col("sz")).sum().alias("notional_usd"),
+            pl.col("sz").sum().alias("volume"),
+            (
+                pl.when(pl.col("side") == "buy")
+                .then(pl.col("px") * pl.col("sz"))
+                .otherwise(-pl.col("px") * pl.col("sz"))
+            )
+            .sum()
+            .alias("signed_notional"),
+            pl.len().alias("n_trades"),
+        )
+        .collect(engine="streaming")
+    )
+    if per_second.is_empty():
+        return pl.DataFrame()
+    start = ms(day)
+    dense = pl.DataFrame({"coin": sorted(set(coins))}, schema={"coin": pl.String}).join(
+        pl.DataFrame(
+            {"ts_ms": range(start, start + 86_400_000, GRID_STEP_MS)}, schema={"ts_ms": pl.Int64}
+        ),
+        how="cross",
+    )
+    return (
+        dense.join(per_second, on=["coin", "ts_ms"], how="left")
+        .sort("coin", "ts_ms")
+        .with_columns(
+            pl.col("last_px").forward_fill().over("coin").alias("mid"),
+            pl.col("notional_usd").fill_null(0.0),
+            pl.col("volume").fill_null(0.0),
+            pl.col("signed_notional").fill_null(0.0),
+            pl.col("n_trades").fill_null(0),
+        )
+        .drop("last_px")
     )

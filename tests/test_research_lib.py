@@ -133,3 +133,96 @@ def test_removing_the_top_clusters_drops_whole_clusters_not_the_best_episodes() 
     trimmed = lib.drop_top_clusters(frame, "net_stress_bps", count=1)
     assert sorted(trimmed["cluster"].unique().to_list()) == [1, 2]
     assert trimmed.height == 4
+
+
+def test_the_streaming_daily_grid_agrees_with_build_grid_bar_for_bar(research_lake: Path) -> None:
+    """daily_grid restates build_grid's bar definition inside a Parquet scan, so it has to
+    produce the identical frame. Without this test the memory fix is free to quietly change
+    what a bar means, which would change every number in the phase."""
+    from liqfade.features.grid import build_grid
+
+    day = "2026-03-01"
+    coins = ["BTC", "ETH", "PEPE"]
+    streamed = lib.daily_grid(research_lake, day, coins)
+    trades = lib.windowed_trades(
+        research_lake, day, {coin: [(lib.ms(day), lib.ms(day) + 86_400_000)] for coin in coins}
+    )
+    dense = build_grid(
+        trades,
+        None,
+        start_ms=lib.ms(day),
+        end_ms=lib.ms(day) + 86_400_000,
+        step_ms=lib.GRID_STEP_MS,
+    )
+    columns = ["coin", "ts_ms", "mid", "notional_usd", "volume", "signed_notional", "n_trades"]
+    assert streamed.select(columns).sort("coin", "ts_ms").to_dicts() == (
+        dense.select(columns).sort("coin", "ts_ms").to_dicts()
+    )
+
+
+def test_the_day_scan_ignores_the_appledouble_files_an_exfat_drive_leaves(
+    tmp_path: Path,
+) -> None:
+    """macOS writes ._name.parquet beside every file on the owner's USB lake. Path.glob
+    returns them, and four kilobytes of resource fork is not a Parquet file."""
+    day = tmp_path / "parquet" / "trades" / "date=2026-03-01"
+    day.mkdir(parents=True)
+    (day / "all_day.parquet").write_bytes(b"")
+    (day / "._all_day.parquet").write_bytes(b"\x00\x05\x16\x07")
+    found = lib.day_files(tmp_path, "trades", "2026-03-01")
+    assert [path.name for path in found] == ["all_day.parquet"]
+
+
+def test_asking_for_a_year_of_trades_raises_instead_of_swapping_the_machine_to_death() -> None:
+    """The lake holds 1.79 billion trade rows. The first run died in swap asking for them."""
+    with pytest.raises(ValueError, match="too large"):
+        lib.load_table("anywhere", "trades", "2025-09-01", "2026-08-31")
+
+
+def test_overlapping_windows_collapse_into_one_span() -> None:
+    """A busy day's episode windows overlap; one predicate per episode is one scan per
+    episode over fifty million rows."""
+    assert lib.merge_windows([(0, 10), (5, 20), (30, 40)]) == [(0, 20), (30, 40)]
+    assert lib.merge_windows([]) == []
+
+
+def test_the_episode_grid_only_reads_the_coins_and_windows_it_needs(research_lake: Path) -> None:
+    """The memory fix in one assertion: the grid covers the episode windows and nothing else.
+
+    A grid that quietly widened to whole days would still produce correct numbers and would
+    still kill an 8 GB machine on a year of a table with 1.79 billion rows in it.
+    """
+    episodes = pl.DataFrame(
+        {
+            "coin": ["BTC"],
+            "side": ["long"],
+            "start_ts": [1_772_330_000_000],
+            "end_ts": [1_772_330_030_000],
+        }
+    )
+    grid = lib.episode_grid(research_lake, episodes)
+    assert not grid.is_empty()
+    assert grid["coin"].unique().to_list() == ["BTC"]
+    assert grid["ts_ms"].min() >= 1_772_330_000_000 - lib.LEAD_IN_S * 1000
+    assert grid["ts_ms"].max() <= 1_772_330_030_000 + lib.TRAIL_S * 1000
+
+
+def test_the_tape_spread_does_not_grow_with_the_episode_count(research_lake: Path) -> None:
+    """`_tape_spread` used to join episodes to the grid on coin alone and filter afterwards.
+
+    That is a cross product, and on a real month it is 22,000 episodes against millions of
+    grid rows. This asserts the result is one row per episode however many share a coin,
+    which the cross-product version also satisfied, and that it returns at all, which it did
+    not.
+    """
+    grid = lib.daily_grid(research_lake, "2026-03-01", ["BTC"])
+    episodes = pl.DataFrame(
+        {
+            "key": [f"BTC/long/{index}" for index in range(200)],
+            "coin": ["BTC"] * 200,
+            "extreme_ts": [1_772_326_000_000 + index * 60_000 for index in range(200)],
+        }
+    )
+    spread = lib._tape_spread(grid, episodes)
+    assert spread.height <= episodes.height
+    assert spread["key"].n_unique() == spread.height

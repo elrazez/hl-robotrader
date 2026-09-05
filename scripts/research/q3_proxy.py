@@ -23,6 +23,7 @@ Writes `reports/proxy_calibration.md`, at that exact path, because other docs re
 from __future__ import annotations
 
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -33,7 +34,6 @@ import _lib as lib
 
 from liqfade.config.loader import load_settings
 from liqfade.features.context import with_ctx
-from liqfade.features.grid import build_grid
 from liqfade.features.proxy import hl_forced_proxy
 
 THRESHOLDS = (2.0, 3.0, 4.0, 6.0)
@@ -162,58 +162,81 @@ def trigger_branch(headline: dict[float, Score]) -> tuple[str, str]:
 
 
 def build_scores(args: object, settings: object, episodes: pl.DataFrame) -> pl.DataFrame:
-    """The proxy over the whole window, gated and ungated, a month at a time."""
+    """The proxy over the whole window, gated and ungated, one UTC day at a time.
+
+    This is the one question that cannot restrict itself to where the answer already is:
+    precision counts the triggers that found nothing, so the sweep has to cover the tape
+    rather than the episodes. It still never holds a day of trades. `lib.daily_grid`
+    aggregates each day to a 1s grid inside the Parquet scan, the proxy runs on that, and
+    only the triggers survive the day, which are a few hundred rows.
+
+    Restricted to the coins that carry an episode in the window. Those are the tradeable
+    universe by definition, and a coin the strategy would never trade contributes only
+    false positives to a precision it is not measured on.
+
+    Each day is computed with the previous day in front of it, so the hourly volume median
+    and the 24h mark-divergence percentile are full before the day being scored begins;
+    only the scored day's rows are kept.
+    """
     features = settings.features  # type: ignore[attr-defined]
     proxy_cfg = features.proxy
-    parts = []
-    for first, last in lib.month_chunks(args.start, args.end):  # type: ignore[attr-defined]
-        load_start, load_end = lib.padded(first, last)
-        trades = lib.load_table(args.data_dir, "trades", load_start, load_end, venue="hyperliquid")  # type: ignore[attr-defined]
-        if trades.is_empty():
+    coins = sorted(episodes["coin"].unique().to_list()) if not episodes.is_empty() else []
+    if not coins:
+        return pl.DataFrame()
+    common = {
+        "window_s": PROXY_WINDOW_S,
+        "median_lookback_s": int(proxy_cfg.vol_median_lookback_s),
+        "step_ms": lib.GRID_STEP_MS,
+        "oi_window_s": int(proxy_cfg.oi_delta_window_s),
+    }
+    columns = [f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s" for side in ("long", "short")]
+    parts: list[pl.DataFrame] = []
+    previous: pl.DataFrame | None = None
+    for day in lib.dates(args.start, args.end):  # type: ignore[attr-defined]
+        today = lib.daily_grid(args.data_dir, day, coins)  # type: ignore[attr-defined]
+        if today.is_empty():
+            previous = None
             continue
-        ctx = lib.load_table(args.data_dir, "asset_ctx", load_start, load_end)  # type: ignore[attr-defined]
-        grid = build_grid(
-            trades,
-            None,
-            start_ms=lib.ms(load_start),
-            end_ms=lib.ms(load_end) + 86_400_000,
-            step_ms=lib.GRID_STEP_MS,
+        grid = pl.concat([previous, today]) if previous is not None else today
+        ctx = lib._ctx_for(
+            args.data_dir,  # type: ignore[attr-defined]
+            (date.fromisoformat(day) - timedelta(days=1)).isoformat(),
+            day,
+            coins,
         )
         grid = with_ctx(
-            grid,
+            grid.sort("coin", "ts_ms"),
             ctx,
             windows_s=[int(proxy_cfg.oi_delta_window_s)],
             step_ms=lib.GRID_STEP_MS,
             quantile=proxy_cfg.mark_mid_pct_threshold / 100.0,
         )
-        common = {
-            "window_s": PROXY_WINDOW_S,
-            "median_lookback_s": int(proxy_cfg.vol_median_lookback_s),
-            "step_ms": lib.GRID_STEP_MS,
-            "oi_window_s": int(proxy_cfg.oi_delta_window_s),
-        }
         gated = hl_forced_proxy(grid, gated=True, **common)
         ungated = hl_forced_proxy(grid, gated=False, **common)
-        window = (pl.col("ts_ms") >= lib.ms(first)) & (pl.col("ts_ms") < lib.ms(last) + 86_400_000)
-        parts.append(
-            gated.filter(window)
-            .select(
+        scored_day = pl.col("ts_ms") >= lib.ms(day)  # type: ignore[attr-defined]
+        kept = gated.filter(scored_day).select("coin", "ts_ms", *columns)
+        kept = kept.join(
+            ungated.filter(scored_day).select(
                 "coin",
                 "ts_ms",
-                *[f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s" for side in ("long", "short")],
-            )
-            .join(
-                ungated.filter(window).select(
-                    "coin",
-                    "ts_ms",
-                    *[
-                        pl.col(f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s").alias(f"ungated_{side}")
-                        for side in ("long", "short")
-                    ],
-                ),
-                on=["coin", "ts_ms"],
-            )
+                *[
+                    pl.col(f"hl_forced_proxy_{side}_{PROXY_WINDOW_S}s").alias(f"ungated_{side}")
+                    for side in ("long", "short")
+                ],
+            ),
+            on=["coin", "ts_ms"],
         )
+        # Only ticks that could ever be a trigger survive the day; the rest of the grid is
+        # dropped here and never accumulates across the year.
+        floor = min(THRESHOLDS)
+        interesting = pl.any_horizontal(
+            [pl.col(column) >= floor for column in [*columns, "ungated_long", "ungated_short"]]
+        )
+        kept = kept.filter(interesting)
+        if not kept.is_empty():
+            parts.append(kept)
+        previous = today
+        del today, grid, gated, ungated
     return pl.concat(parts) if parts else pl.DataFrame()
 
 

@@ -153,31 +153,24 @@ def main() -> None:
     episodes = episodes.filter(pl.col("qualified"))
     rows: list[list[str]] = []
     means: dict[str, float] = {}
-    fired = 0
-    for first, last in lib.month_chunks(args.start, args.end):
-        grid = lib.feature_grid(args.data_dir, first, last, settings)
-        if grid.is_empty():
+    grid = lib.feature_grid(
+        args.data_dir, episodes, settings, lib.episode_grid(args.data_dir, episodes)
+    )
+    entries = exhaustion_ticks(grid, episodes, settings) if not grid.is_empty() else pl.DataFrame()
+    fired = entries.height
+    for label, table in [("exhaustion", entries)] + [
+        (f"fixed {delay}s", fixed_entries(episodes, delay)) for delay in FIXED_DELAYS_S
+    ]:
+        if grid.is_empty() or table.is_empty():
             continue
-        window = (pl.col("start_ts") >= lib.ms(first)) & (
-            pl.col("start_ts") < lib.ms(last) + 86_400_000
-        )
-        month = episodes.filter(window)
-        if month.is_empty():
+        result = priced(episodes, table, grid)
+        if result.is_empty():
             continue
-        entries = exhaustion_ticks(grid, month, settings)
-        fired += entries.height
-        for label, table in [("exhaustion", entries)] + [
-            (f"fixed {delay}s", fixed_entries(month, delay)) for delay in FIXED_DELAYS_S
-        ]:
-            result = priced(month, table, grid)
-            if result.is_empty():
-                continue
-            values = result.drop_nulls("net_stress_bps")
-            if values.is_empty():
-                continue
-            means.setdefault(label, 0.0)
-            means[label] += float(values["net_stress_bps"].sum())
-            rows.append([label, str(values.height), f"{values['net_stress_bps'].mean():+.1f}"])
+        values = result.drop_nulls("net_stress_bps")
+        if values.is_empty():
+            continue
+        means[label] = float(values["net_stress_bps"].sum())
+        rows.append([label, str(values.height), f"{values['net_stress_bps'].mean():+.1f}"])
     summary = dict(means)
     qualifying, facts = lib.qualifies(episodes)
     best = max(summary, key=lambda label: summary[label]) if summary else None
