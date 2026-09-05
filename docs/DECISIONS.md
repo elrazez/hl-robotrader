@@ -286,6 +286,20 @@ partition left unfolded. That sweep matters because this mount has timed out mid
 before and left a Parquet with no footer. `fills_full` (22,795 files) was started
 detached after the rest finished and its result is appended here when it lands.
 
+**It landed (appended 2026-09-05).** `fills_full` 22,795 files -> 365, 2,853,564,289
+rows, 13:26:38 to 19:40:41 UTC on 2026-09-04, 6.2 hours. The worst partition is the
+2025-10-10 cascade day, 348 files and 19,127,562 rows folded in 348s; the median day is
+around 40 files and 30s. The mount timed out three times (`[Errno 60]`, twice opening an
+input and once stat-ing the temp file mid-write, on 2025-10-12, 2025-12-29 and
+2026-01-19); the driving loop retried each and all three days completed, which is the
+behaviour `_compact_partition` is built for: an exception leaves every input in place and
+removes the temp file, so a retry is a clean redo. Two numbers in the run's own summary
+line are wrong for the same reason the rederive's were, and are not the ones above: it
+printed 10,089 files and 1,920,241,471 rows, counting only from the last restart. The
+per-day log lines cover all 365 days exactly once and are what the totals here come from.
+2,853,564,289 fills against 1,428,662,127 derived `trades` rows is the maker/taker pairing
+the derivation collapses, so the two agree.
+
 **Compaction is row-exact; the manifest is not the row authority.** Every partition's
 output footer is compared against the sum of its inputs' footers before a single input is
 deleted, so the compacted totals are the pre-compaction totals by construction. `l2`
@@ -672,3 +686,194 @@ The reason the reference is Tardis and not the lake is unchanged and now enforce
 script's own error message: `candleSnapshot` keeps about three days of `1m` bars and the
 lake's `trades` end 2026-08-30, so there is no day both hold. The moment the recorder
 starts there will be, and `--ours lake` is that run.
+
+## 2026-09-05 (the Phase 2 data quality gate)
+
+**The gate report covers the whole lake now.** `scripts/research/data_quality.py` grew
+three sections and a rule. Per table per day it now reports files as well as rows, and
+flags any partition not holding exactly one file after compaction, with the two
+uncompacted Tardis side tables exempted at 16 (four venues by four coins). A "days
+present / days expected" line per table puts the coverage next to the row count, because
+on `asset_ctx` the row count alone is misleading in both directions. `liquidations` and
+`trades` are split by `venue` and `source`, since both carry four venues from two pulls
+and a day full of Binance rows with every Hyperliquid row gone would otherwise read as
+healthy. And the side rule now runs over the whole year, month by month, as an ASOF join
+rather than the per-file Python loop in `SideRuleCheck`; the script exits non-zero if any
+month inverts. `--footers-only` skips the two sections that read data.
+
+**The final table, 2025-08-31 to 2026-08-30, 365 calendar days in the span.**
+
+| table | days | rows | files | source of the shortfall |
+|---|---:|---:|---:|---|
+| `fills_full` | 365 | 2,853,564,289 | 365 | complete |
+| `trades` | 365 | 1,790,750,306 | 365 | complete |
+| `l2` | 343 | 3,425,187,420 | 343 | 21 days the archive has no files for |
+| `candles_1m` | 364 | 174,697,608 | 364 | equals `trades` days, less 2025-08-31 |
+| `liquidations` | 364 | 5,770,019 | 365 | 2025-08-31 has trades but no liquidation |
+| `asset_ctx` | 363 | 116,884,578 | 363 | 2026-07-08 is not in the bucket |
+| `tardis_book_snapshot_5` | 12 | 281,773,008 | 192 | free first-of-month days only |
+| `tardis_derivative_ticker` | 12 | 36,619,381 | 192 | free first-of-month days only |
+
+Every one of those numbers matches what 02b, 02c, 02d and 02f recorded, independently
+recounted from the footers. `trades` splits 1,428,662,127 `hl_s3` and 362,088,179
+`tardis`; `liquidations` 5,633,882 and 136,137. No partition anywhere in the lake holds
+the wrong number of files.
+
+**The 365th day is three rows.** `fills_full` and `trades` cover 365 days rather than 364
+because the first hourly object of 2025-09-01 carries six fills stamped 2025-08-31, which
+derive to three trades. `liquidations` and `candles_1m` are 364 because none of those six
+is a liquidation and three trades of one coin are not a bar worth writing.
+
+**`l2` is 343 days, and the 21 missing ones come in three blocks.** 2025-10-17 to 10-22
+(6), 2025-11-18 to 11-25 (8), and 2026-07-08 plus 2026-07-12 to 07-17 (7). Contiguous
+blocks, not a scatter, which is what a source outage looks like and not what a failed
+pull looks like. 2026-07-08 is missing from `asset_ctx` too, from a different bucket and a
+different job, which is as close to proof as this gets that the date itself is the hole.
+Not re-verified against S3: `.env` holds no AWS keys any more and the answer would not
+change what we do.
+
+**The `l2` snapshot cadence drops tenfold in June 2026, and this is the one finding that
+changes Phase 3 and 4.** Not a hole: every day present holds all four coins across all 24
+hours. What changed is how often the archive publishes a snapshot. Through 2026-06-14 it
+is about 155,000 snapshots per coin per day, one every 0.56s. Then it steps down over a
+week, and from 2026-06-21 to the end of the range it is about 16,085 per coin per day,
+one every 5.4s:
+
+| span | rows/day | snapshots per coin per day | gap between snapshots |
+|---|---:|---:|---:|
+| 2025-09-01 to 2026-06-14 | ~12.5M | ~156,000 | 0.55s |
+| 2026-06-15 | 6,373,500 | 79,669 | 1.1s |
+| 2026-06-16 to 06-19 | ~3.12M | ~38,985 | 2.2s |
+| 2026-06-20 | 1,975,740 | 24,697 | 3.5s |
+| 2026-06-21 to 2026-08-30 | ~1.25M | ~15,500 | 5.6s |
+
+The consequence is a trap for the Phase 4 DoD, which asks for a held-out last 25%. The
+last 25% of this range starts in June 2026, which is exactly where the book resolution
+falls off a cliff. A fill model tuned on a 0.55s book and validated on a 5.6s one will
+report worse fills out of sample and the cause will look like the strategy. Whatever the
+split is, it has to be stated in book-cadence terms as well as in dates, or the L2-derived
+features have to be built at a cadence both halves can serve. Recorded here rather than
+solved, because the choice belongs to the research.
+
+**`asset_ctx` is 363 days, and the one absent day is 2026-07-08, confirmed.** July 2026
+lists 30 files, and 2026-07-07 and 2026-07-09 both hold a full 332,640 rows (231 coins by
+1440 minutes). Not filled from another source: a row there would carry a `source` that is
+not true.
+
+Five days are short rather than absent, three more than 02f named, and all five are the
+archive's own truncation rather than a stopped pull. The test is the object size against
+the rows it produced: the median across the year is 34.5 bytes per row, and all five sit
+at 30 to 32, so the `.lz4` is proportionally small and there is nothing in it we failed to
+read. Each starts at 00:00 and stops early, with every coin present for every minute up to
+the cut:
+
+| day | rows | ends (UTC) | coins | bytes/row |
+|---|---:|---|---:|---:|
+| 2026-05-30 | 96,140 | 06:57 | 230 | 32.4 |
+| 2026-08-08 | 160,544 | 11:31 | 232 | 31.2 |
+| 2026-08-09 | 240,120 | 17:14 | 232 | 30.2 |
+| 2026-08-27 | 155,440 | 11:09 | 232 | 32.2 |
+| 2026-08-30 | 119,248 | 08:33 | 232 | 30.6 |
+
+The 02f entry gives 14:39 and 12:03 for the last two. Same instants: those were read in
+local time. Everything in this repo is UTC, which is why the table
+says so explicitly.
+
+**The "under 90% of the median" rule is the wrong rule for `asset_ctx`, and the report no
+longer leans on it.** It flags 21 days, and 16 of them are complete: the whole of early
+September 2025 sits at exactly 296,640 rows, which is 206 coins by 1440 minutes, and the
+year's median of 329,760 is 229 coins. The table grew with the exchange, from 206 coins to
+232. The rule that actually separates a short day from a small one is whether the row
+count divides by 1440: a complete day does, a truncated day does not. That is why the
+"days present / days expected" line matters here more than the row count, and it is what
+the report now leads with.
+
+**The manifest and the lake reconcile, and every disagreement has a name.** Over the 290
+days whose manifest was not rebuilt on the wiped rented box:
+
+- `liquidations` disagrees on exactly nine days, every one a Tardis free first-of-month,
+  by exactly +105,705 rows in total. That is precisely the Tardis liquidation rows the
+  `s3-fills` manifest never claimed to count: Tardis's own manifest records 136,137 for
+  the year, of which 30,432 fall on the three month-firsts inside the rebuilt window. On
+  all 281 other days the lake equals the manifest to the row.
+- `fills_full` disagrees on most days by two to a few hundred rows, always an even number,
+  and the disagreements cancel between adjacent days. Net over the 290 days: **-4 rows**
+  in 2.4 billion. The manifest counts rows per hourly object and the lake buckets a row by
+  the UTC day of its `ts_ms`; a block straddling midnight puts a few fills on the other
+  side, and fills come in maker/taker pairs, which is the even numbers.
+- All 8,736 hourly objects are present, 24 for each of the 364 days. There is no missing
+  hour in the year.
+
+The 22 days whose `fills_full` count is under 40% of the median are 18 Saturdays and
+Sundays plus Christmas Eve, Christmas, New Year's Eve and New Year's Day, each with all
+24 hourly objects. Volume seasonality, not a hole.
+
+**One real defect, and it is 173,868 rows of Bybit ETH.** 02b left a residual it could not
+place: Tardis `trades` in the lake were 173,868 rows (0.05%) above the manifest. It is one
+file. Binance and OKX match their manifests exactly. Bybit is over by 173,868, all of it
+on 2026-01-01, all of it ETH: the lake holds 657,605 rows where the manifest records
+483,737, and 657,605 - 173,868 = 483,737 exactly.
+
+Located by the hour. Grouping the day's Bybit ETH rows on `(ts_ms, px, sz, side)`, hours
+00:00 to 11:59 UTC have 140,841 groups and **not one of them has an odd count**, while
+hours 12 to 23, and BTC on both halves of the same day, are odd on 85 to 90% of groups as
+real trades are. Hours 00 to 11 hold 347,736 rows, exactly twice 173,868. So the first
+half of that file was written twice: a first attempt died after hour 11 without recording
+a manifest entry, the retry wrote all 24 hours, and compaction folded both into
+`all_day.parquet`. The manifest's 483,737 is the true count.
+
+Not repaired here, because deleting recorded data is the owner's call (CLAUDE.md rule 8).
+Blast radius is small and known: `candles_1m` filters `venue == "hyperliquid"` before it
+does anything, so the bars are untouched, and Tardis is the cross-venue validation set
+rather than a training set. Anything that counts Bybit trades or volume on 2026-01-01 is
+double until it is fixed. The fix is to keep one row of each pair for
+`venue = 'bybit' AND source = 'tardis' AND coin = 'ETH'` in hours 0 to 11 of that
+partition, or to re-pull that one free file and rewrite those rows.
+
+The wider lesson is the one the year keeps teaching: **`tid` is null on Tardis Bybit
+rows**, so `(coin, tid)` cannot deduplicate them, and the duplicate-key heuristic that
+finds nothing real on `liquidations` finds nothing real here either. What found it was
+comparing the lake against the manifest per venue and per day, which is why the gate
+report now splits by both.
+
+**The side rule holds in all twelve months.** Mean signed price move in the 60s into each
+liquidation, Hyperliquid rows only so that the liquidations and the price series come from
+one venue. Long liquidations are forced selling and the price into them is falling in
+every single month, by 68 to 423 bps, against short liquidations rising by 65 to 161:
+
+| month | long n | long mean bps | short n | short mean bps |
+|---|---:|---:|---:|---:|
+| 2025-09 | 298,728 | -143.16 | 98,284 | +124.30 |
+| 2025-10 | 729,986 | -423.13 | 123,253 | +109.08 |
+| 2025-11 | 489,810 | -113.72 | 162,108 | +154.58 |
+| 2025-12 | 237,121 | -74.92 | 91,214 | +152.88 |
+| 2026-01 | 315,594 | -127.96 | 108,140 | +75.93 |
+| 2026-02 | 279,724 | -68.14 | 125,588 | +66.61 |
+| 2026-03 | 240,401 | -76.79 | 132,533 | +64.97 |
+| 2026-04 | 127,925 | -110.15 | 149,261 | +70.59 |
+| 2026-05 | 205,904 | -85.83 | 145,105 | +67.69 |
+| 2026-06 | 454,241 | -68.12 | 170,171 | +87.36 |
+| 2026-07 | 294,624 | -116.10 | 167,310 | +136.44 |
+| 2026-08 | 208,049 | -180.21 | 266,197 | +161.17 |
+
+The two extremes are the two facts about the year: October 2025 at -423 bps is the
+2025-10-10 cascade, 394,452 liquidations in a day against a median of 11,005, and August
+2026 is the only month where short liquidations outnumber long ones. Neither is a data
+question, and the sign never turns.
+
+**Tardis rows land on 5 days that are not a first of the month, and it is 40 rows.**
+`trades` shows Binance on 14 days, OKX on 13 and Bybit on 16 rather than 12 each. The
+extras are 2025-09-30 (28 rows), 2025-11-30 (1), 2026-01-31 (1), 2026-02-28 (1) and
+2026-07-31 (9): trades stamped in the last milliseconds before midnight that Tardis
+includes in its day-01 file, bucketed into the previous day's partition by `ts_ms`. The
+same effect as the six fills on 2025-08-31. `liquidations` shows a clean 12 days for each
+of the three venues, no Hyperliquid row from Tardis anywhere in either table, and the
+`tardis` manifest records the 48 Hyperliquid liquidation requests as answered with no
+rows, which is the 400 that Tardis never carried them.
+
+**Every `candles_1m` file is newer than the `trades` file it was built from**, on all 364
+days. The bars are the ones rebuilt after the 02d rederive, not the ones before it.
+
+**Phase 2 is done.** No unexplained hole. One explained defect, 173,868 rows in one venue
+on one day of the validation set, with a known fix. One property of the data that the
+research has to plan around, the June 2026 book cadence.

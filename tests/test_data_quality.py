@@ -24,11 +24,11 @@ def load() -> object:
 dq = load()
 
 
-def liq_rows(day: date, count: int) -> list[dict[str, object]]:
+def liq_rows(day: date, count: int, venue: str = "hyperliquid") -> list[dict[str, object]]:
     base = int(datetime.combine(day, time.min, tzinfo=UTC).timestamp() * 1000)
     return [
         {
-            "venue": "hyperliquid",
+            "venue": venue,
             "coin": "BTC",
             "venue_symbol": "BTC",
             "ts_ms": base + index * 1000,
@@ -55,7 +55,7 @@ def lake(tmp_path: Path) -> Path:
 
 def test_counts_come_from_the_footers_per_table_per_day(lake: Path) -> None:
     counts = dq.scan(lake / "parquet")
-    assert counts == {"liquidations": {"2026-09-01": 3, "2026-09-03": 9}}
+    assert counts == {"liquidations": {"2026-09-01": (3, 1), "2026-09-03": (9, 1)}}
 
 
 def test_an_empty_lake_scans_to_nothing(tmp_path: Path) -> None:
@@ -82,7 +82,7 @@ def test_a_partition_the_filesystem_cannot_open_is_a_hole_not_a_crash(
     monkeypatch.setattr(writer, "lake_files", fails_on_one)
     counts = dq.scan(lake / "parquet")
 
-    assert counts == {"liquidations": {"2026-09-01": 3, "2026-09-03": 0}}
+    assert counts == {"liquidations": {"2026-09-01": (3, 1), "2026-09-03": (0, 0)}}
     assert "UNREADABLE" in capsys.readouterr().err
 
 
@@ -94,7 +94,9 @@ def test_an_appledouble_sidecar_does_not_break_the_report(lake: Path) -> None:
     """
     partition = lake / "parquet" / "liquidations" / "date=2026-09-01"
     (partition / "._hyperliquid_00.parquet").write_bytes(b"not parquet at all")
-    assert dq.scan(lake / "parquet") == {"liquidations": {"2026-09-01": 3, "2026-09-03": 9}}
+    assert dq.scan(lake / "parquet") == {
+        "liquidations": {"2026-09-01": (3, 1), "2026-09-03": (9, 1)}
+    }
 
 
 def test_a_day_with_no_partition_at_all_still_appears_in_the_range(lake: Path) -> None:
@@ -136,7 +138,66 @@ def test_the_script_writes_the_report_and_exits_zero(
     reports = lake / "reports"
     assert dq.main(["--data-dir", str(lake), "--reports-dir", str(reports)]) == 0
     assert (reports / "data_quality" / "counts.md").exists()
-    assert "1 zero-row days" in capsys.readouterr().out
+    assert "1 days short of expected" in capsys.readouterr().out
+
+
+def test_the_breakdown_splits_a_day_by_venue_and_source(tmp_path: Path) -> None:
+    """One day, two venues, two pulls: the day is not empty and is still half missing.
+
+    The count per day says nothing on its own for `liquidations` and `trades`, which is
+    why the report splits them: a partition full of Binance rows from Tardis with every
+    Hyperliquid row gone reads as a healthy day until you look at this.
+    """
+    root = tmp_path / "parquet"
+    day = date(2026, 9, 1)
+    write_partitioned(root, "liquidations", "hyperliquid", "hl_s3", liq_rows(day, 3))
+    write_partitioned(root, "liquidations", "binance", "tardis", liq_rows(day, 5, "binance"))
+    write_partitioned(
+        root, "liquidations", "binance", "tardis", liq_rows(date(2026, 9, 2), 2, "binance")
+    )
+
+    found = dq.breakdown(root, ["2026-09-01", "2026-09-02"], tables=("liquidations",))
+    assert found == {
+        "liquidations": {
+            ("hyperliquid", "hl_s3"): {"2026-09-01": 3},
+            ("binance", "tardis"): {"2026-09-01": 5, "2026-09-02": 2},
+        }
+    }
+
+    text = dq.render(dq.scan(root), dq.all_days(dq.scan(root)), found)
+    assert "| liquidations | binance | tardis | 7 | 2 | 2026-09-01 | 2026-09-02 |" in text
+    assert "| liquidations | hyperliquid | hl_s3 | 3 | 1 | 2026-09-01 | 2026-09-01 |" in text
+
+
+def test_the_side_rule_reads_falling_prices_into_long_liquidations(tmp_path: Path) -> None:
+    """The same measurement `SideRuleCheck` makes, in SQL, over a day of the lake."""
+    root = tmp_path / "parquet"
+    day = date(2026, 9, 1)
+    base = int(datetime.combine(day, time.min, tzinfo=UTC).timestamp() * 1000)
+    # A price falling 1% over three minutes, and a long liquidation at the end of it.
+    trades = [
+        {
+            "venue": "hyperliquid",
+            "coin": "BTC",
+            "ts_ms": base + minute * 60_000,
+            "rx_ms": 0,
+            "px": 100.0 - minute,
+            "sz": 1.0,
+            "side": "sell",
+            "tid": minute,
+        }
+        for minute in range(4)
+    ]
+    write_partitioned(root, "trades", "hyperliquid", "hl_s3", trades)
+    liq = liq_rows(day, 1)
+    liq[0]["ts_ms"] = base + 3 * 60_000
+    write_partitioned(root, "liquidations", "hyperliquid", "hl_s3", liq)
+
+    totals = dq.side_rule(root, ["2026-09-01"])
+    count, summed = totals["2026-09"]["long"]
+    assert count == 1
+    # 97 against 98 one minute earlier: -102.04 bps, and the sign is the whole point.
+    assert summed == pytest.approx(-102.0408, abs=1e-3)
 
 
 def test_the_script_exits_one_when_there_is_no_lake(

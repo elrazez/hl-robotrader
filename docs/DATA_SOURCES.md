@@ -318,6 +318,16 @@ per hour, going back to 2023. Do not pull the whole market. Pick the handful of 
 backtest actually trades and pull hourly snapshots. The backtester needs the book to
 model what a taker order would really have paid.
 
+**The archive's snapshot cadence is not constant across the year in the lake, and any
+split of it has to account for that.** Through 2026-06-14 it publishes about 155,000
+snapshots per coin per day, one every 0.55s. Over the following week it steps down, and
+from 2026-06-21 to 2026-08-30 it is about 15,500 a day, one every 5.6s: a tenfold loss of
+resolution across the last ten weeks of the range. No day or coin or hour is missing, so
+nothing reads as a gap; only the spacing changed. The trap is that the held-out last 25%
+of this range begins inside that transition, so a fill model fitted on a 0.55s book and
+validated on a 5.6s one will report worse out-of-sample fills for a reason that has
+nothing to do with the strategy. Measured 2026-09-05; see docs/DECISIONS.md.
+
 ### Counting a liquidation once
 
 Fills arrive in maker and taker pairs, so the same liquidation shows up twice. Key on
