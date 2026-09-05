@@ -398,18 +398,37 @@ def test_a_snapshot_replayed_after_a_reconnect_does_not_rewrite_bars_already_emi
     assert parse(_candle_frame(1788098880000, 1.0, 1.0), RX) == []
 
 
-def test_the_candle_snapshot_list_emits_every_closed_bar_but_not_the_open_one() -> None:
-    snapshot = (
-        b'{"channel":"candle","data":['
-        b'{"t":1788098760000,"T":1788098819999,"s":"BTC","i":"1m","o":"1","c":"2",'
-        b'"h":"3","l":"0","v":"9","n":1},'
-        b'{"t":1788098820000,"T":1788098879999,"s":"BTC","i":"1m","o":"2","c":"3",'
-        b'"h":"4","l":"1","v":"8","n":2},'
-        b'{"t":1788098880000,"T":1788098939999,"s":"BTC","i":"1m","o":"3","c":"4",'
-        b'"h":"5","l":"2","v":"7","n":3}]}'
-    )
-    rows = rows_for(hl.make_parser()(snapshot, RX), "candles_1m")
-    assert [row["ts_ms"] for row in rows] == [1788098760000, 1788098820000]
+_SNAPSHOT = (
+    b'{"channel":"candle","data":['
+    b'{"t":1788098760000,"T":1788098819999,"s":"BTC","i":"1m","o":"1","c":"2",'
+    b'"h":"3","l":"0","v":"9","n":1},'
+    b'{"t":1788098820000,"T":1788098879999,"s":"BTC","i":"1m","o":"2","c":"3",'
+    b'"h":"4","l":"1","v":"8","n":2},'
+    b'{"t":1788098880000,"T":1788098939999,"s":"BTC","i":"1m","o":"3","c":"4",'
+    b'"h":"5","l":"2","v":"7","n":3}]}'
+)
+
+
+def test_the_subscribe_snapshot_seeds_a_fresh_coin_and_writes_nothing() -> None:
+    """Every restart resubscribes and HL replies with the last bars of every coin. Folded
+    like live pushes they were all written again, into a table with no `rx_ms` and no
+    dedupe, so a day summed over `v` or `n` counted each restart twice."""
+    parse = hl.make_parser()
+    assert parse(_SNAPSHOT, RX) == []
+    # The newest bar of the snapshot is the one now held, so the next bar closes it.
+    (row,) = rows_for(parse(_candle_frame(1788098940000, 9.0, 9.0), RX), "candles_1m")
+    assert row["ts_ms"] == 1788098880000
+    assert row["c"] == 4.0  # the snapshot's own values, not the frame that closed it
+
+
+def test_the_snapshot_after_a_reconnect_still_closes_the_bar_it_interrupted() -> None:
+    """Seeding is only for a coin with no held bar. Mid-run the held bar is real and the
+    snapshot has to close it, or a reconnect would eat the minute it happened in."""
+    parse = hl.make_parser()
+    parse(_candle_frame(1788098820000, 1.0, 1.0), RX)  # holding the 08:47 bar
+    rows = rows_for(parse(_SNAPSHOT, RX), "candles_1m")
+    assert [row["ts_ms"] for row in rows] == [1788098820000]
+    assert rows[0]["c"] == 3.0  # the snapshot's version, which is the complete one
 
 
 def test_candles_are_held_per_coin() -> None:

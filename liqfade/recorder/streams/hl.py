@@ -93,10 +93,12 @@ def make_parser() -> Parser:
     is the closed bar; the prompt's alternative (keep the first, drop the repeats) would
     have kept an in-progress bar instead. A bar older than the one held is dropped, which
     is what makes the subscribe snapshot after a reconnect stop rewriting bars already in
-    the lake. Costs: the newest bar per coin is written up to a minute late and is lost
-    if the process stops before the next one opens. `candles_1m` is derivable from
-    `trades` (`liqfade derive candles`), and an in-progress bar in the lake is worse than
-    a missing one.
+    the lake; on a restart there is no held bar to compare against, so the snapshot seeds
+    the coin instead of being folded (see `_snapshot`). Costs: the newest bar per coin is
+    written up to a minute late and is lost if the process stops before the next one
+    opens, and the bars from a restart's downtime are not written at all. `candles_1m` is
+    derivable from `trades` (`liqfade derive candles`), and both a duplicated bar and an
+    in-progress bar in the lake are worse than a missing one.
     """
     open_bars: dict[str, tuple[int, dict[str, Any]]] = {}
 
@@ -113,8 +115,9 @@ def make_parser() -> Parser:
             return _l2(data, rx_ms)
         if channel == "candle":
             # A snapshot on subscribe arrives as a list, live updates as one object.
-            rows = data if isinstance(data, list) else [data]
-            return [row for update in rows for row in _candle(update, open_bars)]
+            if isinstance(data, list):
+                return _snapshot(data, open_bars)
+            return _candle(data, open_bars)
         if channel == "activeAssetCtx":
             return [_asset_ctx(data, rx_ms)]
         return []
@@ -191,6 +194,57 @@ def _l2(data: dict[str, Any], rx_ms: int) -> list[ParsedRow]:
     return rows
 
 
+def _bar_row(update: dict[str, Any]) -> dict[str, Any]:
+    """One `candles_1m` row from one candle push. No `rx_ms`: the table has none."""
+    return {
+        "coin": update["s"],
+        "ts_ms": int(update["t"]),
+        "o": _f(update["o"]),
+        "h": _f(update["h"]),
+        "l": _f(update["l"]),
+        "c": _f(update["c"]),
+        "v": _f(update["v"]),
+        "n": int(update.get("n") or 0),
+    }
+
+
+def _snapshot(
+    updates: list[dict[str, Any]], open_bars: dict[str, tuple[int, dict[str, Any]]]
+) -> list[ParsedRow]:
+    """Fold a subscribe snapshot. A coin we hold no bar for is seeded, never replayed.
+
+    The snapshot carries the last bars of every coin subscribed, so folding it the way a
+    live push is folded emits all of them but the newest. Across a reconnect that is
+    right: a bar is held for the coin, so everything older is dropped and the held bar is
+    closed by the first entry past it. Across a process *restart* there is no held bar,
+    and folding wrote every bar in the snapshot again, into a table with no `rx_ms` and
+    no dedupe. Those bars are already in the lake from the previous run, so anything
+    summing `v` or `n` over a day counted a restart twice.
+
+    A coin with no held bar therefore takes the snapshot's newest bar as its open one and
+    emits nothing. The cost is the bars from a downtime window, which are not written by
+    the recorder at all: `liqfade derive candles` rebuilds them exactly from `trades`,
+    which is the canonical source anyway. A missing bar is fillable and a duplicated one
+    is silently wrong, and this table has already chosen missing once (see `make_parser`).
+    """
+    seeding = {update["s"] for update in updates} - set(open_bars)
+    rows: list[ParsedRow] = []
+    for update in updates:
+        if update["s"] in seeding:
+            _seed(update, open_bars)
+        else:
+            rows.extend(_candle(update, open_bars))
+    return rows
+
+
+def _seed(update: dict[str, Any], open_bars: dict[str, tuple[int, dict[str, Any]]]) -> None:
+    """Hold a coin's newest snapshot bar without emitting the ones before it."""
+    bar_ms = int(update["t"])
+    held = open_bars.get(update["s"])
+    if held is None or bar_ms > held[0]:
+        open_bars[update["s"]] = (bar_ms, _bar_row(update))
+
+
 def _candle(
     update: dict[str, Any], open_bars: dict[str, tuple[int, dict[str, Any]]]
 ) -> list[ParsedRow]:
@@ -203,16 +257,7 @@ def _candle(
     """
     coin = update["s"]
     bar_ms = int(update["t"])
-    row = {
-        "coin": coin,
-        "ts_ms": bar_ms,
-        "o": _f(update["o"]),
-        "h": _f(update["h"]),
-        "l": _f(update["l"]),
-        "c": _f(update["c"]),
-        "v": _f(update["v"]),
-        "n": int(update.get("n") or 0),
-    }
+    row = _bar_row(update)
     held = open_bars.get(coin)
     if held is not None and bar_ms < held[0]:
         return []
