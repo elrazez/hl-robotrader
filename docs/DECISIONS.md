@@ -1114,3 +1114,68 @@ market-wide sweep liquidates dozens of coins inside one minute and the strategy 
 all of them at once. Sizing on the pooled number would size one bet as if it were fifty.
 `sizing/` and `risk/` need a cap on concurrent exposure within a five minute window across
 all coins on the same side, and Phase 4 sizes on 27 to 34 bps rather than on 85.
+
+## 2026-09-06 (Phase 4 entry, owner override of stop rule 5)
+
+**The owner overrides stop rule 5 and builds Phase 4 now.** Phase 3 parked the project on
+that rule: the edge is real on exact S3 liquidations (Q1 +84.6 bps pooled, +26.7 isolated;
+Q8 harvestable with `k_stop=1`, `k_target=0.8`) but the live bot cannot see those
+liquidations, the HL-native proxy reaches precision 0.01, and Q4 cannot be answered until
+the recorder has sixty days on 2026-11-04. The rule's instruction is to park rather than
+build blind. The owner accepts that reasoning and overrides it anyway, on this basis: the
+engine is the same engine whichever trigger eventually feeds it, and building it now means
+the day a live-visible trigger passes its bar the answer is a rerun rather than a week of
+work. Nothing about the science changed; the decision is about build order.
+
+**What that override does and does not license.**
+
+- The historical year is backtested on the archive's **exact** liquidations, and every
+  number that comes out of it is **a ceiling, not a forecast**. It is what the strategy
+  would have made with a trigger nobody can see in real time.
+- **No live trading path is built in this phase.** `execution/` gets `rounding.py` and
+  nothing else; `live/` and `alerts/` stay empty.
+- **Phase 5 stays blocked** until a live-visible trigger passes its bar: Q3's re-cut at
+  thresholds above the preregistered range, or Q4 rerun at sixty recorder days. Neither
+  can happen before 2026-11-04.
+
+**The trigger becomes a config switch, `cascade.trigger`.** Three values, one detector, one
+engine, so the ceiling run and the eventual live run differ by one config key rather than
+by a code path.
+
+- `exact`: the lake's `liquidations` table, source `hl_s3`. Backtest only, and the default
+  for the year run. `Settings` refuses it on mainnet outright and
+  `live_trading_block_reason()` names it, so the Phase 5 loop cannot start on it by either
+  route. That refusal is written now rather than when Phase 5 is built, because the person
+  who would forget it is the person writing Phase 5.
+- `proxy`: `hl_forced_proxy_60s` over `cascade.proxy_min`. Q3 measured precision 0.01 at the
+  preregistered thresholds and a re-cut is outstanding. Shipped, default off.
+- `crossvenue`: aggregated `liq_z_60s` over the recorded Bybit and OKX feeds, weighted by
+  `venues.*.liq_weight`. What Phase 5 runs if Q4 passes. On the historical year it has data
+  on the twelve Tardis days only, so every report naming this trigger prints the days it
+  actually had data for.
+
+Every report's first page names the trigger it ran on. A report that does not is a report
+whose numbers cannot be read.
+
+**Nothing research said no to is deleted.** Q2, Q5, Q6 and Q7 all returned `no`, and the
+temptation is to strip the code they rejected. Every one of those rules stays as code behind
+a config switch defaulted off, so the owner can turn one on in a backtest config and read
+the cost rather than re-litigate the decision from memory. `exhaustion.mode` defaults to
+`fixed_delay` at 120s because Q2 says the flat delay carries more PnL than the rule, and the
+rule code stays under `exhaustion.mode: rule`. `zone_proximity` ships disabled because Q7
+found in-zone *worse*; `features/levels.py` stays. The all-rules-off, `fixed_delay`
+configuration is the golden baseline the tests pin.
+
+The partial-liquidation rhythm (Q5) is the exception: it never reached the spec as a rule,
+so there is nothing to switch off and none is added.
+
+**Phase 4 sizes on 30 bps and adds a per-cluster exposure cap.** Already argued in the
+2026-09-05 entries; recorded here as the thing this phase implements.
+`risk.cluster_window_s` (300s) and `risk.max_cluster_exposure_frac` (0.25 of equity) cap the
+gross notional entered across all coins on one side inside one window, because a sweep that
+liquidates forty coins in a minute is one bet and the pooled +84.6 bps is what sizing it as
+forty would assume.
+
+**Reverse this entry** if the owner decides the ceiling numbers are being read as forecasts,
+or if Q3's re-cut and Q4 both fail on 2026-11-04, in which case the engine built here has no
+trigger and the momentum variant needs its own Phase 3.
