@@ -236,4 +236,10 @@ def _with_capacity(
             participation
             * (pl.col("traded_at_end").fill_null(0.0) - pl.col("traded_at_extreme").fill_null(0.0))
         ).alias(name)
-    ).drop("capacity_end", "traded_at_extreme", "traded_at_end")
+    ).drop(
+        "capacity_end",
+        "traded_at_extreme",
+        "traded_at_extreme_ts",
+        "traded_at_end",
+        "traded_at_end_ts",
+    )

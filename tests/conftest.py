@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -37,6 +38,22 @@ def restore_structlog() -> Iterator[None]:
             structlog.reset_defaults()
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(**context)
+
+
+@pytest.fixture(scope="session")
+def research_lake(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Four hours of synthetic tape with about fifty injected cascades.
+
+    Built once per session rather than committed: a generator stays in step with
+    `data/schemas.py` and keeps half a megabyte of Parquet out of the repo. See
+    `tests/fixtures/research_lake.py` for what it does and does not prove.
+    """
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    import research_lake as builder
+
+    root = tmp_path_factory.mktemp("lake")
+    builder.build(root)
+    return root
 
 
 @pytest.fixture

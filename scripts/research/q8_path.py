@@ -1,0 +1,313 @@
+"""Q8: the path, not the destination. Maximum adverse excursion and the stop/target grid.
+
+The second gate, and the one most likely to kill the project. Nothing in Q1 to Q7 measures
+the path, so nothing in them measures the loss: terminal reversion cannot say whether a
+stop was hit before a target, and a strategy with +20 bps of mean reversion and a 60%
+stop-out rate loses money. Built from trades rather than 1m bars, or MAE is meaningless.
+
+Per episode, entering at the first print after `extreme_ts + 1s`:
+
+- the maximum adverse excursion before the time stop, in bps and in units of `rv_5m`;
+- the joint outcome over `k_stop` in {1.0, 1.5, 2.5, infinity} by `k_target` in
+  {0.3, 0.5, 0.8} with a 15 minute time stop, net-stress, as a hit/stop/timeout breakdown.
+
+`target_px = extreme_px + k_target * (anchor_px - extreme_px)` and
+`stop_px = extreme_px - k_stop * rv_5m * extreme_px`, beyond the extreme and vol scaled,
+exactly as `docs/STRATEGY_AND_RISK.md` section 3 defines them. When both levels are touched
+inside the same second the stop is assumed first, because the tape cannot say which came
+first and the pessimistic reading is the only honest one.
+
+DECISION yes only if some cell beats hold-to-horizon, has a stop-out rate under 50%, and
+its neighbours in the grid are also positive. An isolated positive cell is the
+multiple-comparison problem wearing a hat.
+
+    uv run python scripts/research/q8_path.py --start 2025-09-01 --end 2026-08-31
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+from pathlib import Path
+
+import polars as pl
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+import _lib as lib
+
+from liqfade.config.loader import load_settings
+
+K_STOPS = (1.0, 1.5, 2.5, math.inf)
+K_TARGETS = (0.3, 0.5, 0.8)
+TIME_STOP_S = 900
+MAX_STOP_RATE = 0.5
+
+
+def levels(episodes: pl.DataFrame, k_stop: float, k_target: float) -> pl.DataFrame:
+    """Target and stop prices for one cell of the grid, per episode.
+
+    A long liquidation is faded by buying, so its target is above the extreme and its stop
+    below; a short liquidation is the mirror. `direction` is +1 when the trade is long.
+    """
+    direction = pl.when(pl.col("side") == "long").then(1.0).otherwise(-1.0)
+    span = pl.col("anchor_px") - pl.col("extreme_px")
+    stop_distance = (
+        pl.lit(float("inf"))
+        if math.isinf(k_stop)
+        else k_stop * pl.col("rv_5m") * pl.col("extreme_px")
+    )
+    return episodes.with_columns(
+        direction.alias("direction"),
+        (pl.col("extreme_px") + k_target * span).alias("target_px"),
+        (pl.col("extreme_px") - direction * stop_distance).alias("stop_px"),
+    )
+
+
+def outcomes(episodes: pl.DataFrame, tape: pl.DataFrame) -> pl.DataFrame:
+    """First touch of target or stop per episode, and the exit price that implies."""
+    marked = tape.join(
+        episodes.select("key", "direction", "target_px", "stop_px"), on="key", how="inner"
+    )
+    signed = marked.with_columns((pl.col("direction") * pl.col("px")).alias("signed_px"))
+    touches = signed.group_by("key").agg(
+        pl.col("ts_ms")
+        .filter(pl.col("signed_px") >= pl.col("direction") * pl.col("target_px"))
+        .min()
+        .alias("target_ts"),
+        pl.col("ts_ms")
+        .filter(pl.col("signed_px") <= pl.col("direction") * pl.col("stop_px"))
+        .min()
+        .alias("stop_ts"),
+    )
+    joined = episodes.join(touches, on="key", how="left")
+    # A tie inside one second resolves to the stop: the tape cannot order two prints in the
+    # same millisecond bucket, and assuming the win would flatter every cell in the grid.
+    stopped = pl.col("stop_ts").is_not_null() & (
+        pl.col("target_ts").is_null() | (pl.col("stop_ts") <= pl.col("target_ts"))
+    )
+    hit = pl.col("target_ts").is_not_null() & ~stopped
+    return joined.with_columns(
+        pl.when(stopped)
+        .then(pl.lit("stop"))
+        .when(hit)
+        .then(pl.lit("target"))
+        .otherwise(pl.lit("timeout"))
+        .alias("outcome"),
+        pl.when(stopped)
+        .then(pl.col("stop_px"))
+        .when(hit)
+        .then(pl.col("target_px"))
+        .otherwise(pl.col("mid_plus_15m"))
+        .alias("exit_px"),
+    )
+
+
+def excursion_table(episodes: pl.DataFrame, tape: pl.DataFrame) -> tuple[str, pl.DataFrame]:
+    """MAE from entry over the time stop window, in bps and in units of rv_5m.
+
+    Floored at zero: a trade whose worst print was still better than its entry had no
+    adverse excursion, and reporting that as a negative MAE would make the quantiles read
+    as if a stop there were safe.
+    """
+    direction = pl.when(pl.col("side") == "long").then(1.0).otherwise(-1.0)
+    worst = (
+        tape.join(
+            episodes.select("key", direction.alias("direction"), "entry_px_delayed", "rv_5m"),
+            on="key",
+        )
+        .with_columns((pl.col("direction") * pl.col("px")).alias("signed_px"))
+        .group_by("key")
+        .agg(
+            pl.col("signed_px").min().alias("_worst"),
+            pl.col("direction").first(),
+            pl.col("entry_px_delayed").first(),
+            pl.col("rv_5m").first(),
+        )
+        .with_columns(
+            (
+                1e4
+                * (pl.col("direction") * pl.col("entry_px_delayed") - pl.col("_worst"))
+                / pl.col("entry_px_delayed")
+            )
+            .clip(lower_bound=0.0)
+            .alias("mae_bps")
+        )
+        .with_columns(
+            pl.when(pl.col("rv_5m") > 0)
+            .then(pl.col("mae_bps") / (1e4 * pl.col("rv_5m")))
+            .otherwise(None)
+            .alias("mae_rv")
+        )
+    )
+    rows = []
+    for quantile in (0.25, 0.5, 0.75, 0.9, 0.95):
+        bps = worst["mae_bps"].quantile(quantile)
+        rv = worst["mae_rv"].quantile(quantile)
+        rows.append(
+            [
+                f"p{quantile * 100:.0f}",
+                f"{bps:.1f}" if bps is not None else "n/a",
+                f"{rv:.2f}" if rv is not None else "n/a",
+            ]
+        )
+    return lib.table(["quantile", "MAE bps", "MAE in rv_5m"], rows), worst
+
+
+def grid_table(
+    episodes: pl.DataFrame, tape: pl.DataFrame
+) -> tuple[str, dict[tuple[float, float], dict[str, float]]]:
+    """One row per cell: net-stress mean, stop-out rate and the hit/stop/timeout split."""
+    rows = []
+    cells: dict[tuple[float, float], dict[str, float]] = {}
+    for k_stop in K_STOPS:
+        for k_target in K_TARGETS:
+            resolved = outcomes(levels(episodes, k_stop, k_target), tape)
+            if resolved.is_empty():
+                continue
+            priced = lib.with_cost_columns(resolved)
+            counts = {
+                name: resolved.filter(pl.col("outcome") == name).height
+                for name in ("target", "stop", "timeout")
+            }
+            total = max(resolved.height, 1)
+            estimate = lib.cluster_bootstrap(
+                priced.drop_nulls("net_stress_bps")["net_stress_bps"].to_numpy(),
+                priced.drop_nulls("net_stress_bps")["cluster"].to_numpy(),
+            )
+            cells[(k_stop, k_target)] = {
+                "net_stress": estimate.mean,
+                "stop_rate": counts["stop"] / total,
+                "lo": estimate.lo,
+            }
+            rows.append(
+                [
+                    "none" if math.isinf(k_stop) else f"{k_stop:g}",
+                    f"{k_target:g}",
+                    f"{priced['gross_bps'].mean():+.1f}",
+                    f"{priced['net_9bps'].mean():+.1f}",
+                    estimate.render(),
+                    f"{counts['stop'] / total:.0%}",
+                    f"{counts['target']}/{counts['stop']}/{counts['timeout']}",
+                ]
+            )
+    header = [
+        "k_stop",
+        "k_target",
+        "gross bps",
+        "net-9bps",
+        "net-stress bps",
+        "stop rate",
+        "hit/stop/timeout",
+    ]
+    return lib.table(header, rows), cells
+
+
+def neighbours(cell: tuple[float, float]) -> list[tuple[float, float]]:
+    """The cells adjacent in the grid, which must also be positive for a yes."""
+    stop_index, target_index = K_STOPS.index(cell[0]), K_TARGETS.index(cell[1])
+    out = []
+    for step in (-1, 1):
+        if 0 <= stop_index + step < len(K_STOPS):
+            out.append((K_STOPS[stop_index + step], cell[1]))
+        if 0 <= target_index + step < len(K_TARGETS):
+            out.append((cell[0], K_TARGETS[target_index + step]))
+    return out
+
+
+def verdict(
+    cells: dict[tuple[float, float], dict[str, float]], hold: float, qualifying: bool, facts: str
+) -> str:
+    if not qualifying:
+        return lib.decision(
+            "inconclusive",
+            f"The sample does not clear the preregistered bar: {facts}. A stop-out rate "
+            f"measured on a sample this size is a rate of nothing.",
+        )
+    winners = [
+        (cell, stats)
+        for cell, stats in cells.items()
+        if stats["net_stress"] > hold
+        and stats["stop_rate"] < MAX_STOP_RATE
+        and all(
+            cells.get(other, {"net_stress": -1.0})["net_stress"] > 0 for other in neighbours(cell)
+        )
+    ]
+    if not winners:
+        best = max(cells.values(), key=lambda stats: stats["net_stress"], default=None)
+        detail = f"best cell {best['net_stress']:+.1f} bps" if best else "no cells"
+        return lib.decision(
+            "no",
+            f"Stop rule 2, unharvestable edge. No cell beats hold-to-horizon "
+            f"({hold:+.1f} bps) with a stop-out rate under {MAX_STOP_RATE:.0%} and positive "
+            f"neighbours ({detail}). The reversion may be real and still not be reachable "
+            f"through a stop. {facts}.",
+        )
+    cell, stats = max(winners, key=lambda item: item[1]["net_stress"])
+    stop_label = "none" if math.isinf(cell[0]) else f"{cell[0]:g}"
+    return lib.decision(
+        "yes",
+        f"k_stop {stop_label}, k_target {cell[1]:g}: {stats['net_stress']:+.1f} bps net-stress "
+        f"against {hold:+.1f} bps for holding to the horizon, stopping out "
+        f"{stats['stop_rate']:.0%} of the time, with every neighbouring cell positive. "
+        f"These are the values the config writeback takes. {facts}.",
+    )
+
+
+def main() -> None:
+    args = lib.parse_args(__doc__ or "")
+    settings = load_settings()
+    out_dir = Path(args.out_dir)
+    episodes = lib.build_episodes(
+        args.data_dir, args.start, args.end, settings, cache=out_dir / "episodes.parquet"
+    )
+    title = "Q8: path, maximum adverse excursion and the stop/target grid"
+    if episodes.is_empty():
+        lib.write_report(
+            out_dir / "q8_path.md",
+            title,
+            [
+                f"No liquidations in the lake between {args.start} and {args.end}.",
+                lib.decision("inconclusive", "There is no data to answer this question."),
+            ],
+        )
+        return
+    episodes = lib.with_btc_regime(episodes.filter(pl.col("qualified")))
+    tape = lib.episode_tape(args.data_dir, episodes, horizon_s=TIME_STOP_S)
+    qualifying, facts = lib.qualifies(episodes)
+    hold = (
+        lib.with_cost_columns(episodes.with_columns(pl.col("mid_plus_15m").alias("exit_px")))[
+            "net_stress_bps"
+        ].mean()
+        or 0.0
+    )
+    excursion, _ = excursion_table(episodes, tape)
+    grid, cells = grid_table(episodes, tape)
+    blocks = [
+        f"Window: {args.start} to {args.end}. Qualifying episodes: **{episodes.height}**, "
+        f"clusters: **{episodes['cluster'].n_unique()}**. Prints read: **{tape.height}**. "
+        f"Entry is the first print after `extreme_ts + 1s`; the time stop is "
+        f"{TIME_STOP_S // 60} minutes.",
+        "",
+        "## Maximum adverse excursion from entry",
+        "",
+        "How far the trade goes against you before the time stop, whatever the exit rule. A "
+        "stop inside the p50 is a stop that fires on half the winners.",
+        "",
+        excursion,
+        "",
+        "## The stop and target grid",
+        "",
+        f"Hold to the {TIME_STOP_S // 60} minute horizon with no stop and no target is "
+        f"**{hold:+.1f} bps** net-stress. A cell has to beat that, stop out less than "
+        f"{MAX_STOP_RATE:.0%} of the time, and have positive neighbours.",
+        "",
+        grid,
+        verdict(cells, hold, qualifying, facts),
+    ]
+    path = lib.write_report(out_dir / "q8_path.md", title, blocks)
+    print(f"wrote {path}")
+
+
+if __name__ == "__main__":
+    main()
