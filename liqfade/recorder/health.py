@@ -11,6 +11,11 @@ up either silently losing data or paging its owner every ten minutes:
   quiet whenever the market is calm. Silence there means nothing, so only the connection
   being down is alerted, which the ping/pong on the socket already tells us.
 
+Parse errors are the third question, and the one neither of the others can answer. A
+venue renaming a field leaves the socket connected and the message rate normal while
+every row is dropped, so the only evidence is the count of rows the parser refused. Past
+`recorder.parse_error_alert_1h` per stream per hour, that is an alert.
+
 Disk is checked every five minutes with `shutil.disk_usage`, and `data/ALERT_DISK`, the
 flag the VPS cron writes at 80%, is treated as an alert in its own right so the two
 paths agree.
@@ -100,6 +105,12 @@ class Health:
         for stat in self._all_stats():
             if stat.check_silence(self.cfg.gap_alert_s, at_ms):
                 log.warning("stream_gap", stream=stat.name, silent_s=round(stat.silent_s(at_ms), 1))
+            errors = stat.parse_errors_1h()
+            if errors >= self.cfg.parse_error_alert_1h:
+                sent.append(
+                    f"recorder: {stat.name} parse errors over "
+                    f"{self.cfg.parse_error_alert_1h}/h, the wire has stopped matching the parser"
+                )
             silent_s = stat.silent_s(at_ms)
             if stat.continuous and silent_s > self.cfg.silence_alert_s:
                 sent.append(f"recorder: {stat.name} silent for {silent_s:.0f}s")

@@ -54,6 +54,11 @@ recorder:
   ring_buffer_rows: 200000  # rows per coin per stream held in memory between flushes
   gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap (Phase 1 DoD)
   silence_alert_s: 60.0  # seconds of silence that raises a Telegram alert
+  # Rows the parser refused plus messages it could not read, per stream per hour, above
+  # which Telegram is told. A venue renaming a field takes a feed to zero rows while the
+  # socket stays up, so this is the only thing that would say so. Set above the handful of
+  # malformed frames a busy day produces and far below the flood a schema change causes.
+  parse_error_alert_1h: 100
   reconnect_backoff_min_s: 0.5  # seconds: initial reconnect delay
   reconnect_backoff_max_s: 30.0  # seconds: capped reconnect delay
   reconnect_jitter_frac: 0.3  # fraction of the delay added as uniform jitter

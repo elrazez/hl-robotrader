@@ -130,6 +130,12 @@ class StreamStats:
         """Seconds since the last message. 0 when the stream has never delivered one."""
         return 0.0 if self.last_msg_ms == 0 else (now_ms - self.last_msg_ms) / 1000.0
 
+    def parse_errors_1h(self, now: float | None = None) -> int:
+        """Refused rows plus unreadable messages in the trailing hour."""
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        return len(self._parse_errors)
+
     def msgs_1m(self, now: float | None = None) -> int:
         now = time.monotonic() if now is None else now
         return int(sum(count for second, count in self._buckets if now - second < 60.0))
@@ -150,7 +156,7 @@ class StreamStats:
             msgs_1m=self.msgs_1m(now),
             gaps_1h=len(self._gap_times),
             reconnects_1h=len(self._reconnects),
-            parse_errors_1h=len(self._parse_errors),
+            parse_errors_1h=len(self._parse_errors),  # already pruned above
         )
 
 
@@ -346,6 +352,13 @@ class WSStream:
         try:
             rows = self.parse(raw, rx_ms)
         except Exception as exc:
+            # A message that will not parse cannot be attributed to a table, so it counts
+            # against every table of this venue. They share one connection, so a venue
+            # renaming a field makes all of them suspect anyway, and the alternative is a
+            # counter nobody can find. `handle` is the only place that drops a whole
+            # message; a single refused row is counted by its own table below.
+            for stat in self.stats.values():
+                stat.record_parse_error()
             log.warning(
                 "parse_error",
                 venue=self.venue,

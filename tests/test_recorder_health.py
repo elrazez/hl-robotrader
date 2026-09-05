@@ -95,3 +95,28 @@ def test_disk_stats_works_before_the_data_dir_exists(tmp_path: Path) -> None:
     stats = disk_stats(tmp_path / "not" / "created" / "yet")
     assert stats["total_bytes"] > 0
     assert 0.0 <= stats["used_pct"] <= 100.0
+
+
+async def test_a_stream_whose_parse_errors_cross_the_rate_alerts(tmp_path: Path) -> None:
+    """A venue renaming a field is silent otherwise: connected, and zero rows."""
+    stat = StreamStats(name="bybit.liquidations", continuous=True, connected=True)
+    at = now_ms()
+    stat.record_message(at)
+    for _ in range(CFG.parse_error_alert_1h):
+        stat.record_parse_error()
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == [
+        f"recorder: bybit.liquidations parse errors over {CFG.parse_error_alert_1h}/h, "
+        "the wire has stopped matching the parser"
+    ]
+
+
+async def test_parse_errors_under_the_rate_are_not_worth_a_message(tmp_path: Path) -> None:
+    stat = StreamStats(name="bybit.liquidations", continuous=True, connected=True)
+    at = now_ms()
+    stat.record_message(at)
+    stat.record_parse_error()
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == []

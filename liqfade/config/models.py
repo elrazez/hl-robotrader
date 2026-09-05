@@ -78,6 +78,9 @@ class Recorder(Base):
     ring_buffer_rows: int = Field(..., gt=0, description="rows held in memory per coin per stream")
     gap_alert_s: Pos = Field(..., description="seconds of stream silence counted as a gap")
     silence_alert_s: Pos = Field(..., description="seconds of silence that alerts Telegram")
+    parse_error_alert_1h: int = Field(
+        ..., gt=0, description="count: refused rows plus unreadable messages per hour that alerts"
+    )
     reconnect_backoff_min_s: Pos = Field(..., description="seconds: initial reconnect delay")
     reconnect_backoff_max_s: Pos = Field(..., description="seconds: capped reconnect delay")
     reconnect_jitter_frac: Frac = Field(..., description="fraction of delay added as jitter")

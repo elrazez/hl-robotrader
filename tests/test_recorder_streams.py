@@ -8,7 +8,7 @@ import pytest
 
 from liqfade.config import load_settings
 from liqfade.config.models import Recorder
-from liqfade.recorder.streams import bybit
+from liqfade.recorder.streams import bybit, hl
 from liqfade.recorder.streams.base import (
     CONTINUOUS_STREAMS,
     StreamStats,
@@ -208,3 +208,16 @@ def test_a_dropped_row_is_counted_and_never_reaches_the_sink() -> None:
     assert len(rows) == 1
     (state,) = stream.feed_states(NOW_MS)
     assert state.parse_errors_1h == 1
+
+
+def test_an_unreadable_message_counts_against_every_table_of_that_venue() -> None:
+    """A venue field rename used to take a feed to zero rows with `connected=True` and
+    nothing anywhere saying so. A message that fails to parse cannot be attributed to one
+    table, so it counts against all of them; the alert names the stream either way."""
+    stream, rows = _stream(parse=hl.make_parser(), tables=("trades", "bbo"), venue="hyperliquid")
+    stream.handle(b"not json at all", NOW_MS)
+    assert rows == []
+    assert {s.name: s.parse_errors_1h() for s in stream.stats.values()} == {
+        "hyperliquid.trades": 1,
+        "hyperliquid.bbo": 1,
+    }
