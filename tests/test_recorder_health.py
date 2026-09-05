@@ -60,7 +60,9 @@ async def test_the_silence_alert_reads_the_same_all_through_one_outage(tmp_path:
 
 async def test_the_silence_alert_names_the_coin_on_a_per_coin_stream(tmp_path: Path) -> None:
     """One dead subscription out of twenty: the alert has to say which."""
-    stat = StreamStats(name="hyperliquid.bbo", continuous=True, connected=True, per_coin=True)
+    stat = StreamStats(
+        name="hyperliquid.bbo", continuous=True, connected=True, per_coin=True, per_coin_gaps=True
+    )
     at = now_ms()
     stat.record_message(at - 120_000, ["BTC"])
     stat.record_message(at, ["ETH"])

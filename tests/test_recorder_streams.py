@@ -11,6 +11,8 @@ from liqfade.config.models import Recorder
 from liqfade.recorder.streams import bybit, hl
 from liqfade.recorder.streams.base import (
     CONTINUOUS_STREAMS,
+    PER_COIN_GAP_STREAMS,
+    PER_COIN_STREAMS,
     StreamStats,
     WSStream,
     backoff_delay,
@@ -229,7 +231,7 @@ def test_an_unreadable_message_counts_against_every_table_of_that_venue() -> Non
 def test_one_dead_coin_subscription_is_a_gap_even_while_the_others_keep_flowing() -> None:
     """Stats keyed `venue.table` alone: if BTC's bbo died while ETH and SOL kept the
     stream alive, `lag_ms` stayed near zero and the Phase 1 DoD could not be evidenced."""
-    stat = StreamStats(name="hyperliquid.bbo", continuous=True, per_coin=True)
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, per_coin=True, per_coin_gaps=True)
     stat.record_message(NOW_MS, ["BTC", "ETH"])
     stat.record_message(NOW_MS + 10_000, ["ETH"])  # BTC's subscription is gone
 
@@ -244,7 +246,7 @@ def test_one_dead_coin_subscription_is_a_gap_even_while_the_others_keep_flowing(
 
 def test_a_coin_dropped_from_the_universe_stops_being_a_gap() -> None:
     """Otherwise an unsubscribed coin is silent forever and alerts forever."""
-    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, per_coin=True, per_coin_gaps=True)
     stat.record_message(NOW_MS, ["BTC", "WIF"])
     stat.forget_coin("WIF")
     stat.record_message(NOW_MS + 10_000, ["BTC"])
@@ -280,3 +282,31 @@ async def test_dropping_a_coin_from_the_universe_reaches_its_stream_stats() -> N
     await stream.set_symbols(["BTC"])
     stat.record_message(NOW_MS + 10_000, ["BTC"])
     assert stat.check_silence(5.0, NOW_MS + 10_000) == []  # WIF is unsubscribed, not silent
+
+
+def test_a_thin_coin_going_a_minute_without_a_trade_is_not_a_gap() -> None:
+    """Measured against the live feed on 2026-09-05: counting per-coin gaps on `trades`
+    and `l2` produced 20 warnings in one quiet minute, nearly all of them normal market.
+    Trades are events (a thin coin genuinely goes minutes without one) and l2 pushes
+    about every 4s per coin, so only `bbo` ticks per coin continuously."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC"])
+    stat.record_message(NOW_MS + 60_000, ["ETH"])
+
+    assert stat.check_silence(5.0, NOW_MS + 60_000) == []
+    assert stat.silent_s(NOW_MS + 60_000) == 0.0  # the stream is alive, so it is not silent
+    # But which coin has been quiet longest is still reported, which is the evidence a
+    # dead per-coin subscription leaves.
+    assert stat.feed_state(NOW_MS + 60_000).worst_coin == "BTC"
+
+
+def test_the_whole_trades_stream_going_quiet_is_still_a_gap() -> None:
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC"])
+    assert stat.check_silence(5.0, NOW_MS + 6_000) == [""]
+    assert stat.silent_s(NOW_MS + 6_000) == 6.0
+
+
+def test_which_streams_count_gaps_per_coin() -> None:
+    assert set(PER_COIN_GAP_STREAMS) == {"hyperliquid.bbo"}
+    assert PER_COIN_GAP_STREAMS < PER_COIN_STREAMS  # a strict subset, by construction

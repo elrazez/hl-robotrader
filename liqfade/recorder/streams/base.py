@@ -56,12 +56,12 @@ CONTINUOUS_STREAMS = frozenset(
     }
 )
 
-# Streams whose silence has to be measured per coin, not per stream. Hyperliquid
-# subscribes each coin separately, so one coin's subscription can die while the others
-# keep the stream's last-message time fresh: `lag_ms` stays near zero, no gap is counted,
-# and the Phase 1 DoD ("no gap over 5s on HL trades and BBO for the core coins") cannot be
-# evidenced from the metrics. Bybit is not here: one topic per symbol, but its silence is
-# already meaningful at the stream level and the venue is a single liquidation feed.
+# Streams that track a last-message time per coin. Hyperliquid subscribes each coin
+# separately, so one coin's subscription can die while the others keep the stream's
+# last-message time fresh: `lag_ms` stays near zero and nothing in the metrics says which
+# subscription went. These carry `worst_coin` and `worst_lag_ms` to the panel, which is
+# the evidence that failure leaves. Bybit is not here: one topic per symbol, but the venue
+# is a single liquidation feed and its silence is meaningful at the stream level.
 PER_COIN_STREAMS = frozenset(
     {
         "hyperliquid.trades",
@@ -69,6 +69,16 @@ PER_COIN_STREAMS = frozenset(
         "hyperliquid.l2",
     }
 )
+
+# Of those, the ones whose *silence* is per coin too, so a gap is counted and the outage
+# alert fires per coin. Only `bbo`, which ticks 2 to 5 times a second for every coin.
+# Measured against the live feed on 2026-09-05: with all three counting per coin, one
+# quiet minute produced twenty `stream_gap` warnings, nearly all normal market. `trades`
+# are events and a thin coin genuinely goes minutes without one; `l2` pushes about every
+# four seconds per coin, so `recorder.gap_alert_s` of 5s sits just above its natural
+# cadence (docs/DATA_SOURCES.md says so). For those two the stream as a whole going quiet
+# is the outage worth alerting, and `worst_coin` still shows a dead subscription.
+PER_COIN_GAP_STREAMS = frozenset({"hyperliquid.bbo"})
 
 HOUR_S = 3600.0
 STABLE_CONNECTION_S = 60.0  # a connection alive this long resets the backoff ladder
@@ -95,7 +105,8 @@ class StreamStats:
     name: str
     continuous: bool = False
     connected: bool = False
-    per_coin: bool = False
+    per_coin: bool = False  # track a last-message time per coin, and report the worst
+    per_coin_gaps: bool = False  # and count a gap, and alert, per coin
     last_msg_ms: int = 0
     _buckets: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
     _gap_times: deque[float] = field(default_factory=deque)
@@ -158,7 +169,7 @@ class StreamStats:
         """
         if not self.continuous:
             return []
-        if self.per_coin:
+        if self.per_coin_gaps:
             opened = []
             for coin, last in sorted(self._coin_msg_ms.items()):
                 if coin in self._coin_gap_open or (now_ms - last) / 1000.0 <= gap_alert_s:
@@ -188,14 +199,15 @@ class StreamStats:
     def silent_s(self, now_ms: int, coin: str | None = None) -> float:
         """Seconds since the last message. 0 when nothing has ever been delivered.
 
-        For a per-coin stream with no coin named, this is the *worst* coin's silence, not
-        the stream's: one dead subscription out of twenty is what the number has to show,
-        because the stream as a whole is never quiet while any coin still ticks.
+        For a stream whose gaps are counted per coin, and with no coin named, this is the
+        *worst* coin's silence rather than the stream's: one dead subscription out of
+        twenty is what the number has to show, because the stream as a whole is never
+        quiet while any coin still ticks.
         """
         if coin is not None:
             last = self._coin_msg_ms.get(coin, 0)
             return 0.0 if last == 0 else (now_ms - last) / 1000.0
-        if self.per_coin and self._coin_msg_ms:
+        if self.per_coin_gaps and self._coin_msg_ms:
             return self.worst_coin(now_ms)[1]
         return 0.0 if self.last_msg_ms == 0 else (now_ms - self.last_msg_ms) / 1000.0
 
@@ -301,6 +313,7 @@ class WSStream:
                 name=name,
                 continuous=name in CONTINUOUS_STREAMS,
                 per_coin=name in PER_COIN_STREAMS,
+                per_coin_gaps=name in PER_COIN_GAP_STREAMS,
             )
             self.stats[name] = stat
         return stat
