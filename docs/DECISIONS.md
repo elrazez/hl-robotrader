@@ -949,3 +949,61 @@ chunks by coin-month so memory is never the constraint, and `build_episodes` cac
 output so the other seven scripts do not repeat it. Reverse by folding the four flow
 functions into a single pass over a single sort, roughly a 3x win, at the cost of merging
 four independently tested seams into one.
+
+## 2026-09-05 (Phase 3 research, defects found on the first real run)
+
+**The research scripts never applied the configured universe, and the first year of
+results is void because of it.** `config/default.yaml` carries `universe.min_day_ntl_vlm_usd`
+(20M), `min_open_interest_usd` (5M), `min_listing_days` (14) and `exclude`, and CLAUDE.md
+says the universe is "high market-cap, liquid HL perps, selected dynamically by volume and
+open interest". `scripts/research/_lib.py` read none of it and studied every coin the
+liquidation table mentions.
+
+Logged **before** the fix is run, per the preregistration's anti-tinkering rule, stating
+what had already been seen. This is recorded as a **defect, not a re-cut of the episode
+definition**: the specification always said the universe was filtered, so neither of the
+two permitted re-cuts is consumed. Owner's decision, 2026-09-05.
+
+What had already been seen on the unfiltered year (2025-09-01 to 2026-08-30):
+
+- 279,307 episodes detected, 5,149 qualifying, 3,262 clusters.
+- Q1 headline +84.3 bps net-stress at +15 min, 95% CI [+1.0, +195.8], median +28.3. A mean
+  three times its median with a lower bound of one basis point.
+- Q8 DECISION yes on `k_stop = none`, no stop at all, beating hold-to-horizon by 0.2 bps
+  (+84.5 against +84.3). Every cell's interval spans zero.
+- Capacity-weighted edge reported as $130,342,102 a year, which is its own proof that
+  something upstream was wrong.
+- **1,496 of the 5,149 qualifying episodes (29%) were builder-deployed HIP-3 markets**:
+  `cash:AMZN`, `cash:GOOGL`, `cash:USA500`, `flx:GOLD`, `flx:OIL`, `flx:SILVER`, `xyz:TSM`,
+  `xyz:MU`, and `hyna:BTC`/`hyna:ETH` duplicating the majors on third-party DEXs. All 1,496
+  have no `asset_ctx` row at all, so their net-stress was null: they contributed nothing to
+  the mean while inflating the episode and cluster counts that the preregistered sample bar
+  is read against.
+- Effective spread p99 4,805 bps and max 18,333 bps; gross PnL max +36,212 bps. Broken mids
+  on illiquid tape, not trades.
+
+The fix: one universe rule, applied at episode detection in `build_episodes`, reusing
+`liqfade/recorder/universe.py:select_universe` rather than writing a second copy of it. A
+coin is in the universe for a UTC day when the recorder's own rule says so, evaluated on the
+last `asset_ctx` sample strictly before that day began. A coin with no `asset_ctx` row is
+out, not null. A coin whose name contains a colon is out: those are builder-deployed HIP-3
+markets and are not the venue this strategy trades. `min_listing_days` is measured from the
+coin's first `asset_ctx` sample in the lake, so a coin listed before the lake starts reads as
+old as the lake and no older.
+
+**The top-N-by-volume ranking is evaluated once a UTC day, not once a minute.** It is a
+cross-sectional rank over 300 coins, and half a million minutes of it does not compute in a
+research run; the recorder itself refreshes it hourly and `day_ntl_vlm` is a rolling 24h
+figure that barely moves within a day. Every input to it is trailing: the snapshot precedes
+the day it selects for. The per-coin floors are also checked at the episode's own trailing
+minute sample, so an episode in a coin that fell through the floor mid-day is still excluded.
+
+**Phase 3 research runs peak at 3.0 GB (Q1) and 3.3 GB (Q8) over a year, against a 3 GB
+budget on an 8 GB machine.** Accepted by the owner, 2026-09-05. A month runs at 1.6 GB.
+The change that would clear the year, materialising a dense core plus narrow islands around
+the five horizon timestamps instead of a dense 66 minutes, saves about a gigabyte and was
+measured to move the March headline from +38.5 to +37.9 bps: `mid` is a forward-filled last
+trade price, an island cannot forward fill from a trade outside itself, and a row dropped for
+having no price lets the horizon's asof reach a price from after the horizon. Reverted. A
+smaller footprint is not worth a lookahead. Reverse only with a design that keeps the
+forward fill correct across the gaps.
