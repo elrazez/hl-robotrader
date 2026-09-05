@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+import orjson
 
 from liqfade.config.models import Universe
 from liqfade.log import get_logger
@@ -61,7 +62,7 @@ async def fetch_meta_and_ctxs(client: httpx.AsyncClient, api_url: str) -> tuple[
         timeout=REQUEST_TIMEOUT_S,
     )
     response.raise_for_status()
-    payload = response.json()
+    payload = orjson.loads(response.content)
     return payload, (time.monotonic() - started) * 1000.0
 
 

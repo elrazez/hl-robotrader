@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import orjson
 
 from liqfade.data.ingest.common import BackfillError, Manifest, day_range, write_partitioned
 from liqfade.data.schemas import SOURCE_HL_API
@@ -55,7 +56,7 @@ def day_bounds(start: date, end: date) -> tuple[int, int]:
 def _post(client: httpx.Client, api_url: str, payload: dict[str, Any]) -> Any:
     response = client.post(f"{api_url}/info", json=payload, timeout=REQUEST_TIMEOUT_S)
     response.raise_for_status()
-    return response.json()
+    return orjson.loads(response.content)
 
 
 def live_coins(client: httpx.Client, api_url: str) -> list[str]:

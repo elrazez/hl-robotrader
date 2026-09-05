@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import httpx
+import orjson
 
 from liqfade.config.models import Coinalyze
 from liqfade.data.symbols import to_coin
@@ -75,7 +76,7 @@ class CoinalyzePoller:
     async def _get(self, client: httpx.AsyncClient, path: str, params: dict[str, str]) -> Any:
         response = await client.get(path, params=params, headers={"api_key": self.api_key})
         response.raise_for_status()
-        return response.json()
+        return orjson.loads(response.content)
 
     async def _load_markets(self, client: httpx.AsyncClient) -> None:
         """symbol -> (coin, exchange). One call at start, refreshed only on restart."""
