@@ -34,6 +34,8 @@ from liqfade.features.episodes import group_episodes
 
 MATCH_WINDOW_MS = 120_000
 REDUCED_CLUSTER_BAR = 15
+# The other half of the reduced bar. Both must hold; the recorder has not started.
+REDUCED_DAYS_BAR = 60
 
 
 def bybit_episodes(args: object, settings: object) -> pl.DataFrame:
@@ -152,12 +154,22 @@ def main() -> None:
         if not lonely.is_empty()
         else 0
     )
-    if clusters < REDUCED_CLUSTER_BAR:
+    # The reduced bar is 15 clusters AND 60 recorder days, and the recorder has not run at
+    # all: every cross-venue row in the lake is one of the twelve Tardis first-of-month
+    # days. Counting clusters alone and calling it a pass was reading half a bar.
+    recorder_days = (
+        bybit.select(pl.col("start_ts").cast(pl.Datetime("ms")).dt.strftime("%Y-%m-%d"))
+        .to_series()
+        .n_unique()
+    )
+    if clusters < REDUCED_CLUSTER_BAR or recorder_days < REDUCED_DAYS_BAR:
         verdict = lib.decision(
             "inconclusive",
-            f"{lonely.height} orphaned Bybit cascades in {clusters} clusters, against the "
-            f"reduced bar of {REDUCED_CLUSTER_BAR} clusters and 60 recorder days. The "
-            f"recorder has not run that long. Whether this blocks Phase 4 is Q3's trigger "
+            f"{lonely.height} orphaned Bybit cascades in {clusters} clusters over "
+            f"{recorder_days} days of cross-venue data, against the reduced bar of "
+            f"{REDUCED_CLUSTER_BAR} clusters **and** {REDUCED_DAYS_BAR} recorder days. The "
+            f"recorder has not run at all, so every cross-venue row here is one of the "
+            f"twelve Tardis first-of-month days. Whether this blocks Phase 4 is Q3's trigger "
             f"branch to decide, and this report does not decide it. What the sample does "
             f"say: {coincidence:.0%} of Bybit cascades coincide with an HL episode, so the "
             f"two venues are {'largely the same event' if coincidence > 0.5 else 'often'} "

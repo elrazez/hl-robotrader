@@ -217,3 +217,18 @@ anyway, not as a refactor of its own.
     stream never connects. Poll only the recorder's universe (the coins HL actually
     subscribes), spread the chunks across the interval, and back off on `429` instead of
     abandoning the cycle. Until then the cross-venue context table is empty.
+30. **`with_ctx` computes the mark divergence percentile on the 1s grid though `asset_ctx`
+    changes once a minute.** Measured 2026-09-05 on the Q3 year sweep: 15s per day, the
+    single largest cost in the pass. `_mark_divergence` builds `mark_mid_bps` on every grid
+    row and then filters to minute samples for the rolling quantile, so 86,400 rows a coin a
+    day are produced to sample 1,440 of them. The threshold could be computed on the minute
+    frame and joined onto the grid. **This is a speedup that must not change a number**: the
+    per-tick `mark_mid_bps` comparison still has to be evaluated at 1s, and only the
+    trailing p95 behind it moves. Any change here reruns Q3 and diffs the trigger counts
+    before it is kept.
+31. **`hl_forced_proxy` runs twice per day in Q3, 8s each.** The gated and ungated variants
+    share every rolling sum and differ only in the final gate mask, so one pass could emit
+    both columns. Measured 2026-09-05 on the same sweep. **Also a speedup that must not
+    change a number**: the gate-lift table is the difference between the two, and the
+    difference is the deliverable, so a shared pass has to be proved identical to two
+    separate ones on a real day before it is kept.

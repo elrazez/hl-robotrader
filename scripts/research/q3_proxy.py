@@ -38,8 +38,6 @@ from liqfade.features.proxy import hl_forced_proxy
 
 THRESHOLDS = (2.0, 3.0, 4.0, 6.0)
 MATCH_WINDOW_MS = 120_000
-# Coin batches the year is swept in. Memory scales with the coins held at 1s resolution.
-COIN_BATCHES = 3
 PRECISION_BAR = 0.6
 RECALL_BAR = 0.4
 # Below this, and with Q4 unanswerable, the preregistration parks the project (stop rule 5).
@@ -199,28 +197,9 @@ def build_scores(args: object, settings: object, episodes: pl.DataFrame) -> pl.D
     and the 24h mark-divergence percentile are full before the day being scored begins;
     only the scored day's rows are kept.
     """
-    universe = sorted(episodes["coin"].unique().to_list()) if not episodes.is_empty() else []
-    if not universe:
-        return pl.DataFrame()
-    # Split the universe into batches and sweep each separately. A trigger belongs to one
-    # coin and is matched against episodes on that same coin, so batching by coin is exact
-    # and not an approximation: the two halves' triggers simply concatenate. It costs a
-    # second pass over the drive and halves the resident grid, which is what a 42 coin
-    # universe over two days at 1s resolution needs.
-    batches = [universe[start::COIN_BATCHES] for start in range(COIN_BATCHES)]
-    return (
-        pl.concat(
-            [part for batch in batches if not (part := _sweep(args, settings, batch)).is_empty()]
-        )
-        if any(batches)
-        else pl.DataFrame()
-    )
-
-
-def _sweep(args: object, settings: object, coins: list[str]) -> pl.DataFrame:
-    """One coin batch's year of proxy triggers, a UTC day at a time."""
     features = settings.features  # type: ignore[attr-defined]
     proxy_cfg = features.proxy
+    coins = sorted(episodes["coin"].unique().to_list()) if not episodes.is_empty() else []
     if not coins:
         return pl.DataFrame()
     common = {
