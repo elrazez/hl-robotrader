@@ -66,7 +66,12 @@ def build_grid(
     # an integer millisecond.
     grid = grid.with_columns((pl.col("ts_ms") - 1).alias("before"))
     grid = _with_mid(grid, marked, bbo)
-    return _with_volume(grid.drop("before"), marked, step_ms).sort("coin", "ts_ms")
+    # `known` rides in on the asof join's right key and is not part of the contract.
+    return (
+        _with_volume(grid.drop("before"), marked, step_ms)
+        .drop("known", strict=False)
+        .sort("coin", "ts_ms")
+    )
 
 
 def _with_mid(grid: pl.DataFrame, trades: pl.DataFrame, bbo: pl.DataFrame | None) -> pl.DataFrame:

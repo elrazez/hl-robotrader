@@ -44,7 +44,7 @@ def liq_intensity(
         weights: venue to weight. Missing venues weigh 1.0.
 
     Returns:
-        `coin`, `ts_ms` and, per window w, `liq_long_usd_{w}s`, `liq_short_usd_{w}s` and
+        `grid` plus, per window w, `liq_long_usd_{w}s`, `liq_short_usd_{w}s` and
         `liq_imbalance_{w}s`. Notionals are USD and never negative; imbalance is
         `(long - short) / (long + short)` in `[-1, 1]` and 0.0 in an empty window. The
         first w seconds of the grid are warm-up and understate, since the window reaches
@@ -63,7 +63,10 @@ def liq_intensity(
         .group_by("coin", "ts_ms", "side")
         .agg(pl.col("weighted").sum())
     )
-    per_step = grid.select("coin", "ts_ms").sort("coin", "ts_ms")
+    # Built on the grid rather than beside it: every other feature module returns the grid
+    # with columns added, and a function here that returned a bare key frame would silently
+    # drop mid and the volume columns from any pipeline that called it in the middle.
+    per_step = grid.sort("coin", "ts_ms")
     for side in ("long", "short"):
         column = bucketed.filter(pl.col("side") == side).select(
             "coin", "ts_ms", pl.col("weighted").alias(side)

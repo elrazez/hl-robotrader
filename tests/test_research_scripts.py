@@ -20,12 +20,8 @@ SCRIPTS = Path(__file__).parents[1] / "scripts" / "research"
 LAKE_START = "2026-03-01"
 LAKE_END = "2026-03-01"
 
-# script stem -> the report it must write under the out dir.
-QUESTIONS = {
-    "q1_reversion": "q1_reversion.md",
-    "q3_proxy": "q3_proxy.md",
-    "q8_path": "q8_path.md",
-}
+# Discovered rather than listed, so a ninth question cannot be added without a smoke test.
+QUESTIONS = {path.stem: f"{path.stem}.md" for path in sorted(SCRIPTS.glob("q[0-9]_*.py"))}
 
 
 def run(name: str, tmp_path: Path, lake: Path) -> None:
@@ -52,6 +48,11 @@ def run(name: str, tmp_path: Path, lake: Path) -> None:
         sys.argv = old
 
 
+def test_all_eight_question_scripts_exist() -> None:
+    """The phase's deliverable is eight questions, one script each."""
+    assert len(QUESTIONS) == 8, f"expected eight question scripts, found {sorted(QUESTIONS)}"
+
+
 @pytest.mark.parametrize("name,report", sorted(QUESTIONS.items()))
 def test_the_script_runs_on_the_fixture_lake_and_writes_a_report_with_a_decision(
     name: str, report: str, tmp_path: Path, research_lake: Path
@@ -60,4 +61,7 @@ def test_the_script_runs_on_the_fixture_lake_and_writes_a_report_with_a_decision
     text = (tmp_path / report).read_text()
     verdict = re.search(r"^## DECISION: (yes|no|inconclusive)$", text, re.MULTILINE)
     assert verdict, f"{report} has no parseable DECISION line"
-    assert "net-stress" in text, f"{report} never mentions the cost basis every DECISION reads"
+    # Q5 measures timing, not money, and says so; every other report has to state the cost
+    # basis its DECISION is read from.
+    if name != "q5_rhythm":
+        assert "net-stress" in text, f"{report} never states the cost basis its DECISION reads"

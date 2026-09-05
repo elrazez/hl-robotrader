@@ -25,8 +25,9 @@ from typing import NamedTuple
 import numpy as np
 import polars as pl
 
+from liqfade.features.context import with_ctx
 from liqfade.features.episodes import group_episodes, qualify_episodes
-from liqfade.features.flow import realized_vol
+from liqfade.features.flow import cvd, realized_vol
 from liqfade.features.grid import build_grid, effective_ts
 from liqfade.features.intensity import liq_intensity
 from liqfade.features.zscore import robust_z
@@ -219,21 +220,24 @@ def drop_top_clusters(frame: pl.DataFrame, column: str, *, count: int) -> pl.Dat
     return frame.filter(~pl.col("cluster").is_in(ranked))
 
 
-def write_report(path: Path, title: str, blocks: list[str]) -> Path:
-    """Write a question's markdown report and return its path."""
+def write_report(path: Path, title: str, blocks: list[str], *, costs: bool = True) -> Path:
+    """Write a question's markdown report and return its path.
+
+    `costs=False` for a question that measures timing rather than money and so has no cost
+    columns to carry. Everything else states the three-column rule in its header, because a
+    reader should not have to trust that a table they are looking at is net of anything.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    header = [
-        f"# {title}",
-        "",
-        f"Generated {stamp} by `{Path(__file__).parent.name}/{Path(__file__).name}`'s caller.",
-        "",
-        "Every table below carries three columns: gross, net-9bps (0.09% round trip) and",
-        "net-stress (that fee, entry one second after the extreme, and one effective spread",
-        "per side). The DECISION reads net-stress and nothing else. Funding is ignored: at a",
-        "1 to 60 minute hold it is under a tenth of a basis point.",
-        "",
-    ]
+    header = [f"# {title}", "", f"Generated {stamp} from the Parquet lake.", ""]
+    if costs:
+        header += [
+            "Every table below carries three columns: gross, net-9bps (0.09% round trip) and",
+            "net-stress (that fee, entry one second after the extreme, and one effective",
+            "spread per side). The DECISION reads net-stress and nothing else. Funding is",
+            "ignored: at a 1 to 60 minute hold it is under a tenth of a basis point.",
+            "",
+        ]
     path.write_text("\n".join(header + blocks) + "\n")
     return path
 
@@ -367,8 +371,7 @@ def _chunk_episodes(
         liq_z_min=cfg.liq_z_min,
     )
     window = (pl.col("start_ts") >= ms(start)) & (pl.col("start_ts") < ms(end) + 86_400_000)
-    grid = realized_vol(grid, windows_s=[RV_WINDOW_S], step_ms=GRID_STEP_MS)
-    return _attach_outcomes(episodes.filter(window), grid, trades, data_dir, load_start, load_end)
+    return attach_outcomes(episodes.filter(window), grid, trades, data_dir, load_start, load_end)
 
 
 def _attach_max_z(episodes: pl.DataFrame, scored: pl.DataFrame) -> pl.DataFrame:
@@ -392,7 +395,7 @@ def _attach_max_z(episodes: pl.DataFrame, scored: pl.DataFrame) -> pl.DataFrame:
     return episodes.join(peak, on=["coin", "side", "start_ts"], how="left")
 
 
-def _attach_outcomes(
+def attach_outcomes(
     episodes: pl.DataFrame,
     grid: pl.DataFrame,
     trades: pl.DataFrame,
@@ -400,9 +403,16 @@ def _attach_outcomes(
     load_start: str,
     load_end: str,
 ) -> pl.DataFrame:
-    """Entry prices, horizon mids and the spread estimate, all read forward from the extreme."""
+    """Entry prices, horizon mids, spread and the filter inputs, read forward from the extreme.
+
+    Public because Q4 measures Bybit-detected episodes on Hyperliquid's own tape, which is
+    the same measurement on a different set of episodes, and a second copy of it would be
+    a second chance to get the cost model wrong.
+    """
     if episodes.is_empty():
         return episodes
+    if f"rv_{RV_WINDOW_S}s" not in grid.columns:
+        grid = realized_vol(grid, windows_s=[RV_WINDOW_S], step_ms=GRID_STEP_MS)
     mids = grid.select("coin", "ts_ms", "mid").sort("ts_ms")
     out = episodes.with_columns(
         pl.col("extreme_px").alias("entry_px"),
@@ -448,7 +458,43 @@ def _attach_outcomes(
         out = _mid_at(out, mids, f"_h{minutes}", f"mid_plus_{minutes}m")
     out = out.drop([f"_h{minutes}" for minutes in HORIZONS_MIN])
     out = _attach_spread(out, trades, data_dir, load_start, load_end)
+    out = _attach_filter_inputs(out, trades, data_dir, load_start, load_end)
     return with_clusters(out, window_s=CLUSTER_WINDOW_S)
+
+
+def _attach_filter_inputs(
+    frame: pl.DataFrame, trades: pl.DataFrame, data_dir: str | Path, start: str, end: str
+) -> pl.DataFrame:
+    """The columns Q6 splits the sample by: funding, session hour and listing age.
+
+    `since_listing_days` is measured from the coin's first print inside the loaded window,
+    so a coin listed before the lake starts reads as old as the lake and no older. Q6 says
+    so, because the filter it feeds is "listed under 14 days" and the lake is a year.
+    """
+    ctx = load_table(data_dir, "asset_ctx", start, end)
+    if ctx.is_empty():
+        frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("funding_at_start"))
+    else:
+        samples = ctx.select(
+            "coin", pl.col("ts_ms").alias("_f_ts"), pl.col("funding").alias("funding_at_start")
+        ).sort("_f_ts")
+        frame = (
+            frame.with_columns((pl.col("start_ts") - 1).alias("_before"))
+            .sort("_before")
+            .join_asof(samples, left_on="_before", right_on="_f_ts", by="coin", strategy="backward")
+            .drop("_before", "_f_ts")
+        )
+    first_print = trades.group_by("coin").agg(pl.col("ts_ms").min().alias("_first_print"))
+    return (
+        frame.join(first_print, on="coin", how="left")
+        .with_columns(
+            ((pl.col("start_ts") - pl.col("_first_print")) / 86_400_000).alias(
+                "since_listing_days"
+            ),
+            pl.col("start_ts").cast(pl.Datetime("ms")).dt.hour().alias("session_hour"),
+        )
+        .drop("_first_print")
+    )
 
 
 def _mid_at(frame: pl.DataFrame, mids: pl.DataFrame, when: str, alias: str) -> pl.DataFrame:
@@ -645,3 +691,49 @@ def episode_tape(data_dir: str | Path, episodes: pl.DataFrame, *, horizon_s: int
         if not part.is_empty():
             parts.append(part)
     return pl.concat(parts).sort("key", "ts_ms") if parts else empty
+
+
+def feature_grid(data_dir: str | Path, first: str, last: str, settings: object) -> pl.DataFrame:
+    """One month of the grid with the tick features an entry rule needs, plus its pads.
+
+    Q2 evaluates the exhaustion rule tick by tick, which needs the liquidation intensity,
+    the CVD slope, the mark divergence percentile and the running extreme all on the same
+    frame. Built here rather than in the script so the windows come from config in one
+    place. Returns an empty frame when the month has no trades.
+    """
+    features = settings.features  # type: ignore[attr-defined]
+    exhaustion = settings.exhaustion  # type: ignore[attr-defined]
+    load_start, load_end = padded(first, last)
+    trades = load_table(data_dir, "trades", load_start, load_end, venue="hyperliquid")
+    if trades.is_empty():
+        return pl.DataFrame()
+    liquidations = load_table(data_dir, "liquidations", load_start, load_end, venue="hyperliquid")
+    ctx = load_table(data_dir, "asset_ctx", load_start, load_end)
+    grid = build_grid(
+        trades,
+        None,
+        start_ms=ms(load_start),
+        end_ms=ms(load_end) + 86_400_000,
+        step_ms=GRID_STEP_MS,
+    )
+    if not liquidations.is_empty():
+        grid = liq_intensity(
+            liquidations,
+            grid,
+            windows_s=list(features.windows_s),
+            step_ms=GRID_STEP_MS,
+            weights={"hyperliquid": 1.0},
+        )
+    grid = cvd(
+        grid,
+        windows_s=[int(features.cvd_slope_window_s)],
+        slope_window_s=int(features.cvd_slope_window_s),
+        step_ms=GRID_STEP_MS,
+    )
+    return with_ctx(
+        grid,
+        ctx,
+        windows_s=[int(features.proxy.oi_delta_window_s)],
+        step_ms=GRID_STEP_MS,
+        quantile=exhaustion.mark_mid_pct_threshold / 100.0,
+    )
