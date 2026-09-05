@@ -900,3 +900,40 @@ days. The bars are the ones rebuilt after the 02d rederive, not the ones before 
 **Phase 2 is done.** No unexplained hole. One explained defect, 173,868 rows in one venue
 on one day of the validation set, with a known fix. One property of the data that the
 research has to plan around, the June 2026 book cadence.
+
+## 2026-09-05 (Phase 3 features)
+
+**The grid row at `t` covers `[t - step, t)`, strictly before t.** The no-lookahead rule is
+enforced once, in `features/grid.py`, rather than re-checked in nine feature modules: a
+value read at t was knowable at t, so every feature built on the grid inherits the
+guarantee. A trade stamped exactly on the second belongs to the next bar. Reverse never;
+the property tests in `tests/test_features_*.py` pin it.
+
+**`mid` prefers the bbo midpoint and falls back to the last trade price.** The historical
+year has no bbo at all, so for the backfilled window `mid` is the last trade price and
+carries no spread. That is accepted only because the cost model subtracts an estimated
+effective spread per side (`reports/research/PREREGISTRATION.md`). Reverse when the
+recorder has enough bbo to rerun on quotes.
+
+**The extreme of an episode is searched to `end_ts + join_gap_s`, not to `end_ts`.** The
+silence is what ended the episode, and the price impact of the last liquidation lands in
+the seconds after it. Searching only to `end_ts` would record `anchor == extreme` for every
+single-event episode and score a zero move. Reverse if a re-cut of the episode definition
+is logged first, per the preregistration's two-re-cut limit.
+
+**The MAD in `features/zscore.py` is the streaming form.** `MAD_t = rolling_median(abs(v -
+rolling_median(v)))`, two rolling medians, rather than the exact per-window median of
+deviations from that window's own median. Exact MAD needs a median of medians per window,
+which does not vectorize: a year of one coin at 1-minute samples is 525,600 windows of
+1,440 points, minutes per coin against the phase's one-minute-per-coin-year budget. Over a
+slowly moving median the two agree closely. Reverse if a research result ever turns on the
+difference.
+
+**The z-score scales the MAD by 1.4826.** Without it a threshold of 3 means three MADs,
+which is about two sigma on normal data, and every threshold in
+`docs/STRATEGY_AND_RISK.md` is written as a z. Reverse never.
+
+**Sums over a partial window are reported; volatility over a partial window is null.** A
+sum of what happened is still what happened, but an understated `rv` is a denominator that
+inflates everything divided by it, including the stop distance. So `rv_{w}s` is null until
+its window is full and liquidation and CVD sums are not.
