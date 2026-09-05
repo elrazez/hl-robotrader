@@ -586,3 +586,19 @@ signal and the whole node question goes away.
 - **ASXN and Proof Group peering prices.** Pages rendered no price.
 - **Whether HyperTracker or Hypurrscan sell HL liquidations at all.** Neither documents it.
 - **Vendor terms of service.** Not checked, because no vendor here is recommended.
+
+## Answer to the open query: how much is backstop?
+
+Run 2026-09-06 over the lake's `liquidations` table, `venue = hyperliquid`, `source =
+hl_s3`, the full year:
+
+| method | events | share of events | notional | share of notional |
+|---|---:|---:|---:|---:|
+| market | 5,569,709 | 98.9% | $35.3bn | 87.6% |
+| backstop | 64,173 | 1.1% | $4.98bn | 12.4% |
+
+Inside the minutes that matter, the 16,958 coin-minutes with at least $250k liquidated
+(the episode floor), backstop is 14.1% of the notional and only 3.4% of those minutes
+contain any backstop fill at all. The free vault subscription would see roughly one cascade
+in thirty. It is not a trigger. The node is the only complete real-time source, and the
+question is now a purchase decision, not a research one.
