@@ -21,3 +21,11 @@ VPS, if a test ever needs multi-venue liquidations.
 
 Raw WebSocket payloads for the parser tests live inline in `tests/test_recorder_parsers.py`
 and are refreshed with `scripts/probe/ws_payloads.py`.
+
+`research_lake.py` is not a fixture but the generator of one: four hours of synthetic tape
+carrying about fifty injected cascades, built into a temporary directory by the
+`research_lake` session fixture in `conftest.py` and used by the research scripts' smoke
+tests. It is generated rather than committed so it cannot drift from `data/schemas.py` and
+so half a megabyte of Parquet stays out of the repo. It proves the eight scripts run end to
+end; it proves nothing about the science, and every question it answers reads
+`inconclusive` because four hours cannot clear a bar written for eight calendar months.

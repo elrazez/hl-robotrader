@@ -216,6 +216,7 @@ def drop_top_clusters(frame: pl.DataFrame, column: str, *, count: int) -> pl.Dat
         .agg(pl.col(column).mean().alias("_mean"))
         .sort("_mean", descending=True)
         .head(count)["cluster"]
+        .to_list()
     )
     return frame.filter(~pl.col("cluster").is_in(ranked))
 
@@ -266,6 +267,15 @@ def decision(verdict: str, reason: str) -> str:
 # 24h warm-up in front, so the z-score's trailing distribution is full before the first
 # episode of the month is judged, and a 65 minute pad behind, so the +60 minute horizon of
 # an episode on the last day of the month has tape to read.
+#
+# ponytail: a year of one coin costs about 275s through the whole feature set, against the
+# 60s budget in prompts/03_research.md, so a year of a twenty coin universe is a few hours
+# rather than twenty minutes. Nothing loops over rows; the cost is that a year at 1s is 31.5
+# million rows and every rolling op with `.over("coin")` re-partitions and re-materialises
+# them. The upgrade path, if the owner ever needs the run to be interactive, is to fold the
+# four flow functions into one pass over one sort instead of four, which measurement puts at
+# roughly a 3x win. Not taken now: it would merge four tested seams into one to speed up a
+# job that runs once.
 # ---------------------------------------------------------------------------------------
 
 WARMUP_MS = 25 * 3_600_000  # the 24h z lookback plus an hour of slack for the longest window

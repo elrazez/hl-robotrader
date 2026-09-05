@@ -80,6 +80,7 @@ def test_displacement_measures_the_mid_against_the_vwap_before_the_window() -> N
 
 
 def test_no_flow_feature_can_see_a_bar_that_has_not_closed() -> None:
+    """One test over all four: prices and volume after the cut, every value before it fixed."""
     early = grid(
         [100.0] * 20, signed_notional=[1e5] * 20, notional_usd=[1e5] * 20, volume=[1.0] * 20
     )
@@ -95,4 +96,24 @@ def test_no_flow_feature_can_see_a_bar_that_has_not_closed() -> None:
     assert (
         realized_vol(early, **kwargs).filter(cut).to_dicts()
         == realized_vol(late, **kwargs).filter(cut).to_dicts()
+    )
+    flooded = early.with_columns(
+        pl.when(pl.col("ts_ms") > DAY + 15 * STEP)
+        .then(1e9)
+        .otherwise(pl.col("signed_notional"))
+        .alias("signed_notional"),
+        pl.when(pl.col("ts_ms") > DAY + 15 * STEP)
+        .then(1e9)
+        .otherwise(pl.col("notional_usd"))
+        .alias("notional_usd"),
+    )
+    cvd_kwargs = {"windows_s": [5], "slope_window_s": 5, "step_ms": STEP}
+    assert (
+        cvd(early, **cvd_kwargs).filter(cut).to_dicts()
+        == cvd(flooded, **cvd_kwargs).filter(cut).to_dicts()
+    )
+    disp_kwargs = {"windows_s": [5], "anchor_s": 5, "step_ms": STEP}
+    assert (
+        displacement(early, **disp_kwargs).filter(cut).to_dicts()
+        == displacement(flooded, **disp_kwargs).filter(cut).to_dicts()
     )

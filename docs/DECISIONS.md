@@ -937,3 +937,15 @@ which is about two sigma on normal data, and every threshold in
 sum of what happened is still what happened, but an understated `rv` is a denominator that
 inflates everything divided by it, including the stop distance. So `rv_{w}s` is null until
 its window is full and liquidation and CVD sums are not.
+
+**Phase 3 features run in a few hours over a year, not the budgeted twenty minutes.**
+Measured 2026-09-05 on a synthetic year of one coin at 1s resolution: `build_grid` 50s,
+`liq_intensity` 14s, `robust_z` 63s, the four flow functions 149s, 275s in all against the
+60s per coin-year the prompt asks for. Nothing loops over rows. The cost is that a year at
+1s is 31.5 million rows, and every rolling op carrying `.over("coin")` re-partitions and
+re-materialises the frame: measured standalone, `.over("coin")` costs about 4x on a rolling
+sum and turns a free `shift` into 1.75s. Accepted because the run happens once, the pipeline
+chunks by coin-month so memory is never the constraint, and `build_episodes` caches its
+output so the other seven scripts do not repeat it. Reverse by folding the four flow
+functions into a single pass over a single sort, roughly a 3x win, at the cost of merging
+four independently tested seams into one.
