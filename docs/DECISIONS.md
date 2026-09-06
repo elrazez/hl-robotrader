@@ -1538,3 +1538,68 @@ and what the backtest should do; it is a follow-up engine item and not this run.
 **Reverse this entry** if signing `edge_frac` turns out to have been hiding a different bug
 in the fill model rather than fixing one in the exit, which the 863 bps slippage above is
 the reason to suspect.
+
+
+## 2026-09-06: a week-old book priced three fills, and the lake's drive went read-only
+
+**The three entries that slipped 863 to 1,152 bps in the four-coin year rerun were an engine
+defect, not a cost.** They were 38% of that run's loss. Both of the obvious explanations
+were wrong and the trade log said so before any code was read: all three had
+`no_book_entry=False`, so the degraded tape path did not price them, and each asked price
+matched a tape 0.14 to 0.25 seconds old, so the IOC price was the mid the intent was built
+on. They were walked against a real `l2` book.
+
+| | BTC | SOL | HYPE |
+| --- | --- | --- | --- |
+| asked | 83,492.00 | 124.74 | 34.25 |
+| filled | 93,109.53 | 138.53 | 37.21 |
+| slippage | 1,151.9 bps | 1,105.4 bps | 863.2 bps |
+| last trade before the fill | 83,400.00 | 124.79 | 34.182 |
+| its age at the fill | 0.14 s | 0.17 s | 0.25 s |
+| `l2` snapshot age | there is no `l2` on that day | | |
+
+All three are 2025-11-21, inside eighty seconds of each other. `_CoinState` holds one
+`BookState` for the length of a run, a `Trade` event rebuilds the book keeping the levels it
+already had, and **`l2` is missing 21 whole days of the 364 in the run window** while
+`trades` has all 364. On a day with no snapshots the engine therefore walks the last book it
+ever saw, and `stale_book_s` charged a snapshot a second or two old five basis points while
+nothing at all bounded how old a snapshot could get.
+
+**`backtest.max_quote_age_s`, 5 seconds, applies this module's own rule to its own inputs.**
+The rule was already written down for the tape: a taker fill priced off a guess is refused
+and counted, never filled. It simply was not applied to the book.
+
+- A book older than the cap is discarded and the fill degrades to the tape, because the last
+  trade is better information than a snapshot from another day. That is the same rung of the
+  ladder as a coin that never had a book at all, and it is counted the same way.
+- A tape older than the cap, or one that never printed, refuses the fill. The engine already
+  counts that as an abandoned entry.
+- A fresh book is still walked, which a test pins, because the failure mode of a cap set too
+  tight is that every fill quietly becomes an estimate and the report stops saying so.
+
+The reference digest does not move: the reference window has `l2` throughout, which is also
+why a year of runs never showed this. Measured after the fix, three days across the 42-coin
+research universe: maximum entry slippage 31.3 bps, median 13.8, none over 100, and no
+target exit behind its entry.
+
+**The 42-coin research universe is `reports/research/q1_episodes.parquet`'s coin set**, not
+a `daily_universe` rebuild. That is why the rebuild the owner and this chat both expected
+gives 26 over the reference window and 80 over the year and cannot land on 42. A three-day
+pass over those 42 reports `coins=38`, which is the "four of the forty-two had no tape at all
+in that window" of the streaming entry above, confirmed rather than assumed. A coin needs
+tape in the day being built, not merely somewhere in the padded window.
+
+**The lake's drive unmounted mid-session and came back read-only.** It is NTFS served by
+FSKit; after the drop it mounts `read-only` and a write fails with `errno 30`, so the feature
+cache cannot be written and any run without `--no-cache` dies in `_CacheWriter.add`. Reads
+are healthy and the contents look intact. `diskutil unmount` and `mount` do not clear it and
+`diskutil verifyVolume` refuses NTFS with `-69886`; clearing an NTFS dirty bit needs `chkdsk`
+on Windows. Recorded because it is the third time this drive has changed a result on this
+date: it faked a kill switch, it killed a year run with a `TimeoutError` from `os.stat`, and
+now it has stopped the cache. **A run whose numbers matter should check the mount is
+read-write before it starts**, and the reason the backtest no longer consults the kill switch
+at all is the first of those three.
+
+**Reverse this entry** if 5 seconds turns out to be too tight on a thin coin whose book
+genuinely updates more slowly than that, which would show up as a jump in abandoned entries
+rather than as a wrong price.
