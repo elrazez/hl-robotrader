@@ -1452,3 +1452,89 @@ replayed across 843 windows.
 single rule would have justified, which is what the pass-rate table exists to make visible:
 a rule that passes on almost everything is not corroboration, it is a rule that should be
 dropped rather than counted.
+
+
+## 2026-09-06: the target was behind the entry, and the four-coin year rerun
+
+**Everything the 04c entry above reports as a result was measured with a broken exit.** The
+fix and the rerun are here rather than folded into that entry, so the two sets of numbers
+cannot be confused for each other.
+
+**`Intent.edge_frac` was `abs(target - entry) / entry`.** The absolute value agreed with the
+signed answer on every trade the fixed-delay entry produced, because that entry lands 120s
+into a cascade with price still near the extreme and a target 80% of the way back is ahead
+of it. Under `exhaustion.mode: rule`, and again with `level_reclaim`, the entry waits for
+the bounce to be visible. By then price can be past the target, and `abs()` reported the
+distance *back* to it as edge, so `filters.min_edge_multiple` passed intents whose expected
+move was negative by construction. `edge_frac` is now signed in the trade's direction and a
+non-positive edge is blocked as `target_behind`, its own reason, because a funnel filing
+these under `edge_too_small` says the threshold is too high when what is wrong is the target.
+
+**The reference digest moved, from seven trades to four, and that is the finding.** The
+reference run of the streaming change carried the same defect: three of its seven trades
+were targets already passed. The digest is re-pinned at
+`ee18f6c2164c84e97e785439cecdd80f94d3099b98dcd5a01bd9979e93e10496` with the reason in the
+test comment. A digest that had survived this change would have meant the fix did nothing.
+
+**`intent.target_from` says what the fraction is a fraction of.** `extreme` is the spec's
+formula and stays the default, so v0 and every Phase 3 number are untouched. `entry` gives
+`target = entry + k_target * (anchor - entry)`, the same fraction of the reversion that is
+*left*. The stop does not move in either mode: it belongs beyond the extreme, below the wick
+that swept the level, wherever we got in. A late entry therefore has a nearer target and a
+wider stop, and sizing divides the risk budget by the stop distance, so the same risk
+fraction buys a smaller position. That is the real price of entering late, and it is now in
+the numbers instead of hidden in a target nobody could reach.
+
+**The backtest no longer reads the kill switch.** `Settings.kill_switch_present` fails
+closed on any `OSError`, which is right for a live account and wrong for a replay: a USB
+timeout on the lake's drive was recorded as a `kill_switch` block twice on this date, cost
+the reference run an entry, and made two runs of one command disagree. `RiskEngine` takes
+the check as an argument, defaulting to the real gate so the live path and the gate's own
+tests are untouched, and the backtest passes one that never fires. A replay places no
+orders; there is nothing for a kill file to stop.
+
+**`v1_confluence.yaml` relaxes the account halts, on the owner's instruction.** Tuning runs
+only, in that file alone: `max_dd_frac` and `max_daily_loss_frac` to 1.0 and the losing
+streak cooldown to 0, so the whole tape replays instead of two months of trading and ten of
+a halted account. The per-coin cooldowns and the cluster cap stay, because they shape which
+trades a run takes rather than cutting the tape short. `config/default.yaml` keeps 0.10 and
+0.03 and a test pins both halves.
+
+**The rerun.** Same command, cache warm. The exit is a trade now rather than an accident:
+
+| | before the fix | after |
+| --- | --- | --- |
+| trades | 39 | 51 |
+| net | -1,083.41 USD | **-601.22 USD** |
+| hit rate | 7.7% | **49.0%** |
+| median hold on a target exit | **1.4 s** | **116.3 s** |
+| target exits whose target was behind the entry | 31 of 33 | 3 of 26 |
+| worst drawdown | 10.83%, halted in month three | 6.10%, nothing halted |
+
+The 3s lagged rerun gives 51 trades and -558.72 USD, so nothing is latency fragile; there is
+no positive expectancy to lose. `target_behind` drops **449** intents, which is the size of
+the defect: those were trades before. The loss is now in the stops, 16 of them for -533.5
+USD against -26.9 across all 26 target exits.
+
+**Three trades are 38% of the loss and none of them is the strategy.** The three remaining
+behind-target exits are entry slippage of 863 to 1,152 bps: the fill model filling far worse
+than the resting price during a violent cascade, which puts the realised entry past a target
+that was ahead when the intent was built. That is `backtest/fills.py` and the no-book path,
+not the exit rule, and it is the next thing to look at rather than any threshold.
+
+**`vwap_stretch` passes 92.7% of candidates and is barely a condition.** A cascade that has
+moved price by two volatilities is nearly always 30 bps from the session VWAP. Left at 30
+bps deliberately: the owner sets it after one clean run, and this is that run. `oi_flush` at
+22.6% is the only one of the four that is discriminating much.
+
+**The universe run's coin list, and a selection effect kept on purpose.** The run that
+follows uses a universe fixed from `daily_universe` over 2025-10-09 to 2025-10-11 and
+applied to the whole year, so September's coins are chosen by October's volume. Kept rather
+than fixed, because comparability with the streaming change's memory numbers matters more
+for a run whose question is cost. **The right answer is a universe that changes day by day**,
+read from `daily_universe` with a one-day lag, which is how the live loop will pick coins
+and what the backtest should do; it is a follow-up engine item and not this run.
+
+**Reverse this entry** if signing `edge_frac` turns out to have been hiding a different bug
+in the fill model rather than fixing one in the exit, which the 863 bps slippage above is
+the reason to suspect.
