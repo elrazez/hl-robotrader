@@ -106,3 +106,93 @@ export interface Liquidations {
   totals: Record<string, number>;
   events?: Record<string, number>;
 }
+
+/** GET /api/reports: one row per backtest run, newest first. */
+export interface ReportRow {
+  run_id: string;
+  error: string | null;
+  trigger: string | null;
+  env: string | null;
+  start_ms: number | null;
+  end_ms: number | null;
+  coins: string[];
+  latency_fragile: boolean | null;
+  trades: number | null;
+  net_pnl: number | null;
+  avg_net_bps: number | null;
+  hit_rate: number | null;
+  sharpe_per_trade: number | null;
+  max_drawdown_frac: number | null;
+  top5_pnl_share: number | null;
+  no_book_share: number | null;
+}
+
+/** GET /api/reports/{run_id}: the sidecar plus the markdown the owner reads. */
+export interface ReportDetail {
+  run_id: string;
+  summary: Record<string, unknown>;
+  markdown: string;
+}
+
+/** One row of trades.parquet. `index` is its place in entry order across the whole run. */
+export interface TradeRow {
+  index: number;
+  coin: string;
+  side: string;
+  size: number;
+  entry_px: number;
+  exit_px: number;
+  entry_ms: number;
+  exit_ms: number;
+  hold_s: number;
+  exit_reason: string;
+  net_pnl: number;
+  net_bps: number;
+  fees_usd: number;
+  funding_usd: number;
+  entry_slippage_bps: number;
+  exit_slippage_bps: number;
+  no_book_entry: boolean;
+  no_book_exit: boolean;
+  urgency: string;
+  cascade_notional_usd: number;
+}
+
+export interface TradesPage {
+  total: number;
+  offset: number;
+  trades: TradeRow[];
+}
+
+/** GET /api/reports/{run_id}/equity: cumulative net PnL at each exit. */
+export interface EquityCurve {
+  ts_ms: number[];
+  equity: number[];
+  drawdown: number[];
+}
+
+export interface Candle {
+  ts_ms: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+}
+
+export interface LiquidationMark {
+  ts_ms: number;
+  venue: string;
+  side: string;
+  px: number;
+  notional_usd: number | null;
+}
+
+/** GET /api/reports/{run_id}/trade/{n}/window: everything one trade's chart needs. */
+export interface TradeWindow {
+  trade: TradeRow;
+  start_ms: number;
+  end_ms: number;
+  candles: Candle[];
+  liquidations: LiquidationMark[];
+}

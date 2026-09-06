@@ -424,3 +424,156 @@ def test_a_row_timestamped_in_the_future_does_not_break_the_chart(settings: Sett
         root, [_liq("bybit", FIXED_HOUR, 2.0), _liq("okx", FIXED_HOUR + 48 * 3_600_000, 9.0)]
     )
     assert liquidations_by_venue(root, 24, now=FIXED_HOUR + 60_000)["totals"] == {"bybit": 2.0}
+
+
+class TestReportsApi:
+    """Panel v2: the backtest report browser, over a real run written to a temp dir."""
+
+    @staticmethod
+    def _write_run(reports_dir: Path) -> str:
+        """Produce one genuine report by running the engine, not by faking files."""
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from test_strategy_cascade_consistency import build_stream
+
+        from liqfade.backtest.engine import RunInputs, run_backtest
+        from liqfade.backtest.report import write_report
+        from liqfade.config import resolve
+        from liqfade.config.models import Settings
+
+        merged, _ = resolve("paper")
+        merged["features"]["z_lookback_h"] = 1.0
+        settings = Settings.model_validate(merged)
+        trades, liquidations, start_ms, end_ms = build_stream()
+        result = run_backtest(
+            RunInputs(
+                trades=trades,
+                liquidations=liquidations,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                starting_equity=100_000.0,
+            ),
+            settings,
+        )
+        write_report(
+            result,
+            settings,
+            reports_dir=reports_dir,
+            run_id="20260906T000000Z_deadbeef",
+            n_trials=1,
+        )
+        return "20260906T000000Z_deadbeef"
+
+    def test_it_lists_runs_with_their_headline_metrics(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import list_reports
+
+        run_id = self._write_run(tmp_path)
+        (runs,) = (list_reports(tmp_path),)
+        assert [run["run_id"] for run in runs] == [run_id]
+        assert runs[0]["trades"] == 6
+        assert runs[0]["trigger"] == "exact"
+        assert runs[0]["error"] is None
+
+    def test_a_run_with_a_broken_sidecar_is_listed_with_an_error(self, tmp_path: Path) -> None:
+        """A report the owner can see is broken beats one that silently is not there."""
+        from liqfade.panel.app import list_reports
+
+        (tmp_path / "20260101T000000Z_bad").mkdir()
+        (tmp_path / "20260101T000000Z_bad" / "summary.json").write_text("{not json")
+        (runs,) = (list_reports(tmp_path),)
+        assert runs[0]["error"] is not None
+        assert runs[0]["trades"] is None
+
+    def test_runs_come_back_newest_first(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import list_reports
+
+        for name in ("20260101T000000Z_aaaa", "20260301T000000Z_bbbb", "20260201T000000Z_cccc"):
+            (tmp_path / name).mkdir()
+        assert [run["run_id"][:8] for run in list_reports(tmp_path)] == [
+            "20260301",
+            "20260201",
+            "20260101",
+        ]
+
+    def test_an_absent_reports_directory_is_an_empty_list(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import list_reports
+
+        assert list_reports(tmp_path / "nope") == []
+
+    def test_trades_page(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import read_trades
+
+        run_id = self._write_run(tmp_path)
+        page = read_trades(tmp_path / run_id, limit=2, offset=0)
+        assert page["total"] == 6
+        assert len(page["trades"]) == 2
+        assert page["trades"][0]["index"] == 0
+
+        second = read_trades(tmp_path / run_id, limit=2, offset=2)
+        assert second["trades"][0]["index"] == 2
+        assert second["trades"][0]["entry_ms"] > page["trades"][0]["entry_ms"]
+
+    def test_the_equity_curve_is_cumulative_net_pnl(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import equity_curve
+
+        run_id = self._write_run(tmp_path)
+        curve = equity_curve(tmp_path / run_id)
+        assert len(curve["ts_ms"]) == 6
+        assert curve["equity"] == sorted(curve["equity"]), "this fixture only wins"
+        assert all(value <= 0 for value in curve["drawdown"])
+
+    def test_the_trade_window_carries_candles_and_the_marks(self, tmp_path: Path) -> None:
+        """The chart needs the flow that triggered the trade, not only the fill."""
+        from liqfade.panel.app import trade_window
+
+        run_id = self._write_run(tmp_path)
+        # The lake this fixture came from is synthetic and not on disk, so the candle
+        # lookup finds nothing. The window must still describe the trade.
+        window = trade_window(tmp_path / run_id, tmp_path / "parquet", index=0, before_min=10)
+        assert window["trade"]["coin"] == "BTC"
+        assert window["start_ms"] == window["trade"]["entry_ms"] - 10 * 60_000
+        assert window["end_ms"] > window["trade"]["exit_ms"]
+        assert window["candles"] == []
+
+    def test_the_trade_window_reads_candles_off_a_real_lake(self, tmp_path: Path) -> None:
+        """Derived from the tape when candles_1m has nothing, so a window always renders."""
+        from liqfade.panel.app import _candles
+
+        lake = Path(__file__).parent / "fixtures" / "parquet"
+        start_ms = 1_788_100_624_120
+        rows = _candles(lake, "BTC", start_ms, start_ms + 300_000)
+        assert rows, "the fixture lake has five minutes of BTC tape"
+        assert {"ts_ms", "o", "h", "l", "c", "v"} <= set(rows[0])
+
+    def test_an_out_of_range_trade_index_is_a_404(self, tmp_path: Path) -> None:
+        from fastapi import HTTPException
+
+        from liqfade.panel.app import trade_window
+
+        run_id = self._write_run(tmp_path)
+        with pytest.raises(HTTPException) as caught:
+            trade_window(tmp_path / run_id, tmp_path / "parquet", index=99, before_min=10)
+        assert caught.value.status_code == 404
+
+
+class TestReportPathTraversal:
+    """`run_id` comes from the URL, so it is untrusted input used to build a path."""
+
+    def test_a_run_id_that_escapes_the_reports_directory_is_refused(self, tmp_path: Path) -> None:
+        from fastapi import HTTPException
+
+        from liqfade.panel.app import _run_dir
+
+        (tmp_path / "reports").mkdir()
+        (tmp_path / "secrets").mkdir()
+        for attempt in ("../secrets", "../../etc", "..%2Fsecrets"):
+            with pytest.raises(HTTPException) as caught:
+                _run_dir(tmp_path / "reports", attempt)
+            assert caught.value.status_code == 404
+
+    def test_a_real_run_id_resolves(self, tmp_path: Path) -> None:
+        from liqfade.panel.app import _run_dir
+
+        (tmp_path / "ok").mkdir()
+        assert _run_dir(tmp_path, "ok").name == "ok"

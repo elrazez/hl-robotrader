@@ -3,6 +3,7 @@ import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, log
 import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
 import Login from "./Login";
+import Reports from "./Reports";
 import type { DiskStats, FeedState, Latency, Liquidations, StateSnapshot } from "./types";
 
 const POLL_MS = 1000;
@@ -79,7 +80,35 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
   );
 }
 
+type Tab = "recorder" | "reports";
+
+function TabButton({
+  tab,
+  current,
+  onPick,
+  label,
+}: {
+  tab: Tab;
+  current: Tab;
+  onPick: (tab: Tab) => void;
+  label: string;
+}) {
+  return (
+    <button
+      onClick={() => onPick(tab)}
+      className={`rounded px-3 py-1 text-sm ${
+        tab === current
+          ? "bg-neutral-800 text-neutral-100"
+          : "text-neutral-500 hover:text-neutral-300"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 export default function App() {
+  const [tab, setTab] = useState<Tab>("recorder");
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -107,19 +136,22 @@ export default function App() {
     setLatency(await fetchLatency());
   }, []);
 
+  // Both polls stop on the reports tab. A backtest report is a file that does not move,
+  // and polling state.json once a second behind it would keep the trading loop's snapshot
+  // warm for a page nobody is looking at.
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || tab !== "recorder") return;
     poll();
     const timer = setInterval(poll, POLL_MS);
     return () => clearInterval(timer);
-  }, [authed, poll]);
+  }, [authed, tab, poll]);
 
   useEffect(() => {
-    if (!authed) return;
+    if (!authed || tab !== "recorder") return;
     pollRecorder();
     const timer = setInterval(pollRecorder, RECORDER_POLL_MS);
     return () => clearInterval(timer);
-  }, [authed, pollRecorder]);
+  }, [authed, tab, pollRecorder]);
 
   if (authed === null) return <div className="min-h-screen bg-neutral-950" />;
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
@@ -136,21 +168,27 @@ export default function App() {
             {state?.env ?? "?"} / {state?.proc ?? "?"}
           </span>
         </h1>
-        <button
-          onClick={() => logout().then(() => setAuthed(false))}
-          className="text-sm text-neutral-500 hover:text-neutral-300"
-        >
-          log out
-        </button>
+        <div className="flex items-center gap-2">
+          <TabButton tab="recorder" current={tab} onPick={setTab} label="recorder" />
+          <TabButton tab="reports" current={tab} onPick={setTab} label="reports" />
+          <button
+            onClick={() => logout().then(() => setAuthed(false))}
+            className="ml-4 text-sm text-neutral-500 hover:text-neutral-300"
+          >
+            log out
+          </button>
+        </div>
       </header>
 
-      {problem && (
+      {tab === "reports" ? <Reports /> : null}
+
+      {tab === "recorder" && problem && (
         <div className="mb-4 rounded border border-amber-700/60 bg-amber-950/40 px-4 py-2 text-sm text-amber-300">
           stale: {problem}
         </div>
       )}
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className={`grid gap-4 md:grid-cols-3 ${tab === "recorder" ? "" : "hidden"}`}>
         <Section title="status">
           <Row
             label="live trading"

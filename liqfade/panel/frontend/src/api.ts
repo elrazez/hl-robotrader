@@ -1,4 +1,14 @@
-import type { DiskStats, Latency, Liquidations, StateSnapshot } from "./types";
+import type {
+  DiskStats,
+  EquityCurve,
+  Latency,
+  Liquidations,
+  ReportDetail,
+  ReportRow,
+  StateSnapshot,
+  TradeWindow,
+  TradesPage,
+} from "./types";
 
 export interface StateResult {
   state: StateSnapshot | null;
@@ -70,4 +80,45 @@ export async function fetchLiquidations(hours = 24): Promise<Liquidations | null
     credentials: "same-origin",
   });
   return res.ok ? ((await res.json()) as Liquidations) : null;
+}
+
+/** Backtest reports. All of these are session gated like everything else. */
+export async function fetchReports(limit = 50): Promise<ReportRow[]> {
+  const res = await fetch(`/api/reports?limit=${limit}`, { credentials: "same-origin" });
+  if (!res.ok) return [];
+  return ((await res.json()).runs ?? []) as ReportRow[];
+}
+
+export async function fetchReport(runId: string): Promise<ReportDetail | null> {
+  const res = await fetch(`/api/reports/${encodeURIComponent(runId)}`, {
+    credentials: "same-origin",
+  });
+  return res.ok ? ((await res.json()) as ReportDetail) : null;
+}
+
+export async function fetchTrades(runId: string, offset = 0, limit = 200): Promise<TradesPage> {
+  const res = await fetch(
+    `/api/reports/${encodeURIComponent(runId)}/trades?limit=${limit}&offset=${offset}`,
+    { credentials: "same-origin" },
+  );
+  if (!res.ok) return { total: 0, offset: 0, trades: [] };
+  return (await res.json()) as TradesPage;
+}
+
+export async function fetchEquity(runId: string): Promise<EquityCurve | null> {
+  const res = await fetch(`/api/reports/${encodeURIComponent(runId)}/equity`, {
+    credentials: "same-origin",
+  });
+  return res.ok ? ((await res.json()) as EquityCurve) : null;
+}
+
+export async function fetchTradeWindow(
+  runId: string,
+  index: number,
+): Promise<TradeWindow | null> {
+  const res = await fetch(
+    `/api/reports/${encodeURIComponent(runId)}/trade/${index}/window`,
+    { credentials: "same-origin" },
+  );
+  return res.ok ? ((await res.json()) as TradeWindow) : null;
 }

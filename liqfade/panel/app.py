@@ -52,6 +52,224 @@ def is_loopback(host: str) -> bool:
 
 
 HOUR_MS = 3_600_000
+MINUTE_MS = 60_000
+# Trades returned in one page. The owner scrolls a table; a year of runs is not a dataset
+# to hand a browser in one response.
+MAX_TRADES_PAGE = 2000
+
+
+def _run_dir(reports_dir: Path, run_id: str) -> Path:
+    """Resolve a run id to its directory, refusing anything that escapes `reports/`.
+
+    `run_id` arrives from the URL, so it is untrusted input used to build a path. A id of
+    `../../etc` would otherwise read files outside the reports directory entirely. The
+    check is on the resolved path rather than on the string, because that is the only form
+    that cannot be tricked by encoding.
+    """
+    root = Path(reports_dir).resolve()
+    directory = (root / run_id).resolve()
+    if not directory.is_relative_to(root) or not directory.is_dir():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no run {run_id!r}")
+    return directory
+
+
+def _read_summary(directory: Path) -> dict[str, Any]:
+    """One run's sidecar, or an `error` field saying why it could not be read."""
+    import orjson
+
+    path = directory / "summary.json"
+    try:
+        loaded: dict[str, Any] = orjson.loads(path.read_bytes())
+    except FileNotFoundError:
+        return {"error": "summary.json missing"}
+    except (ValueError, OSError) as exc:
+        return {"error": f"summary.json unreadable: {exc}"}
+    return loaded
+
+
+def list_reports(reports_dir: Path, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Run directories with their headline metrics, newest first.
+
+    Sorted by directory name, which begins with a UTC timestamp, so newest first is a
+    reverse sort rather than a stat of every directory.
+    """
+    root = Path(reports_dir)
+    if not root.is_dir():
+        return []
+    directories = sorted(
+        (path for path in root.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )[: max(1, limit)]
+    runs = []
+    for directory in directories:
+        summary = _read_summary(directory)
+        metrics = summary.get("metrics", {})
+        runs.append(
+            {
+                "run_id": directory.name,
+                "error": summary.get("error"),
+                "trigger": summary.get("trigger"),
+                "env": summary.get("env"),
+                "start_ms": summary.get("start_ms"),
+                "end_ms": summary.get("end_ms"),
+                "coins": summary.get("coins", []),
+                "latency_fragile": summary.get("latency_fragile"),
+                "trades": metrics.get("trades"),
+                "net_pnl": metrics.get("net_pnl"),
+                "avg_net_bps": metrics.get("avg_net_bps"),
+                "hit_rate": metrics.get("hit_rate"),
+                "sharpe_per_trade": metrics.get("sharpe_per_trade"),
+                "max_drawdown_frac": metrics.get("max_drawdown_frac"),
+                "top5_pnl_share": metrics.get("top5_pnl_share"),
+                "no_book_share": metrics.get("no_book_share"),
+            }
+        )
+    return runs
+
+
+def read_trades(directory: Path, *, limit: int, offset: int) -> dict[str, Any]:
+    """One page of `trades.parquet`, ordered by entry time."""
+    import polars as pl
+
+    path = directory / "trades.parquet"
+    if not path.exists():
+        return {"total": 0, "offset": 0, "trades": []}
+    frame = pl.read_parquet(path).sort("entry_ms")
+    total = frame.height
+    page = frame.slice(max(offset, 0), max(1, min(limit, MAX_TRADES_PAGE)))
+    rows = page.to_dicts()
+    for position, row in enumerate(rows):
+        # The index the trade detail endpoint takes, which is the row's place in entry
+        # order rather than its place in this page.
+        row["index"] = max(offset, 0) + position
+    return {"total": total, "offset": max(offset, 0), "trades": rows}
+
+
+def equity_curve(directory: Path) -> dict[str, Any]:
+    """Cumulative net PnL at each exit, as uplot shaped parallel arrays."""
+    import polars as pl
+
+    path = directory / "trades.parquet"
+    if not path.exists():
+        return {"ts_ms": [], "equity": [], "drawdown": []}
+    frame = pl.read_parquet(path).sort("exit_ms")
+    if frame.is_empty():
+        return {"ts_ms": [], "equity": [], "drawdown": []}
+    stamps = frame.get_column("exit_ms").to_list()
+    cumulative = frame.get_column("net_pnl").cum_sum().to_list()
+    peak, drawdown = float("-inf"), []
+    for value in cumulative:
+        peak = max(peak, value)
+        drawdown.append(value - peak)
+    return {"ts_ms": stamps, "equity": cumulative, "drawdown": drawdown}
+
+
+def trade_window(
+    directory: Path, parquet_root: Path, *, index: int, before_min: int
+) -> dict[str, Any]:
+    """One trade, the tape around it, and the liquidations that triggered it.
+
+    Candles come from `candles_1m` where the lake has them and are derived from `trades`
+    where it does not, so a window still renders on a day the derived table was never
+    built. Both come through duckdb over the partition files, which needs no running
+    process: the lake is the database.
+    """
+    import polars as pl
+
+    path = directory / "trades.parquet"
+    if not path.exists():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no trades.parquet for this run")
+    frame = pl.read_parquet(path).sort("entry_ms")
+    if not 0 <= index < frame.height:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no trade {index} in this run")
+
+    trade = frame.row(index, named=True)
+    coin = str(trade["coin"])
+    # From before the cascade rather than before the entry: the flow that triggered the
+    # trade is the thing worth looking at, and under a fixed delay entry it is already two
+    # minutes in the past by the time the order goes in.
+    start_ms = int(trade["entry_ms"]) - before_min * MINUTE_MS
+    end_ms = int(trade["exit_ms"]) + MINUTE_MS
+    return {
+        "trade": trade,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "candles": _candles(parquet_root, coin, start_ms, end_ms),
+        "liquidations": _liquidations(parquet_root, coin, start_ms, end_ms),
+    }
+
+
+def _window_files(parquet_root: Path, table: str, start_ms: int, end_ms: int) -> list[str]:
+    from liqfade.backtest.data import day_files, utc_days
+
+    return [
+        str(path)
+        for day in utc_days(start_ms, end_ms)
+        for path in day_files(parquet_root.parent, table, day)
+    ]
+
+
+def _candles(parquet_root: Path, coin: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    """One minute OHLC over the window, from candles_1m or derived from the tape."""
+    import duckdb
+
+    files = _window_files(parquet_root, "candles_1m", start_ms, end_ms)
+    connection = duckdb.connect()
+    if files:
+        rows = connection.execute(
+            """
+            select ts_ms, o, h, l, c, v from read_parquet(?, union_by_name = true)
+            where coin = ? and ts_ms between ? and ? order by ts_ms
+            """,
+            [files, coin, start_ms, end_ms],
+        ).fetchall()
+        if rows:
+            return [
+                {"ts_ms": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows
+            ]
+
+    tape = _window_files(parquet_root, "trades", start_ms, end_ms)
+    if not tape:
+        return []
+    rows = connection.execute(
+        """
+        select (ts_ms // ?) * ? as minute,
+               first(px order by ts_ms) as o, max(px) as h, min(px) as l,
+               last(px order by ts_ms) as c, sum(sz) as v
+        from read_parquet(?, union_by_name = true)
+        where coin = ? and ts_ms between ? and ?
+        group by 1 order by 1
+        """,
+        [MINUTE_MS, MINUTE_MS, tape, coin, start_ms, end_ms],
+    ).fetchall()
+    return [{"ts_ms": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows]
+
+
+def _liquidations(
+    parquet_root: Path, coin: str, start_ms: int, end_ms: int
+) -> list[dict[str, Any]]:
+    """Every venue's liquidations in the window, as chart markers."""
+    import duckdb
+
+    files = _window_files(parquet_root, "liquidations", start_ms, end_ms)
+    if not files:
+        return []
+    rows = (
+        duckdb.connect()
+        .execute(
+            """
+            select ts_ms, venue, side, px, notional_usd
+            from read_parquet(?, union_by_name = true)
+            where coin = ? and ts_ms between ? and ? order by ts_ms
+            """,
+            [files, coin, start_ms, end_ms],
+        )
+        .fetchall()
+    )
+    return [
+        {"ts_ms": r[0], "venue": r[1], "side": r[2], "px": r[3], "notional_usd": r[4]} for r in rows
+    ]
 
 
 def liquidations_by_venue(
@@ -267,6 +485,59 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
         """
         hours = max(1, min(hours, 168))
         return liquidations_by_venue(settings.paths.data_dir / "parquet", hours)
+
+    @api.get("/reports", dependencies=[Depends(require_session)])
+    def reports(limit: int = 50) -> dict[str, Any]:
+        """Every run under `reports/`, newest first, from the `summary.json` sidecars.
+
+        The sidecar exists precisely so this does not parse markdown. A run whose sidecar
+        is missing or unreadable is listed with an `error` rather than dropped: a report
+        the owner can see is broken is more useful than one that silently is not there.
+        """
+        return {"runs": list_reports(settings.paths.reports_dir, limit=limit)}
+
+    @api.get("/reports/{run_id}", dependencies=[Depends(require_session)])
+    def report(run_id: str) -> dict[str, Any]:
+        """One run's summary plus its markdown, for the report view."""
+        directory = _run_dir(settings.paths.reports_dir, run_id)
+        summary = _read_summary(directory)
+        markdown = (
+            (directory / "report.md").read_text() if (directory / "report.md").exists() else ""
+        )
+        return {"run_id": run_id, "summary": summary, "markdown": markdown}
+
+    @api.get("/reports/{run_id}/trades", dependencies=[Depends(require_session)])
+    def report_trades(run_id: str, limit: int = 500, offset: int = 0) -> dict[str, Any]:
+        """A page of the run's trades, straight out of `trades.parquet`."""
+        directory = _run_dir(settings.paths.reports_dir, run_id)
+        return read_trades(directory, limit=limit, offset=offset)
+
+    @api.get("/reports/{run_id}/equity", dependencies=[Depends(require_session)])
+    def report_equity(run_id: str) -> dict[str, Any]:
+        """The equity curve, rebuilt from the trades so no extra file is needed.
+
+        Cumulative net PnL at each exit, which is the same shape as the engine's own curve
+        at the resolution a chart can use, and it comes from the file the panel already
+        reads rather than from a second artifact that could disagree with it.
+        """
+        directory = _run_dir(settings.paths.reports_dir, run_id)
+        return equity_curve(directory)
+
+    @api.get("/reports/{run_id}/trade/{index}/window", dependencies=[Depends(require_session)])
+    def report_trade_window(run_id: str, index: int, before_min: int = 10) -> dict[str, Any]:
+        """Candles, liquidations and the entry and exit marks around one trade.
+
+        The window runs from `before_min` before the cascade started to the exit, which is
+        what makes a trade arguable after the fact: the chart shows the flow that triggered
+        it, not just the fill.
+        """
+        directory = _run_dir(settings.paths.reports_dir, run_id)
+        return trade_window(
+            directory,
+            settings.paths.data_dir / "parquet",
+            index=index,
+            before_min=before_min,
+        )
 
     @api.get("/config", dependencies=[Depends(require_session)])
     def config() -> dict[str, Any]:
