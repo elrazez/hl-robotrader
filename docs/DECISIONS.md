@@ -1226,8 +1226,30 @@ previous day's candidates as a carry, which a cascade starting at 23:59 needs.
 
 **Proof.** `trades.parquet` is byte-identical to the engine this replaces, on the golden
 fixture and on `2025-10-09` to `2025-10-11` of the real lake for `BTC,ETH,SOL,HYPE`; the
-digest and the command are pinned in `tests/test_backtest_streaming.py`. Three days: 8.6
-minutes and 2.39 GB before (3.14 GB on a re-run), 37 seconds and 1.59 GB after.
+digest and the command are pinned in `tests/test_backtest_streaming.py`.
+
+Measured on the owner's machine, `/usr/bin/time -l`, nothing else running, four coins,
+`features.z_robust: false` so that the runs have fills to be identical about:
+
+| run | wall | peak RSS |
+| --- | --- | --- |
+| three days, the engine this replaces | 8.6 min | 2.39 GB (3.14 GB on a re-run) |
+| three days, streaming | 37 s | 1.59 GB |
+| the year, `2025-09-01` to `2026-08-30`, cold cache | 60.7 min | 2.64 GB |
+| the year, warm cache | 32.0 min | 1.96 GB |
+
+The year replayed **10.4% of the tape in 1,376 windows**, skipping 28,193,589 simulated
+seconds. The warm run saves 28.7 minutes, 47% of the wall clock, and writes a
+`trades.parquet` byte-identical to the cold run's (`703d0a95…`), which is a second proof of
+the cache on top of the unit tests: a year of features read back off disk produces the same
+sixty-four trades as a year of features built from the tape. A year of four coins costs
+6.8 GB of cache.
+
+The cold run's 2.64 GB is over the 2 GB the task asked for and the warm run's 1.96 GB is
+under it, which places the excess in the grid build rather than the replay. `load_day`'s
+`tail_only` is the answer to that and is proven result-identical on the three day
+reference; **the cold year has not been re-measured with it, and the 42-coin universe has
+not been run at all.** Both are outstanding.
 
 **Two things found along the way that are not this change's to fix.**
 
