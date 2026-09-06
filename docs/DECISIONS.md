@@ -1580,6 +1580,17 @@ One consequence worth stating: `recorder.silence_alert_s` (60s) can no longer be
 because a thin coin's normal 92s quiet spell is longer than it. The outage alert now fires at
 `max(silence_alert_s, gap_threshold)`, so nothing pages that is not even a gap.
 
+**And one thing this gives up, deliberately.** A single dead `bbo` subscription no longer
+raises anything. It used to, and that is where 3,829 of the false gaps came from, so the
+trade was worth making; but the failure it used to catch is real, and what is left of it is
+`worst_coin` and `worst_lag_ms` in `liqfade status` and on the panel, which nobody is paged
+about. `trades` still catches a dead coin at 180s, so a coin that dies on both is caught.
+A coin dead on `bbo` alone is visible and not alerted. If that turns out to matter, the
+cheap version is an alert (not a gap count) on a `bbo` coin quiet far past any measured
+quiet spell: the worst on 2026-09-05 was 33s, so 60s would have fired zero times that day.
+Left out of 01c because the instruction for this change was that the worst-coin figure is
+information rather than a gap, and adding a second alert is a decision for the owner.
+
 ## 2026-09-06: 01c, "DOGE arrives 356s late" is Hyperliquid replaying trades we already had
 
 The report was that DOGE trades reached the lake up to 356s behind their exchange time on

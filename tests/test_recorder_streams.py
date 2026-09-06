@@ -587,3 +587,40 @@ async def test_a_stream_with_no_rotation_configured_is_unchanged() -> None:
 
     assert rows, "it should still record"
     assert stream.stats["bybit.trades"].feed_state(NOW_MS).reconnects_1h >= 1
+
+
+async def test_closing_a_retired_socket_does_not_take_the_stream_down() -> None:
+    """Measured on the box: Hyperliquid does not answer our close frame, so closing the
+    socket we retired raises `ConnectionClosedError: sent 1000 (OK); no close frame
+    received` out of its receive loop. That used to leave the task group, which took the
+    replacement's tasks with it and made `run` reconnect from scratch, so every rotation
+    still cost the hole and the resubscribe snapshot it existed to avoid."""
+    stream, _ = _stream(venue="hyperliquid", tables=("trades",))
+    stream._ws = object()  # the replacement is the live socket now
+
+    retired = _ClosingWS(websockets.exceptions.ConnectionClosedError(None, None))
+    await stream._recv_loop(retired)  # returns rather than raising
+
+
+async def test_the_live_socket_dropping_is_still_an_error() -> None:
+    """The same exception on the connection actually in use has to reach `run`, which is
+    what reconnects. Distinguishing them is the whole point."""
+    stream, _ = _stream(venue="hyperliquid", tables=("trades",))
+    live = _ClosingWS(websockets.exceptions.ConnectionClosedError(None, None))
+    stream._ws = live
+
+    with pytest.raises(websockets.exceptions.ConnectionClosedError):
+        await stream._recv_loop(live)
+
+
+class _ClosingWS:
+    """A socket that hands over one message and then reports the connection closed."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def __aiter__(self) -> _ClosingWS:
+        return self
+
+    async def __anext__(self) -> str:
+        raise self.error

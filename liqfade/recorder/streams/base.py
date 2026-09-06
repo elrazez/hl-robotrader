@@ -668,12 +668,30 @@ class WSStream:
             await ws.send(self._encode(self.ping_frame))
 
     async def _recv_loop(self, ws: Any) -> None:
-        async for message in ws:
-            raw = message.encode() if isinstance(message, str) else message
-            # rx_ms is stamped here, before anything is parsed or queued, because every
-            # no-lookahead check downstream is against this number.
-            rx_ms = int(time.time() * 1000)
-            self.handle(raw, rx_ms)
+        """Pump one socket until it closes. Raises only for the socket in use.
+
+        Hyperliquid does not answer our close frame, so closing a socket we retired
+        during a rotation raises `ConnectionClosedError: sent 1000 (OK); no close frame
+        received` here. Letting that out took the `_pump` task group down, and with it
+        the replacement's tasks, so `run` reconnected from scratch and every rotation
+        still cost the hole and the resubscribe snapshot it existed to avoid. Measured on
+        the box, 2026-09-06: two rotations, two reconnects.
+
+        A socket that is no longer `self._ws` was retired by `_rotate` and its close is
+        the point rather than a failure. The live connection dropping still raises, which
+        is what makes `run` reconnect.
+        """
+        try:
+            async for message in ws:
+                raw = message.encode() if isinstance(message, str) else message
+                # rx_ms is stamped here, before anything is parsed or queued, because
+                # every no-lookahead check downstream is against this number.
+                rx_ms = int(time.time() * 1000)
+                self.handle(raw, rx_ms)
+        except Exception as exc:
+            if ws is self._ws:
+                raise
+            log.info("stream_retired", venue=self.venue, reason=_describe(exc))
 
     # --- message handling ----------------------------------------------------
 
