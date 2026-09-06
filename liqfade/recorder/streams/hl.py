@@ -5,9 +5,9 @@ feeding the `trades`, `bbo`, `l2`, `candles_1m` and `asset_ctx` tables. Payload 
 were captured live with `scripts/probe/ws_payloads.py` on 2026-08-30, not taken from a
 doc, and the parser tests embed those exact bytes.
 
-`make_parser()` rather than a module level `parse`, as on every other venue: the candle
-channel needs one piece of per connection state, the open bar of each coin. See its
-docstring for why.
+`make_parser()` rather than a module level `parse`, as on every other venue: two channels
+need per connection state, the open bar of each coin and the trade ids already recorded.
+See its docstring for why.
 
 Two things the schema doc does not say and the wire does:
 
@@ -39,6 +39,14 @@ TABLES = tuple(CHANNEL_TABLES.values())
 VENUE = "hyperliquid"
 CANDLE_INTERVAL = "1m"
 L2_LEVELS = 20  # what the l2Book subscription returns per side
+# Trade ids remembered per coin, so a trade Hyperliquid replays is recognised rather than
+# written a second time. Measured at the 22:42 UTC reconnect of 2026-09-05: the subscribe
+# answer carries the last ~30 trades of each coin, the same count on every coin whatever
+# its rate. 512 is that with room to spare, and it is per coin on purpose: DOGE prints 3
+# times a minute against PONS's 176, so one shared ring would be drained by PONS long
+# before DOGE's six minutes of snapshot arrived. 512 ids across even a 200 coin universe
+# is nothing to hold.
+SEEN_TIDS_PER_COIN = 512
 
 PING_FRAME = {"method": "ping"}
 PONG_MARKER = b'"pong"'
@@ -80,9 +88,28 @@ def _f(value: Any) -> float | None:
 
 
 def make_parser() -> Parser:
-    """A parser bound to one connection, holding the open 1m bar of each coin.
+    """A parser bound to one connection, holding the open 1m bar and seen trades per coin.
 
-    Only the candle channel needs state, and it needs it because HL pushes the
+    **Trades.** Hyperliquid answers a `trades` subscribe with a snapshot of the last ~30
+    trades of that coin, and every reconnect resubscribes. The recorder wrote all of them
+    again: 2,336 duplicate `(coin, tid)` rows on 2026-09-05, and at the 22:42 reconnect
+    every one of the 458 replayed rows was already in the lake. It also made a thin coin
+    look minutes behind, because 30 trades back is six minutes on DOGE and three seconds
+    on BTC, which is the whole of the "DOGE arrives 356s late" report.
+
+    So a trade whose `(coin, tid)` this connection has already emitted is dropped. Not the
+    whole snapshot: the same replay is what fills the hole a reconnect leaves, and the
+    trades that happened while we were away are exactly the ones we have not seen. The
+    memory is per coin and bounded, and it lives as long as the process rather than as
+    long as the socket, which is what makes it survive the reconnect it exists for.
+
+    The one case it cannot cover is a process restart, which starts with an empty memory
+    and so writes one snapshot per coin that the previous run already recorded. That is
+    about 30 rows per coin per restart against 2,336 a day from reconnects, and telling it
+    from a genuine first subscribe would mean reading the lake from inside a parser.
+    docs/DECISIONS.md, 2026-09-06.
+
+    **Candles.** HL pushes the
     in-progress bar over and over: the recorder used to write every push, so a partition
     held many rows per `(coin, ts_ms)`. `candles_1m` has no `rx_ms` by design and
     compaction re-sorts by `ts_ms`, so afterwards nothing could tell which of them was
@@ -101,6 +128,9 @@ def make_parser() -> Parser:
     in-progress bar in the lake are worse than a missing one.
     """
     open_bars: dict[str, tuple[int, dict[str, Any]]] = {}
+    # coin -> its recent trade ids, oldest first. A dict rather than a deque plus a set:
+    # it is insertion ordered, so it is both the membership test and the eviction order.
+    seen_tids: dict[str, dict[int, None]] = {}
 
     def parse(msg: bytes, rx_ms: int) -> list[ParsedRow]:
         """Turn one HL frame into canonical rows. Unknown channels yield nothing."""
@@ -108,7 +138,11 @@ def make_parser() -> Parser:
         channel = obj.get("channel")
         data = obj.get("data")
         if channel == "trades":
-            return [_trade(row, rx_ms) for row in data]
+            return [
+                parsed
+                for parsed in (_trade(row, rx_ms) for row in data)
+                if _first_sight(parsed, seen_tids)
+            ]
         if channel == "bbo":
             return [_bbo(data, rx_ms)]
         if channel == "l2Book":
@@ -142,6 +176,26 @@ def _trade(row: dict[str, Any], rx_ms: int) -> ParsedRow:
             "tid": int(row["tid"]),
         },
     )
+
+
+def _first_sight(parsed: ParsedRow, seen_tids: dict[str, dict[int, None]]) -> bool:
+    """True for a trade this connection has not emitted before. Records it on the way.
+
+    A refused row (`row is None`) passes through so the parse error is still counted; it
+    carries no id to remember. `tid` is Hyperliquid's own trade id and is unique per
+    trade, so the same one twice is the same trade twice.
+    """
+    row = parsed[1]
+    if row is None:
+        return True
+    ids = seen_tids.setdefault(str(row["coin"]), {})
+    tid = int(row["tid"])
+    if tid in ids:
+        return False
+    ids[tid] = None
+    while len(ids) > SEEN_TIDS_PER_COIN:
+        del ids[next(iter(ids))]
+    return True
 
 
 def _level(levels: Any, index: int) -> dict[str, Any]:

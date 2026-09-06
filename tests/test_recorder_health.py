@@ -238,3 +238,61 @@ async def test_the_disk_alert_reads_the_same_as_the_volume_keeps_filling(tmp_pat
     await health.check_disk()
     await health.check_disk()
     assert len(set(alerts.sent)) == 1
+
+
+# --- delivery lag ---------------------------------------------------------------
+
+
+async def test_a_coin_delivering_minutes_behind_is_an_alert(tmp_path: Path) -> None:
+    """The failure `lag_ms` and `gaps_1h` both miss: DOGE trades arrived up to 356s late
+    on 2026-09-05 while the stream itself was never quiet and every other coin on the
+    same connection was under a second."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, connected=True, per_coin=True)
+    at = now_ms()
+    for _ in range(40):
+        stat.record_message(at, lags_ms={"BTC": 200, "DOGE": 90_000})
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == [
+        f"recorder: hyperliquid.trades DOGE arriving over {CFG.lag_alert_s:.0f}s "
+        f"behind its exchange time"
+    ]
+
+
+async def test_the_delivery_lag_alert_reads_the_same_all_through_one_episode(
+    tmp_path: Path,
+) -> None:
+    """Same reason the silence alert carries the threshold: telegram._deduped keys on the
+    exact string, and a lag that moves every check defeats it."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, connected=True, per_coin=True)
+    at = now_ms()
+    for step in range(40):
+        stat.record_message(at, lags_ms={"DOGE": 90_000 + step * 137})
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    await health.check_streams(at + 5_000)
+    assert len(set(alerts.sent)) == 1
+
+
+async def test_a_coin_arriving_on_time_is_not_an_alert(tmp_path: Path) -> None:
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, connected=True, per_coin=True)
+    at = now_ms()
+    for _ in range(40):
+        stat.record_message(at, lags_ms={"BTC": 231, "DOGE": 209})  # the p50s of 2026-09-05
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == []
+
+
+async def test_only_the_streams_whose_lag_means_something_alert(tmp_path: Path) -> None:
+    """`asset_ctx` sets ts_ms to rx_ms because the payload carries no exchange time, so
+    its lag is zero by construction; `l2` is a snapshot whose age is its cadence."""
+    stat = StreamStats(name="hyperliquid.l2", continuous=True, connected=True, per_coin=True)
+    at = now_ms()
+    for _ in range(40):
+        stat.record_message(at, lags_ms={"BTC": 90_000})
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == []
+    # Still reported, because it is the evidence: it is just not a page.
+    assert stat.feed_state(at).delivery_lag_ms == 90_000

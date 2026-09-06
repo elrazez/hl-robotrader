@@ -71,6 +71,12 @@ class FeedState(Base):
     cadence_ms: int = Field(
         0, ge=0, description="ms this stream typically leaves between messages, 0 if not measured"
     )
+    delivery_coin: str | None = Field(
+        None, description="the coin whose rows arrive furthest behind their exchange time"
+    )
+    delivery_lag_ms: int = Field(
+        0, ge=0, description="median rx_ms minus ts_ms for delivery_coin, 0 if not measured"
+    )
 
 
 class PositionState(Base):

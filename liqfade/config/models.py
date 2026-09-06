@@ -83,6 +83,9 @@ class Recorder(Base):
     trades_gap_s: Pos = Field(
         ..., description="seconds without a trade on one coin, counted as a gap"
     )
+    lag_alert_s: Pos = Field(
+        ..., description="seconds one coin may arrive behind its exchange time before alerting"
+    )
     silence_alert_s: Pos = Field(..., description="seconds of silence that alerts Telegram")
     parse_error_alert_1h: int = Field(
         ..., gt=0, description="count: refused rows plus unreadable messages per hour that alerts"

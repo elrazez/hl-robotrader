@@ -392,3 +392,61 @@ def test_a_thin_coins_natural_silence_does_not_trip_the_trades_gap() -> None:
 def test_every_other_stream_keeps_the_configured_gap_threshold() -> None:
     for name in ("hyperliquid.bbo", "bybit.liquidations"):
         assert gap_threshold_s(StreamStats(name=name), CFG) == CFG.gap_alert_s
+
+
+# --- delivery lag ---------------------------------------------------------------
+
+
+def test_delivery_lag_is_measured_per_coin() -> None:
+    """`lag_ms` on a feed is how long since the stream last said anything. It cannot see
+    a coin that is delivering steadily but minutes behind, which is what DOGE did."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    for step in range(40):
+        at = NOW_MS + step * 1_000
+        stat.record_message(at, lags_ms={"BTC": 200, "DOGE": 90_000})
+
+    assert stat.delivery_lag_ms("BTC") == 200
+    assert stat.delivery_lag_ms("DOGE") == 90_000
+    assert stat.worst_delivery() == ("DOGE", 90_000)
+    state = stat.feed_state(NOW_MS + 40_000)
+    assert (state.delivery_coin, state.delivery_lag_ms) == ("DOGE", 90_000)
+
+
+def test_one_late_row_does_not_become_the_coins_lag() -> None:
+    """A subscribe snapshot replays trades minutes old, so a single sample is noise. The
+    number that alerts has to mean the coin is behind, not that one row was."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    for _ in range(40):
+        stat.record_message(NOW_MS, lags_ms={"DOGE": 200})
+    stat.record_message(NOW_MS, lags_ms={"DOGE": 356_085})  # the 2026-09-05 burst's worst
+
+    assert stat.delivery_lag_ms("DOGE") == 200
+
+
+def test_a_coin_with_no_delivery_lag_measured_reports_nothing() -> None:
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC"])
+    assert stat.delivery_lag_ms("BTC") == 0
+    assert stat.worst_delivery() == (None, 0)
+    assert stat.feed_state(NOW_MS).delivery_coin is None
+
+
+def test_a_coin_dropped_from_the_universe_stops_carrying_a_delivery_lag() -> None:
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    for _ in range(40):
+        stat.record_message(NOW_MS, lags_ms={"BTC": 200, "WIF": 90_000})
+    stat.forget_coin("WIF")
+    assert stat.worst_delivery() == ("BTC", 200)
+
+
+def test_the_stream_measures_the_lag_of_the_rows_it_parsed() -> None:
+    """End to end from the wire: `handle` is what knows both timestamps."""
+    stream, _ = _stream(
+        venue="hyperliquid",
+        parse=lambda msg, rx: [("trades", {"coin": "DOGE", "ts_ms": rx - 90_000, "rx_ms": rx})],
+        tables=("trades",),
+    )
+    for step in range(40):
+        stream.handle(b"{}", NOW_MS + step * 1_000)
+
+    assert stream.stats["hyperliquid.trades"].delivery_lag_ms("DOGE") == 90_000

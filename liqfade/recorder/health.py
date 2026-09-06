@@ -44,7 +44,12 @@ from liqfade.alerts.telegram import send_alert
 from liqfade.config.models import Recorder
 from liqfade.control.protocol import now_ms
 from liqfade.log import get_logger
-from liqfade.recorder.streams.base import StreamStats, gap_threshold_s, silence_threshold_s
+from liqfade.recorder.streams.base import (
+    LAG_ALERT_STREAMS,
+    StreamStats,
+    gap_threshold_s,
+    silence_threshold_s,
+)
 
 log = get_logger(__name__)
 
@@ -140,6 +145,19 @@ class Health:
                 sent.append(
                     f"recorder: {stat.name} parse errors over "
                     f"{self.cfg.parse_error_alert_1h}/h, the wire has stopped matching the parser"
+                )
+            slow_coin, slow_ms = stat.worst_delivery()
+            if (
+                slow_coin
+                and stat.name in LAG_ALERT_STREAMS
+                and slow_ms > self.cfg.lag_alert_s * 1000
+            ):
+                # The threshold, not the measured lag: `telegram._deduped` keys on the
+                # exact string and the lag moves on every check, so carrying it would
+                # send one message per check for as long as the coin stayed behind.
+                sent.append(
+                    f"recorder: {stat.name} {slow_coin} arriving over "
+                    f"{self.cfg.lag_alert_s:.0f}s behind its exchange time"
                 )
             silent_s = stat.silent_s(at_ms)
             outage_s = silence_threshold_s(stat, self.cfg)

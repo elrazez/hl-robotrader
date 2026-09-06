@@ -438,3 +438,58 @@ def test_candles_are_held_per_coin() -> None:
     assert parse(eth, RX) == []  # a different coin's first bar, not BTC's advance
     (row,) = rows_for(parse(_candle_frame(1788098940000, 3.0, 3.0), RX), "candles_1m")
     assert row["coin"] == "BTC"
+
+
+# --- the subscribe snapshot Hyperliquid replays on every resubscribe -------------
+
+
+def _hl_trade(coin: str, tid: int, ts_ms: int) -> bytes:
+    return (
+        b'{"channel":"trades","data":[{"coin":"' + coin.encode() + b'","side":"B",'
+        b'"px":"0.21","sz":"100.0","time":' + str(ts_ms).encode() + b',"hash":"0xab",'
+        b'"tid":' + str(tid).encode() + b',"users":["0x01","0x02"]}]}'
+    )
+
+
+def test_a_trade_hyperliquid_replays_after_a_resubscribe_is_not_recorded_twice() -> None:
+    """Measured on the box at the 22:42 UTC reconnect of 2026-09-05: Hyperliquid answers
+    a `trades` subscribe with the last ~30 trades of each coin, and the recorder wrote
+    every one of them again. All 458 replayed rows of that reconnect were already in the
+    lake under the same `(coin, tid)`, and the day held 2,336 duplicate trades in total.
+    """
+    parse = hl.make_parser()
+    live = parse(_hl_trade("DOGE", 1084082034831336, 1788648000000), RX)
+    assert rows_for(live, "trades")
+
+    # The resubscribe two seconds later, replaying the same trade.
+    replay = parse(_hl_trade("DOGE", 1084082034831336, 1788648000000), RX + 2_000)
+    assert replay == []
+
+
+def test_a_trade_that_only_the_snapshot_carries_is_still_recorded() -> None:
+    """The replay is also how the 18s hole a reconnect leaves gets filled. Dropping the
+    whole snapshot would throw away the trades that happened while we were away; only the
+    ones already in the lake are duplicates."""
+    parse = hl.make_parser()
+    parse(_hl_trade("DOGE", 111, 1788648000000), RX)
+    # Happened during the hole, so we have never seen it.
+    fresh = rows_for(parse(_hl_trade("DOGE", 222, 1788648009000), RX + 18_000), "trades")
+    assert [row["tid"] for row in fresh] == [222]
+
+
+def test_the_same_trade_id_on_two_coins_is_two_trades() -> None:
+    parse = hl.make_parser()
+    assert rows_for(parse(_hl_trade("DOGE", 7, 1788648000000), RX), "trades")
+    assert rows_for(parse(_hl_trade("BTC", 7, 1788648000000), RX), "trades")
+
+
+def test_the_replay_memory_is_bounded_per_coin() -> None:
+    """A busy coin must not push a thin coin's ids out: DOGE prints 3 times a minute and
+    its 30-trade snapshot reaches back six minutes, while PONS prints 176 times a minute.
+    One shared ring would be drained by PONS before DOGE's snapshot arrived."""
+    parse = hl.make_parser()
+    parse(_hl_trade("DOGE", 1, 1788648000000), RX)
+    for tid in range(2, 5_000):
+        parse(_hl_trade("PONS", tid, 1788648000000), RX)
+
+    assert parse(_hl_trade("DOGE", 1, 1788648000000), RX + 60_000) == []

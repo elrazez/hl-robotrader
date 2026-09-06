@@ -1579,3 +1579,58 @@ So each stream gets the threshold its own shape justifies, in
 One consequence worth stating: `recorder.silence_alert_s` (60s) can no longer be taken alone,
 because a thin coin's normal 92s quiet spell is longer than it. The outage alert now fires at
 `max(silence_alert_s, gap_threshold)`, so nothing pages that is not even a gap.
+
+## 2026-09-06: 01c, "DOGE arrives 356s late" is Hyperliquid replaying trades we already had
+
+The report was that DOGE trades reached the lake up to 356s behind their exchange time on
+2026-09-05, and again 26s behind on 2026-09-06, while every other coin on the same box sat
+under a second. Four measurements on the recorded Parquet, taken at the 22:42:14 UTC
+reconnect of 2026-09-05:
+
+1. **Every coin was replayed, about 30 rows each**, whatever its rate: 30 for DOGE, 30 for
+   CASHCAT, 29 for BTC, 16 for LIT. A fixed count, not a delay.
+2. **How far back those 30 rows reach is exactly 30 trades at that coin's rate.** DOGE
+   prints 3 times a minute, so 30 trades back is 356s. PONS prints 176 times a minute, so
+   30 trades back is 17.7s. BTC's were all under 5s. The ordering by age is the ordering by
+   rate, inverted, across all 18 coins.
+3. **All 458 replayed rows were already in the lake** under the same `(coin, tid)`. Not one
+   of them was new data.
+4. **They arrived at 22:42:15 and 22:42:16**, one and two seconds after the disconnect.
+
+So Hyperliquid answers a `trades` subscribe with a snapshot of each coin's last ~30 trades,
+`docs/DATA_SOURCES.md` said so from a probe on 2026-08-30 ("the first `trades` and `l2Book`
+messages after subscribing are snapshots ... do not read it as latency"), and the recorder
+wrote all of them again on every reconnect. It is ours, not Hyperliquid's.
+
+**The recorder does not shard subscriptions.** `Recorder._build_streams` makes one `WSStream`
+per venue and `hl.on_connect` puts one subscribe frame per coin per channel on it, so all 18
+coins and all 5 channels ride a single socket; `ss -tnp` on the box shows exactly one
+established connection to `api.hyperliquid.xyz`. DOGE is on the same connection as BTC,
+which on its own rules out the connection being behind.
+
+Four other explanations were ruled out by the same evidence: Hyperliquid genuinely
+delivering late (the rows are duplicates, and they arrive one second after a reconnect
+rather than at random), clock skew on the box (it would move every coin, and the p50 is
+220 ms on all of them), a backlog in our own receive loop (`rx_ms` is stamped in
+`WSStream._recv_loop` before anything is parsed, so a backlog would show on every coin at
+once), and per-coin subscription sharding (there is none).
+
+**The fix** is in `hl.make_parser()`: a trade whose `(coin, tid)` this process has already
+emitted is dropped, against a bounded per-coin memory of 512 ids. Not the whole snapshot,
+because the same replay is what fills the hole a reconnect leaves and those trades are
+exactly the ones we have not seen; across all of 2026-09-05, 69 of the 517 late rows were
+genuinely new. Per coin rather than one shared ring, because DOGE at 3 prints a minute
+needs six minutes of memory while PONS at 176 would drain a shared ring in seconds.
+
+**What it does not cover:** a process restart begins with an empty memory, so the first
+snapshot after one writes about 30 rows per coin that the previous run already recorded.
+That is roughly 540 rows per restart against 2,336 a day from the eight reconnects, and
+telling a restart's snapshot from a genuine first subscribe would mean reading the lake from
+inside a parser. Left, and stated here, so that anyone counting trades on a restart day
+knows the size of it. `select count(*) - count(distinct (coin, tid))` over a day is the
+measurement.
+
+**Consequences of the duplicates beyond the lag figure**, both now fixed: any research
+summing volume or counting prints over 2026-09-05 counted 2,336 trades twice, and the
+replayed rows are what put hour 23's file before hour 22's end and stopped the day
+compacting at all.

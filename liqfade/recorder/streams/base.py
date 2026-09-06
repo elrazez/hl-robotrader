@@ -16,7 +16,7 @@ import contextlib
 import random
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Any
@@ -91,6 +91,12 @@ PER_COIN_STREAMS = frozenset(
 #   coin's natural silence, which `recorder.trades_gap_s` is.
 PER_COIN_GAP_STREAMS = frozenset({"hyperliquid.trades"})
 
+# Streams whose delivery lag is worth a Telegram alert, which needs an exchange timestamp
+# that means something. `asset_ctx` sets `ts_ms` to `rx_ms` because the payload carries no
+# exchange time, so its lag is zero by construction; `l2` is a snapshot whose age is its
+# own cadence rather than a delay. Both still report the figure, which is the evidence.
+LAG_ALERT_STREAMS = frozenset({"hyperliquid.trades", "hyperliquid.bbo"})
+
 # Streams whose gap threshold is measured rather than configured in seconds, because the
 # venue's own cadence is the only thing it can sensibly be compared against.
 CADENCE_STREAMS = frozenset({"hyperliquid.l2"})
@@ -101,6 +107,10 @@ MAX_LOGGED_PAYLOAD = 500  # bytes of a bad message kept in the log line
 # Intervals behind the measured cadence. Enough that a stall or two cannot move the
 # median, short enough that the number follows the venue rather than the last hour.
 CADENCE_SAMPLES = 64
+# Delivery lag samples behind each coin's reported figure. Same reason as the cadence: a
+# subscribe snapshot replays trades minutes old, and one such row must not read as a coin
+# falling behind. The median of 32 says the coin is behind, not that a row was.
+LAG_SAMPLES = 32
 
 
 def backoff_delay(attempt: int, cfg: Recorder) -> float:
@@ -137,15 +147,29 @@ class StreamStats:
     _coin_msg_ms: dict[str, int] = field(default_factory=dict)
     _coin_gap_open: set[str] = field(default_factory=set)
     _intervals: deque[int] = field(default_factory=lambda: deque(maxlen=CADENCE_SAMPLES))
+    # coin -> its recent rx_ms minus ts_ms. Populated only for PER_COIN_STREAMS, and only
+    # from rows that carry both timestamps.
+    _coin_lags: dict[str, deque[int]] = field(default_factory=dict)
 
     def record_message(
-        self, rx_ms: int, coins: Iterable[str] = (), now: float | None = None
+        self,
+        rx_ms: int,
+        coins: Iterable[str] = (),
+        *,
+        lags_ms: Mapping[str, int] | None = None,
+        now: float | None = None,
     ) -> None:
         """One received message for this stream, and the coins it carried rows for.
 
         Counted once however many rows the message held: it used to be called per row, so
         `msgs_1m` for `hyperliquid.l2` read twenty times the real message rate.
+
+        `lags_ms` is each coin's `rx_ms - ts_ms` on this message, where the row carried an
+        exchange timestamp to measure against. Passing it also names the coins, so a
+        caller that has it does not pass `coins` as well.
         """
+        if lags_ms is not None and not coins:
+            coins = lags_ms
         now = time.monotonic() if now is None else now
         if self.cadence and not self.per_coin and self.last_msg_ms:
             self._intervals.append(rx_ms - self.last_msg_ms)
@@ -162,6 +186,8 @@ class StreamStats:
                         self._intervals.append(rx_ms - last)
                     self._coin_msg_ms[coin] = rx_ms
                     self._coin_gap_open.discard(coin)
+                    if lags_ms is not None and (lag := lags_ms.get(coin)) is not None:
+                        self._coin_lags.setdefault(coin, deque(maxlen=LAG_SAMPLES)).append(lag)
         second = float(int(now))
         if self._buckets and self._buckets[-1][0] == second:
             self._buckets[-1][1] += 1
@@ -175,6 +201,7 @@ class StreamStats:
         """
         self._coin_msg_ms.pop(coin, None)
         self._coin_gap_open.discard(coin)
+        self._coin_lags.pop(coin, None)
 
     def record_reconnect(self, now: float | None = None) -> None:
         self._reconnects.append(time.monotonic() if now is None else now)
@@ -239,6 +266,28 @@ class StreamStats:
             return self.worst_coin(now_ms)[1]
         return 0.0 if self.last_msg_ms == 0 else (now_ms - self.last_msg_ms) / 1000.0
 
+    def delivery_lag_ms(self, coin: str) -> int:
+        """How far behind this coin's rows are arriving. 0 until measured.
+
+        The median of its last `LAG_SAMPLES` `rx_ms - ts_ms`, which is a different
+        question from `lag_ms` on the feed: that is how long since the stream last said
+        anything, and it cannot see a coin delivering steadily but minutes late. DOGE did
+        exactly that on 2026-09-05 while every other coin on the same connection was
+        under a second.
+        """
+        samples = self._coin_lags.get(coin)
+        if not samples or len(samples) < LAG_SAMPLES // 2:
+            return 0
+        return int(median(samples))
+
+    def worst_delivery(self) -> tuple[str | None, int]:
+        """The coin arriving furthest behind, and by how many ms."""
+        lags = {coin: self.delivery_lag_ms(coin) for coin in self._coin_lags}
+        if not any(lags.values()):
+            return None, 0
+        coin = max(lags, key=lambda name: (lags[name], name))
+        return coin, lags[coin]
+
     def cadence_ms(self) -> int:
         """Milliseconds this stream typically leaves between messages. 0 until measured.
 
@@ -270,6 +319,7 @@ class StreamStats:
         now = time.monotonic() if now is None else now
         self._prune(now)
         worst, worst_s = self.worst_coin(now_ms)
+        slow, slow_ms = self.worst_delivery()
         return FeedState(
             name=self.name,
             connected=self.connected,
@@ -282,6 +332,8 @@ class StreamStats:
             worst_coin=worst,
             worst_lag_ms=int(worst_s * 1000.0),
             cadence_ms=self.cadence_ms(),
+            delivery_coin=slow,
+            delivery_lag_ms=slow_ms,
         )
 
 
@@ -534,16 +586,26 @@ class WSStream:
         # `hyperliquid.l2` emits twenty rows per frame and used to report twenty messages.
         # The coins go with it, because per-coin silence is what tells you which
         # subscription died on a venue that subscribes each coin separately.
-        coins: dict[str, list[str]] = {}
+        # coin -> the worst delivery lag this message carried for it, per table. The
+        # worst rather than the last, because one message can hold a burst of replayed
+        # trades and the oldest of them is the one worth measuring.
+        seen: dict[str, dict[str, int]] = {}
         for table, row in rows:
             stat = self._stat(table)
             if row is None:
                 stat.record_parse_error()
                 continue
-            coins.setdefault(table, []).append(str(row.get("coin") or ""))
+            coin = str(row.get("coin") or "")
+            lags = seen.setdefault(table, {})
+            ts_ms = row.get("ts_ms")
+            lag = rx_ms - int(ts_ms) if row.get("rx_ms") and ts_ms is not None else None
+            if lag is not None:
+                lags[coin] = max(lags.get(coin, lag), lag)
+            else:
+                lags.setdefault(coin, 0)
             self.sink(table, self.venue, row)
-        for table, seen in coins.items():
-            self._stat(table).record_message(rx_ms, seen)
+        for table, lags in seen.items():
+            self._stat(table).record_message(rx_ms, lags_ms=lags)
 
     def _record_pong(self) -> None:
         if self._ping_sent is None:

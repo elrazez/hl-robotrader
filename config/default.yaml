@@ -66,6 +66,11 @@ recorder:
   # was 54.5s and the worst interval on any coin all day was 92.3s. 180s is twice that,
   # so normal market never trips it and a dead subscription does. docs/DECISIONS.md.
   trades_gap_s: 180.0
+  # Seconds one coin's rows may arrive behind their exchange time before Telegram is told.
+  # A different failure from silence: on 2026-09-05 DOGE trades arrived up to 356s late
+  # while the stream itself was never quiet and every other coin was under a second, so
+  # nothing in lag_ms or gaps_1h could see it. Normal is 220 ms across every coin.
+  lag_alert_s: 60.0
   silence_alert_s: 60.0  # seconds of silence that raises a Telegram alert
   # Rows the parser refused plus messages it could not read, per stream per hour, above
   # which Telegram is told. A venue renaming a field takes a feed to zero rows while the
