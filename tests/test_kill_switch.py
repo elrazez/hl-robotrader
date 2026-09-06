@@ -227,3 +227,36 @@ def test_the_kill_path_does_not_import_strategy() -> None:
         [sys.executable, "-c", program], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert leaked == "", f"the kill path imported {leaked}"
+
+
+def test_a_flag_we_cannot_overwrite_but_that_exists_still_counts_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The VPS drill of 2026-09-06 found this one.
+
+    The owner drops data/KILL by hand as root, the service user cannot overwrite it, and
+    the kill reported "NOT written, a restart will not stay killed" about a file sitting
+    right there. What matters is that the flag is on disk, not who put it there.
+    """
+    from liqfade.control.backend import write_kill_file
+
+    flag = tmp_path / "KILL"
+    flag.write_text("killed_at: by hand\n")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    assert write_kill_file(flag, "kill file appeared") is True
+
+
+def test_a_flag_that_is_neither_writable_nor_present_is_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from liqfade.control.backend import write_kill_file
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+    assert write_kill_file(tmp_path / "KILL", "nowhere to write") is False

@@ -50,10 +50,41 @@ def write_kill_file(path: Path, reason: str | None = None) -> bool:
             stamp += f"reason: {reason}\n"
         path.write_text(stamp)
     except OSError as exc:
+        # What matters is that the flag is on disk, not that we are the ones who put it
+        # there. A flag the owner dropped by hand as root cannot be overwritten by the
+        # service user, and the 2026-09-06 drill on the VPS reported "NOT written, a
+        # restart will not stay killed" about a file sitting right there. That is a false
+        # alarm in the one moment where the message has to be trusted.
+        if _flag_present(path):
+            log.warning(
+                "kill_file_not_updated",
+                path=str(path),
+                error=f"{type(exc).__name__}: {exc}",
+                detail="the flag is already on disk, so the kill still persists",
+            )
+            return True
         log.error("kill_file_write_failed", path=str(path), error=f"{type(exc).__name__}: {exc}")
         return False
     log.warning("kill_file_written", path=str(path), reason=reason)
     return True
+
+
+def _flag_present(path: Path) -> bool:
+    """Whether the flag is definitely on disk. Anything we cannot see counts as absent.
+
+    The opposite bias to `Settings.kill_switch_present`, deliberately, because the two
+    answer different questions. That gate asks "is the kill switch on", where not being
+    able to tell has to mean yes. This asks "did the flag survive", where not being able
+    to tell has to mean no: reporting a kill as persisted on the strength of an error is
+    how a restart comes back trading.
+    """
+    try:
+        # A regular file specifically. A directory sitting where the flag belongs is a
+        # broken install, not a flag we wrote, and it must not talk the kill into
+        # reporting that it persisted.
+        return path.is_file()
+    except OSError:
+        return False
 
 
 def kill_not_persisted(path: Path, reason: str | None) -> str:
