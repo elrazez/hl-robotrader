@@ -23,12 +23,13 @@ backtest fill model and the live order manager round identically by construction
 from __future__ import annotations
 
 import math
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 
 __all__ = [
     "MAX_PRICE_SIG_FIGS",
     "PERP_DECIMAL_BUDGET",
     "RoundingError",
+    "floor_size",
     "max_price_decimals",
     "price_is_valid",
     "round_price",
@@ -117,6 +118,26 @@ def round_size(sz: float | Decimal, sz_decimals: int) -> Decimal:
     if value < 0:
         raise RoundingError(f"size must be non-negative, got {sz}")
     return _normalize(value.quantize(Decimal(1).scaleb(-sz_decimals), rounding=ROUND_HALF_UP))
+
+
+def floor_size(sz: float | Decimal, sz_decimals: int) -> Decimal:
+    """Round `sz` **down** to the asset's `szDecimals`. What a cap must use.
+
+    `round_size` rounds to nearest, which can round *up*, and a size rounded up past a cap
+    is an order larger than every cap said was allowed. On a 25,000 USD limit that showed
+    up as a notional of 25,000.00005: five hundredths of a cent, and enough to make the
+    per-cluster gate refuse a trade that the per-coin cap had just approved.
+
+    Half a tick is nothing on its own. It matters because a cap is a promise, and a promise
+    that is kept to within half a tick in the wrong direction is not one. Sizing floors;
+    everything else rounds to nearest.
+    """
+    if not 0 <= sz_decimals <= PERP_DECIMAL_BUDGET:
+        raise RoundingError(f"szDecimals must be 0..{PERP_DECIMAL_BUDGET}, got {sz_decimals}")
+    value = _decimal(sz, "size")
+    if value < 0:
+        raise RoundingError(f"size must be non-negative, got {sz}")
+    return _normalize(value.quantize(Decimal(1).scaleb(-sz_decimals), rounding=ROUND_DOWN))
 
 
 def price_is_valid(px: Decimal, sz_decimals: int) -> bool:

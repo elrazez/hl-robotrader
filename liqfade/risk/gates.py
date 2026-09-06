@@ -35,6 +35,13 @@ __all__ = [
 
 DAY_MS = 86_400_000
 STORM_WINDOW_S = 600.0  # the ten minutes both storm gates count over
+# Relative slack on the cluster cap comparison, for float arithmetic only.
+# `sizing.coin_exposure_frac` and `risk.max_cluster_exposure_frac` are both 0.25 by
+# default, so a trade sized at exactly the per-coin cap lands exactly on the cluster cap,
+# and `size * price` can land a few ulps either side of it. Sizing floors the size so the
+# real overshoot is gone; this covers the last bit of the multiplication. A notional a
+# billionth over the cap is not over the cap.
+_CAP_EPSILON = 1e-9
 
 
 def kill_switch(settings: Settings) -> str | None:
@@ -176,4 +183,4 @@ def cluster_exposure(
         return "cluster_exposure"
     cap = risk.max_cluster_exposure_frac * equity
     taken = state.cluster_exposure(side, now_ms, risk.cluster_window_s)
-    return "cluster_exposure" if taken + notional_usd > cap else None
+    return "cluster_exposure" if taken + notional_usd > cap * (1.0 + _CAP_EPSILON) else None

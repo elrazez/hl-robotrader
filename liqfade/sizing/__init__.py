@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from liqfade.config.models import Settings
-from liqfade.execution.rounding import RoundingError, round_size
+from liqfade.execution.rounding import RoundingError, floor_size
 from liqfade.strategy.types import AssetMeta, Intent
 
 __all__ = ["LiquidityStats", "SizeDecision", "size_intent"]
@@ -145,7 +145,9 @@ def size_intent(
         return _blocked(binding, depth_cap_applied=depth_known)
 
     try:
-        size = round_size(notional / intent.entry_px, meta.sz_decimals)
+        # Floored, never rounded to nearest. Every cap above is an upper bound, and a size
+        # rounded up sends an order larger than all of them allowed. See `floor_size`.
+        size = floor_size(notional / intent.entry_px, meta.sz_decimals)
     except RoundingError:
         # An entry price that cannot produce a size is not a tradeable intent. The strategy
         # already refuses a non-positive entry, so reaching here means something upstream
