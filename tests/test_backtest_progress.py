@@ -48,6 +48,27 @@ def test_the_writer_is_throttled_and_the_file_is_always_whole(
     assert json.loads(path.read_text())["stage"] == "replaying"
 
 
+def test_a_new_phase_restarts_the_throttle_so_the_lagged_pass_reports_its_trades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = {"wall": 100.0}
+    monkeypatch.setattr("liqfade.backtest.progress.time.monotonic", lambda: clock["wall"])
+    path = tmp_path / "p.json"
+    writer = ProgressWriter(path)
+    end = 10 * CHECK_EVERY_SIM_MS
+    writer.set(stage="replaying", window_start_ms=0, window_end_ms=end)
+    # The main pass runs to the end of the window; its last checkpoint now sits past it.
+    writer.tick(end, trades=5, net=50.0, equity=1.0, intents=6)
+    assert read_progress(path).trades == 5  # type: ignore[union-attr]
+    # The lagged pass restarts the clock. Its first tick must not be swallowed.
+    clock["wall"] += 5.0
+    writer.set(phase="lagged", stage="replaying", trades=0, net=0.0, intents=0)
+    writer.tick(0, trades=1, net=-3.0, equity=1.0, intents=2)
+    state = read_progress(path)
+    assert state is not None and state.phase == "lagged" and state.trades == 1
+    assert state.net == -3.0 and state.intents == 2
+
+
 def test_the_engine_reports_the_clock_and_the_trade_count(
     settings_factory: object, tmp_path: Path
 ) -> None:

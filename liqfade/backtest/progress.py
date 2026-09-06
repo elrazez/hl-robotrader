@@ -79,6 +79,12 @@ class ProgressWriter:
         """Update fields and write now. Used at stage changes, not in the hot loop."""
         if "phase" in fields and fields["phase"] != self.state.phase:
             self.state.phase_started_at = time.time()
+            # A new phase restarts the replay clock from the window start. The throttle
+            # checkpoints are in that clock, so left alone they would sit at the end of the
+            # previous pass and silence every tick of this one: the bar would move (the
+            # engine sets the day directly) while trades and net stayed at zero.
+            self._next_sim_ms = 0
+            self._next_wall = 0.0
         for key, value in fields.items():
             setattr(self.state, key, value)
         self._write()
