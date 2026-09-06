@@ -14,11 +14,19 @@ from textual.app import App, ComposeResult
 from textual.binding import BindingType
 from textual.widgets import Footer, Header, TabbedContent, TabPane
 
+from liqfade.lab.runs import RunQueue
 from liqfade.lab.screen_configs import ConfigsPane
+from liqfade.lab.screen_run import RunPane
 
 LAB_CSS = """
 Screen { layout: vertical; }
 #configs-table { height: 1fr; min-height: 8; }
+.run-row { height: 3; }
+.run-key { width: 12; padding: 1 1 0 0; }
+#run-command { padding: 1 1; color: $success; }
+#run-status { color: $text-muted; padding: 0 1; }
+#run-progress { padding: 1 1; height: auto; min-height: 4; }
+#run-jobs { height: auto; min-height: 5; }
 #configs-status { color: $text-muted; padding: 0 1; }
 ConfigViewScreen, ConfigEditScreen, ConfirmScreen, ConfigNameScreen {
     align: center middle;
@@ -58,19 +66,47 @@ class LabApp(App[None]):
         config_dir: Path,
         reports_dir: Path,
         data_dir: Path | None = None,
+        core_coins: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE"),
     ) -> None:
         super().__init__()
         self.config_dir = Path(config_dir)
         self.reports_dir = Path(reports_dir)
         self.data_dir = Path(data_dir) if data_dir else Path("data")
+        self.core_coins = core_coins
+        self.queue = RunQueue(self.reports_dir)
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with TabbedContent(id="tabs", initial="tab-configs"), TabPane("Configs", id="tab-configs"):
-            yield ConfigsPane(self.config_dir)
+        with TabbedContent(id="tabs", initial="tab-configs"):
+            with TabPane("Configs", id="tab-configs"):
+                yield ConfigsPane(self.config_dir)
+            with TabPane("Run", id="tab-run"):
+                yield RunPane(
+                    self.config_dir,
+                    self.reports_dir,
+                    self.data_dir,
+                    self.queue,
+                    self.core_coins,
+                )
         yield Footer()
 
     def action_tab(self, name: str) -> None:
+        """Switch tab and give the new pane the keyboard.
+
+        Without the focus move the app has nothing focused after a switch, and a pane's
+        own keys, which are the whole interface, would go nowhere.
+        """
         tabs = self.query_one("#tabs", TabbedContent)
-        if f"tab-{name}" in {pane.id for pane in tabs.query(TabPane)}:
-            tabs.active = f"tab-{name}"
+        if f"tab-{name}" not in {pane.id for pane in tabs.query(TabPane)}:
+            return
+        tabs.active = f"tab-{name}"
+        self.call_after_refresh(self._focus_active_pane)
+
+    def _focus_active_pane(self) -> None:
+        pane = self.query_one("#tabs", TabbedContent).get_pane(
+            self.query_one("#tabs", TabbedContent).active
+        )
+        for widget in pane.query("*"):
+            if widget.focusable:
+                widget.focus()
+                return
