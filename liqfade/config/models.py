@@ -128,6 +128,9 @@ class Features(Base):
     z_grid_s: Pos = Field(..., description="seconds: grid the z distribution is sampled on")
     z_robust: bool = Field(..., description="use median and MAD instead of mean and stdev")
     rv_windows_s: tuple[int, ...] = Field(..., min_length=1, description="seconds: rv windows")
+    oi_windows_s: tuple[int, ...] = Field(
+        ..., min_length=1, description="seconds: open interest change windows"
+    )
     cvd_slope_window_s: Pos = Field(..., description="seconds over which CVD slope is measured")
     depth_bps: Pos = Field(..., description="bps from the touch used for depth features")
     vwap_anchor_s: Pos = Field(..., description="seconds: pre-cascade VWAP anchor window")

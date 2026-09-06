@@ -31,7 +31,12 @@ import pytest
 
 from liqfade.backtest.data import load_day, utc_days
 from liqfade.backtest.engine import RunInputs, run_backtest
-from liqfade.backtest.features import candidates, cascade_windows
+from liqfade.backtest.features import (
+    candidates,
+    cascade_windows,
+    iter_grid_rows,
+    row_columns,
+)
 from liqfade.backtest.source import LakeSource, feature_hash
 from liqfade.config.models import Settings
 
@@ -408,6 +413,53 @@ class TestTheCandidateSuperset:
     ) -> None:
         """The shipped default. Every z here is null, so nothing is a candidate."""
         assert candidates(self.grid(), settings_factory()).is_empty()
+
+
+class TestTheRowMapping:
+    """Grid column names to `FeatureRow` field names, the one place they meet.
+
+    A column the grid computes and `_row_at` forgets is a feature the strategy can never
+    read, and nothing else in the stack would say so: the field simply stays None and every
+    rule that consults it quietly fails.
+    """
+
+    def test_the_open_interest_and_vwap_columns_reach_the_row(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        settings = settings_factory()
+        columns = row_columns(settings)
+        for name in (
+            "open_interest",
+            "oi_delta_60s",
+            "oi_delta_300s",
+            "oi_delta_3600s",
+            "disp_300s_bps",
+            "disp_day_bps",
+        ):
+            assert name in columns, f"{name} is computed but never read"
+
+        values: dict[str, list[object]] = {name: [None] for name in columns}
+        values |= {
+            "mid": [100.0],
+            "open_interest": [1_000_000.0],
+            "oi_delta_60s": [-0.004],
+            "oi_delta_300s": [-0.03],
+            "oi_delta_3600s": [0.07],
+            "disp_300s_bps": [-45.0],
+            "disp_day_bps": [-120.0],
+        }
+        grid = pl.DataFrame({"coin": ["BTC"], "ts_ms": [1_000], **values})
+        keep = pl.Series("_needed", [True])
+        ((_ts, batch),) = list(iter_grid_rows(grid, settings, keep=keep))
+        row = batch["BTC"]
+        assert row.open_interest == 1_000_000.0
+        assert row.oi_delta_w == -0.004
+        assert row.oi_delta_rv == -0.03
+        assert row.oi_delta_build == 0.07
+        assert row.disp_anchor_bps == -45.0
+        assert row.disp_day_bps == -120.0
+        # The resolved windows, so `explain()` can name them in seconds.
+        assert (row.oi_build_window_s, row.vwap_anchor_s) == (3600, 300)
 
 
 class TestTheWindowMaths:

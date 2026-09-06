@@ -342,6 +342,12 @@ class StrategyEngine:
             "book_imbalance": row.book_imbalance,
             "funding": row.funding,
             "mark_mid_bps": row.mark_mid_bps,
+            "open_interest": row.open_interest,
+            f"oi_delta_{row.window_s}s": row.oi_delta_w,
+            f"oi_delta_{row.rv_window_s}s": row.oi_delta_rv,
+            f"oi_delta_{row.oi_build_window_s}s": row.oi_delta_build,
+            f"disp_{row.vwap_anchor_s}s_bps": row.disp_anchor_bps,
+            "disp_day_bps": row.disp_day_bps,
         }
         values.update({key: value for key, value in optional.items() if value is not None})
         # Which entry rule fired, as a number because explain is a float mapping. The

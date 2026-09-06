@@ -17,7 +17,9 @@ from collections.abc import Sequence
 
 import polars as pl
 
-__all__ = ["cvd", "displacement", "realized_vol", "returns"]
+__all__ = ["cvd", "displacement", "realized_vol", "returns", "session_vwap"]
+
+DAY_MS = 86_400_000
 
 
 def _steps(window_s: int, step_ms: int) -> int:
@@ -144,3 +146,34 @@ def displacement(
         vwap = pl.when(volume > 0).then(notional / volume).otherwise(None)
         out = out.with_columns((1e4 * (pl.col("mid") - vwap) / vwap).alias(f"disp_{window_s}s_bps"))
     return out.drop("_anchor_notional", "_anchor_volume")
+
+
+def session_vwap(grid: pl.DataFrame) -> pl.DataFrame:
+    """How far mid sits from the session VWAP, cumulative from 00:00 UTC.
+
+    The other displacement here is measured against a fixed window that ended before the
+    cascade; this one is the reference a discretionary trader actually watches, the average
+    price everyone who traded today paid, and it resets at midnight rather than rolling.
+
+    The cumulative sums are shifted one grid step, so a row is compared against the VWAP of
+    everything that traded strictly before it and never against a reference its own trades
+    helped set. That is the same no-lookahead rule the rest of the module inherits from the
+    grid, applied to a running total where it would otherwise not hold.
+
+    Args:
+        grid: `build_grid` output; needs `coin`, `ts_ms`, `mid`, `notional_usd`, `volume`.
+
+    Returns:
+        `grid` plus `disp_day_bps`, basis points of mid above the session VWAP, signed.
+        Null until the day's first trade, which is a missing reference and not a zero
+        displacement. A grid spanning several days resets at each UTC midnight, so a day
+        built with the previous day in front of it is unaffected by the carry.
+    """
+    out = grid.sort("coin", "ts_ms").with_columns((pl.col("ts_ms") // DAY_MS).alias("_session"))
+    traded = pl.col("notional_usd").cum_sum().shift(1).over("coin", "_session")
+    size = pl.col("volume").cum_sum().shift(1).over("coin", "_session")
+    out = out.with_columns(traded.alias("_day_notional"), size.alias("_day_volume"))
+    vwap = pl.when(pl.col("_day_volume") > 0).then(pl.col("_day_notional") / pl.col("_day_volume"))
+    return out.with_columns((1e4 * (pl.col("mid") - vwap) / vwap).alias("disp_day_bps")).drop(
+        "_session", "_day_notional", "_day_volume"
+    )

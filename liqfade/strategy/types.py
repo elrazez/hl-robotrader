@@ -125,6 +125,21 @@ class FeatureRow:
         depth_bid: resting USD within `features.depth_bps` of the touch on the bid.
         depth_ask: the same on the ask.
         book_imbalance: `(bid - ask) / (bid + ask)` in `[-1, 1]`.
+        open_interest: the venue's own open interest in contracts, both sides of the book,
+            as Hyperliquid publishes it. None where the coin has no context sample yet.
+        oi_delta_w: fractional change in `open_interest` over the cascade window, so -0.02
+            is two percent of the open interest closed. None until the window is full.
+        oi_delta_rv: the same over the rv window (300s), which is the window `oi_flush`
+            asks whether positions were flushed over.
+        oi_delta_build: the same over the longest configured OI window (3600s), which is
+            the crowding that was there to be flushed. It is measured to *now*, so it is
+            net of the flush: a build of +0.05 after a -0.02 flush means open interest is
+            still five percent above where it was an hour ago.
+        disp_anchor_bps: mid against the VWAP of the window before the last one, in bps,
+            signed. `features.vwap_anchor_s` both ways, so at the defaults it is the 300s
+            of tape that ended 300s ago. None when nothing traded in that window.
+        disp_day_bps: mid against the session VWAP accumulated from 00:00 UTC, in bps,
+            signed. None before the day's first trade.
         mark_mid_bps: `abs(mark - mid) / mid` in bps.
         mark_mid_threshold: the trailing percentile `mark_mid_bps` is judged against. Which
             percentile depends on the caller: the exhaustion rule wants
@@ -141,6 +156,8 @@ class FeatureRow:
         window_s: the resolved cascade window in seconds.
         peak_window_s: the resolved peak window in seconds.
         rv_window_s: the resolved rv window in seconds.
+        oi_build_window_s: the resolved window behind `oi_delta_build`, in seconds.
+        vwap_anchor_s: the resolved window behind `disp_anchor_bps`, in seconds.
     """
 
     coin: str
@@ -166,6 +183,14 @@ class FeatureRow:
     depth_ask: float | None = None
     book_imbalance: float | None = None
 
+    open_interest: float | None = None
+    oi_delta_w: float | None = None
+    oi_delta_rv: float | None = None
+    oi_delta_build: float | None = None
+
+    disp_anchor_bps: float | None = None
+    disp_day_bps: float | None = None
+
     mark_mid_bps: float | None = None
     mark_mid_threshold: float | None = None
     funding: float | None = None
@@ -177,6 +202,8 @@ class FeatureRow:
     window_s: int = 60
     peak_window_s: int = 15
     rv_window_s: int = 300
+    oi_build_window_s: int = 3600
+    vwap_anchor_s: int = 300
 
     def liq_usd_w(self, liq_side: LiqSide) -> float:
         """Liquidated notional on one side over the cascade window."""

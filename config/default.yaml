@@ -73,6 +73,11 @@ features:
   z_grid_s: 60  # seconds: grid the z-score distribution is sampled on
   z_robust: true  # use median and MAD rather than mean and stdev, cascades are fat tailed
   rv_windows_s: [60, 300]  # seconds: realized volatility windows from 1s mid changes
+  # Seconds: open interest change windows. The rule layer reads three of them, and they are
+  # three different questions: the cascade window says whether OI is falling right now, 300s
+  # says whether the flush has happened, and the hour says whether there was a crowded
+  # position to flush in the first place.
+  oi_windows_s: [60, 300, 3600]
   cvd_slope_window_s: 15  # seconds over which the CVD slope is measured
   depth_bps: 10.0  # basis points from the touch used for the depth features
   vwap_anchor_s: 300  # seconds: pre-cascade VWAP anchor for the displacement feature

@@ -38,7 +38,7 @@ import polars as pl
 from liqfade.config.models import Settings
 from liqfade.features.book import book_features
 from liqfade.features.context import with_ctx
-from liqfade.features.flow import cvd, realized_vol, returns
+from liqfade.features.flow import cvd, displacement, realized_vol, returns, session_vwap
 from liqfade.features.grid import build_grid
 from liqfade.features.intensity import liq_intensity
 from liqfade.features.proxy import hl_forced_proxy
@@ -81,12 +81,22 @@ class FeatureWindows:
         self.cvd_s = int(settings.features.cvd_slope_window_s)
         self.oi_s = int(settings.features.proxy.oi_delta_window_s)
         self.vol_s = int(settings.sizing.vol_window_s)
+        self.anchor_s = int(settings.features.vwap_anchor_s)
+        # Every OI window the grid computes: the configured set, plus the two the proxy and
+        # the cascade window need, so a config that names neither still gets its columns.
+        self.oi_windows = sorted(
+            {int(window) for window in settings.features.oi_windows_s}
+            | {self.oi_s, self.cascade_s, self.rv_s}
+        )
+        # The crowding window: the longest one configured, which is the hour by default.
+        self.build_s = max(int(window) for window in settings.features.oi_windows_s)
         for name, seconds in (
             ("cascade.window_s", self.cascade_s),
             ("features.episodes.peak_window_s", self.peak_s),
             ("features.rv_windows_s", self.rv_s),
             ("features.cvd_slope_window_s", self.cvd_s),
             ("sizing.vol_window_s", self.vol_s),
+            ("features.vwap_anchor_s", self.anchor_s),
         ):
             if seconds * 1000 % self.step_ms:
                 raise ValueError(
@@ -129,7 +139,7 @@ def build_feature_grid(
         start_ms: first grid timestamp, inclusive.
         end_ms: end of the grid, exclusive.
         bbo: canonical `bbo`, or None. Absent for the whole historical year.
-        l2: canonical `l2`, or None. Hourly snapshots on four coins historically.
+        l2: canonical `l2`, or None. Four coins, a snapshot roughly every 0.55s.
         asset_ctx: canonical `asset_ctx`, or None. Funding, mark and open interest.
         levels: `features/levels.py` output, or None. Only read by `zone_proximity`.
 
@@ -152,11 +162,18 @@ def build_feature_grid(
         slope_window_s=windows.cvd_s,
         step_ms=windows.step_ms,
     )
+    grid = displacement(
+        grid,
+        windows_s=[windows.anchor_s],
+        anchor_s=windows.anchor_s,
+        step_ms=windows.step_ms,
+    )
+    grid = session_vwap(grid)
     grid = book_features(grid, _frame(l2), depth_bps=settings.features.depth_bps)
     grid = with_ctx(
         grid,
         _frame(asset_ctx),
-        windows_s=[windows.oi_s],
+        windows_s=windows.oi_windows,
         step_ms=windows.step_ms,
         # The exhaustion rule is the only consumer of `mark_mid_threshold`, so the grid is
         # built at its percentile. The proxy's own gate wants a different one and gets a
@@ -488,6 +505,8 @@ def _with_proxy(
     gate_source = with_ctx(
         grid.select("coin", "ts_ms", "mid"),
         ctx,
+        # Only the gate boolean is taken from this pass, so it computes one OI window
+        # rather than the whole set the real grid carries.
         windows_s=[windows.oi_s],
         step_ms=windows.step_ms,
         quantile=settings.features.proxy.mark_mid_pct_threshold / 100.0,
@@ -566,6 +585,12 @@ def _row_columns(windows: FeatureWindows) -> tuple[str, ...]:
         "depth_bid",
         "depth_ask",
         "book_imbalance",
+        "open_interest",
+        f"oi_delta_{cascade_s}s",
+        f"oi_delta_{windows.rv_s}s",
+        f"oi_delta_{windows.build_s}s",
+        f"disp_{windows.anchor_s}s_bps",
+        "disp_day_bps",
         "mark_mid_bps",
         "mark_mid_threshold",
         "funding",
@@ -617,6 +642,12 @@ def _row_at(
         depth_bid=number("depth_bid"),
         depth_ask=number("depth_ask"),
         book_imbalance=number("book_imbalance"),
+        open_interest=number("open_interest"),
+        oi_delta_w=number(f"oi_delta_{cascade_s}s"),
+        oi_delta_rv=number(f"oi_delta_{windows.rv_s}s"),
+        oi_delta_build=number(f"oi_delta_{windows.build_s}s"),
+        disp_anchor_bps=number(f"disp_{windows.anchor_s}s_bps"),
+        disp_day_bps=number("disp_day_bps"),
         mark_mid_bps=number("mark_mid_bps"),
         mark_mid_threshold=number("mark_mid_threshold"),
         funding=number("funding"),
@@ -626,4 +657,6 @@ def _row_at(
         window_s=cascade_s,
         peak_window_s=peak_s,
         rv_window_s=windows.rv_s,
+        oi_build_window_s=windows.build_s,
+        vwap_anchor_s=windows.anchor_s,
     )

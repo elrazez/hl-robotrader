@@ -11,7 +11,7 @@ import math
 import polars as pl
 import pytest
 
-from liqfade.features.flow import cvd, displacement, realized_vol, returns
+from liqfade.features.flow import cvd, displacement, realized_vol, returns, session_vwap
 
 DAY = 1_772_323_200_000
 STEP = 1000
@@ -117,3 +117,51 @@ def test_no_flow_feature_can_see_a_bar_that_has_not_closed() -> None:
         displacement(early, **disp_kwargs).filter(cut).to_dicts()
         == displacement(flooded, **disp_kwargs).filter(cut).to_dicts()
     )
+
+
+def test_the_session_vwap_accumulates_from_midnight_and_excludes_the_current_row() -> None:
+    """Two prints before second 3: 200 at 100 and 100 at 103, a VWAP of 101.
+
+    Second 3's own print is deliberately enormous and must not move the reference it is
+    measured against, which is the whole reason the cumulative sums are shifted a step.
+    """
+    volume = [0.0, 200.0, 100.0, 5000.0] + [0.0] * 6
+    notional = [0.0, 200 * 100.0, 100 * 103.0, 5000 * 90.0] + [0.0] * 6
+    disp = session_vwap(grid([100.0] * 10, notional_usd=notional, volume=volume))
+    assert at(disp, 3, "disp_day_bps") == pytest.approx(1e4 * (100.0 - 101.0) / 101.0)
+    # Second 4 sees second 3's print, so the reference drops towards 90.
+    assert at(disp, 4, "disp_day_bps") == pytest.approx(
+        1e4
+        * (100.0 - (200 * 100.0 + 100 * 103.0 + 5000 * 90.0) / 5300.0)
+        / ((200 * 100.0 + 100 * 103.0 + 5000 * 90.0) / 5300.0)
+    )
+
+
+def test_the_session_vwap_is_null_until_the_days_first_trade() -> None:
+    """A missing reference, not a zero displacement."""
+    disp = session_vwap(grid([100.0] * 5, notional_usd=[0.0] * 5, volume=[0.0] * 5))
+    assert disp["disp_day_bps"].null_count() == 5
+
+
+def test_the_session_vwap_resets_at_midnight() -> None:
+    """The streaming engine builds each day with the previous day in front of it.
+
+    Yesterday's tape must not reach today's reference, or every day of a run but the first
+    would be measured against a two-day average.
+    """
+    rows = 6
+    frame = pl.DataFrame(
+        {
+            "coin": ["BTC"] * rows,
+            # Three seconds either side of a UTC midnight.
+            "ts_ms": [DAY - 3000, DAY - 2000, DAY - 1000, DAY, DAY + 1000, DAY + 2000],
+            "mid": [100.0] * rows,
+            "notional_usd": [1000 * 50.0, 0.0, 0.0, 0.0, 200 * 100.0, 0.0],
+            "volume": [1000.0, 0.0, 0.0, 0.0, 200.0, 0.0],
+        }
+    )
+    disp = session_vwap(frame)
+    values = disp.sort("ts_ms")["disp_day_bps"].to_list()
+    assert values[2] == pytest.approx(1e4 * (100.0 - 50.0) / 50.0), "yesterday's own VWAP"
+    assert values[3] is None and values[4] is None, "today has not printed yet"
+    assert values[5] == pytest.approx(0.0), "today's first print, at mid"
