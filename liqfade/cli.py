@@ -703,10 +703,13 @@ def _print_state(state: Any, origin: str, settings: Settings) -> None:
         for feed in state.feeds:
             mark = "ok" if feed.connected else "DOWN"
             worst = f"  worst={feed.worst_coin} {feed.worst_lag_ms}ms" if feed.worst_coin else ""
+            # The cadence is what the l2 gap threshold is measured against, so it belongs
+            # next to gaps_1h: a number that has moved is why the gap count has.
+            cadence = f"  cadence={feed.cadence_ms}ms" if feed.cadence_ms else ""
             print(
                 f"  {feed.name:<28} {mark:<5} lag={feed.lag_ms:>7}ms  "
                 f"msgs_1m={feed.msgs_1m:<7} gaps_1h={feed.gaps_1h}  "
-                f"parse_errors_1h={feed.parse_errors_1h}{worst}"
+                f"parse_errors_1h={feed.parse_errors_1h}{cadence}{worst}"
             )
     if state.positions:
         print("\npositions:")

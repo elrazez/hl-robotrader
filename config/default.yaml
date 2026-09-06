@@ -55,6 +55,17 @@ recorder:
   # roughly the number of tables times venues, and does not grow with the universe.
   ring_buffer_rows: 200000
   gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap (Phase 1 DoD)
+  # `hyperliquid.l2` pushes one snapshot per coin every 5.4s (measured on the box
+  # 2026-09-05: BTC interval p50 5,390 ms, p90 5,511 ms, every coin the same), so
+  # gap_alert_s of 5s sits under the feed's own cadence and counted 1,192 gaps in 24h.
+  # The threshold is this multiple of the cadence the stream is actually delivering at,
+  # so about 16s, which no normal snapshot reaches and a stalled book does.
+  l2_gap_multiple: 3.0
+  # Seconds without a trade on one coin that count as a gap. Trades are events, so a thin
+  # coin is naturally quiet: over the 18-coin universe of 2026-09-05 DOGE's interval p99
+  # was 54.5s and the worst interval on any coin all day was 92.3s. 180s is twice that,
+  # so normal market never trips it and a dead subscription does. docs/DECISIONS.md.
+  trades_gap_s: 180.0
   silence_alert_s: 60.0  # seconds of silence that raises a Telegram alert
   # Rows the parser refused plus messages it could not read, per stream per hour, above
   # which Telegram is told. A venue renaming a field takes a feed to zero rows while the

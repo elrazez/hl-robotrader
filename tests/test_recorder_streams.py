@@ -16,6 +16,7 @@ from liqfade.recorder.streams.base import (
     StreamStats,
     WSStream,
     backoff_delay,
+    gap_threshold_s,
 )
 
 CFG: Recorder = load_settings(
@@ -309,5 +310,85 @@ def test_the_whole_trades_stream_going_quiet_is_still_a_gap() -> None:
 
 
 def test_which_streams_count_gaps_per_coin() -> None:
-    assert set(PER_COIN_GAP_STREAMS) == {"hyperliquid.bbo"}
+    assert set(PER_COIN_GAP_STREAMS) == {"hyperliquid.trades"}
     assert PER_COIN_GAP_STREAMS < PER_COIN_STREAMS  # a strict subset, by construction
+
+
+def test_a_quiet_bbo_coin_is_not_a_gap_while_the_stream_still_ticks() -> None:
+    """`bbo` sends on a best-quote change, so a thin coin is quiet and the venue is fine.
+
+    Measured on the box over the 18h to 2026-09-06: the recorded bbo stream's p99 between
+    messages is 185 ms and it went over 5s five times, every one a reconnect. The detector
+    logged 3,829 gaps in the same window, because CASHCAT and DOGE sit still for 5 to 10s
+    at a time. Any coin's message proves the connection is alive, so that is the test.
+    """
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, per_coin=True)
+    stat.record_message(NOW_MS, ["BTC", "CASHCAT"])
+    for step in range(1, 20):  # BTC keeps quoting, CASHCAT does not
+        stat.record_message(NOW_MS + step * 1_000, ["BTC"])
+
+    assert stat.check_silence(5.0, NOW_MS + 19_000) == []
+    assert stat.feed_state(NOW_MS + 19_000).gaps_1h == 0
+    # The quiet coin is still reported, as information rather than as a gap.
+    assert stat.feed_state(NOW_MS + 19_000).worst_coin == "CASHCAT"
+
+
+# --- thresholds that match how each stream actually arrives ---------------------
+
+
+def test_the_l2_gap_threshold_is_a_multiple_of_the_measured_cadence() -> None:
+    """`l2Book` arrives as one snapshot per coin every 5.4s, all coins within a few ms.
+
+    Measured on the box on 2026-09-05: BTC's interval p50 is 5,390 ms and p90 is 5,511 ms,
+    identical on every coin. `recorder.gap_alert_s` of 5s therefore sits just under the
+    feed's normal cadence, which is how the detector logged 1,192 l2 gaps in 24h.
+    """
+    stat = StreamStats(name="hyperliquid.l2", continuous=True, per_coin=True, cadence=True)
+    for step in range(40):  # forty snapshots of two coins, 5.4s apart
+        stat.record_message(NOW_MS + step * 5_400, ["BTC", "ETH"])
+
+    assert stat.cadence_ms() == 5_400
+    # 3 x 5.4s, so the natural cadence is nowhere near it and a real stall still is.
+    assert gap_threshold_s(stat, CFG) == pytest.approx(16.2)
+
+
+def test_an_l2_stream_with_no_cadence_yet_falls_back_to_the_configured_multiple() -> None:
+    """The first seconds of a process have nothing measured. 3 x 5s, not 5s."""
+    stat = StreamStats(name="hyperliquid.l2", continuous=True, per_coin=True, cadence=True)
+    assert stat.cadence_ms() == 0
+    assert gap_threshold_s(stat, CFG) == CFG.gap_alert_s * CFG.l2_gap_multiple
+
+
+def test_the_l2_cadence_is_measured_per_coin_not_per_message() -> None:
+    """Every coin's snapshot lands in the same millisecond, so the stream-level interval
+    is 1 ms seventeen times out of eighteen and 5.4s once. The median of that is 1 ms,
+    which would set the threshold to nothing. The cadence a coin sees is the real one."""
+    stat = StreamStats(name="hyperliquid.l2", continuous=True, per_coin=True, cadence=True)
+    coins = [f"C{n}" for n in range(18)]
+    for step in range(20):
+        for offset, coin in enumerate(coins):  # a batch spread over 17 ms
+            stat.record_message(NOW_MS + step * 5_400 + offset, [coin])
+
+    assert stat.cadence_ms() == 5_400
+
+
+def test_a_thin_coins_natural_silence_does_not_trip_the_trades_gap() -> None:
+    """Per-coin trade intervals over the 18-coin universe of 2026-09-05: DOGE p99 54.5s,
+    XRP p99 44.1s, and the worst interval on any coin all day was 92.3s. At 60s the day
+    holds 32 such intervals, at 120s none. `recorder.trades_gap_s` of 180s is twice the
+    worst measured silence, so a quiet coin is quiet and a dead subscription is a gap."""
+    stat = StreamStats(
+        name="hyperliquid.trades", continuous=True, per_coin=True, per_coin_gaps=True
+    )
+    threshold = gap_threshold_s(stat, CFG)
+    stat.record_message(NOW_MS, ["DOGE", "BTC"])
+    stat.record_message(NOW_MS + 92_300, ["BTC"])  # DOGE's worst measured quiet spell
+
+    assert stat.check_silence(threshold, NOW_MS + 92_300) == []
+    # Three minutes without a print on a coin the universe still subscribes is a gap.
+    assert stat.check_silence(threshold, NOW_MS + 181_000) == ["DOGE"]
+
+
+def test_every_other_stream_keeps_the_configured_gap_threshold() -> None:
+    for name in ("hyperliquid.bbo", "bybit.liquidations"):
+        assert gap_threshold_s(StreamStats(name=name), CFG) == CFG.gap_alert_s

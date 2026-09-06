@@ -44,7 +44,7 @@ from liqfade.alerts.telegram import send_alert
 from liqfade.config.models import Recorder
 from liqfade.control.protocol import now_ms
 from liqfade.log import get_logger
-from liqfade.recorder.streams.base import StreamStats
+from liqfade.recorder.streams.base import StreamStats, gap_threshold_s, silence_threshold_s
 
 log = get_logger(__name__)
 
@@ -127,7 +127,7 @@ class Health:
         at_ms = now_ms() if at_ms is None else at_ms
         sent: list[str] = []
         for stat in self._all_stats():
-            for label in stat.check_silence(self.cfg.gap_alert_s, at_ms):
+            for label in stat.check_silence(gap_threshold_s(stat, self.cfg), at_ms):
                 # `label` is a coin on a per-coin stream and "" for the stream as a whole.
                 log.warning(
                     "stream_gap",
@@ -142,15 +142,16 @@ class Health:
                     f"{self.cfg.parse_error_alert_1h}/h, the wire has stopped matching the parser"
                 )
             silent_s = stat.silent_s(at_ms)
-            if stat.continuous and silent_s > self.cfg.silence_alert_s:
+            outage_s = silence_threshold_s(stat, self.cfg)
+            if stat.continuous and silent_s > outage_s:
                 # The text carries the threshold, not the elapsed time. It used to say
                 # "silent for {n}s", and `telegram._deduped` keys on the exact string, so
                 # one ten minute outage sent about 120 messages and hit the rate limit.
                 # Constant per stream per outage, so the dedupe collapses it to one every
                 # DEDUPE_S, which is the "still down" reminder anyone would want.
-                worst = stat.worst_coin(at_ms)[0]
+                worst = stat.worst_coin(at_ms)[0] if stat.per_coin_gaps else None
                 sent.append(
-                    f"recorder: {stat.name} silent for over {self.cfg.silence_alert_s:.0f}s"
+                    f"recorder: {stat.name} silent for over {outage_s:.0f}s"
                     + (f" (worst coin {worst})" if worst else "")
                 )
             elif not stat.connected and (stat.last_msg_ms or self._past_grace()):

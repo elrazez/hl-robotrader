@@ -18,6 +18,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Any
 
 import orjson
@@ -71,18 +72,35 @@ PER_COIN_STREAMS = frozenset(
 )
 
 # Of those, the ones whose *silence* is per coin too, so a gap is counted and the outage
-# alert fires per coin. Only `bbo`, which ticks 2 to 5 times a second for every coin.
-# Measured against the live feed on 2026-09-05: with all three counting per coin, one
-# quiet minute produced twenty `stream_gap` warnings, nearly all normal market. `trades`
-# are events and a thin coin genuinely goes minutes without one; `l2` pushes about every
-# four seconds per coin, so `recorder.gap_alert_s` of 5s sits just above its natural
-# cadence (docs/DATA_SOURCES.md says so). For those two the stream as a whole going quiet
-# is the outage worth alerting, and `worst_coin` still shows a dead subscription.
-PER_COIN_GAP_STREAMS = frozenset({"hyperliquid.bbo"})
+# alert fires per coin. Only `trades`, and only against `recorder.trades_gap_s`.
+#
+# The three streams arrive in three different shapes, measured on the box over the first
+# 24h (docs/DECISIONS.md, 2026-09-06), and one threshold cannot fit them:
+#
+# - `bbo` sends on a best-quote change. Any coin's message proves the connection is
+#   alive, so a gap is stream-wide silence. Counting it per coin logged 3,829 gaps in
+#   18h from thin coins sitting still for 5 to 10s, against a stream whose own p99
+#   between messages is 185 ms and which went over 5s five times, all reconnects.
+# - `l2` pushes one snapshot per coin every 5.4s, every coin within a few ms of the rest,
+#   so the stream is never quiet for long and no coin is ever quiet for less than its
+#   cadence. Its threshold is `recorder.l2_gap_multiple` times the cadence it is actually
+#   delivering at (see `cadence_ms`), which is the only number that moves with the feed.
+# - `trades` are events, so the stream as a whole is never quiet while any coin prints,
+#   and one dead subscription hides behind the other seventeen. That is the one stream
+#   where the per-coin question is the right one; it just needs a threshold above a thin
+#   coin's natural silence, which `recorder.trades_gap_s` is.
+PER_COIN_GAP_STREAMS = frozenset({"hyperliquid.trades"})
+
+# Streams whose gap threshold is measured rather than configured in seconds, because the
+# venue's own cadence is the only thing it can sensibly be compared against.
+CADENCE_STREAMS = frozenset({"hyperliquid.l2"})
 
 HOUR_S = 3600.0
 STABLE_CONNECTION_S = 60.0  # a connection alive this long resets the backoff ladder
 MAX_LOGGED_PAYLOAD = 500  # bytes of a bad message kept in the log line
+# Intervals behind the measured cadence. Enough that a stall or two cannot move the
+# median, short enough that the number follows the venue rather than the last hour.
+CADENCE_SAMPLES = 64
 
 
 def backoff_delay(attempt: int, cfg: Recorder) -> float:
@@ -107,6 +125,7 @@ class StreamStats:
     connected: bool = False
     per_coin: bool = False  # track a last-message time per coin, and report the worst
     per_coin_gaps: bool = False  # and count a gap, and alert, per coin
+    cadence: bool = False  # measure how often this stream delivers, and gap off that
     last_msg_ms: int = 0
     _buckets: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
     _gap_times: deque[float] = field(default_factory=deque)
@@ -117,6 +136,7 @@ class StreamStats:
     # populated for PER_COIN_STREAMS; every other stream reads its silence off last_msg_ms.
     _coin_msg_ms: dict[str, int] = field(default_factory=dict)
     _coin_gap_open: set[str] = field(default_factory=set)
+    _intervals: deque[int] = field(default_factory=lambda: deque(maxlen=CADENCE_SAMPLES))
 
     def record_message(
         self, rx_ms: int, coins: Iterable[str] = (), now: float | None = None
@@ -127,11 +147,19 @@ class StreamStats:
         `msgs_1m` for `hyperliquid.l2` read twenty times the real message rate.
         """
         now = time.monotonic() if now is None else now
+        if self.cadence and not self.per_coin and self.last_msg_ms:
+            self._intervals.append(rx_ms - self.last_msg_ms)
         self.last_msg_ms = rx_ms
         self._gap_open = False
         if self.per_coin:
             for coin in coins:
                 if coin:
+                    # Per coin, because every coin's l2 snapshot lands in the same
+                    # millisecond as the rest: the stream-level interval is 1 ms
+                    # seventeen times out of eighteen and 5.4s once, whose median is
+                    # 1 ms. The interval a single coin sees is the cadence.
+                    if self.cadence and (last := self._coin_msg_ms.get(coin)):
+                        self._intervals.append(rx_ms - last)
                     self._coin_msg_ms[coin] = rx_ms
                     self._coin_gap_open.discard(coin)
         second = float(int(now))
@@ -211,6 +239,18 @@ class StreamStats:
             return self.worst_coin(now_ms)[1]
         return 0.0 if self.last_msg_ms == 0 else (now_ms - self.last_msg_ms) / 1000.0
 
+    def cadence_ms(self) -> int:
+        """Milliseconds this stream typically leaves between messages. 0 until measured.
+
+        The median of the last `CADENCE_SAMPLES` intervals, so one stall does not move it
+        and a venue that changes its push rate is followed within a minute or so. Only
+        measured for `CADENCE_STREAMS`; every other stream returns 0 and is judged
+        against `recorder.gap_alert_s`.
+        """
+        if len(self._intervals) < CADENCE_SAMPLES // 2:
+            return 0
+        return int(median(self._intervals))
+
     def parse_errors_1h(self, now: float | None = None) -> int:
         """Refused rows plus unreadable messages in the trailing hour."""
         now = time.monotonic() if now is None else now
@@ -241,7 +281,33 @@ class StreamStats:
             parse_errors_1h=len(self._parse_errors),  # already pruned above
             worst_coin=worst,
             worst_lag_ms=int(worst_s * 1000.0),
+            cadence_ms=self.cadence_ms(),
         )
+
+
+def gap_threshold_s(stat: StreamStats, cfg: Recorder) -> float:
+    """Seconds of silence that count as a gap on this stream.
+
+    One number per stream shape rather than one for all three, because the three
+    Hyperliquid streams arrive in three different rhythms; see PER_COIN_GAP_STREAMS.
+    A cadence stream that has not measured itself yet uses `gap_alert_s` as the stand-in
+    cadence, so the first seconds of a process are judged at 3 x 5s rather than at 5s.
+    """
+    if stat.name in PER_COIN_GAP_STREAMS:
+        return cfg.trades_gap_s
+    if stat.cadence:
+        return cfg.l2_gap_multiple * (stat.cadence_ms() / 1000.0 or cfg.gap_alert_s)
+    return cfg.gap_alert_s
+
+
+def silence_threshold_s(stat: StreamStats, cfg: Recorder) -> float:
+    """Seconds of silence that raise a Telegram alert, which is never below a gap.
+
+    `recorder.silence_alert_s` is 60s and a thin coin's trades go quiet for 92s in normal
+    market, so taking the configured number alone would page the owner about a working
+    feed the moment `trades` started counting gaps per coin.
+    """
+    return max(cfg.silence_alert_s, gap_threshold_s(stat, cfg))
 
 
 def _describe(exc: BaseException) -> str:
@@ -314,6 +380,7 @@ class WSStream:
                 continuous=name in CONTINUOUS_STREAMS,
                 per_coin=name in PER_COIN_STREAMS,
                 per_coin_gaps=name in PER_COIN_GAP_STREAMS,
+                cadence=name in CADENCE_STREAMS,
             )
             self.stats[name] = stat
         return stat

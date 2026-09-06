@@ -77,6 +77,12 @@ class Recorder(Base):
         ..., gt=0, description="rows buffered per output file before an early flush"
     )
     gap_alert_s: Pos = Field(..., description="seconds of stream silence counted as a gap")
+    l2_gap_multiple: Pos = Field(
+        ..., description="multiples of the measured l2 cadence that count as a gap"
+    )
+    trades_gap_s: Pos = Field(
+        ..., description="seconds without a trade on one coin, counted as a gap"
+    )
     silence_alert_s: Pos = Field(..., description="seconds of silence that alerts Telegram")
     parse_error_alert_1h: int = Field(
         ..., gt=0, description="count: refused rows plus unreadable messages per hour that alerts"

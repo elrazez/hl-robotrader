@@ -1538,3 +1538,44 @@ and what the backtest should do; it is a follow-up engine item and not this run.
 **Reverse this entry** if signing `edge_frac` turns out to have been hiding a different bug
 in the fill model rather than fixing one in the exit, which the 863 bps slippage above is
 the reason to suspect.
+
+## 2026-09-06: 01c, three gap thresholds because the three HL streams arrive in three shapes
+
+The recorder's first 24 hours on the VPS logged 1,192 `hyperliquid.l2` gaps and 3,829
+`hyperliquid.bbo` gaps against `recorder.gap_alert_s: 5.0`. Neither number was an outage.
+Measured against the recorded Parquet on the box rather than against the logs
+(`data/parquet/{l2,bbo,trades}/date=2026-09-05`, 18 coins):
+
+| stream | how it arrives | measured |
+| --- | --- | --- |
+| `l2` | one snapshot per coin, every coin within a few ms of the rest | interval per coin p50 **5,390 ms**, p90 5,511 ms, p99 5,700 ms, max 19-20s, identical on all 18 coins |
+| `bbo` | only on a best-quote change | stream-wide p50 68 ms, **p99 316 ms**, 2 intervals over 5s in the day; per coin p99 up to 4.6s and max 33s |
+| `trades` | events | per coin p50 0.4 to 3.4s, p99 3.2s (PONS) to **54.5s** (DOGE), worst single interval on any coin all day **92.3s** |
+
+So each stream gets the threshold its own shape justifies, in
+`liqfade/recorder/streams/base.py`:
+
+- **`bbo` is judged stream-wide.** Any coin's message proves the connection is alive, and
+  the five silences over 5s in 18h were all reconnects. The quiet coin is still reported as
+  `worst_coin` in `liqfade status` and on the panel, because that is the evidence a dead
+  subscription leaves; it is information, not a gap.
+- **`l2`'s threshold is `recorder.l2_gap_multiple` (3) times its own measured cadence**, so
+  about 16s. The cadence is the median of the last 64 **per-coin** intervals, not per
+  message: with 18 coins landing in the same millisecond, seventeen of eighteen stream-level
+  intervals are 1 ms and the median of those is 1 ms, which would set the threshold to
+  nothing. `cadence_ms` is reported in status, so a threshold that has moved is visible.
+  Fixing the number instead would have to be re-measured every time Hyperliquid changes its
+  push rate, which it already has: `docs/DATA_SOURCES.md` recorded 4s on 2026-08-30 against
+  the 5.4s measured a week later.
+- **`trades` counts gaps per coin**, which is the one stream where that is the right
+  question (the stream as a whole is never quiet while any of eighteen coins prints, so one
+  dead subscription hides behind the others), against **`recorder.trades_gap_s: 180`**. That
+  is twice the worst natural silence measured. At 60s the day holds 32 intervals that would
+  have counted, at 120s none, so 180s has a factor of two of headroom on this universe. It is
+  a function of the thinnest coin the universe selects: a universe reaching further down the
+  volume ranking wants this raised, and `gaps_1h` on `hyperliquid.trades` climbing with no
+  reconnects behind it is what says so.
+
+One consequence worth stating: `recorder.silence_alert_s` (60s) can no longer be taken alone,
+because a thin coin's normal 92s quiet spell is longer than it. The outage alert now fires at
+`max(silence_alert_s, gap_threshold)`, so nothing pages that is not even a gap.

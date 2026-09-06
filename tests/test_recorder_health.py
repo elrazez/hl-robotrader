@@ -34,15 +34,32 @@ def _health(tmp_path: Path, *stats: StreamStats) -> tuple[Health, Collector]:
 
 
 async def test_a_continuous_stream_gone_quiet_alerts_and_counts_a_gap(tmp_path: Path) -> None:
-    stat = StreamStats(name="hyperliquid.trades", continuous=True, connected=True)
+    stat = StreamStats(name="hyperliquid.bbo", continuous=True, connected=True)
     at = now_ms()
     stat.record_message(at - 120_000)
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
     assert stat.feed_state(at).gaps_1h == 1
-    assert alerts.sent == [
-        f"recorder: hyperliquid.trades silent for over {CFG.silence_alert_s:.0f}s"
-    ]
+    assert alerts.sent == [f"recorder: hyperliquid.bbo silent for over {CFG.silence_alert_s:.0f}s"]
+
+
+async def test_a_thin_coins_quiet_spell_never_reaches_telegram(tmp_path: Path) -> None:
+    """`silence_alert_s` is 60s and DOGE went 92s between trades in normal market on
+    2026-09-05, so the outage threshold can never sit below the gap threshold."""
+    stat = StreamStats(
+        name="hyperliquid.trades",
+        continuous=True,
+        connected=True,
+        per_coin=True,
+        per_coin_gaps=True,
+    )
+    at = now_ms()
+    stat.record_message(at - 92_300, ["DOGE"])
+    stat.record_message(at, ["BTC"])
+    health, alerts = _health(tmp_path, stat)
+    await health.check_streams(at)
+    assert alerts.sent == []
+    assert stat.feed_state(at).gaps_1h == 0
 
 
 async def test_the_silence_alert_reads_the_same_all_through_one_outage(tmp_path: Path) -> None:
@@ -61,15 +78,19 @@ async def test_the_silence_alert_reads_the_same_all_through_one_outage(tmp_path:
 async def test_the_silence_alert_names_the_coin_on_a_per_coin_stream(tmp_path: Path) -> None:
     """One dead subscription out of twenty: the alert has to say which."""
     stat = StreamStats(
-        name="hyperliquid.bbo", continuous=True, connected=True, per_coin=True, per_coin_gaps=True
+        name="hyperliquid.trades",
+        continuous=True,
+        connected=True,
+        per_coin=True,
+        per_coin_gaps=True,
     )
     at = now_ms()
-    stat.record_message(at - 120_000, ["BTC"])
+    stat.record_message(at - 400_000, ["BTC"])
     stat.record_message(at, ["ETH"])
     health, alerts = _health(tmp_path, stat)
     await health.check_streams(at)
     assert alerts.sent == [
-        f"recorder: hyperliquid.bbo silent for over {CFG.silence_alert_s:.0f}s (worst coin BTC)"
+        f"recorder: hyperliquid.trades silent for over {CFG.trades_gap_s:.0f}s (worst coin BTC)"
     ]
 
 
