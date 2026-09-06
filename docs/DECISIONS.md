@@ -1251,10 +1251,11 @@ under it, which places the excess in the grid build rather than the replay. `loa
 reference; **the cold year has not been re-measured with it, and the 42-coin universe has
 not been run at all.** Both are outstanding.
 
-**Two things found along the way that are not this change's to fix.**
+**Two things found along the way that were not this change's to fix.**
 
-Under the shipped `features.z_robust: true` the liquidation z-score is null on every row of
-real data, so the `exact` trigger never fires and a backtest over the lake finds nothing.
+Under the shipped `features.z_robust: true` the liquidation z-score was null on every row
+of real data, so the `exact` trigger never fired and a backtest over the lake found
+nothing.
 `liq_long_usd_60s` is zero in 82% of grid seconds, so its 24h rolling median is zero and
 the median absolute deviation of a mostly-zero series is also zero; `robust_z` correctly
 refuses to divide by a zero scale and returns null, and the detector correctly refuses to
@@ -1262,9 +1263,16 @@ trade on null. Every part behaves as documented and the composition finds nothin
 run over 2025-10-09 to 2025-10-11, which carries the busiest cascade day of the year for
 these four coins, produced zero intents and zero trades, and every `liq_*_z` on BTC's grid
 over that window is null. With `features.z_robust: false` the same window gives 246
-candidate rows and seven trades. The reference run above is therefore taken with the non-robust z, so that it
-has fills to be identical about. **Phase 5 is blocked on this**, and the fix is a scale that
-is defined for a series that is zero most of the time, not a lower threshold.
+candidate rows and seven trades. The reference run above is therefore taken with the
+non-robust z, so that it has fills to be identical about, and it stays that way: it pins
+the engine, and re-taking it under a scale that has since changed would confuse the two
+questions.
+
+**Fixed in `b673bc8`**, by the 04c work running in parallel with this one, with a fallback
+to the mean absolute deviation about the same median where the MAD is zero. That was the
+right shape of fix: a scale that is defined for a series that is zero most of the time,
+rather than a lower threshold. What a `liq_z_min` of 3 means on that scale is a
+measurement, not three sigma, and 04c owns it.
 
 `Settings.kill_switch_present` fails closed on any `OSError` from `os.stat`, which is
 right, and the lake's USB drive produced one during an eight-minute run. The risk engine
