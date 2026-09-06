@@ -137,6 +137,9 @@ def test_the_shipped_backtest_configs_load_and_say_what_they_switch_on() -> None
     assert v1.cascade.liq_usd_min is not None
     assert v1.cascade.liq_usd_min.core == 500_000.0
     assert v1.exhaustion.mode == "rule"
+    # The exhaustion rule and level_reclaim both enter after the bounce has started, so the
+    # target has to be measured from the fill rather than from the low.
+    assert v1.intent.target_from == "entry"
     # The default is what commit 2 fixed; a run config overriding it back would hide that.
     assert v1.features.z_robust is True
 

@@ -161,6 +161,11 @@ intent:
   # over 2,722 episodes, chosen because every neighbouring cell is also positive. It keeps
   # +80.6 of the +84.6 bps that holding to the horizon returns, at a 15% stop-out rate.
   # See reports/research/q8_path.md and docs/DECISIONS.md, 2026-09-05.
+  # Where the reversion target is measured from. extreme is the spec's formula and is what
+  # every Phase 3 number was taken under, so it stays the default. entry measures the same
+  # fraction of the distance that is left, target = entry + k*(anchor-entry), which is what
+  # an entry landing after the bounce has started needs. docs/DECISIONS.md, 2026-09-06.
+  target_from: extreme  # extreme | entry
   k_target: 0.8  # fraction of (anchor_px - extreme_px) retraced; target = extreme + k*(anchor-extreme)
   k_stop: 1.0  # stop distance beyond the extreme in units of rv_5m * mid, vol scaled
   time_stop_s: 900  # seconds: flatten if neither target nor stop hit. Q8's grid used this and tested no other

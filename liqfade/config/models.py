@@ -210,7 +210,17 @@ class Exhaustion(Base):
         return self
 
 
+TargetFrom = Literal["extreme", "entry"]
+
+
 class Intent(Base):
+    # Where the reversion target is measured from. `extreme` is the spec's formula and the
+    # default, so v0 and every number taken under it are untouched. `entry` measures the
+    # same fraction of the distance that is *left*, which is the only sensible reading once
+    # the entry can land after the bounce has started. docs/DECISIONS.md, 2026-09-06.
+    target_from: TargetFrom = Field(
+        "extreme", description="anchor the target on the cascade extreme or on the entry"
+    )
     k_target: Pos = Field(..., description="fraction of (anchor - extreme) used as the target")
     k_stop: Pos = Field(..., description="multiple of rv_5m * mid placed beyond the extreme")
     time_stop_s: Pos = Field(..., description="seconds before an unresolved position is flattened")

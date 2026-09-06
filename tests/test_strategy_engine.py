@@ -34,6 +34,25 @@ def run_to_signal(
     return intents
 
 
+def run_with_recovery(
+    engine: StrategyEngine, *, low: float, entry_mid: float, ticks: int = 700
+) -> list[Intent]:
+    """Start a cascade at 100, print `low` long enough to set the extreme, then recover.
+
+    `run_to_signal` holds one price after the start, so the extreme it produces *is* the
+    entry price and a target can never be behind the fill. The interesting case needs a real
+    wick: price makes its low, comes back, and the fixed delay fires while it is back up.
+    """
+    engine.on_tick(START_MS, {"BTC": falling_row(START_MS, 100.0)})
+    intents: list[Intent] = []
+    for step in range(1, ticks):
+        ts = START_MS + step * TICK_MS
+        intents.extend(
+            engine.on_tick(ts, {"BTC": quiet_row(ts, low if step <= 200 else entry_mid)})
+        )
+    return intents
+
+
 class TestIntent:
     def test_a_cascade_becomes_one_intent(self, settings_factory: SettingsFactory) -> None:
         engine = StrategyEngine(settings_factory(), META)
@@ -54,6 +73,49 @@ class TestIntent:
         assert intent.stop_px == pytest.approx(extreme - settings.intent.k_stop * rv * mid)
         assert intent.stop_px < extreme, "a stop inside the extreme is not a stop"
         assert intent.time_stop_s == settings.intent.time_stop_s
+
+    def test_target_from_entry_measures_the_reversion_that_is_left(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """Anchor 100, extreme 95, fill at 98. 80% of the 2 that is left, not of the 5.
+
+        `extreme` puts the target at 99.0, a fixed price 80% of the way back from the low.
+        `entry` puts it at 99.6, 80% of the way back from where we actually got in. Both are
+        ahead of this fill, so the two formulas can be compared at one entry.
+        """
+        from_extreme = settings_factory()
+        from_entry = settings_factory(**{"intent.target_from": "entry"})
+        assert from_extreme.intent.target_from == "extreme", "v0's formula stays the default"
+
+        (a,) = run_with_recovery(StrategyEngine(from_extreme, META), low=95.0, entry_mid=98.0)
+        (b,) = run_with_recovery(StrategyEngine(from_entry, META), low=95.0, entry_mid=98.0)
+        k = from_entry.intent.k_target
+        assert a.target_px == pytest.approx(95.0 + k * (100.0 - 95.0))
+        assert b.target_px == pytest.approx(98.0 + k * (100.0 - 98.0))
+        # The stop belongs below the wick that swept the level, so it does not move.
+        assert a.stop_px == pytest.approx(b.stop_px)
+        assert b.edge_frac > a.edge_frac > 0
+
+    def test_target_from_entry_keeps_the_target_ahead_of_a_late_fill(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """A fill at 99.5 is already past the extreme-anchored target of 99.0.
+
+        The year run's 31 trades in one case. Under `extreme` the intent is built with its
+        target behind the entry and `target_behind` throws it away; under `entry` there is
+        still 80% of the remaining 50 bps to aim at.
+        """
+        engine = StrategyEngine(settings_factory(), META)
+        assert run_with_recovery(engine, low=95.0, entry_mid=99.5) == []
+        assert engine.take_rejections()[0].reason == "target_behind"
+
+        (intent,) = run_with_recovery(
+            StrategyEngine(settings_factory(**{"intent.target_from": "entry"}), META),
+            low=95.0,
+            entry_mid=99.5,
+        )
+        assert intent.target_px > intent.entry_px
+        assert intent.edge_frac > 0
 
     def test_fading_a_long_liquidation_goes_long(self, settings_factory: SettingsFactory) -> None:
         engine = StrategyEngine(settings_factory(), META)

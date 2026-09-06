@@ -318,7 +318,20 @@ class StrategyEngine:
         intent_cfg = self.settings.intent
         # Partial reversion back towards the pre-cascade anchor. k_target 0.8 is Q8's
         # winning cell over 2,722 episodes, taken because every neighbour was positive.
-        target_px = state.extreme_px + intent_cfg.k_target * (state.anchor_px - state.extreme_px)
+        #
+        # `target_from` decides what that fraction is a fraction *of*. `extreme` is the
+        # spec's formula, a fixed price on the way back from the low, and it assumes the
+        # entry is near that low: true under `exhaustion.mode: fixed_delay`, false under the
+        # rule mode and false again with `level_reclaim`, both of which wait for the bounce
+        # to be visible before entering. From a late entry that fixed price is already
+        # behind us. `entry` measures the same fraction of the distance that is left, so the
+        # target is always ahead of the fill and the edge is `k_target` times the remaining
+        # reversion. The stop is unaffected and stays beyond the extreme in both modes: it
+        # belongs below the wick that swept the level, wherever we happened to get in. A
+        # late entry therefore has a nearer target and a wider stop, and sizing follows the
+        # stop, so the same risk fraction buys a smaller position.
+        anchor_from = state.extreme_px if intent_cfg.target_from == "extreme" else entry_px
+        target_px = anchor_from + intent_cfg.k_target * (state.anchor_px - anchor_from)
         # Beyond the extreme, scaled by volatility, never inside it. `direction` is -1 for
         # a long liquidation, which puts the stop below the low it is protecting.
         stop_px = state.extreme_px + state.direction * intent_cfg.k_stop * row.rv * row.mid
