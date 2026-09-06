@@ -89,8 +89,16 @@ intent:
   k_stop: 1.0
   time_stop_s: 900
 
-# risk.max_dd_frac is 0.10 in default.yaml. The v0 year hit it in month three and the
-# other nine months replayed halted. Raising it here for a tuning run is the owner's call.
+# Tuning runs only. The 10% drawdown halt fired in November in both years so far and the
+# other nine months replayed halted, which hides the strategy. The owner wants the whole
+# tape until the strategy is good; the live limits in default.yaml are untouched.
+risk:
+  max_dd_frac: 1.0
+  max_daily_loss_frac: 1.0
+  cooldown_after_streak_min: 0
+  # The per-coin cooldowns and the cluster cap stay as they are: they shape which trades a
+  # run takes rather than cutting the tape short, so relaxing them would change the result
+  # instead of revealing it.
 
 backtest:
   latency_ms: 1000

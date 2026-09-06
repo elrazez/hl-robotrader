@@ -140,8 +140,19 @@ def test_the_shipped_backtest_configs_load_and_say_what_they_switch_on() -> None
     # The exhaustion rule and level_reclaim both enter after the bounce has started, so the
     # target has to be measured from the fill rather than from the low.
     assert v1.intent.target_from == "entry"
-    # The default is what commit 2 fixed; a run config overriding it back would hide that.
+    # The default is what the robust z fix restored; overriding it back would hide that.
     assert v1.features.z_robust is True
+
+    # Tuning runs only: the account halts are off in v1 so the whole tape replays, and the
+    # live limits are untouched. A run config that quietly relaxed the shipped ones, or a
+    # default that drifted to match, would both be invisible without this pair.
+    assert (v1.risk.max_dd_frac, v1.risk.max_daily_loss_frac) == (1.0, 1.0)
+    assert v1.risk.cooldown_after_streak_min == 0
+    # The gates that shape which trades are taken, rather than cutting the tape short, stay.
+    base = load_settings("paper", environ={})
+    assert v1.risk.max_cluster_exposure_frac == base.risk.max_cluster_exposure_frac
+    assert v1.risk.coin_cooldown_after_loss_min == base.risk.coin_cooldown_after_loss_min
+    assert (base.risk.max_dd_frac, base.risk.max_daily_loss_frac) == (0.10, 0.03)
 
 
 def test_flatten_produces_dotted_keys() -> None:
