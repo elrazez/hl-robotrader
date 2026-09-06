@@ -202,3 +202,20 @@ def test_deploy_is_valid_bash() -> None:
     subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "deploy.sh")], check=True, capture_output=True
     )
+
+
+@pytest.mark.parametrize("unit", UNITS, ids=lambda p: p.name)
+def test_environment_values_with_spaces_are_quoted(unit: Path) -> None:
+    """systemd drops `Environment=K=two words` with a parse warning and carries on.
+
+    The watchdog shipped with `Environment=LIQFADE_WATCH_LABEL=paper loop` and the box
+    logged "Invalid environment assignment, ignoring: loop" while starting anyway, so the
+    label silently fell back to the default. A unit that is half applied is worse than one
+    that refuses.
+    """
+    for line in unit.read_text().splitlines():
+        if not line.startswith("Environment="):
+            continue
+        value = line.removeprefix("Environment=")
+        if " " in value:
+            assert value.startswith('"') and value.endswith('"'), line

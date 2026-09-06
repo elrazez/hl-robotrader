@@ -22,7 +22,7 @@ EnvironmentFile=/srv/liqfade/.env
 # Seconds of silence before it pages. The loop writes the heartbeat every second, so ten
 # is nine missed writes and not a slow disk.
 Environment=LIQFADE_WATCH_STALE_S=10
-Environment=LIQFADE_WATCH_LABEL=paper loop
+Environment="LIQFADE_WATCH_LABEL=paper loop"
 WorkingDirectory=/srv/liqfade/app
 Restart=always
 RestartSec=3
