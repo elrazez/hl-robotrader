@@ -209,6 +209,26 @@ strategy:
       # purpose: it is the rule that proves the mechanism with something anyone can check.
       enabled: false
       min_notional_usd: 250000.0  # USD of liquidated notional in the cascade so far
+    oi_flush:
+      # Passes when open interest fell over the rv window, so positions were actually
+      # forced out rather than price merely moving, and optionally when open interest is
+      # still up over the build window, which is the crowding there was to flush.
+      enabled: false
+      drop_min_frac: 0.01  # fraction of open interest closed over the rv window
+      build_min_frac: null  # fraction OI is up over the build window; null skips the half
+    vwap_stretch:
+      # Passes when mid is stretched past the VWAP the way the cascade pushed it: below it
+      # for a long liquidation we are buying, above it for a short one.
+      enabled: false
+      reference: day  # day: session VWAP from 00:00 UTC | anchor: features.vwap_anchor_s
+      min_disp_bps: 30.0  # bps mid must sit past the VWAP
+    level_reclaim:
+      # The swing failure and the three tap: the cascade traded through a level that
+      # already existed and price is back on the near side of it now. Reads the same
+      # features/levels.py set zone_proximity does.
+      enabled: false
+      sweep_min_bps: 5.0  # bps beyond the level the cascade extreme must have traded
+      reclaim_min_bps: 0.0  # bps back past the level mid must be now
 
 sizing:
   risk_frac: 0.005  # fraction of equity risked at the stop, 0.5%

@@ -35,15 +35,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from liqfade.config.models import MinCascadeNotionalRule, Settings, ZoneProximityRule
+from liqfade.config.models import (
+    LevelReclaimRule,
+    MinCascadeNotionalRule,
+    OiFlushRule,
+    Settings,
+    VwapStretchRule,
+    ZoneProximityRule,
+)
 from liqfade.strategy.types import CascadeState, FeatureRow
 
 __all__ = [
     "LEVEL_RULES",
     "RULES",
     "ConfluenceRule",
+    "LevelReclaim",
     "MinCascadeNotional",
+    "OiFlush",
     "RuleVerdict",
+    "VwapStretch",
     "ZoneProximity",
     "build_enabled_rules",
     "level_rules_enabled",
@@ -55,7 +65,7 @@ __all__ = [
 # that turns on an expensive join for nothing; a level-reading rule missing from here reads
 # nulls and fails on every candidate, which is the more expensive mistake because it looks
 # like a result. `tests/test_strategy_rules.py` pins the membership.
-LEVEL_RULES: tuple[str, ...] = ("zone_proximity",)
+LEVEL_RULES: tuple[str, ...] = ("zone_proximity", "level_reclaim")
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,10 +158,144 @@ class MinCascadeNotional:
         )
 
 
+class OiFlush:
+    """Passes when open interest was flushed, and optionally when it had built up first.
+
+    Two questions, one rule, because they are two halves of the same observation a trader
+    makes by eye: positions were crowded, and then they were forced out. `oi_delta_rv` over
+    the rv window is the flush, and it must be at least `drop_min_frac` **down**, so the
+    comparison is against a negative number. `oi_delta_build` over the longest configured OI
+    window is the crowding, and it is measured to now rather than to the start of the
+    cascade, so it is already net of the flush: requiring it to be positive is requiring
+    open interest to still be above where it was an hour ago even after the liquidations.
+
+    A null delta fails. It means the window is not full yet or the coin has no context
+    samples, and "we cannot see the open interest" is not evidence that it was flushed.
+    """
+
+    name = "oi_flush"
+
+    def __init__(self, config: OiFlushRule) -> None:
+        self.config = config
+
+    def evaluate(self, features: FeatureRow, cascade: CascadeState) -> RuleVerdict:
+        drop, build = features.oi_delta_rv, features.oi_delta_build
+        values: dict[str, float] = {"drop_min_frac": self.config.drop_min_frac}
+        for key, value in (
+            ("oi_delta_rv", drop),
+            ("oi_delta_build", build),
+            ("open_interest", features.open_interest),
+        ):
+            if value is not None:
+                values[key] = value
+        if drop is None or drop > -self.config.drop_min_frac:
+            return RuleVerdict(False, values)
+        floor = self.config.build_min_frac
+        if floor is not None:
+            values["build_min_frac"] = floor
+            if build is None or build < floor:
+                return RuleVerdict(False, values)
+        return RuleVerdict(True, values)
+
+
+class VwapStretch:
+    """Passes when mid is at least `min_disp_bps` past the VWAP, the way the cascade pushed.
+
+    Fading a long liquidation means price fell, so the displacement must be **negative**:
+    we buy when price is stretched below the reference everyone else paid. Fading a short
+    liquidation mirrors it. There is deliberately no mode for the opposite sign, which
+    would be a momentum rule and is out of scope for v0.
+
+    `reference: day` is the session VWAP accumulated from 00:00 UTC, which is what a
+    discretionary trader watches; `anchor` is the fixed pre-cascade window
+    (`features.vwap_anchor_s`), which cannot be dragged along by the cascade but is also
+    blind to where the day has actually traded. A null reference fails: no VWAP is not the
+    same as no stretch, and early in a UTC day the session VWAP does not exist yet.
+    """
+
+    name = "vwap_stretch"
+
+    def __init__(self, config: VwapStretchRule) -> None:
+        self.config = config
+
+    def evaluate(self, features: FeatureRow, cascade: CascadeState) -> RuleVerdict:
+        disp = features.disp_day_bps if self.config.reference == "day" else features.disp_anchor_bps
+        values: dict[str, float] = {"min_disp_bps": self.config.min_disp_bps}
+        if disp is None:
+            return RuleVerdict(False, values)
+        values["disp_bps"] = disp
+        # `cascade.side` is the liquidated side: `long` means longs were closed, so price
+        # fell and the fade is a buy into a negative displacement.
+        passed = (
+            disp <= -self.config.min_disp_bps
+            if cascade.side == "long"
+            else disp >= self.config.min_disp_bps
+        )
+        return RuleVerdict(passed, values)
+
+
+class LevelReclaim:
+    """The swing failure and the three tap: through a level, and back on the right side.
+
+    For a long liquidation the level is `support_px`, the nearest one below the current
+    mid. The cascade extreme must be at least `sweep_min_bps` below it, which is the
+    "traded through a significant swing low" half, and mid must now be at least
+    `reclaim_min_bps` above it, which is the "failed to close below" half. A short
+    liquidation mirrors it against `resistance_px`.
+
+    The two conditions together require the level to sit **between the extreme and the
+    current mid**, which is what makes the nearest level below mid the right one to ask
+    about: it is the highest level that could be in that band, so if any level satisfies the
+    rule that one does. The corollary is that the rule sees one level and not all of them,
+    so where a shallower level sits between the swept one and mid, that shallower level is
+    the one judged. See `_with_levels` in `backtest/features.py` for how it is chosen and
+    for the deliberate restriction to levels knowable at the start of the day.
+
+    A null level fails. `support_px` is null when no level of that kind is within
+    `features.levels.max_dist_bps`, and no level nearby means nothing was swept.
+    """
+
+    name = "level_reclaim"
+
+    def __init__(self, config: LevelReclaimRule) -> None:
+        self.config = config
+
+    def evaluate(self, features: FeatureRow, cascade: CascadeState) -> RuleVerdict:
+        below = cascade.side == "long"
+        level = features.support_px if below else features.resistance_px
+        mid, extreme = features.mid, cascade.extreme_px
+        values: dict[str, float] = {
+            "sweep_min_bps": self.config.sweep_min_bps,
+            "reclaim_min_bps": self.config.reclaim_min_bps,
+            "extreme_px": extreme,
+        }
+        if level is not None:
+            values["level_px"] = level
+        if mid is not None:
+            values["mid"] = mid
+        if level is None or level <= 0 or mid is None or mid <= 0 or extreme <= 0:
+            return RuleVerdict(False, values)
+
+        # Both positive exactly when the geometry holds: the extreme beyond the level, mid
+        # back on the near side of it.
+        sign = 1.0 if below else -1.0
+        sweep_bps = 1e4 * sign * (level - extreme) / level
+        reclaim_bps = 1e4 * sign * (mid - level) / level
+        values["sweep_bps"] = sweep_bps
+        values["reclaim_bps"] = reclaim_bps
+        passed = (
+            sweep_bps >= self.config.sweep_min_bps and reclaim_bps >= self.config.reclaim_min_bps
+        )
+        return RuleVerdict(passed, values)
+
+
 # The registry. Keys must match `StrategyRules`' field names exactly; a test pins it.
 RULES: dict[str, type] = {
     ZoneProximity.name: ZoneProximity,
     MinCascadeNotional.name: MinCascadeNotional,
+    OiFlush.name: OiFlush,
+    VwapStretch.name: VwapStretch,
+    LevelReclaim.name: LevelReclaim,
 }
 
 

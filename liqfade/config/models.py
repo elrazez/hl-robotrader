@@ -232,6 +232,48 @@ class MinCascadeNotionalRule(Base):
     min_notional_usd: Pos = Field(..., description="USD of liquidated notional the cascade needs")
 
 
+class OiFlushRule(Base):
+    """Open interest was flushed by the cascade, and had built up before it.
+
+    The two halves are separable because they are separate claims. The drop says forced
+    closing actually happened rather than price merely moving; the build says there was a
+    crowded position there to be closed, which is what a trader reads before a cascade and
+    what distinguishes a flush from a slow bleed. `build_min_frac` is null by default
+    because the drop alone is the cheaper claim and the one the feature measures directly.
+    """
+
+    enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    drop_min_frac: NonNeg = Field(
+        ..., description="fraction of open interest closed over the rv window"
+    )
+    build_min_frac: NonNeg | None = Field(
+        None, description="fraction open interest is up over the build window; null skips it"
+    )
+
+
+VwapReference = Literal["day", "anchor"]
+
+
+class VwapStretchRule(Base):
+    """Price is stretched away from a VWAP, on the side the cascade pushed it."""
+
+    enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    reference: VwapReference = Field(
+        "day", description="day: session VWAP from 00:00 UTC; anchor: the pre-cascade window"
+    )
+    min_disp_bps: NonNeg = Field(..., description="bps mid must sit past the VWAP")
+
+
+class LevelReclaimRule(Base):
+    """The swing failure and the three tap: through a level, then back above it."""
+
+    enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    sweep_min_bps: NonNeg = Field(
+        ..., description="bps beyond the level the cascade extreme must have traded"
+    )
+    reclaim_min_bps: NonNeg = Field(..., description="bps back past the level mid must be now")
+
+
 class StrategyRules(Base):
     """One field per rule in `strategy.rules.RULES`.
 
@@ -243,6 +285,9 @@ class StrategyRules(Base):
 
     zone_proximity: ZoneProximityRule
     min_cascade_notional: MinCascadeNotionalRule
+    oi_flush: OiFlushRule
+    vwap_stretch: VwapStretchRule
+    level_reclaim: LevelReclaimRule
 
 
 class Strategy(Base):
