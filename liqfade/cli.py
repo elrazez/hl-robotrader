@@ -617,6 +617,38 @@ def _with_latency(settings: Settings, latency_ms: int) -> Settings:
     return Settings.model_validate(payload)
 
 
+# --- lab ----------------------------------------------------------------------
+
+
+def cmd_lab(args: argparse.Namespace) -> int:
+    """Open the terminal workbench.
+
+    Textual is imported here rather than at module scope so that a box which installed the
+    core only still gets every other subcommand. The lab reads the same config directory
+    the loader does and the reports directory the settings name, so it shows what
+    `liqfade backtest` would run against.
+    """
+    from liqfade.config.loader import config_dir
+
+    settings = _settings(args)
+    try:
+        from liqfade.lab.app import LabApp
+    except ImportError as exc:
+        print(
+            f"lab: {exc}. The terminal workbench needs the optional `lab` extra: "
+            "run `make setup`, or `uv sync --extra lab`.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    LabApp(
+        config_dir=Path(args.config_dir) if args.config_dir else config_dir() / "backtest",
+        reports_dir=settings.paths.reports_dir,
+        data_dir=settings.paths.data_dir,
+    ).run()
+    return 0
+
+
 # --- watch --------------------------------------------------------------------
 
 
@@ -960,6 +992,14 @@ def build_parser() -> argparse.ArgumentParser:
         "'-' disables it)",
     )
 
+    lab = sub.add_parser(
+        "lab", parents=[common], help="the terminal workbench: configs, runs, results"
+    )
+    lab.add_argument(
+        "--config-dir", default=None, help="strategy configs (default: config/backtest)"
+    )
+    lab.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+
     watch = sub.add_parser(
         "watch", parents=[common], help="live progress of a running backtest, in this terminal"
     )
@@ -1029,6 +1069,7 @@ HANDLERS = {
     "watch": cmd_watch,
     "sync": cmd_sync,
     "panel": cmd_panel,
+    "lab": cmd_lab,
 }
 
 
