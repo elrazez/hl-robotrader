@@ -1538,3 +1538,79 @@ and what the backtest should do; it is a follow-up engine item and not this run.
 **Reverse this entry** if signing `edge_frac` turns out to have been hiding a different bug
 in the fill model rather than fixing one in the exit, which the 863 bps slippage above is
 the reason to suspect.
+
+## 2026-09-06 (05a: Phase 5 plumbing gap audit)
+
+Phase 5 is blocked on a trigger the live bot can see, which blocks the seven day
+acceptance run and the paper-versus-backtest comparison in the DoD. It does not block the
+plumbing underneath: the order manager, reconciliation, the kill switch, the watchdog, the
+Telegram command bot and the paper loop are the same code whichever trigger eventually
+feeds them, exactly as the 2026-09-06 Phase 4 override argued for the engine. This branch
+builds and drills that plumbing. It does not start the seven day clock and it does not
+touch the mainnet gates: `live_trading_enabled` still needs `LIQFADE_ENV=mainnet`,
+`LIQFADE_LIVE_TRADING=1` and no `data/KILL`.
+
+**What already exists**, from Phase 0 and Phase 1:
+
+| Area | State | What is there |
+| --- | --- | --- |
+| `control/protocol.py` | done | Typed command set, `StateSnapshot`, `OrderState`, `RiskState`, `LatencyState`. No `inject_intent` command yet. |
+| `control/server.py` | done | Unix socket, created 0600 under a narrowed umask, one process per socket enforced by `flock`. |
+| `control/client.py`, `control/state.py` | done | Client and the atomic 0600 `state.json` writer on a 1s interval. |
+| `control/backend.py` | done as a seam | `ControlBackend` protocol, `NoopBackend`, `write_kill_file`, `kill_not_persisted`. No trading backend implements it. |
+| `recorder/backend.py` | done | The one real `ControlBackend`, and the model the paper backend follows. Refuses `pause`/`resume`/`flat`, honours `kill`. |
+| `alerts/telegram.py` | half | Outbound `send_alert` only: one POST, ten minute dedupe, never raises. |
+| `execution/rounding.py` | done | Price and size rounding, the only place it happens. |
+| `backtest/fills.py` | done | The maker, taker, stale book and gapped stop model paper mode reuses unchanged. |
+| `strategy/`, `sizing/`, `risk/` | done | Phase 4. `RiskEngine` already takes its kill check as an argument. |
+| `scripts/deploy.sh` | done | Already deploys any ref through `LIQFADE_BRANCH`, so no new variable is needed to put a branch on the box. `liqfade-live` and `liqfade-watchdog` are in `NEVER_ENABLE`. |
+| `scripts/systemd/` | 3 of 5 | Recorder, panel and live units are hardened and installed. The live unit's `ExecStartPre` refuses to start while `data/KILL` exists. |
+
+**What is a stub:**
+
+- `liqfade/live/__init__.py` and `liqfade/execution/__init__.py` are docstrings that say
+  "empty until Phase 5". Nothing else in either package.
+- `cli.py`'s `paper`, `testnet` and `live` subcommands are `cmd_not_yet`.
+- `scripts/systemd/liqfade-watchdog.service` runs `python -m liqfade.execution.watchdog`,
+  a module that does not exist. This is why `NEVER_ENABLE` lists it: enabling it today
+  would crash loop every three seconds.
+- `alerts/telegram.py`'s docstring points at a command bot in "its own module". There is
+  no such module.
+
+**What is missing outright:** `execution/signer.py` (the only module that may read the
+agent key), the Hyperliquid REST and user-stream client, the order manager state machine
+and its `data/orders.sqlite` persistence, the cloid registry, reconciliation against
+`clearinghouseState` and `openOrders`, the kill switch path with its own tests, the
+watchdog, the inbound Telegram command bot with the chat id allowlist, the paper loop
+itself, and a `liqfade-paper` unit.
+
+**The six testnet probes from `docs/HYPERLIQUID.md`, by status.** None of the six has been
+run. `scripts/probe/` holds two scripts and neither is one of them: `hl_meta.py` reads
+`metaAndAssetCtxs` over public REST, and `ws_payloads.py` captures public WebSocket
+payload shapes. Both are keyless and read only.
+
+| # | Probe | Status | Needs |
+| --- | --- | --- | --- |
+| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | not run | testnet agent key |
+| 2 | `Alo` that would cross, confirm the rejection string | not run | testnet agent key |
+| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | not run | testnet agent key, faucet USDC |
+| 4 | 50 submit-to-ack latencies at a quiet and a busy time | not run | testnet agent key |
+| 5 | `scheduleCancel` availability and its exact error when gated | not run | testnet agent key |
+| 6 | `userFees` payload shape and current rates | not run | testnet account address only, no signing |
+
+`/srv/liqfade/.env` on the box has `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` and
+`TELEGRAM_ALLOWED_CHAT_IDS` filled, and both `HL_TESTNET_ACCOUNT_ADDRESS` and
+`HL_TESTNET_AGENT_PRIVATE_KEY` empty, checked by name and length without reading a value.
+So probes 1 to 5 are blocked on Phase 0 item 4, which only the owner can do, and probe 6
+is blocked with them because it wants a real account's fee tier rather than a stranger's.
+The probe scripts are written on this branch anyway and land unrun; their answers get
+encoded in `docs/HYPERLIQUID.md` the day the key exists, and until then that file's
+"researched against docs" caveat stands.
+
+**What this branch will therefore not deliver:** the testnet half of the kill drill (the
+file and Telegram paths are drilled in paper mode instead, which exercises the same
+`ControlBackend.kill`), any testnet order round trip, and the seven day acceptance run.
+Those stay open against Phase 5's DoD.
+
+Reverse this entry if the trigger question resolves before the plumbing lands, in which
+case Phase 5 proceeds as written rather than as two halves.
