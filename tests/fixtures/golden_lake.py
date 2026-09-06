@@ -64,7 +64,6 @@ So: three identical trades, all `long`, all exiting on `target` at 99.333, enter
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -170,33 +169,45 @@ def build() -> tuple[pl.DataFrame, pl.DataFrame, int, int]:
     return pl.DataFrame(trades), pl.DataFrame(liquidations), START_MS, END_MS
 
 
-def write_lake(root: Path, days: int) -> tuple[int, int]:
+def write_lake(root: Path, days: int, *, offset_ms: int = 0) -> tuple[int, int]:
     """Write the same tape to a real Parquet lake, repeated over `days` UTC days.
 
-    Returns `(start_ms, end_ms)` of the whole window. Each day is an independent copy of
-    the one-day fixture, shifted by a whole day, so a run over three days must find
+    Returns `(start_ms, end_ms)`, the whole run window, midnight to midnight. Each day is
+    an independent copy of the one-day fixture, so a run over three days must find
     `3 * N_CASCADES` cascades and every one of them must produce the trade the golden
     derivation above predicts. That is what makes a streaming run checkable: the day loop,
-    the cache and the window maths cannot quietly drop or duplicate a day without the
-    trade count saying so.
+    the cache and the window maths cannot quietly drop or duplicate a day without the trade
+    count saying so.
 
-    The tape runs to midnight rather than stopping at `END_MS`, so a day boundary falls in
-    the middle of quiet tape rather than in the middle of a cascade. A cascade that
-    straddled midnight would be a good test of the spill, and it is a separate one; this
-    fixture is the baseline the spill is measured against.
+    `offset_ms` slides the tape within each day. At the default the cascades sit at 01:00,
+    02:00 and 03:00 and a day boundary falls in quiet tape, which is the baseline. Push it
+    to 20h50m and the last cascade of each day starts at 23:50, so its replay window and
+    the position it opens both cross midnight, which is the case the day loop has to carry
+    rather than cut in half.
+
+    Rows are partitioned by the UTC date they actually fall on rather than by the day they
+    were copied from, so a shifted tape lands in the right files.
     """
     from liqfade.data.schemas import SOURCE_HL_S3
     from liqfade.recorder.writer import write_rows
 
     trades, liquidations, start_ms, _ = build()
     parquet = Path(root) / "parquet"
-    day_start = datetime.fromtimestamp(START_MS / 1000, UTC).date()
-    for offset in range(days):
-        shift = offset * DAY_MS
-        date = (day_start + timedelta(days=offset)).isoformat()
-        for table, frame in (("trades", trades), ("liquidations", liquidations)):
-            rows = frame.with_columns(pl.col("ts_ms") + shift).to_dicts()
-            write_rows(parquet, (table, "hyperliquid", date, 0), rows, source=SOURCE_HL_S3)
+    for table, frame in (("trades", trades), ("liquidations", liquidations)):
+        shifted = pl.concat(
+            frame.with_columns(pl.col("ts_ms") + offset_ms + offset * DAY_MS)
+            for offset in range(days)
+        )
+        stamped = shifted.with_columns(
+            pl.from_epoch("ts_ms", time_unit="ms").dt.strftime("%Y-%m-%d").alias("_date")
+        )
+        for (day,), rows in stamped.group_by("_date", maintain_order=True):
+            write_rows(
+                parquet,
+                (table, "hyperliquid", str(day), 0),
+                rows.drop("_date").to_dicts(),
+                source=SOURCE_HL_S3,
+            )
     return start_ms, start_ms + days * DAY_MS
 
 

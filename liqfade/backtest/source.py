@@ -47,6 +47,7 @@ from liqfade.backtest.data import Event, iter_events, load_day, utc_days
 from liqfade.backtest.features import build_feature_grid, row_columns
 from liqfade.config.models import Settings
 from liqfade.log import get_logger
+from liqfade.strategy.types import AssetMeta
 
 log = get_logger(__name__)
 
@@ -137,7 +138,10 @@ class LakeSource:
         self.end_ms = end_ms
         self.starting_equity = starting_equity
         self.seed = seed
-        self.meta: Mapping[str, object] = {}
+        # Nothing fills this yet: a historical window has no venue metadata, and
+        # `_resolve_meta` invents the most constraining defaults. It is here because the
+        # engine reads it off the source and the lake will have real values in Phase 5.
+        self.meta: Mapping[str, AssetMeta] = {}
         self.levels: pl.DataFrame | None = None
         self._cache = cache
         self._cache_root = self.data_dir / CACHE_DIR / feature_hash(settings)

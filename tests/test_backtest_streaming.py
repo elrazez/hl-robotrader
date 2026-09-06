@@ -19,6 +19,7 @@ The reference test at the bottom is the same claim against real data.
 
 from __future__ import annotations
 
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -26,8 +27,10 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from liqfade.backtest.engine import run_backtest
-from liqfade.backtest.source import LakeSource
+from liqfade.backtest.data import load_day, utc_days
+from liqfade.backtest.engine import RunInputs, run_backtest
+from liqfade.backtest.features import cascade_windows
+from liqfade.backtest.source import LakeSource, feature_hash
 from liqfade.config.models import Settings
 
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
@@ -45,6 +48,42 @@ def day_lake(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, int, int]:
     root = tmp_path_factory.mktemp("day_lake")
     start_ms, end_ms = golden_lake.write_lake(root, LAKE_DAYS)
     return root, start_ms, end_ms
+
+
+def _whole_window(lake: tuple[Path, int, int]) -> RunInputs:
+    """The same lake as frames, so a streamed run can be checked against an unstreamed one.
+
+    Only ever used on a fixture. The real lake does not fit in memory, which is the whole
+    reason `LakeSource` exists.
+    """
+    data_dir, start_ms, end_ms = lake
+    read = {
+        table: [
+            frame
+            for day in utc_days(start_ms, end_ms)
+            if not (frame := load_day(data_dir, table, day)).is_empty()
+        ]
+        for table in ("trades", "liquidations")
+    }
+    return RunInputs(
+        trades=pl.concat(read["trades"]),
+        liquidations=pl.concat(read["liquidations"]),
+        start_ms=start_ms,
+        end_ms=end_ms,
+        starting_equity=EQUITY,
+    )
+
+
+@pytest.fixture
+def fresh_lake(day_lake: tuple[Path, int, int], tmp_path: Path) -> tuple[Path, int, int]:
+    """A private copy of the lake, for tests that write a cache into it.
+
+    The lake itself is built once for the module because building it is the slow part;
+    anything that leaves a cache behind would change what the next test sees.
+    """
+    _, start_ms, end_ms = day_lake
+    shutil.copytree(day_lake[0], tmp_path / "lake")
+    return tmp_path / "lake", start_ms, end_ms
 
 
 @pytest.fixture
@@ -97,6 +136,73 @@ class TestTheLakeIsReadOneDayAtATime:
         result = run_backtest(source(day_lake, settings, cache=False), settings)
         assert result.trades, "a run that read nothing would pass this test vacuously"
         assert len(set(single_day_reads)) > 1, "the fixture spans days; the run must too"
+
+
+class TestACascadeThatStraddlesMidnight:
+    """The day loop's one genuinely hard case, and the reason for the carry and the spill.
+
+    Every window here opens at 23:45 and closes at 00:20 the next morning, so the grid
+    rows the detector reads, the tape the fills come from, the funding the position accrues
+    and the equity sample that prices it all sit on two sides of a day boundary.
+    """
+
+    @pytest.fixture(scope="class")
+    def midnight_lake(self, tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, int, int]:
+        root = tmp_path_factory.mktemp("midnight_lake")
+        # 20h50m puts the three cascades of each day at 21:50, 22:50 and 23:50.
+        start_ms, end_ms = golden_lake.write_lake(root, LAKE_DAYS, offset_ms=75_000_000)
+        return root, start_ms, end_ms
+
+    def test_the_cascade_at_2350_still_trades(
+        self, midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """It is the last cascade of each day, so it is the one a naive day loop loses."""
+        result = run_backtest(source(midnight_lake, settings, cache=False), settings)
+        crossing = [
+            trade
+            for trade in result.trades
+            if trade.entry_ms % golden_lake.DAY_MS > 84_000_000  # after 23:20
+        ]
+        assert crossing, "the cascade that starts at 23:50 produced no trade at all"
+        assert all(trade.exit_reason == "target" for trade in crossing)
+
+    def test_a_position_open_at_midnight_is_carried_rather_than_cut(
+        self, midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """A window clipped at midnight must not flatten what it was holding.
+
+        `window_end` is what `_close_out` stamps on a position the run ended holding. Any
+        of those in the middle of the run would mean the day loop closed a position because
+        the clock rolled over, which is not a decision the strategy made.
+        """
+        result = run_backtest(source(midnight_lake, settings, cache=False), settings)
+        early = [
+            trade
+            for trade in result.trades
+            if trade.exit_reason == "window_end" and trade.exit_ms < result.end_ms - 60_000
+        ]
+        assert not early, f"{len(early)} positions were closed by a day boundary"
+
+    def test_the_carry_finds_the_same_trades_the_whole_window_would(
+        self, midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The day loop against the same tape held whole, on the hardest case for it.
+
+        `RunInputs` builds one grid over the whole window; `LakeSource` builds a grid per
+        day with the previous day carried in front of it. If the carry is short of what a
+        rolling window or the 24h z-score lookback needs, the two disagree here first,
+        because every cascade in this fixture sits within ten minutes of a boundary.
+        """
+        streamed = run_backtest(source(midnight_lake, settings, cache=False), settings)
+        whole = run_backtest(_whole_window(midnight_lake), settings)
+        assert whole.trades, "the baseline found nothing, so it proves nothing"
+        assert [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in streamed.trades
+        ] == [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in whole.trades
+        ]
 
 
 # --- the reference run --------------------------------------------------------
@@ -179,3 +285,128 @@ class TestNothingMoved:
             "the streaming engine changed a number the old engine produced; "
             f"got {digest}, expected {REFERENCE['sha256']}"
         )
+
+
+class TestTheWindowMaths:
+    def test_a_window_opens_before_the_candidate_and_closes_past_the_time_stop(
+        self, settings: Settings
+    ) -> None:
+        """The bound the flat-outside-a-window assertion rests on, stated once."""
+        found = pl.DataFrame({"coin": ["GOLD"], "ts_ms": [1_000_000]})
+        ((start, end),) = cascade_windows(found, settings)["GOLD"]
+        assert start == 1_000_000 - int(settings.backtest.window_warmup_s * 1000)
+        assert end == 1_000_000 + int(
+            (
+                settings.exhaustion.max_age_s
+                + settings.intent.time_stop_s
+                + settings.backtest.window_margin_s
+            )
+            * 1000
+        )
+
+    def test_overlapping_windows_become_one(self, settings: Settings) -> None:
+        """Replaying an overlap twice would apply the same prints to the same book twice."""
+        found = pl.DataFrame({"coin": ["GOLD", "GOLD"], "ts_ms": [1_000_000, 1_060_000]})
+        assert len(cascade_windows(found, settings)["GOLD"]) == 1
+
+    def test_windows_far_apart_stay_apart(self, settings: Settings) -> None:
+        span = int(
+            (
+                settings.exhaustion.max_age_s
+                + settings.intent.time_stop_s
+                + settings.backtest.window_margin_s
+                + settings.backtest.window_warmup_s
+            )
+            * 1000
+        )
+        found = pl.DataFrame({"coin": ["GOLD", "GOLD"], "ts_ms": [1_000_000, 1_000_000 + span + 1]})
+        assert len(cascade_windows(found, settings)["GOLD"]) == 2
+
+    def test_each_coin_gets_its_own_windows(self, settings: Settings) -> None:
+        """A BTC cascade must not drag every other coin's tape into the replay."""
+        found = pl.DataFrame({"coin": ["BTC", "ETH"], "ts_ms": [1_000_000, 9_000_000]})
+        windows = cascade_windows(found, settings)
+        assert set(windows) == {"BTC", "ETH"}
+        assert windows["BTC"] != windows["ETH"]
+
+    def test_the_run_replays_far_less_than_the_whole_clock(
+        self, day_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The claim the report prints. Three cascades a day at half an hour apiece
+        cannot add up to a day, and if this ever reached 100% the engine would be reading
+        the whole tape again with extra steps."""
+        result = run_backtest(source(day_lake, settings, cache=False), settings)
+        _, start_ms, end_ms = day_lake
+        assert 0 < result.replayed_ms < (end_ms - start_ms) * 0.5
+        assert result.windows >= LAKE_DAYS
+
+
+class TestTheGridCache:
+    def test_a_second_run_reads_the_cache_and_builds_nothing(
+        self, fresh_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        first = source(fresh_lake, settings)
+        cold = run_backtest(first, settings)
+        assert first.grids_built > 0
+
+        second = source(fresh_lake, settings)
+        warm = run_backtest(second, settings)
+        # The run's first day is deliberately never cached: it has no previous day inside
+        # the window, so its lookbacks are cold and its grid is not a function of the date.
+        assert second.grids_built == 1
+        assert second.grids_cached > 0
+        assert [trade.net_pnl for trade in warm.trades] == [trade.net_pnl for trade in cold.trades]
+
+    def test_no_cache_rebuilds_every_day_and_writes_nothing(
+        self, fresh_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        data_dir, _, _ = fresh_lake
+        run_backtest(source(fresh_lake, settings, cache=False), settings)
+        assert not (data_dir / "cache").exists()
+
+    def test_a_changed_stop_reuses_the_cache_and_a_changed_feature_does_not(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The whole point of the hash: a sweep over the trade's shape is free, a change
+        to what a feature column means is not."""
+        base = settings_factory(**{"features.z_lookback_h": 1.0})
+        for key, value in (
+            ("intent.k_stop", 2.0),
+            ("intent.time_stop_s", 600),
+            ("sizing.risk_frac", 0.001),
+            ("risk.max_dd_frac", 0.5),
+        ):
+            same = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
+            assert feature_hash(same) == feature_hash(base), f"{key} must not invalidate"
+        for key, value in (
+            ("features.z_lookback_h", 2.0),
+            ("features.depth_bps", 20.0),
+            ("cascade.liq_z_min", 2.0),
+            ("cascade.trigger", "proxy"),
+            ("backtest.feature_grid_ms", 250),
+            ("sizing.vol_window_s", 600),
+            ("exhaustion.max_age_s", 600.0),
+        ):
+            other = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
+            assert feature_hash(other) != feature_hash(base), f"{key} must invalidate"
+
+    def test_a_cache_written_for_fewer_coins_is_not_trusted_for_more(
+        self, fresh_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """A partial answer would silently drop the coins it never covered from the run.
+
+        A coin with no prints leaves no rows, so "covered and empty" cannot be told from
+        "never asked about" by looking at the rows; the coin list is stamped on the file.
+        """
+        data_dir, start_ms, end_ms = fresh_lake
+        run_backtest(source(fresh_lake, settings), settings)
+        wider = LakeSource(
+            data_dir,
+            settings=settings,
+            coins=[golden_lake.COIN, "NOTINTHELAKE"],
+            start_ms=start_ms,
+            end_ms=end_ms,
+            starting_equity=EQUITY,
+        )
+        run_backtest(wider, settings)
+        assert wider.grids_cached == 0, "a narrower cache must not answer for a wider run"

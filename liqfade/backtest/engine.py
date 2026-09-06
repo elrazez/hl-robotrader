@@ -366,8 +366,9 @@ def _day_rows(
     kept: dict[str, pl.DataFrame] = {}
     found: list[pl.DataFrame] = []
     for coin, grid in source.grids(day, settings, first=first):
-        has_carry = carry is not None and not carry.is_empty()
-        coin_carry = carry.filter(pl.col("coin") == coin) if has_carry else None
+        coin_carry = (
+            None if carry is None or carry.is_empty() else carry.filter(pl.col("coin") == coin)
+        )
         mask = active_mask(grid, settings, carry=coin_carry)
         rows = grid.sort("coin", "ts_ms").filter(mask)
         if not rows.is_empty():
