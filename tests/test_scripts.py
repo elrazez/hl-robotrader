@@ -129,7 +129,7 @@ def test_deploy_installs_every_unit_before_it_enables_any() -> None:
     """Install, then daemon-reload, then start. Restarting a unit systemd has not
     re-read gives you the old ExecStart with the new code."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
-    install = text.index('install -m 0644 "$src" "$dest"')
+    install = text.index('install -m 0644 "$candidate" "$dest"')
     reload_units = text.index("systemctl daemon-reload")
     enable = text.index('systemctl enable "$name"')
     assert install < reload_units < enable
@@ -178,3 +178,27 @@ def test_no_em_dashes_anywhere_in_the_repo_text() -> None:
             if EM_DASH in path.read_text(errors="ignore"):
                 offenders.append(str(path.relative_to(ROOT)))
     assert not offenders, f"em dash found in: {offenders}"
+
+
+def test_deploy_can_put_a_branch_in_its_own_directory() -> None:
+    """Two branches on one box, without either rolling back the other's code.
+
+    The recorder runs from its own checkout on its own branch. A deploy of this branch
+    into the same directory would hand it code from before its fixes, which nothing
+    restarts today and everything picks up at the next reboot.
+    """
+    text = (ROOT / "scripts" / "deploy.sh").read_text()
+    assert 'APP_DIR="${LIQFADE_APP_DIR:-$APP_ROOT/app}"' in text
+    # An isolated deploy has to name what it owns, install only that, and rewrite the
+    # unit paths to its own directory.
+    assert "LIQFADE_APP_DIR needs LIQFADE_UNITS" in text
+    assert 'if [ "$ISOLATED" -eq 1 ] && ! runnable "$name"; then' in text
+    assert 'sed "s|$DEFAULT_APP_DIR|$APP_DIR|g"' in text
+
+
+def test_deploy_is_valid_bash() -> None:
+    import subprocess
+
+    subprocess.run(
+        ["bash", "-n", str(ROOT / "scripts" / "deploy.sh")], check=True, capture_output=True
+    )
