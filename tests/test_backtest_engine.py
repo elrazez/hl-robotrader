@@ -163,6 +163,37 @@ class TestDeterminism:
         assert digests[0] == digests[1]
 
 
+class TestGridFilter:
+    def test_filtering_the_grid_does_not_change_a_single_trade(
+        self,
+        stream: tuple[pl.DataFrame, pl.DataFrame, int, int],
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`active_mask` is a speed optimisation, so its only job is to change nothing.
+
+        It skips building a FeatureRow for market states no cascade could involve, which is
+        most of a year. The mask is written as a superset of the detector's own start
+        conditions, and this is what holds it to that: run once with the real mask and once
+        with everything kept, and require the two to agree trade for trade. A mask that
+        became too strict would quietly delete trades and every other test here would still
+        pass.
+        """
+        import liqfade.backtest.features as features
+
+        filtered = [asdict(t) for t in run(stream, settings).trades]  # type: ignore[attr-defined]
+
+        monkeypatch.setattr(
+            features,
+            "active_mask",
+            lambda grid, settings: pl.Series([True] * grid.height),
+        )
+        unfiltered = [asdict(t) for t in run(stream, settings).trades]  # type: ignore[attr-defined]
+
+        assert filtered == unfiltered
+        assert filtered, "the comparison is worthless if neither run traded"
+
+
 class TestReport:
     def test_it_writes_all_three_files(
         self,

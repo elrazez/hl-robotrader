@@ -80,6 +80,9 @@ ignore = [
 # mirror boto3's PascalCase keyword arguments or it is not a stand-in for one.
 "tests/**" = ["S", "N803", "N806", "ASYNC240"]
 "scripts/probe/**" = ["S", "T201"]
+# Research and benchmark scripts print, and seed a generator to build synthetic tape.
+# Neither is a cryptographic use and both are the point of the script.
+"scripts/backtest_speed_check.py" = ["S311", "T201"]
 
 [tool.mypy]
 python_version = "3.12"

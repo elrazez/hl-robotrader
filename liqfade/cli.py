@@ -24,11 +24,20 @@ from liqfade.config.models import Settings
 
 # Subcommands that later phases fill in. Value is the phase number in docs/ROADMAP.md.
 NOT_YET: dict[str, int] = {
-    "backtest": 4,
     "paper": 5,
     "testnet": 5,
     "live": 6,
 }
+
+# Default starting equity for a backtest, USD. The one number in the package that looks
+# like capital, and it is not: it is the denominator every sizing fraction is applied to,
+# so a run reports percentages that scale to any account. CLAUDE.md forbids hardcoding
+# capital in the trading path; --equity overrides this for a run that wants to match a
+# real balance.
+DEFAULT_BACKTEST_EQUITY = 10_000.0
+
+# Profile rows printed by --profile. Twenty is what fits on a screen beside the report.
+PROFILE_ROWS = 20
 
 EXIT_NOT_IMPLEMENTED = 2
 EXIT_ERROR = 1
@@ -424,6 +433,142 @@ def cmd_derive(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
 
+# --- backtest -----------------------------------------------------------------
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Replay the strategy over the lake and write a report.
+
+    Two runs of the same command produce byte-identical `trades.parquet`, which is what
+    `--seed` exists to keep true if anything stochastic is ever added. `--lagged-ms` reruns
+    the same window at a worse latency, and stamps the report "latency fragile" when the
+    edge does not survive it, per the roadmap's Phase 4 definition of done.
+    """
+    import cProfile
+    import pstats
+    from datetime import UTC, datetime
+
+    from liqfade.backtest.engine import load_inputs, run_backtest
+    from liqfade.backtest.report import run_id_for, write_report
+    from liqfade.backtest.validate import bump_n_trials
+    from liqfade.data.ingest.common import BackfillError, parse_day
+    from liqfade.log import setup_logging
+
+    settings = _settings(args)
+    setup_logging(proc="backtest", env=settings.env, level=settings.logging.level)
+
+    try:
+        if not args.start or not args.end:
+            raise BackfillError("backtest needs --start and --end (YYYY-MM-DD, inclusive, UTC)")
+        start_day, end_day = parse_day(args.start), parse_day(args.end)
+    except BackfillError as exc:
+        print(f"backtest error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    start_ms = int(
+        datetime(start_day.year, start_day.month, start_day.day, tzinfo=UTC).timestamp() * 1000
+    )
+    # --end is inclusive of the whole day, matching every other date range in this CLI.
+    end_ms = (
+        int(datetime(end_day.year, end_day.month, end_day.day, tzinfo=UTC).timestamp() * 1000)
+        + 86_400_000
+    )
+    if end_ms <= start_ms:
+        print("backtest error: --end is before --start", file=sys.stderr)
+        return EXIT_ERROR
+
+    coins = [coin.strip().upper() for coin in args.coins.split(",") if coin.strip()]
+    if not coins:
+        coins = list(settings.universe.core_coins)
+
+    reports_dir = Path(args.out) if args.out else settings.paths.reports_dir
+    inputs = load_inputs(
+        settings.paths.data_dir,
+        settings=settings,
+        coins=coins,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        starting_equity=args.equity,
+        seed=args.seed,
+    )
+    if inputs.trades.is_empty():
+        print(
+            f"backtest error: no trades in the lake for {','.join(coins)} between "
+            f"{args.start} and {args.end}. Check --coins and the date range, or run "
+            f"`liqfade backfill` first.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    profiler = cProfile.Profile() if args.profile else None
+    if profiler is not None:
+        profiler.enable()
+    result = run_backtest(inputs, settings)
+    if profiler is not None:
+        profiler.disable()
+
+    # Every run counts towards the deflated Sharpe, including this one, so the tally is
+    # incremented before the report reads it.
+    trials = bump_n_trials(reports_dir)
+
+    net = sum(trade.net_pnl for trade in result.trades)
+    lagged_ms: int | None = None
+    latency_fragile: bool | None = None
+    if args.lagged_ms is not None:
+        lagged_ms = args.lagged_ms
+        degraded = _with_latency(settings, args.lagged_ms)
+        lagged = run_backtest(inputs, degraded)
+        lagged_net = sum(trade.net_pnl for trade in lagged.trades)
+        # Fragile means an edge that the extra latency took away. A run with no edge to
+        # begin with is not fragile, it is empty, and stamping it would put a scary
+        # warning on a report whose real problem is that it found nothing.
+        latency_fragile = net > 0 and lagged_net <= 0
+        print(
+            f"lagged rerun at {args.lagged_ms} ms: {len(lagged.trades)} trades, "
+            f"net {lagged_net:,.2f} USD"
+        )
+        if net <= 0:
+            print(
+                "not marked latency fragile: the baseline run had no positive expectancy "
+                "to lose, so the question does not arise"
+            )
+
+    run_id = run_id_for(settings)
+    directory = write_report(
+        result,
+        settings,
+        reports_dir=reports_dir,
+        run_id=run_id,
+        n_trials=trials,
+        lagged_ms=lagged_ms,
+        latency_fragile=latency_fragile,
+    )
+
+    print(f"{directory}")
+    print(
+        f"trigger={settings.cascade.trigger} coins={len(result.coins)} "
+        f"intents={result.intents} trades={len(result.trades)} net={net:,.2f} USD"
+    )
+    if latency_fragile:
+        print("LATENCY FRAGILE: the lagged rerun did not keep a positive expectancy")
+
+    if profiler is not None:
+        stats = pstats.Stats(profiler)
+        stats.sort_stats("cumulative").print_stats(PROFILE_ROWS)
+    return 0
+
+
+def _with_latency(settings: Settings, latency_ms: int) -> Settings:
+    """The same config with a worse latency, for the fragility rerun.
+
+    Rebuilt through the model rather than mutated, because `Settings` is frozen and because
+    a degraded config that skipped validation would not be a config the loader would accept.
+    """
+    payload = settings.model_dump()
+    payload["backtest"]["latency_ms"] = latency_ms
+    return Settings.model_validate(payload)
+
+
 # --- status -------------------------------------------------------------------
 
 
@@ -698,7 +843,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", action="store_true", help=f"required over {CONFIRM_ABOVE_DAYS} days"
     )
     derive.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
-    sub.add_parser("backtest", parents=[common], help="replay the strategy (Phase 4)")
+    backtest = sub.add_parser(
+        "backtest", parents=[common], help="replay the strategy over the lake"
+    )
+    backtest.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    backtest.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    backtest.add_argument(
+        "--coins", default="", help="comma separated HL coins; default is the core universe"
+    )
+    backtest.add_argument(
+        "--seed", type=int, default=0, help="fixed seed; the same seed replays identically"
+    )
+    backtest.add_argument(
+        "--equity",
+        type=float,
+        default=DEFAULT_BACKTEST_EQUITY,
+        help="starting equity in USD; every sizing fraction is applied to it",
+    )
+    backtest.add_argument("--out", default=None, help="reports directory (default: reports/)")
+    backtest.add_argument(
+        "--lagged-ms",
+        type=int,
+        default=None,
+        help="also rerun at this latency; the report is stamped latency fragile if the "
+        "edge does not survive it",
+    )
+    backtest.add_argument(
+        "--profile", action="store_true", help=f"print the top {PROFILE_ROWS} cumulative frames"
+    )
+    backtest.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
 
     compact = sub.add_parser(
         "compact", parents=[common], help="fold a range of days into one file per table"
@@ -751,6 +924,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 HANDLERS = {
+    "backtest": cmd_backtest,
     "config": cmd_config,
     "backfill": cmd_backfill,
     "derive": cmd_derive,

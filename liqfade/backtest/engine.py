@@ -44,7 +44,7 @@ from liqfade.backtest.data import (
     iter_events,
     load_window,
 )
-from liqfade.backtest.features import build_feature_grid, iter_ticks
+from liqfade.backtest.features import build_feature_grid, iter_grid_rows
 from liqfade.backtest.fills import (
     BookState,
     Fill,
@@ -74,6 +74,11 @@ __all__ = ["BacktestResult", "RunInputs", "run_backtest"]
 # invented a generous asset spec would report sizes the venue would have refused.
 DEFAULT_SZ_DECIMALS = 5
 DEFAULT_MAX_LEVERAGE = 3.0
+
+# How often the equity curve is sampled, in milliseconds. Every decision tick would be
+# 126 million points over a year for a curve whose only consumers are the drawdown and a
+# chart, neither of which can use that resolution.
+EQUITY_SAMPLE_MS = 60_000
 
 
 @dataclass
@@ -115,6 +120,7 @@ class BacktestResult:
     start_ms: int = 0
     end_ms: int = 0
     coins: tuple[str, ...] = ()
+    last_equity_sample_ms: int = 0
 
 
 class _CoinState:
@@ -204,7 +210,10 @@ def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
     state: dict[str, _CoinState] = {coin: _CoinState() for coin in coins}
 
     _load_funding(portfolio, inputs.asset_ctx)
-    rows_by_tick = dict(iter_ticks(grid, settings)) if not grid.is_empty() else {}
+    # One entry per grid step, not per decision tick. The loop carries the last row
+    # forward, which is what makes a month of ten coins finish in minutes rather than
+    # spending most of its time rebuilding a mapping four times a second.
+    grid_rows = list(iter_grid_rows(grid, settings)) if not grid.is_empty() else []
 
     result = BacktestResult(
         trades=portfolio.trades,
@@ -228,19 +237,23 @@ def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
     ticks = tick_times(inputs.start_ms, inputs.end_ms, settings.features.decision_cadence_ms)
     cloid = _CloidCounter()
 
+    latest: dict[str, FeatureRow] = {}
+    next_row = 0
+    grid_step_ms = settings.backtest.feature_grid_ms
+    # How long a consumed grid row stays current. `active_mask` already keeps every row
+    # inside a cascade's window, so once rows stop arriving there is nothing for the
+    # detector to track and the tick can skip the strategy entirely. A stale cascade left
+    # in a detector is dropped by its own max_age check the moment rows resume.
+    active_until = -1
     for item in merge(events, ticks):
         if isinstance(item, Tick):
+            while next_row < len(grid_rows) and grid_rows[next_row][0] <= item.ts_ms:
+                latest.update(grid_rows[next_row][1])
+                active_until = grid_rows[next_row][0] + grid_step_ms
+                next_row += 1
+            rows = latest if item.ts_ms < active_until else {}
             _on_tick(
-                item.ts_ms,
-                state,
-                rows_by_tick,
-                portfolio,
-                strategy,
-                risk,
-                result,
-                meta,
-                settings,
-                cloid,
+                item.ts_ms, state, rows, portfolio, strategy, risk, result, meta, settings, cloid
             )
         else:
             _on_event(item, state, portfolio, result, settings)
@@ -346,7 +359,7 @@ def _fill_against_print(
 def _on_tick(
     now_ms: int,
     state: dict[str, _CoinState],
-    rows_by_tick: Mapping[int, Mapping[str, FeatureRow]],
+    rows: Mapping[str, FeatureRow],
     portfolio: Portfolio,
     strategy: StrategyEngine,
     risk: RiskEngine,
@@ -355,25 +368,50 @@ def _on_tick(
     settings: Settings,
     cloid: _CloidCounter,
 ) -> None:
-    """One decision tick, in the fixed order the module docstring names."""
-    mids = {coin: coin_state.book.mid() for coin, coin_state in state.items()}
-    equity = portfolio.equity(mids)
-    result.equity_curve.append((now_ms, equity))
+    """One decision tick, in the fixed order the module docstring names.
+
+    Marking to market is skipped entirely while the book is flat. With nothing open,
+    equity is cash and re-deriving it costs a dict comprehension over every coin for an
+    answer that has not moved. A month of ten coins is ten million ticks and almost all of
+    them are idle, so this is the difference between the speed target being met and not.
+    The equity curve is sampled rather than recorded per tick for the same reason: 250ms
+    resolution over a year is 126 million points, and the drawdown it feeds does not need
+    them.
+    """
+    if portfolio.positions:
+        mids = {coin: coin_state.book.mid() for coin, coin_state in state.items()}
+        equity = portfolio.equity(mids)
+        _cross_taker_entries(now_ms, state, portfolio, settings)
+        _expire_entries(now_ms, state, portfolio, result, settings)
+        _check_exits(now_ms, state, mids, portfolio, result, settings, cloid)
+    else:
+        mids = {}
+        equity = portfolio.cash
+        if _has_working_orders(state):
+            _cross_taker_entries(now_ms, state, portfolio, settings)
+            _expire_entries(now_ms, state, portfolio, result, settings)
+
     risk.on_equity(equity, now_ms)
+    if now_ms - result.last_equity_sample_ms >= EQUITY_SAMPLE_MS:
+        result.equity_curve.append((now_ms, equity))
+        result.last_equity_sample_ms = now_ms
 
-    _cross_taker_entries(now_ms, state, portfolio, settings)
-    _expire_entries(now_ms, state, portfolio, result, settings)
-    _check_exits(now_ms, state, mids, portfolio, result, settings, cloid)
-
-    rows = rows_by_tick.get(now_ms)
     if not rows:
         return
     intents = strategy.on_tick(now_ms, rows)
     result.intents += len(intents)
+    if not intents:
+        return
+    if not mids:
+        mids = {coin: coin_state.book.mid() for coin, coin_state in state.items()}
     for intent in intents:
         _place_entry(
             intent, now_ms, state, rows, mids, portfolio, risk, result, meta, settings, cloid
         )
+
+
+def _has_working_orders(state: dict[str, _CoinState]) -> bool:
+    return any(coin_state.entry is not None for coin_state in state.values())
 
 
 def _place_entry(

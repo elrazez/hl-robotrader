@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+import warnings
 from typing import TYPE_CHECKING, Any, cast
 
 import orjson
@@ -101,6 +102,21 @@ def _dumps(obj: Any, default: Any = None, **_kw: Any) -> str:
     return orjson.dumps(obj, default=default or repr).decode()
 
 
+def _silence_polars_asof_noise() -> None:
+    """Drop the join_asof sortedness warning, which polars emits on every `by=` join.
+
+    It fires whether the frame is sorted or not, so it carries no signal at all, and the
+    feature pipeline makes dozens of these joins per run. A hundred copies of a warning
+    that means nothing is how the one that means something gets missed. `pyproject.toml`
+    filters the same string for pytest; this is the runtime half.
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message="Sortedness of columns cannot be checked when 'by' groups provided",
+        category=UserWarning,
+    )
+
+
 def setup_logging(*, proc: str, env: str, level: str = "INFO") -> None:
     """Configure structlog and the stdlib root logger to emit the same JSON lines.
 
@@ -109,6 +125,7 @@ def setup_logging(*, proc: str, env: str, level: str = "INFO") -> None:
     by process and environment after the fact.
     """
     numeric = getattr(logging, level.upper(), logging.INFO)
+    _silence_polars_asof_noise()
 
     shared: list[Any] = [
         structlog.contextvars.merge_contextvars,

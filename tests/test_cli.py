@@ -520,3 +520,136 @@ def test_derive_over_a_long_range_wants_confirmation(
 
     assert main([*argv, "--dry-run"]) == 0
     assert "Nothing was changed" in capsys.readouterr().out
+
+
+class TestBacktestCommand:
+    """The `liqfade backtest` surface, against the committed fixture lake.
+
+    The fixture holds five minutes of real BTC recorder output whose only liquidations are
+    OKX rows, so `cascade.trigger: exact` finds no Hyperliquid liquidations and the run
+    produces no intents. That is the point: a window with nothing in it must still produce
+    a complete, readable report rather than an error or an empty directory.
+    """
+
+    LAKE = Path(__file__).parent / "fixtures"
+    DAY = "2026-08-30"
+
+    def run(self, tmp_path: Path, *extra: str) -> tuple[int, str]:
+        import io
+        from contextlib import redirect_stdout
+
+        from liqfade.cli import main
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = main(
+                [
+                    "backtest",
+                    "--data-dir",
+                    str(self.LAKE),
+                    "--coins",
+                    "BTC",
+                    "--start",
+                    self.DAY,
+                    "--end",
+                    self.DAY,
+                    "--out",
+                    str(tmp_path),
+                    *extra,
+                ]
+            )
+        return code, buffer.getvalue()
+
+    def test_it_writes_a_report_directory(self, tmp_path: Path) -> None:
+        code, output = self.run(tmp_path)
+        assert code == 0
+        runs = [path for path in tmp_path.iterdir() if path.is_dir()]
+        assert len(runs) == 1
+        for name in ("report.md", "summary.json", "trades.parquet"):
+            assert (runs[0] / name).exists(), f"{name} missing"
+        assert "trigger=exact" in output
+
+    def test_two_runs_write_a_byte_identical_trades_parquet(self, tmp_path: Path) -> None:
+        """The definition of done. The report itself differs, and must: it carries the
+        run id and the trial counter, both of which are supposed to move."""
+        import hashlib
+
+        for _ in range(2):
+            self.run(tmp_path)
+        digests = {
+            hashlib.sha256((run / "trades.parquet").read_bytes()).hexdigest()
+            for run in tmp_path.iterdir()
+            if run.is_dir()
+        }
+        assert len(digests) == 1
+
+    def test_the_trial_counter_advances_with_each_run(self, tmp_path: Path) -> None:
+        from liqfade.backtest.validate import read_n_trials
+
+        self.run(tmp_path)
+        self.run(tmp_path)
+        assert read_n_trials(tmp_path) == 2
+
+    def test_missing_dates_are_an_error_not_a_traceback(self, tmp_path: Path) -> None:
+        from liqfade.cli import main
+
+        assert main(["backtest", "--data-dir", str(self.LAKE), "--out", str(tmp_path)]) == 1
+
+    def test_an_end_before_the_start_is_an_error(self, tmp_path: Path) -> None:
+        from liqfade.cli import main
+
+        code = main(
+            [
+                "backtest",
+                "--data-dir",
+                str(self.LAKE),
+                "--start",
+                "2026-08-30",
+                "--end",
+                "2026-08-29",
+                "--out",
+                str(tmp_path),
+            ]
+        )
+        assert code == 1
+
+    def test_a_window_with_no_tape_says_so_rather_than_writing_an_empty_report(
+        self, tmp_path: Path
+    ) -> None:
+        from liqfade.cli import main
+
+        code = main(
+            [
+                "backtest",
+                "--data-dir",
+                str(self.LAKE),
+                "--coins",
+                "BTC",
+                "--start",
+                "2020-01-01",
+                "--end",
+                "2020-01-01",
+                "--out",
+                str(tmp_path),
+            ]
+        )
+        assert code == 1
+        assert not list(tmp_path.glob("*/report.md"))
+
+    def test_lagged_ms_reruns_and_reports_the_degraded_result(self, tmp_path: Path) -> None:
+        code, output = self.run(tmp_path, "--lagged-ms", "3000")
+        assert code == 0
+        assert "lagged rerun at 3000 ms" in output
+        # No trades means no edge to lose, so the fragile stamp must not appear.
+        assert "LATENCY FRAGILE" not in output
+        assert "the baseline run had no positive expectancy" in output
+
+    def test_profile_prints_a_cumulative_table(self, tmp_path: Path) -> None:
+        code, output = self.run(tmp_path, "--profile")
+        assert code == 0
+        assert "Ordered by: cumulative time" in output
+
+    def test_backtest_is_no_longer_a_placeholder(self) -> None:
+        from liqfade.cli import NOT_YET
+
+        assert "backtest" not in NOT_YET

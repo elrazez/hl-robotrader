@@ -49,7 +49,20 @@ COLUMNS: dict[str, tuple[str, ...]] = {
     "liquidations": ("venue", "coin", "ts_ms", "rx_ms", "side", "px", "sz", "notional_usd"),
     "bbo": ("coin", "ts_ms", "rx_ms", "bid_px", "bid_sz", "ask_px", "ask_sz"),
     "l2": ("coin", "ts_ms", "rx_ms", "level", "bid_px", "bid_sz", "ask_px", "ask_sz"),
-    "asset_ctx": ("coin", "ts_ms", "rx_ms", "mark_px", "oracle_px", "mid_px", "funding"),
+    # Every column `features/context.py` reads, plus mid_px. Projecting fewer would push
+    # the failure into the feature grid, where the error names a column rather than a
+    # table and is much harder to place.
+    "asset_ctx": (
+        "coin",
+        "ts_ms",
+        "rx_ms",
+        "mark_px",
+        "oracle_px",
+        "mid_px",
+        "funding",
+        "premium",
+        "open_interest",
+    ),
     "candles_1m": ("coin", "ts_ms", "o", "h", "l", "c", "v", "n"),
 }
 
@@ -226,23 +239,35 @@ def _known(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def _trade_events(frame: pl.DataFrame | None) -> list[tuple[int, int, int, Event]]:
+    """The tape, which is the largest table by far.
+
+    Columns are pulled out as Python lists rather than read through `iter_rows(named=True)`,
+    which builds a dict per row: a month of ten coins is 26 million prints and the dicts
+    alone cost more than the rest of the merge put together.
+    """
     if frame is None or frame.is_empty():
         return []
     order = _KIND_ORDER["trade"]
+    marked = _known(frame)
+    known = marked.get_column("known").to_list()
+    coins = marked.get_column("coin").to_list()
+    prices = marked.get_column("px").to_list()
+    sizes = marked.get_column("sz").to_list()
+    sides = marked.get_column("side").to_list()
     return [
         (
-            int(row["known"]),
+            known[index],
             order,
             index,
             Trade(
-                ts_ms=int(row["known"]),
-                coin=str(row["coin"]),
-                px=float(row["px"]),
-                sz=float(row["sz"]),
-                side=str(row["side"]),
+                ts_ms=known[index],
+                coin=coins[index],
+                px=prices[index],
+                sz=sizes[index],
+                side=sides[index],
             ),
         )
-        for index, row in enumerate(_known(frame).iter_rows(named=True))
+        for index in range(marked.height)
     ]
 
 

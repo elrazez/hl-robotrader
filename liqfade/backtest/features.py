@@ -45,7 +45,13 @@ from liqfade.features.proxy import hl_forced_proxy
 from liqfade.features.zscore import robust_z
 from liqfade.strategy.types import FeatureRow
 
-__all__ = ["FeatureWindows", "build_feature_grid", "iter_ticks", "trigger_venues"]
+__all__ = [
+    "FeatureWindows",
+    "build_feature_grid",
+    "iter_grid_rows",
+    "iter_ticks",
+    "trigger_venues",
+]
 
 # Venues whose liquidations a live bot can actually see. Hyperliquid is absent by design:
 # its own liquidations reach us through a next-day S3 pull and nothing else.
@@ -158,44 +164,128 @@ def build_feature_grid(
     return _with_levels(grid, levels, settings)
 
 
-def iter_ticks(
+def active_mask(grid: pl.DataFrame, settings: Settings) -> pl.Series:
+    """Which grid rows a cascade could possibly involve. A deliberate **superset**.
+
+    Almost every second of a year is a market in which nothing can happen: no forced flow,
+    no move, nothing for the detector to do but be handed a row and put it down. Building a
+    `FeatureRow` for each of those is most of a run's wall time, and this is what stops it.
+
+    The mask is a superset of the detector's own start conditions on purpose. It drops the
+    direction test that pairs the move with the liquidated side, and it takes either side's
+    z-score, so a row the detector *would* have acted on can never be filtered away. Being
+    too generous here costs a little speed; being too strict would silently change results,
+    which is why the test asserts a filtered run matches an unfiltered one trade for trade.
+
+    Every row within `exhaustion.max_age_s` after a candidate is kept too, because that is
+    how long the detector can still be tracking the cascade that started there.
+    """
+    windows = FeatureWindows(settings)
+    cascade, exhaustion = settings.cascade, settings.exhaustion
+    w, rv_s = windows.cascade_s, windows.rv_s
+
+    if cascade.trigger == "proxy":
+        long_side = pl.col(f"hl_forced_proxy_long_{w}s") >= cascade.proxy_min
+        short_side = pl.col(f"hl_forced_proxy_short_{w}s") >= cascade.proxy_min
+        flow = long_side.fill_null(False) | short_side.fill_null(False)
+        lopsided = pl.lit(True)
+    else:
+        long_side = pl.col(f"liq_long_usd_{w}s_z") >= cascade.liq_z_min
+        short_side = pl.col(f"liq_short_usd_{w}s_z") >= cascade.liq_z_min
+        flow = long_side.fill_null(False) | short_side.fill_null(False)
+        lopsided = (pl.col(f"liq_imbalance_{w}s").abs() >= cascade.imbalance_min).fill_null(False)
+
+    moved = (
+        pl.col(f"ret_{w}s").abs() / pl.col(f"rv_{rv_s}s") >= cascade.ret_over_rv_min
+    ).fill_null(False)
+    candidate = flow & moved & lopsided
+    # +1 step so the row that starts a cascade is itself inside the window it opens.
+    span = int(exhaustion.max_age_s * 1000 // windows.step_ms) + 1
+    return (
+        grid.sort("coin", "ts_ms")
+        .with_columns(candidate.cast(pl.Int8).alias("_candidate"))
+        .with_columns(
+            pl.col("_candidate")
+            .rolling_max(window_size=span, min_samples=1)
+            .over("coin")
+            .alias("_needed")
+        )
+        .get_column("_needed")
+        .cast(pl.Boolean)
+    )
+
+
+def iter_grid_rows(
     grid: pl.DataFrame, settings: Settings, *, coins: Sequence[str] | None = None
 ) -> Iterator[tuple[int, dict[str, FeatureRow]]]:
-    """Walk the grid at the decision cadence, yielding `(now_ms, rows by coin)`.
+    """Walk the grid one timestamp at a time, yielding the coins that updated at it.
 
-    A decision at `t` reads the last grid row whose timestamp is at or before `t`, which is
-    the row summarising the interval that ended at or before `t`. Nothing from after `t`
-    can reach it: `build_grid`'s half-open convention already guarantees that a row stamped
-    `T` was knowable at `T`.
+    **One entry per grid step, not per decision tick.** The engine carries the last row
+    forward between them, which is the same thing `iter_ticks` used to do by copying a
+    mapping four times a second: a month of ten coins is ten million ticks, and building a
+    dict for each was most of the run's wall time for no information at all.
 
-    Yields ticks in time order, and coins within a tick in name order, so a replay is
-    reproducible. A coin with no grid row yet, which is every coin before its first print,
-    is simply absent from the mapping rather than present with nulls.
+    Columns are pulled out as Python lists once rather than through `iter_rows(named=True)`,
+    which builds a dict per row. That is the difference between roughly 18 and roughly 3
+    microseconds a row, and there are 86,400 rows per coin per day.
+
+    Yields `(ts_ms, {coin: FeatureRow})` in time order, coins within a timestamp in name
+    order, so a replay is reproducible.
     """
     if grid.is_empty():
         return
-    wanted = set(coins) if coins is not None else None
-    cadence_ms = settings.features.decision_cadence_ms
-    step_ms = settings.backtest.feature_grid_ms
-    windows = FeatureWindows(settings)
-
-    frame = grid.sort("ts_ms", "coin")
-    if wanted is not None:
-        frame = frame.filter(pl.col("coin").is_in(sorted(wanted)))
+    sorted_grid = grid.sort("coin", "ts_ms")
+    frame = sorted_grid.filter(active_mask(sorted_grid, settings)).sort("ts_ms", "coin")
+    if coins is not None:
+        frame = frame.filter(pl.col("coin").is_in(sorted(set(coins))))
     if frame.is_empty():
         return
 
-    by_ts: dict[int, dict[str, FeatureRow]] = {}
-    for record in frame.iter_rows(named=True):
-        by_ts.setdefault(record["ts_ms"], {})[record["coin"]] = _row(record, windows)
+    windows = FeatureWindows(settings)
+    columns = _row_columns(windows)
+    present = {name: frame.get_column(name).to_list() for name in columns if name in frame.columns}
+    missing = {name: [None] * frame.height for name in columns if name not in frame.columns}
+    values = present | missing
+    stamps = frame.get_column("ts_ms").to_list()
+    names = frame.get_column("coin").to_list()
 
-    grid_times = sorted(by_ts)
-    first, last = grid_times[0], grid_times[-1]
+    batch: dict[str, FeatureRow] = {}
+    current = stamps[0]
+    for index in range(frame.height):
+        stamp = stamps[index]
+        if stamp != current:
+            yield current, batch
+            batch, current = {}, stamp
+        batch[names[index]] = _row_at(values, index, names[index], stamp, windows)
+    if batch:
+        yield current, batch
+
+
+def iter_ticks(
+    grid: pl.DataFrame, settings: Settings, *, coins: Sequence[str] | None = None
+) -> Iterator[tuple[int, dict[str, FeatureRow]]]:
+    """Walk the grid at the decision cadence, carrying the last row forward.
+
+    Kept for callers that want the per-tick view directly, and for the consistency test.
+    The replay engine uses `iter_grid_rows` and carries rows forward itself, so it never
+    pays for the duplicate mappings this produces.
+
+    A decision at `t` reads the last grid row whose timestamp is at or before `t`. Nothing
+    from after `t` can reach it: `build_grid`'s half-open convention already guarantees a
+    row stamped `T` was knowable at `T`.
+    """
+    cadence_ms = settings.features.decision_cadence_ms
+    step_ms = settings.backtest.feature_grid_ms
+    by_ts = list(iter_grid_rows(grid, settings, coins=coins))
+    if not by_ts:
+        return
+
     latest: dict[str, FeatureRow] = {}
     index = 0
+    first, last = by_ts[0][0], by_ts[-1][0]
     for now_ms in range(first, last + step_ms, cadence_ms):
-        while index < len(grid_times) and grid_times[index] <= now_ms:
-            latest.update(by_ts[grid_times[index]])
+        while index < len(by_ts) and by_ts[index][0] <= now_ms:
+            latest.update(by_ts[index][1])
             index += 1
         if latest:
             yield now_ms, dict(latest)
@@ -333,12 +423,48 @@ def _with_levels(
     return out.sort("coin", "ts_ms")
 
 
-def _row(record: Mapping[str, object], windows: FeatureWindows) -> FeatureRow:
-    """One grid record as a `FeatureRow`. The only place column names become field names."""
+def _row_columns(windows: FeatureWindows) -> tuple[str, ...]:
+    """Every grid column a `FeatureRow` reads, so the walk pulls each out exactly once."""
+    cascade_s, peak_s = windows.cascade_s, windows.peak_s
+    return (
+        "mid",
+        f"liq_long_usd_{cascade_s}s",
+        f"liq_short_usd_{cascade_s}s",
+        f"liq_imbalance_{cascade_s}s",
+        f"liq_long_usd_{cascade_s}s_z",
+        f"liq_short_usd_{cascade_s}s_z",
+        f"hl_forced_proxy_long_{cascade_s}s",
+        f"hl_forced_proxy_short_{cascade_s}s",
+        f"liq_long_usd_{peak_s}s",
+        f"liq_short_usd_{peak_s}s",
+        f"ret_{cascade_s}s",
+        f"rv_{windows.rv_s}s",
+        f"cvd_slope_{windows.cvd_s}s",
+        "spread_bps",
+        "depth_bid",
+        "depth_ask",
+        "book_imbalance",
+        "mark_mid_bps",
+        "mark_mid_threshold",
+        "funding",
+        f"traded_usd_{windows.vol_s}s",
+        "support_px",
+        "resistance_px",
+    )
+
+
+def _row_at(
+    values: Mapping[str, list[object]],
+    index: int,
+    coin: str,
+    ts_ms: int,
+    windows: FeatureWindows,
+) -> FeatureRow:
+    """One grid row as a `FeatureRow`. The only place column names become field names."""
     cascade_s, peak_s = windows.cascade_s, windows.peak_s
 
     def number(name: str) -> float | None:
-        value = record.get(name)
+        value = values[name][index]
         # bool is a subclass of int and several grid columns are booleans, so it is
         # excluded explicitly rather than silently becoming 1.0.
         if isinstance(value, bool) or not isinstance(value, int | float):
@@ -349,11 +475,8 @@ def _row(record: Mapping[str, object], windows: FeatureWindows) -> FeatureRow:
         value = number(name)
         return 0.0 if value is None else value
 
-    ts_ms = record["ts_ms"]
-    assert isinstance(ts_ms, int)
-
     return FeatureRow(
-        coin=str(record["coin"]),
+        coin=coin,
         ts_ms=ts_ms,
         mid=number("mid"),
         liq_long_usd_w=zero(f"liq_long_usd_{cascade_s}s"),
