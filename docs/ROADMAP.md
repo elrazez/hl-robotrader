@@ -64,11 +64,32 @@ is +26.7 isolated and +34.0 with the top five clusters removed, and a cluster is
 Nothing in Phase 3 consumed either of the two re-cuts the preregistration allows. The
 universe defect found mid-phase is logged as a defect, not a re-cut.
 
-## Phase 4: Backtester and strategy v0 (1 week) - blocked until 2026-11-04
+## Phase 4: Backtester and strategy v0 (1 week) - built 2026-09-06 on an owner override
 
 Build: `backtest/` engine per spec, `strategy/` and `sizing/` and `risk/` per spec, `liqfade backtest`, report generator, walk-forward and bootstrap validation, parameter surface plots. All of this runs on the local machine over synced Parquet; the VPS is not involved. **Panel v2**: backtest report browser (runs list, metrics table, equity curve, trade list with per-trade chart replay showing the cascade, entry, exit and liquidation markers), runnable locally with `liqfade panel --local`.
 
 DoD: backtest of v0 over all available data with a held-out last 25%; report shows net-of-cost metrics, PnL concentration, and stability surfaces; a deliberately lagged version (latency 3s) still shows positive expectancy or the strategy is marked latency-fragile; unit tests cover fill model edge cases (partial fills, stale book, stop gap-through).
+
+**Built 2026-09-06.** The owner overrode stop rule 5 and built the engine before a
+live-visible trigger exists, on the grounds that it is the same engine whichever trigger
+eventually feeds it. See `docs/DECISIONS.md`, 2026-09-06, for what that override does and
+does not license. In short: the trigger is a config switch (`cascade.trigger`), the year is
+backtested on `exact` as a **ceiling** rather than a forecast, no live trading path was
+built, and **Phase 5 remains blocked** until Q3's re-cut or Q4 at sixty recorder days
+produces a trigger the live bot can actually see. `Settings` refuses `cascade.trigger:
+exact` on mainnet and `live_trading_block_reason()` names it, so neither route can start on
+the untradeable trigger by accident.
+
+Also delivered here: the per-cluster exposure cap Phase 3 asked for by name, `strategy/`
+with a confluence rule layer so a new entry condition is one class rather than an engine
+edit, and Panel v2. The code owner acceptance runs are the two commands at the end of this
+section.
+
+Owner acceptance runs, once the lake is synced locally:
+
+    uv run liqfade backtest --config config/backtest/v0.yaml       --start 2025-09-01 --end 2026-08-30       --coins BTC,ETH,SOL,HYPE --equity 10000
+
+    uv run liqfade backtest --config config/backtest/v0.yaml       --start 2025-09-01 --end 2026-08-30       --coins BTC,ETH,SOL,HYPE --equity 10000 --lagged-ms 3000
 
 ## Phase 5: Paper trading and testnet execution (1 to 2 weeks running)
 
