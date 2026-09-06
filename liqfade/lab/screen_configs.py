@@ -219,6 +219,7 @@ class ConfigNameScreen(ModalScreen[str | None]):
 class ConfigsPane(VerticalScroll):
     """The list, and the keys that act on the row under the cursor."""
 
+    FOCUS_FIRST = "#configs-table"
     BINDINGS: ClassVar[list[BindingType]] = [
         ("v", "view", "view"),
         ("e", "edit", "edit"),

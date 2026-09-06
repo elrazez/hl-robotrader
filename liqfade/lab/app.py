@@ -16,6 +16,7 @@ from textual.widgets import Footer, Header, TabbedContent, TabPane
 
 from liqfade.lab.runs import RunQueue
 from liqfade.lab.screen_configs import ConfigsPane
+from liqfade.lab.screen_results import ResultsPane
 from liqfade.lab.screen_run import RunPane
 
 LAB_CSS = """
@@ -27,6 +28,17 @@ Screen { layout: vertical; }
 #run-status { color: $text-muted; padding: 0 1; }
 #run-progress { padding: 1 1; height: auto; min-height: 4; }
 #run-jobs { height: auto; min-height: 5; }
+#results-table { height: 1fr; min-height: 8; }
+#results-status { color: $text-muted; padding: 0 1; }
+ReportScreen, CompareScreen { align: center middle; }
+#report-box, #compare-box {
+    width: 92%;
+    max-height: 92%;
+    border: round $accent;
+    background: $surface;
+    padding: 1 2;
+}
+#report-funnel { padding: 0 0 1 0; }
 #configs-status { color: $text-muted; padding: 0 1; }
 ConfigViewScreen, ConfigEditScreen, ConfirmScreen, ConfigNameScreen {
     align: center middle;
@@ -80,6 +92,8 @@ class LabApp(App[None]):
         with TabbedContent(id="tabs", initial="tab-configs"):
             with TabPane("Configs", id="tab-configs"):
                 yield ConfigsPane(self.config_dir)
+            with TabPane("Results", id="tab-results"):
+                yield ResultsPane(self.reports_dir, self.data_dir, self.queue)
             with TabPane("Run", id="tab-run"):
                 yield RunPane(
                     self.config_dir,
@@ -103,9 +117,13 @@ class LabApp(App[None]):
         self.call_after_refresh(self._focus_active_pane)
 
     def _focus_active_pane(self) -> None:
-        pane = self.query_one("#tabs", TabbedContent).get_pane(
-            self.query_one("#tabs", TabbedContent).active
-        )
+        tabs = self.query_one("#tabs", TabbedContent)
+        pane = tabs.get_pane(tabs.active)
+        for widget in pane.query("*"):
+            wanted = getattr(widget, "FOCUS_FIRST", None)
+            if wanted:
+                widget.query_one(wanted).focus()
+                return
         for widget in pane.query("*"):
             if widget.focusable:
                 widget.focus()

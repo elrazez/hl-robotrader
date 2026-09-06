@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+import orjson
+
 from liqfade.backtest.progress import ProgressState, read_progress
 from liqfade.config.loader import ENV_PREFIX
 
@@ -285,18 +287,49 @@ class RunQueue:
             job.state = "cancelled"
         else:
             job.state = "done" if code == 0 else "failed"
-        self._file_the_log(job)
+        self._file_the_sidecars(job)
 
-    def _file_the_log(self, job: Job) -> None:
-        """Move the run's output beside its report, which is where the owner looks for it."""
-        if job.report_dir is None or not job.log_path.exists():
+    def _file_the_sidecars(self, job: Job) -> None:
+        """Put the run's log and the lab's own note beside the report it produced.
+
+        `summary.json` identifies a run by the hash of its resolved config, which is right
+        for reproducibility and useless for reading a list. `lab.json` is the lab saying
+        which file it launched and what that file overrode.
+        """
+        if job.report_dir is None:
             return
         try:
             job.report_dir.mkdir(parents=True, exist_ok=True)
-            job.log_path.replace(job.report_dir / "run.log")
+            if job.log_path.exists():
+                job.log_path.replace(job.report_dir / "run.log")
+                job.log_path = job.report_dir / "run.log"
+            (job.report_dir / "lab.json").write_bytes(
+                orjson.dumps(self._sidecar(job), option=orjson.OPT_INDENT_2)
+            )
         except OSError:
             return
-        job.log_path = job.report_dir / "run.log"
+
+    def _sidecar(self, job: Job) -> dict[str, Any]:
+        from liqfade.lab.configs import LabConfigError, read_config
+
+        name, notes, overrides = job.spec.config.stem, "", {}
+        try:
+            config = read_config(job.spec.config)
+        except (LabConfigError, OSError):
+            pass
+        else:
+            name, notes, overrides = config.name, config.notes, config.overrides
+        return {
+            "job_id": job.id,
+            "config_name": name,
+            "config_path": str(job.spec.config),
+            "notes": notes,
+            "overrides": overrides,
+            "coins": list(job.spec.coins),
+            "command": job.spec.command(progress=job.progress_path),
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+        }
 
     def cancel(self, job: Job) -> None:
         """SIGTERM a running job; a queued one never starts. Both end as cancelled."""

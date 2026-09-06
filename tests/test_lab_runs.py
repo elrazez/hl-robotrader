@@ -193,6 +193,32 @@ def test_the_log_moves_beside_the_report_when_the_run_finishes(tmp_path: Path) -
     assert (report / "run.log").read_text() == "the run said things\n"
 
 
+def test_the_lab_records_which_config_produced_the_report(tmp_path: Path) -> None:
+    """summary.json identifies a run by config hash. The name and the overrides behind that
+    hash are the lab's to remember, and Results reads them back."""
+    import json
+
+    from liqfade.lab.configs import save_config
+
+    config = save_config(
+        tmp_path / "tight.yaml", "Tight stops", "k_stop halved", {"intent.k_stop": 0.5}
+    )
+    report = tmp_path / "20260906T101010Z_abcdef12"
+    report.mkdir()
+    queue = RunQueue(tmp_path, spawn=lambda argv, log, env: FakeProcess(), lake_busy=lambda: False)
+    job = queue.submit(spec(tmp_path, config=config))
+    queue.poll()
+    job.progress_path.write_text(json.dumps({"stage": "done", "report_dir": str(report)}))
+    job.process.code = 0  # type: ignore[union-attr]
+    queue.poll()
+    sidecar = json.loads((report / "lab.json").read_text())
+    assert sidecar["config_name"] == "Tight stops"
+    assert sidecar["overrides"] == {"intent.k_stop": 0.5}
+    assert sidecar["config_path"] == str(config)
+    assert sidecar["finished_at"] >= sidecar["started_at"] > 0
+    assert "liqfade backtest" in sidecar["command"]
+
+
 @pytest.mark.parametrize("signal_name", ["term"])
 def test_cancel_really_stops_a_real_process(tmp_path: Path, signal_name: str) -> None:
     """The one test with a real subprocess: SIGTERM is what a fake cannot prove."""

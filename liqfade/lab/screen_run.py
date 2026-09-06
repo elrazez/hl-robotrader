@@ -34,6 +34,7 @@ def _int_or_none(raw: str) -> int | None:
 class RunPane(VerticalScroll):
     """The form, the queue and one progress frame for whatever is running."""
 
+    FOCUS_FIRST = "#run-config"
     BINDINGS: ClassVar[list[BindingType]] = [
         ("ctrl+r", "launch", "launch"),
         ("ctrl+t", "cancel", "terminate run"),
