@@ -62,8 +62,59 @@ def test_a_value_is_scored_against_the_minute_distribution_that_preceded_it() ->
     assert z_at(scored, 20, 30) == pytest.approx(2.698, rel=1e-3)
 
 
+def mostly_zero(minutes: int, *, period: int, marks: int, last_log: float) -> pl.DataFrame:
+    """One row a second. `marks` minutes in every `period` carry log1p 4, the rest zero.
+
+    The marked minutes are the first `marks` multiples of five in each period, which needs
+    `marks * 5 <= period`.
+
+    A repeating pattern rather than a random one, so any window of exactly `period` samples
+    holds exactly `marks` nonzero values and the arithmetic below is countable. The last
+    minute carries `last_log` throughout, so the value being scored is not part of the
+    distribution scoring it. This is the shape of `liq_long_usd_60s` on real data: long
+    stretches of nothing between bursts.
+    """
+    rows = [
+        {
+            "coin": "BTC",
+            "ts_ms": DAY + minute * MINUTE + second * 1000,
+            "flow": math.expm1(
+                last_log
+                if minute == minutes - 1
+                else (4.0 if minute % period < marks * 5 and minute % 5 == 0 else 0.0)
+            ),
+        }
+        for minute in range(minutes)
+        for second in range(60)
+    ]
+    return pl.DataFrame(rows)
+
+
+def test_a_series_that_is_mostly_zero_still_gets_a_scale() -> None:
+    """The bug that made the `exact` trigger never fire on real data.
+
+    Fifty trailing minute samples, 41 of them zero and 9 at log1p 4, which is the 82%
+    zeros `liq_long_usd_60s` actually shows. The median is zero, so 41 of the 50 absolute
+    deviations are zero too and their median is zero: the shipped robust score divided by
+    nothing and returned null on every row. The mean of the same deviations is
+    9 * 4 / 50 = 0.72, so a log1p of 10 scores 10 / 0.72.
+
+    The scored minute is 150 rather than 50 because the deviations are the streaming form,
+    each measured against the rolling median at its own sample; every sample in the window
+    therefore needs a full lookback of its own before the arithmetic is this simple.
+    """
+    frame = mostly_zero(151, period=50, marks=9, last_log=10.0)
+    scored = robust_z(frame, ["flow"], lookback_h=50 / 60, sample_s=60, robust=True)
+    assert z_at(scored, 150, 30) == pytest.approx(10.0 / 0.72, rel=1e-9)
+
+
 def test_a_coin_with_no_spread_in_its_trailing_flow_has_no_defined_z() -> None:
-    """A flat 24h gives a zero MAD, and dividing by it would invent a signal."""
+    """A flat 24h has a zero MAD *and* a zero mean deviation, so neither scale exists.
+
+    The fallback above is a scale for a series that is mostly zero, not for one that is
+    entirely zero: a series that has never moved says nothing about how unusual a move is,
+    and dividing by nothing would invent a signal.
+    """
     flat = pl.DataFrame(
         {
             "coin": ["BTC"] * 1500,

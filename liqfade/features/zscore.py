@@ -13,6 +13,16 @@ Three choices, all from `docs/STRATEGY_AND_RISK.md` section 2 and the preregistr
   data the result is a z-score and a 3 means three sigma, which is what the config
   threshold assumes. `robust=False` switches to mean and sample standard deviation, which
   is `features.z_robust` in the config.
+- **A fallback scale for a series that is mostly zero.** `liq_long_usd_60s` is zero in 82%
+  of grid seconds, so its rolling median is zero and so is the median of the absolute
+  deviations from it: the MAD is exactly zero on almost every real row, and the shipped
+  robust score was therefore null everywhere and the `exact` trigger never fired. Where the
+  MAD is zero but the lookback holds any nonzero sample, the scale becomes the **mean**
+  absolute deviation about the same median, which a handful of nonzero samples is enough to
+  make positive. It is not the 1.4826-scaled sigma estimate and a 3 on it does not mean
+  three sigma; what a threshold means on this scale is a measurement, recorded in
+  `docs/DECISIONS.md`. A lookback that is all zeros still scores null, because a series
+  that has never moved has no scale at all.
 - **The distribution is sampled once a minute, the value scored is current.** A 24h
   lookback at 1s resolution is 86400 windows per point and computes in hours; at 1 minute
   it is 1440 and computes in seconds, and a distribution that moves within a minute is not
@@ -58,11 +68,13 @@ def robust_z(
         lookback_h: hours of trailing minute samples behind the distribution.
         sample_s: seconds between distribution samples. 60 per the spec.
         robust: median and MAD when true, mean and sample standard deviation when false.
+            Under `robust`, a zero MAD falls back to the mean absolute deviation about the
+            median, which is what makes the score exist at all on a mostly-zero series.
 
     Returns:
         `frame` plus one `{column}_z` per input column. The z is null where the scale is
         zero or the lookback is not yet full enough to have one, which is the first
-        `lookback_h` of any coin and any coin whose flow never varies. Null means
+        `lookback_h` of any coin and any coin whose flow never varies at all. Null means
         undefined, not zero: a caller must not read it as "not unusual".
     """
     sample_ms = sample_s * 1000
@@ -81,14 +93,23 @@ def robust_z(
         if robust:
             centre = value.rolling_median_by("when", window_size=window, closed="left")
             samples = samples.with_columns(centre.over("coin").alias(f"_m_{column}"))
-            spread = (
-                (value - pl.col(f"_m_{column}"))
-                .abs()
-                .rolling_median_by("when", window_size=window, closed="left")
+            deviation = (value - pl.col(f"_m_{column}")).abs()
+            mad = deviation.rolling_median_by("when", window_size=window, closed="left")
+            # The mean absolute deviation about the same median. On a series that is zero
+            # most of the time the median of the deviations is zero and the mean of them is
+            # not, so this is the scale that exists where the MAD does not.
+            aad = deviation.rolling_mean_by("when", window_size=window, closed="left")
+            samples = samples.with_columns(
+                (mad.over("coin") * _MAD_TO_SIGMA).alias(f"_mad_{column}"),
+                aad.over("coin").alias(f"_aad_{column}"),
             )
             samples = samples.with_columns(
-                (spread.over("coin") * _MAD_TO_SIGMA).alias(f"_s_{column}")
+                pl.when(pl.col(f"_mad_{column}") > 0)
+                .then(pl.col(f"_mad_{column}"))
+                .otherwise(pl.col(f"_aad_{column}"))
+                .alias(f"_s_{column}")
             )
+            samples = samples.drop(f"_mad_{column}", f"_aad_{column}")
         else:
             centre = value.rolling_mean_by("when", window_size=window, closed="left")
             spread = value.rolling_std_by("when", window_size=window, closed="left")
