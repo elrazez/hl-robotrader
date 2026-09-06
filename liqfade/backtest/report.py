@@ -255,9 +255,19 @@ def _summary(
             "sizing_blocks": result.sizing_blocks,
             "risk_blocks": result.risk_blocks,
             "filter_blocks": dict(result.strategy.stats.filters),
+            "rule_blocks": {
+                name: s.killed for name, s in result.strategy.stats.rules.items() if s.killed
+            },
+            "confluence_blocks": result.strategy.stats.confluence_blocks,
         },
+        "min_confluence": settings.strategy.min_confluence,
         "rules": {
-            name: {"evaluated": s.evaluated, "passed": s.passed, "killed": s.killed}
+            name: {
+                "evaluated": s.evaluated,
+                "passed": s.passed,
+                "killed": s.killed,
+                "required": s.required,
+            }
             for name, s in result.strategy.stats.rules.items()
         },
         "funding": {
@@ -440,18 +450,9 @@ def _markdown(
         "",
         _blocks_table("Blocked by filters", dict(result.strategy.stats.filters)),
         "",
-        "## Rules",
+        _blocks_table("Blocked by rules", _rule_blocks(result)),
         "",
-        "Every rule the config enabled, and what it cost. A rule with zero evaluations was "
-        "switched off for this run.",
-        "",
-        _table(
-            ["rule", "evaluated", "passed", "intents killed"],
-            [
-                [name, f"{s.evaluated}", f"{s.passed}", f"{s.killed}"]
-                for name, s in sorted(result.strategy.stats.rules.items())
-            ],
-        ),
+        *_rules_section(result, settings),
         "",
         "## Splits",
         "",
@@ -538,6 +539,65 @@ def _pnl_table(title: str, values: Mapping[Any, float]) -> str:
 def _count_table(title: str, values: Mapping[Any, int]) -> str:
     rows = [[str(key), f"{value}"] for key, value in values.items()]
     return f"**{title}**\n\n" + _table(["bucket", "trades"], rows)
+
+
+def _rule_blocks(result: BacktestResult) -> dict[str, int]:
+    """Which rule killed how many intents, plus the count no single rule killed.
+
+    A required rule that fails names itself. Too few confluence rules agreeing is a
+    property of the set, so it gets its own row rather than being charged to whichever
+    optional rule happened to sort first.
+    """
+    stats = result.strategy.stats
+    blocks = {name: s.killed for name, s in stats.rules.items() if s.killed}
+    if stats.confluence_blocks:
+        blocks["confluence count"] = stats.confluence_blocks
+    return blocks
+
+
+def _rules_section(result: BacktestResult, settings: Settings) -> list[str]:
+    """The two rule tables: what could veto, and what merely voted.
+
+    They are separated because they answer different questions. A required rule's number
+    that matters is what it cost; a confluence rule's is how often it agreed, because that
+    pass rate is the evidence for or against promoting it to required later.
+    """
+    stats = sorted(result.strategy.stats.rules.items())
+    required = [(name, s) for name, s in stats if s.required]
+    optional = [(name, s) for name, s in stats if not s.required]
+    needed = settings.strategy.min_confluence
+    lines = [
+        "## Rules",
+        "",
+        "A rule with zero evaluations was switched off for this run. Required rules block "
+        f"on their own; of the optional ones, {needed} had to agree.",
+        "",
+        "**Required**",
+        "",
+        _table(
+            ["rule", "evaluated", "passed", "intents killed"],
+            [[name, f"{s.evaluated}", f"{s.passed}", f"{s.killed}"] for name, s in required],
+        ),
+    ]
+    if optional:
+        lines += [
+            "",
+            "**Confluence**",
+            "",
+            _table(
+                ["rule", "evaluated", "passed", "pass rate"],
+                [
+                    [
+                        name,
+                        f"{s.evaluated}",
+                        f"{s.passed}",
+                        f"{100 * s.passed / s.evaluated:.1f}%" if s.evaluated else "n/a",
+                    ]
+                    for name, s in optional
+                ],
+            ),
+        ]
+    return lines
 
 
 def _blocks_table(title: str, counts: dict[str, int]) -> str:

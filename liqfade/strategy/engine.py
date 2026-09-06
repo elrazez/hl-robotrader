@@ -66,11 +66,23 @@ class Rejection:
 
 @dataclass
 class RuleStats:
-    """How one rule performed over a run. Feeds the report's per-rule table."""
+    """How one rule performed over a run. Feeds the report's per-rule tables.
+
+    Args:
+        evaluated: candidates the rule ran on. Zero means it was switched off.
+        passed: how many of those it said yes to. Over `evaluated` this is the pass rate
+            the report prints for the confluence rules, which is the number that says
+            whether a rule is worth requiring.
+        killed: intents this rule was blamed for. Only a required rule can be blamed;
+            an optional one that fails costs a vote and nothing else.
+        required: whether it blocks on its own. Copied from config so a rule that never
+            ran still lands in the right table.
+    """
 
     evaluated: int = 0
     passed: int = 0
     killed: int = 0
+    required: bool = True
 
 
 @dataclass
@@ -81,6 +93,9 @@ class EngineStats:
     intents: int = 0
     rules: dict[str, RuleStats] = field(default_factory=dict)
     filters: dict[str, int] = field(default_factory=dict)
+    # Intents dropped because too few optional rules agreed, which is not any one rule's
+    # doing and would be invisible in the per-rule table.
+    confluence_blocks: int = 0
     unpriceable: int = 0
 
 
@@ -98,7 +113,12 @@ class StrategyEngine:
         self.settings = settings
         self.meta = dict(meta)
         known_rules = type(settings.strategy.rules).model_fields
-        self.stats = EngineStats(rules={name: RuleStats() for name in known_rules})
+        self.stats = EngineStats(
+            rules={
+                name: RuleStats(required=getattr(settings.strategy.rules, name).required)
+                for name in known_rules
+            }
+        )
         self._detectors: dict[str, CascadeDetector] = {}
         self._rules: list[ConfluenceRule] = build_enabled_rules(settings)
         self._rejections: list[Rejection] = []
@@ -217,27 +237,57 @@ class StrategyEngine:
     def _run_rules(
         self, row: FeatureRow, state: CascadeState, explain: dict[str, float]
     ) -> str | None:
-        """Run every enabled rule, merge its values into `explain`, return the first fail.
+        """Run every enabled rule, merge its values into `explain`, and judge the set.
+
+        Two kinds of rule, because the setup has two kinds of condition. A **required** rule
+        is a precondition and blocks on its own: the liquidation being big enough is the
+        owner's, and without it there is no trade to have. An **optional** rule is
+        confluence, one voice among several, and the question is how many agree rather than
+        whether all do. `strategy.min_confluence` is how many must; at 0 they are evaluated
+        and reported and never block, which is how a new rule earns its place before it is
+        allowed to cost a trade.
 
         Every rule runs even after one has failed, so `explain` carries the full picture of
-        a rejected intent rather than stopping at the first objection. The name returned is
-        the first failure in name order, which `build_enabled_rules` fixes so a rerun
-        blames the same rule.
+        a rejected intent rather than stopping at the first objection, and every enabled
+        rule's verdict reaches it as a 1 or a 0 alongside its values. A required failure is
+        blamed on the first such rule in name order, which `build_enabled_rules` fixes so a
+        rerun blames the same one.
+
+        Returns the reason the intent was dropped, or None. A confluence failure has no one
+        rule to name, so it reports as `confluence n/m`.
         """
-        failed: str | None = None
+        sections = self.settings.strategy.rules
+        failed_required: str | None = None
+        optional_total = 0
+        optional_passed = 0
         for rule in self._rules:
             verdict = rule.evaluate(row, state)
-            stats = self.stats.rules.setdefault(rule.name, RuleStats())
+            required: bool = getattr(sections, rule.name).required
+            stats = self.stats.rules.setdefault(rule.name, RuleStats(required=required))
             stats.evaluated += 1
             for key, value in verdict.values.items():
                 explain[f"{rule.name}.{key}"] = value
+            explain[f"{rule.name}.passed"] = 1.0 if verdict.passed else 0.0
             if verdict.passed:
                 stats.passed += 1
-            else:
-                stats.killed += 1
-                if failed is None:
-                    failed = rule.name
-        return failed
+            if not required:
+                optional_total += 1
+                optional_passed += 1 if verdict.passed else 0
+            elif not verdict.passed and failed_required is None:
+                failed_required = rule.name
+
+        needed = self.settings.strategy.min_confluence
+        explain["confluence_passed"] = float(optional_passed)
+        explain["confluence_optional"] = float(optional_total)
+        explain["confluence_needed"] = float(needed)
+
+        if failed_required is not None:
+            self.stats.rules[failed_required].killed += 1
+            return failed_required
+        if optional_passed < needed:
+            self.stats.confluence_blocks += 1
+            return f"confluence {optional_passed}/{optional_total}"
+        return None
 
     def _reject(
         self,

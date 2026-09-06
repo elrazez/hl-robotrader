@@ -196,6 +196,11 @@ strategy:
   # With every rule disabled the engine is bit identical to the bare spec behaviour, which
   # is the configuration the golden test pins. A new rule is one class in
   # strategy/rules.py, one section here, one model field and one test.
+  # Of the enabled rules with `required: false`, how many must pass. 0 evaluates them and
+  # reports what they said without ever blocking an intent, which is how a rule earns its
+  # place before it is allowed to cost a trade. A value higher than the number of enabled
+  # optional rules is refused, because it would block everything.
+  min_confluence: 0
   rules:
     zone_proximity:
       # Passes when the cascade extreme sits within zone_width_bps of a level that already
@@ -203,23 +208,27 @@ strategy:
       # WORSE than out-of-zone: +36.1 bps against +146.3 at 15 bps over 1,523 in-zone
       # episodes. The code stays built and tested. reports/research/q7_zones.md.
       enabled: false
+      required: true  # false makes it one confluence vote rather than a veto
       zone_width_bps: 15.0  # bps from the nearest level that counts as inside the zone
     min_cascade_notional:
       # Passes when the episode's liquidated notional exceeds the floor. Trivial on
       # purpose: it is the rule that proves the mechanism with something anyone can check.
       enabled: false
+      required: true  # false makes it one confluence vote rather than a veto
       min_notional_usd: 250000.0  # USD of liquidated notional in the cascade so far
     oi_flush:
       # Passes when open interest fell over the rv window, so positions were actually
       # forced out rather than price merely moving, and optionally when open interest is
       # still up over the build window, which is the crowding there was to flush.
       enabled: false
+      required: true  # false makes it one confluence vote rather than a veto
       drop_min_frac: 0.01  # fraction of open interest closed over the rv window
       build_min_frac: null  # fraction OI is up over the build window; null skips the half
     vwap_stretch:
       # Passes when mid is stretched past the VWAP the way the cascade pushed it: below it
       # for a long liquidation we are buying, above it for a short one.
       enabled: false
+      required: true  # false makes it one confluence vote rather than a veto
       reference: day  # day: session VWAP from 00:00 UTC | anchor: features.vwap_anchor_s
       min_disp_bps: 30.0  # bps mid must sit past the VWAP
     level_reclaim:
@@ -227,6 +236,7 @@ strategy:
       # already existed and price is back on the near side of it now. Reads the same
       # features/levels.py set zone_proximity does.
       enabled: false
+      required: true  # false makes it one confluence vote rather than a veto
       sweep_min_bps: 5.0  # bps beyond the level the cascade extreme must have traded
       reclaim_min_bps: 0.0  # bps back past the level mid must be now
 

@@ -222,6 +222,7 @@ class ZoneProximityRule(Base):
     """Q7 said no, so this ships disabled. `features/levels.py` stays built and tested."""
 
     enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    required: bool = Field(True, description="block on its own; false makes it confluence")
     zone_width_bps: Pos = Field(..., description="bps from the nearest level counted as in zone")
 
 
@@ -229,6 +230,7 @@ class MinCascadeNotionalRule(Base):
     """Trivial on purpose: it proves the rule mechanism with something easy to check."""
 
     enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    required: bool = Field(True, description="block on its own; false makes it confluence")
     min_notional_usd: Pos = Field(..., description="USD of liquidated notional the cascade needs")
 
 
@@ -243,6 +245,7 @@ class OiFlushRule(Base):
     """
 
     enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    required: bool = Field(True, description="block on its own; false makes it confluence")
     drop_min_frac: NonNeg = Field(
         ..., description="fraction of open interest closed over the rv window"
     )
@@ -258,6 +261,7 @@ class VwapStretchRule(Base):
     """Price is stretched away from a VWAP, on the side the cascade pushed it."""
 
     enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    required: bool = Field(True, description="block on its own; false makes it confluence")
     reference: VwapReference = Field(
         "day", description="day: session VWAP from 00:00 UTC; anchor: the pre-cascade window"
     )
@@ -268,6 +272,7 @@ class LevelReclaimRule(Base):
     """The swing failure and the three tap: through a level, then back above it."""
 
     enabled: bool = Field(False, description="run this rule after cascade and exhaustion fire")
+    required: bool = Field(True, description="block on its own; false makes it confluence")
     sweep_min_bps: NonNeg = Field(
         ..., description="bps beyond the level the cascade extreme must have traded"
     )
@@ -291,7 +296,33 @@ class StrategyRules(Base):
 
 
 class Strategy(Base):
+    """The rule layer: what blocks on its own, and how much of the rest has to agree.
+
+    An all-AND stack of confluence rules is the wrong shape for this setup. A trader takes
+    tens of trades a week by hand, and the reason is that the liquidation is the signal and
+    the rest are corroboration: any one of them being absent is normal. So a rule is either
+    `required`, in which case it blocks alone, or optional, in which case it is one vote and
+    `min_confluence` is how many votes an entry needs.
+    """
+
     rules: StrategyRules
+    min_confluence: int = Field(
+        0, ge=0, description="count: enabled optional rules that must pass; 0 only reports them"
+    )
+
+    @model_validator(mode="after")
+    def _confluence_is_reachable(self) -> Strategy:
+        optional = sum(
+            1
+            for name in type(self.rules).model_fields
+            if getattr(self.rules, name).enabled and not getattr(self.rules, name).required
+        )
+        if self.min_confluence > optional:
+            raise ValueError(
+                f"strategy.min_confluence is {self.min_confluence} but only {optional} enabled "
+                "rules are optional, so no intent could ever pass"
+            )
+        return self
 
 
 class SpreadTiers(Base):

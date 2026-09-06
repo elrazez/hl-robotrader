@@ -233,6 +233,104 @@ class TestRuleLayer:
         assert rejection.reason == "zone_proximity"
 
 
+class TestConfluence:
+    """Optional rules are votes, not vetoes, and `min_confluence` is how many are needed.
+
+    The setup a trader runs by hand takes tens of trades a week, which an all-AND stack
+    of four corroborating conditions cannot produce: any one of them being absent is normal.
+    `min_cascade_notional` here is the one that is not negotiable, and the two zone rules
+    stand in for the confluences, one of which passes and one of which does not.
+    """
+
+    def settings(
+        self, factory: SettingsFactory, *, needed: int, floor: float = 1_000.0
+    ) -> Settings:
+        return factory(
+            **{
+                "strategy.min_confluence": needed,
+                # Required: the liquidation itself.
+                "strategy.rules.min_cascade_notional.enabled": True,
+                "strategy.rules.min_cascade_notional.required": True,
+                "strategy.rules.min_cascade_notional.min_notional_usd": floor,
+                # Optional and passing: a level 1.02 bps from the extreme, inside 15.
+                "strategy.rules.zone_proximity.enabled": True,
+                "strategy.rules.zone_proximity.required": False,
+                "strategy.rules.zone_proximity.zone_width_bps": 15.0,
+                # Optional and failing: no open interest on these rows at all.
+                "strategy.rules.oi_flush.enabled": True,
+                "strategy.rules.oi_flush.required": False,
+            }
+        )
+
+    def run(self, settings: Settings) -> tuple[StrategyEngine, list[Intent]]:
+        engine = StrategyEngine(settings, META)
+        engine.on_tick(START_MS, {"BTC": falling_row(START_MS, 100.0)})
+        intents: list[Intent] = []
+        for step in range(1, 600):
+            ts = START_MS + step * TICK_MS
+            intents.extend(engine.on_tick(ts, {"BTC": quiet_row(ts, 98.0, support_px=97.99)}))
+        return engine, intents
+
+    def test_one_of_two_confluences_is_enough_when_one_is_asked_for(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        engine, intents = self.run(self.settings(settings_factory, needed=1))
+        (intent,) = intents
+        assert intent.explain["confluence_passed"] == 1.0
+        assert intent.explain["confluence_optional"] == 2.0
+        assert intent.explain["zone_proximity.passed"] == 1.0
+        assert intent.explain["oi_flush.passed"] == 0.0
+        assert engine.stats.confluence_blocks == 0
+
+    def test_two_are_not_enough_when_only_one_agrees(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        engine, intents = self.run(self.settings(settings_factory, needed=2))
+        assert intents == []
+        (rejection,) = engine.take_rejections()
+        assert rejection.reason == "confluence 1/2"
+        assert engine.stats.confluence_blocks == 1
+        # No single optional rule is blamed for a count nobody failed alone.
+        assert engine.stats.rules["oi_flush"].killed == 0
+        assert engine.stats.rules["zone_proximity"].killed == 0
+
+    def test_a_required_rule_blocks_however_many_confluences_agree(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The liquidation is the signal. Nothing votes it back in."""
+        settings = self.settings(settings_factory, needed=0, floor=9_000_000.0)
+        engine, intents = self.run(settings)
+        assert intents == []
+        (rejection,) = engine.take_rejections()
+        assert rejection.reason == "min_cascade_notional"
+        assert engine.stats.rules["min_cascade_notional"].killed == 1
+        assert engine.stats.confluence_blocks == 0
+
+    def test_zero_means_the_optional_rules_are_reported_and_never_block(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """How a rule earns its place before it is allowed to cost a trade."""
+        engine, intents = self.run(self.settings(settings_factory, needed=0))
+        (intent,) = intents
+        assert intent.explain["confluence_needed"] == 0.0
+        assert engine.stats.rules["oi_flush"].evaluated == 1
+        assert engine.stats.rules["oi_flush"].passed == 0
+        assert engine.stats.rules["oi_flush"].killed == 0
+
+    def test_a_confluence_count_no_rule_set_could_reach_is_refused(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """Two votes needed and one optional rule enabled would block every intent."""
+        with pytest.raises(ValueError, match="min_confluence"):
+            settings_factory(
+                **{
+                    "strategy.min_confluence": 2,
+                    "strategy.rules.zone_proximity.enabled": True,
+                    "strategy.rules.zone_proximity.required": False,
+                }
+            )
+
+
 class TestFilters:
     def test_a_wide_spread_blocks_the_trade(self, settings_factory: SettingsFactory) -> None:
         settings = settings_factory()
