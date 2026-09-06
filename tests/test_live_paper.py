@@ -242,3 +242,33 @@ async def test_equity_falls_with_the_fees_a_round_trip_pays(tmp_path: Path) -> N
     trade = session.portfolio.trades[-1]
     assert trade.fees_usd > 0
     assert trade.net_pnl < trade.gross_pnl
+
+
+async def test_a_liquidation_with_no_notional_reaches_neither_the_book_nor_the_features(
+    tmp_path: Path,
+) -> None:
+    """The box found this one: OKX sends a few an hour and they raised on every one.
+
+    The feature engine had been fixed and this path had not, because the edit was written
+    against a line ruff had already wrapped and nothing asserted that it matched. The loop
+    logged paper_ingest_failed every time instead of ingesting anything.
+    """
+    session = await a_session(tmp_path)
+    row = {
+        "coin": COIN,
+        "ts_ms": START,
+        "rx_ms": START,
+        "side": "long",
+        "notional_usd": None,
+        "px": None,
+    }
+
+    import structlog
+
+    with structlog.testing.capture_logs() as entries:
+        session.ingest("liquidations", "okx", row)
+
+    assert [entry for entry in entries if "failed" in entry["event"]] == []
+    session.ingest("liquidations", "okx", {**row, "notional_usd": 9_000.0, "px": 100.0})
+    await session.tick(START + 1_000)
+    assert session.features.row(COIN, START + 1_000).liq_long_usd_w == pytest.approx(9_000.0)

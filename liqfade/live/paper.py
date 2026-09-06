@@ -533,13 +533,20 @@ def _as_event(table: str, venue: str, row: Mapping[str, Any]) -> Any:
                 asks=((float(row["ask_px"]), float(row["ask_sz"])),),
             )
         case "liquidations":
+            notional = _maybe(row.get("notional_usd"))
+            if notional is None:
+                # Same rule as the feature engine: a liquidation with no notional is not a
+                # liquidation of zero. OKX sends these for contracts it has no price for,
+                # a few an hour, and they only prove the feed is alive, which the stream
+                # stats already recorded.
+                return None
             return Liq(
                 ts_ms=known,
                 coin=coin,
                 venue=venue,
                 side=str(row["side"]),
-                px=float(row.get("px") or 0.0),
-                notional_usd=float(row["notional_usd"]),
+                px=_maybe(row.get("px")) or 0.0,
+                notional_usd=notional,
             )
         case "asset_ctx":
             return AssetCtx(
