@@ -288,6 +288,77 @@ class TestTakerWalk:
         assert walk.px == pytest.approx(100.0 * (1 - settings.backtest.slip_stale_bps / 1e4))
 
 
+class TestQuoteAge:
+    """A price nobody has quoted for `max_quote_age_s` is a guess, and guesses are refused.
+
+    The whole class is one bug, found on 2026-09-06. `_CoinState` holds one book for the
+    length of a run, a `Trade` event keeps the levels the book already had, and `l2` has
+    whole days missing from the archive. On 2025-11-21, a day with no `l2` at all, three
+    entries were walked against a snapshot from a previous week and filled 863 to 1,152 bps
+    away from a tape a fifth of a second old. Those three were 38% of that run's loss.
+    `stale_book_s` charged a snapshot a second or two old five basis points, correctly, and
+    nothing bounded how old a snapshot could get.
+    """
+
+    def test_a_book_older_than_the_cap_degrades_to_the_tape(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The real numbers: a book at 93,109 and a tape at 83,400, 0.14s old.
+
+        The last trade is better information than a snapshot from another day, so this
+        degrades rather than refusing: it is the same rung of the ladder as a coin that
+        never had a book at all.
+        """
+        settings = settings_factory()
+        now = T0 + 6 * 86_400_000
+        stale = book(
+            asks=((93_109.0, 5.0),),
+            bids=((93_000.0, 5.0),),
+            snapshot_ms=T0,
+            last_px=83_400.0,
+            last_trade_ms=now - 140,
+        )
+        walk = walk_book(stale, side="long", size=0.1, now_ms=now, settings=settings)
+        assert walk is not None
+        assert walk.no_book is True, "the week-old book must not have priced this"
+        assert walk.px == pytest.approx(83_400.0 * (1 + settings.backtest.slip_stale_bps / 1e4))
+
+    def test_a_stale_tape_refuses_the_fill_rather_than_guessing(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """Nothing fresh to price against, so there is no fill. The engine counts it."""
+        settings = settings_factory()
+        now = T0 + 6 * 86_400_000
+        gap = int(settings.backtest.max_quote_age_s * 1000) + 1
+        dead = book(snapshot_ms=T0, last_px=83_400.0, last_trade_ms=now - gap)
+        assert walk_book(dead, side="long", size=0.1, now_ms=now, settings=settings) is None
+
+    def test_a_tape_that_never_printed_refuses_too(self, settings_factory: SettingsFactory) -> None:
+        """Never seen is at least as bad as long ago."""
+        settings = settings_factory()
+        never = book(snapshot_ms=None, last_px=100.0, last_trade_ms=None)
+        assert walk_book(never, side="long", size=1.0, now_ms=T0, settings=settings) is None
+
+    def test_a_fresh_book_is_still_walked(self, settings_factory: SettingsFactory) -> None:
+        """The cap must not quietly turn every fill into the degraded path."""
+        settings = settings_factory()
+        walk = walk_book(book(), side="long", size=1.0, now_ms=T0 + 200, settings=settings)
+        assert walk is not None
+        assert walk.no_book is False
+        assert walk.px == pytest.approx(101.0)
+
+    def test_an_ioc_order_against_a_stale_tape_does_not_fill(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The seam the engine actually calls, so the refusal reaches `abandoned_entries`."""
+        settings = settings_factory()
+        now = T0 + 6 * 86_400_000
+        gap = int(settings.backtest.max_quote_age_s * 1000) + 1
+        dead = book(snapshot_ms=T0, last_px=100.0, last_trade_ms=now - gap)
+        ioc = order(kind=OrderKind.IOC, px=100.0, size=1.0, visible_ms=T0)
+        assert fill_taker(ioc, dead, now_ms=now, settings=settings) is None
+
+
 class TestStops:
     def test_a_long_stop_triggers_when_mid_falls_to_it(self) -> None:
         assert stop_triggered(side="long", stop_px=95.0, mid=95.0)

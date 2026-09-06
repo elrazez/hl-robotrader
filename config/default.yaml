@@ -310,7 +310,15 @@ backtest:
   maker_queue_pessimism: 1.0  # multiplier on the assumed queue ahead at the resting price
   maker_requires_trade_through: true  # an Alo fills only on trade through or queue exhaustion
   slip_stale_bps: 5.0  # bps added when the L2 snapshot used for a taker fill is over 1s old
-  stale_book_s: 1.0  # seconds after which an L2 snapshot counts as stale
+  stale_book_s: 1.0  # seconds after which an L2 snapshot counts as stale and pays that penalty
+  # Seconds beyond which market data is a guess rather than a price. A book snapshot older
+  # than this is discarded and the fill falls back to the tape; a tape older than this
+  # refuses the fill and counts it. Separate from stale_book_s, which is the mild penalty
+  # for a snapshot a second or two old. l2 has whole days missing from the archive and the
+  # engine carries one coin's book for the length of a run, so without this a snapshot from
+  # a previous week priced a fill at 5 bps over a price that was 11% wrong.
+  # docs/DECISIONS.md, 2026-09-06.
+  max_quote_age_s: 5.0
   # The replay window around each cascade candidate. Outside it the portfolio is flat by
   # construction, so the tape there is read at all only to prove nothing was missed, which
   # it cannot be. Warmup is what the book, the tape and risk.stale_coin_s need to be current

@@ -49,6 +49,7 @@ __all__ = [
     "SimOrder",
     "fill_maker",
     "fill_taker",
+    "stale_quotes",
     "walk_book",
 ]
 
@@ -176,6 +177,26 @@ class WalkResult:
     extras: dict[str, float] = field(default_factory=dict)
 
 
+def stale_quotes(as_of_ms: int | None, now_ms: int, settings: Settings) -> bool:
+    """Whether market data stamped `as_of_ms` is too old to price a fill at `now_ms`.
+
+    `backtest.max_quote_age_s`, and `None` counts as stale: never seen is at least as bad as
+    long ago. This is the module's own rule applied to its own inputs, and it had a hole in
+    it. `stale_book_s` charged a snapshot a second or two old five basis points, which is
+    right, and nothing at all bounded how old a snapshot could get: `_CoinState` holds one
+    book for the length of a run, a `Trade` event keeps the levels it already had, and `l2`
+    has whole days missing from the archive. On 2025-11-21, a day with no `l2` at all, three
+    entries were walked against a snapshot from a previous week and filled 863 to 1,152 bps
+    from a tape that was a fifth of a second old. They were 38% of that run's loss.
+
+    A price nobody has quoted in this long is a guess, and the rest of this module already
+    says what to do with a guess: refuse it and count it, never fill it.
+    """
+    if as_of_ms is None:
+        return True
+    return (now_ms - as_of_ms) / 1000.0 > settings.backtest.max_quote_age_s
+
+
 def walk_book(
     book: BookState,
     *,
@@ -204,10 +225,12 @@ def walk_book(
     direction = 1.0 if side == "long" else -1.0
 
     levels = book.levels(side)
-    if not levels or book.snapshot_ms is None:
+    if not levels or book.snapshot_ms is None or stale_quotes(book.snapshot_ms, now_ms, settings):
         # The historical year, almost everywhere. Priced off the tape and counted, so the
-        # report can say what share of its fills were estimated rather than walked.
-        if book.last_px is None:
+        # report can say what share of its fills were estimated rather than walked. A book
+        # too old to trust degrades to here rather than being walked at its own prices: the
+        # last trade is better information than a snapshot from another day.
+        if book.last_px is None or stale_quotes(book.last_trade_ms, now_ms, settings):
             return None
         return WalkResult(px=book.last_px * (1.0 + direction * slip), size=size, no_book=True)
 

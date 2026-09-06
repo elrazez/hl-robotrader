@@ -425,6 +425,13 @@ class Backtest(Base):
     apply_funding: bool = Field(..., description="accrue funding hourly while a position is open")
     maker_queue_pessimism: Pos = Field(..., description="multiplier on assumed queue ahead")
     maker_requires_trade_through: bool = Field(..., description="Alo needs a trade through to fill")
+    # Market data older than this is a guess, not a price. A book snapshot past it is
+    # discarded and the fill falls back to the tape; a tape past it refuses the fill
+    # outright and counts it. `slip_stale_bps` below is the mild penalty for a snapshot
+    # that is merely a second or two old, which is a different thing.
+    max_quote_age_s: Pos = Field(
+        5.0, description="seconds: book or tape older than this cannot price a taker fill"
+    )
     slip_stale_bps: NonNeg = Field(..., description="bps added when the book snapshot is stale")
     stale_book_s: Pos = Field(..., description="seconds after which an L2 snapshot is stale")
     window_warmup_s: NonNeg = Field(
