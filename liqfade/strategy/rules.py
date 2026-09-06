@@ -39,13 +39,23 @@ from liqfade.config.models import MinCascadeNotionalRule, Settings, ZoneProximit
 from liqfade.strategy.types import CascadeState, FeatureRow
 
 __all__ = [
+    "LEVEL_RULES",
     "RULES",
     "ConfluenceRule",
     "MinCascadeNotional",
     "RuleVerdict",
     "ZoneProximity",
     "build_enabled_rules",
+    "level_rules_enabled",
 ]
+
+# The rules that read `FeatureRow.support_px` and `resistance_px`. Joining a level set onto
+# every grid row is the most expensive thing the feature build does, so the backtest only
+# does it when one of these is switched on. A rule added here and not to `RULES` is a name
+# that turns on an expensive join for nothing; a level-reading rule missing from here reads
+# nulls and fails on every candidate, which is the more expensive mistake because it looks
+# like a result. `tests/test_strategy_rules.py` pins the membership.
+LEVEL_RULES: tuple[str, ...] = ("zone_proximity",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +153,12 @@ RULES: dict[str, type] = {
     ZoneProximity.name: ZoneProximity,
     MinCascadeNotional.name: MinCascadeNotional,
 }
+
+
+def level_rules_enabled(settings: Settings) -> bool:
+    """Whether any enabled rule needs `support_px` and `resistance_px` built."""
+    sections = settings.strategy.rules
+    return any(getattr(sections, name).enabled for name in LEVEL_RULES)
 
 
 def build_enabled_rules(settings: Settings) -> list[ConfluenceRule]:

@@ -32,17 +32,26 @@ separates the historical ceiling from anything tradeable:
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from typing import Literal
 
 import polars as pl
 
 from liqfade.config.models import Settings
 from liqfade.features.book import book_features
 from liqfade.features.context import with_ctx
-from liqfade.features.flow import cvd, displacement, realized_vol, returns, session_vwap
+from liqfade.features.flow import (
+    DAY_MS,
+    cvd,
+    displacement,
+    realized_vol,
+    returns,
+    session_vwap,
+)
 from liqfade.features.grid import build_grid
 from liqfade.features.intensity import liq_intensity
 from liqfade.features.proxy import hl_forced_proxy
 from liqfade.features.zscore import robust_z
+from liqfade.strategy.rules import level_rules_enabled
 from liqfade.strategy.types import FeatureRow
 
 __all__ = [
@@ -61,6 +70,10 @@ __all__ = [
 # Venues whose liquidations a live bot can actually see. Hyperliquid is absent by design:
 # its own liquidations reach us through a next-day S3 pull and nothing else.
 LIVE_VENUES: tuple[str, ...] = ("bybit", "okx", "binance")
+
+# Which side of a price `join_asof` walks to. Named so the support and resistance passes can
+# share one loop without mypy losing the literal.
+AsofStrategy = Literal["backward", "forward"]
 
 
 class FeatureWindows:
@@ -141,7 +154,8 @@ def build_feature_grid(
         bbo: canonical `bbo`, or None. Absent for the whole historical year.
         l2: canonical `l2`, or None. Four coins, a snapshot roughly every 0.55s.
         asset_ctx: canonical `asset_ctx`, or None. Funding, mark and open interest.
-        levels: `features/levels.py` output, or None. Only read by `zone_proximity`.
+        levels: `features/levels.py` output, or None. Only read when a rule in
+            `strategy.rules.LEVEL_RULES` is enabled.
 
     Returns:
         One row per coin per `backtest.feature_grid_ms`, carrying every column
@@ -527,35 +541,75 @@ def _with_proxy(
 def _with_levels(
     grid: pl.DataFrame, levels: pl.DataFrame | None, settings: Settings
 ) -> pl.DataFrame:
-    """Nearest support and resistance price per row, for the `zone_proximity` rule.
+    """The nearest level below mid and the nearest above it, per row, for the level rules.
 
-    Skipped entirely when the rule is disabled, which it is by default: joining every level
-    against every grid row is the most expensive thing in this module, and Q7 says the
-    answer it computes is not one we act on.
+    Skipped entirely when no rule in `LEVEL_RULES` is enabled, which is the default: this
+    is the most expensive join in the module and the levels themselves have to be built
+    from a fortnight of candles before it can run.
+
+    **`support_px` is the nearest usable level *below this row's mid*, not the most
+    recently formed one.** That is what makes the answer an existential one: after a sweep
+    and a reclaim the highest level under mid is the level that was swept, so a rule asking
+    "did the cascade trade through a level and come back above it" gets a yes exactly when
+    some level satisfies it. It also means the rule sees one level and not all of them, so
+    when a shallower level sits between the swept one and mid it is that one the rule reads
+    and judges. `resistance_px` mirrors it above. A level further than
+    `features.levels.max_dist_bps` is reported absent rather than far away.
+
+    **Only levels knowable at the start of the row's UTC day are used.** A fractal is
+    confirmed `fractal_n` bars after it prints, so an intraday swing becomes usable a
+    quarter of an hour after it forms and would need a level set that changes within the
+    day; that is a two-dimensional lookup over price and time, and this is one as-of join
+    per day per side instead. The cost is that a swing formed this morning is not a level
+    until tomorrow, which fits what the rules are asking about anyway: a level a trader
+    would have drawn beforehand. It is a restriction and never a lookahead, because the
+    day's start is earlier than every row it serves.
     """
-    if not settings.strategy.rules.zone_proximity.enabled or levels is None or levels.is_empty():
+    if not level_rules_enabled(settings) or levels is None or levels.is_empty() or grid.is_empty():
         return grid.with_columns(
             pl.lit(None, dtype=pl.Float64).alias("support_px"),
             pl.lit(None, dtype=pl.Float64).alias("resistance_px"),
         )
-    out = grid
-    for kind, column in (("support", "support_px"), ("resistance", "resistance_px")):
+    max_dist_bps = settings.features.levels.max_dist_bps
+    sessions = grid.with_columns((pl.col("ts_ms") // DAY_MS * DAY_MS).alias("_session"))
+    parts = [
+        _nearest_levels(rows, levels.filter(pl.col("known_from") <= session), max_dist_bps)
+        for (session,), rows in sessions.group_by("_session", maintain_order=True)
+    ]
+    return pl.concat(parts).drop("_session").sort("coin", "ts_ms")
+
+
+def _nearest_levels(rows: pl.DataFrame, levels: pl.DataFrame, max_dist_bps: float) -> pl.DataFrame:
+    """One day's rows, matched to the closest level each side of their own mid.
+
+    The as-of join is on **price**, which is why both frames are sorted by it and the row
+    order is carried through on an index rather than restored by re-sorting: `join_asof`
+    silently returns the wrong neighbour on a frame that is not sorted by its key.
+    """
+    out = rows.with_row_index("_row")
+    priced = out.filter(pl.col("mid").is_not_null()).select("_row", "coin", "mid").sort("mid")
+    sides: tuple[tuple[str, str, AsofStrategy], ...] = (
+        ("support", "support_px", "backward"),
+        ("resistance", "resistance_px", "forward"),
+    )
+    for kind, column, strategy in sides:
         side = (
             levels.filter(pl.col("kind") == kind)
-            .select("coin", pl.col("px").alias(column), "known_from")
-            .sort("known_from")
+            .select("coin", pl.col("px").alias(column))
+            .unique()
+            .sort(column)
         )
-        if side.is_empty():
+        if priced.is_empty() or side.is_empty():
             out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
             continue
-        # A level is only usable once it is knowable, which `known_from` records, so the
-        # join is as-of on that rather than a plain join on coin.
-        out = (
-            out.sort("ts_ms")
-            .join_asof(side, left_on="ts_ms", right_on="known_from", by="coin", strategy="backward")
-            .drop("known_from", strict=False)
+        distance_bps = 1e4 * (pl.col("mid") - pl.col(column)).abs() / pl.col("mid")
+        nearest = (
+            priced.join_asof(side, left_on="mid", right_on=column, by="coin", strategy=strategy)
+            .with_columns(pl.when(distance_bps <= max_dist_bps).then(pl.col(column)).alias(column))
+            .select("_row", column)
         )
-    return out.sort("coin", "ts_ms")
+        out = out.join(nearest, on="_row", how="left")
+    return out.drop("_row")
 
 
 def row_columns(settings: Settings) -> tuple[str, ...]:

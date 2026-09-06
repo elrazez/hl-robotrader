@@ -46,7 +46,9 @@ import pyarrow.parquet as pq
 from liqfade.backtest.data import Event, iter_events, load_day, utc_days
 from liqfade.backtest.features import build_feature_grid, row_columns
 from liqfade.config.models import Settings
+from liqfade.features.levels import range_levels, swing_levels
 from liqfade.log import get_logger
+from liqfade.strategy.rules import LEVEL_RULES, level_rules_enabled
 from liqfade.strategy.types import AssetMeta
 
 log = get_logger(__name__)
@@ -56,6 +58,14 @@ __all__ = ["DAY_MS", "Day", "LakeSource", "feature_hash", "midnight_ms"]
 CACHE_DIR = Path("cache") / "features"
 CACHE_FILE = "grid.parquet"
 COINS_KEY = b"liqfade_coins"
+
+# Days of `candles_1m` read in front of a run before its levels are built. The prior ISO
+# week's high and low need the whole of last week present, which is the longest reach of
+# anything in `features/levels.py`; `features.levels.range_d` (5) is shorter. Read once for
+# the whole run, not per day: a year of 1m bars on four coins is two million rows, which is
+# nothing beside the tape, and a level set is a function of the history rather than of the
+# day being replayed.
+LEVEL_WARMUP_D = 15
 
 # The config a feature column actually depends on. Everything else may change without
 # invalidating a cached grid, which is the point: a sweep over stops, targets, sizing
@@ -72,7 +82,9 @@ HASHED_KEYS: tuple[str, ...] = (
     "sizing.vol_window_s",  # names and fills traded_usd_{w}s
     "exhaustion.mark_mid_pct_threshold",  # the percentile mark_mid_threshold is taken at
     "exhaustion.max_age_s",  # how far past a candidate active_mask reaches
-    "strategy.rules.zone_proximity",  # whether support_px and resistance_px are joined
+    # Whether support_px and resistance_px are joined at all, one key per level rule so
+    # toggling a rule that reads no levels does not throw a year of cached grids away.
+    *(f"strategy.rules.{name}" for name in LEVEL_RULES),
 )
 
 
@@ -142,7 +154,11 @@ class LakeSource:
         # `_resolve_meta` invents the most constraining defaults. It is here because the
         # engine reads it off the source and the lake will have real values in Phase 5.
         self.meta: Mapping[str, AssetMeta] = {}
+        # Built on first use from `candles_1m`, and only when a level rule is enabled. A
+        # caller may set it before the first `grids()` call to supply its own levels, which
+        # is what the golden fixture does.
         self.levels: pl.DataFrame | None = None
+        self._levels_built = False
         self._cache = cache
         self.grids_built = 0
         self.grids_cached = 0
@@ -274,7 +290,7 @@ class LakeSource:
             bbo=_or_none(self._read(days, "bbo", coin, tail_carry=True)),
             l2=_or_none(self._read(days, "l2", coin, tail_carry=True)),
             asset_ctx=_or_none(self._read(days, "asset_ctx", coin)),
-            levels=self.levels,
+            levels=self._level_set(settings),
         )
         if grid.is_empty():
             return grid
@@ -283,6 +299,56 @@ class LakeSource:
         wanted = ("coin", "ts_ms", *row_columns(settings))
         keep = [name for name in wanted if name in grid.columns]
         return grid.filter(pl.col("ts_ms") >= day.midnight_ms).select(keep)
+
+    def _level_set(self, settings: Settings) -> pl.DataFrame | None:
+        """Every support and resistance level the run can see, built once from candles.
+
+        None unless a rule in `LEVEL_RULES` is enabled: the rules that read levels are off
+        by default, and reading a fortnight of candles for a column nothing consults is
+        pure cost. Built per coin because every transform in `features/levels.py` is already
+        `.over("coin")`, so it changes no number and keeps a year of 1m bars from being
+        shifted twenty-five ways at once.
+        """
+        if self._levels_built or self.levels is not None:
+            return self.levels
+        self._levels_built = True
+        if not level_rules_enabled(settings):
+            return None
+        bars = self._candles()
+        if bars.is_empty():
+            log.warning("levels_no_candles", coins=list(self.coins))
+            return None
+        config = settings.features.levels
+        parts = []
+        for coin in self.coins:
+            coin_bars = bars.filter(pl.col("coin") == coin)
+            if coin_bars.is_empty():
+                continue
+            parts.append(swing_levels(coin_bars, fractal_n=config.fractal_n))
+            parts.append(range_levels(coin_bars, range_d=config.range_d))
+        if not parts:
+            return None
+        self.levels = pl.concat(parts).sort("coin", "known_from")
+        log.info("levels_built", levels=self.levels.height, coins=len(self.coins))
+        return self.levels
+
+    def _candles(self) -> pl.DataFrame:
+        """`candles_1m` over the run plus `LEVEL_WARMUP_D` days in front of it.
+
+        Projected to the four columns the level detectors read, because the point of
+        holding the whole run's bars at once is that they stay small enough to.
+        """
+        days = self.days()
+        first = date.fromisoformat(days[0].date) - timedelta(days=LEVEL_WARMUP_D)
+        last = date.fromisoformat(days[-1].date)
+        parts = []
+        day = first
+        while day <= last:
+            frame = load_day(self.data_dir, "candles_1m", day.isoformat(), coins=list(self.coins))
+            if not frame.is_empty():
+                parts.append(frame.select("coin", "ts_ms", "h", "l"))
+            day += timedelta(days=1)
+        return pl.concat(parts) if parts else pl.DataFrame()
 
     def _read(
         self,

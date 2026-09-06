@@ -14,7 +14,14 @@ import pytest
 
 from liqfade.config import ConfigError, load_settings
 from liqfade.config.models import Settings, StrategyRules
-from liqfade.strategy.rules import RULES, MinCascadeNotional, ZoneProximity, build_enabled_rules
+from liqfade.strategy.rules import (
+    LEVEL_RULES,
+    RULES,
+    MinCascadeNotional,
+    ZoneProximity,
+    build_enabled_rules,
+    level_rules_enabled,
+)
 from liqfade.strategy.types import CascadeState, FeatureRow
 
 SettingsFactory = Callable[..., Settings]
@@ -40,6 +47,17 @@ def test_registry_and_config_name_the_same_rules() -> None:
     fails: the owner reads a report for a condition that was never evaluated.
     """
     assert set(RULES) == set(StrategyRules.model_fields)
+
+
+def test_every_level_rule_is_a_real_rule_and_switches_the_join_on() -> None:
+    """A name in `LEVEL_RULES` that is not a rule turns on an expensive join for nothing.
+
+    The other direction is the one that costs a day: a rule that reads `support_px` and is
+    missing from this tuple sees nulls on every row and fails every candidate, which reads
+    like a measurement rather than like a bug.
+    """
+    assert set(LEVEL_RULES) <= set(RULES)
+    assert not level_rules_enabled(load_settings("paper"))
 
 
 def test_every_rule_ships_disabled() -> None:
