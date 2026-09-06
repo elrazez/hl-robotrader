@@ -1634,3 +1634,46 @@ measurement.
 summing volume or counting prints over 2026-09-05 counted 2,336 trades twice, and the
 replayed rows are what put hour 23's file before hour 22's end and stopped the day
 compacting at all.
+
+## 2026-09-06: 01c, the recorder replaces a Hyperliquid socket before Hyperliquid expires it
+
+Hyperliquid closes every WebSocket with `1000 (OK) Expired` on a clock rather than on an
+error. Seven measured on the box between 2026-09-05 and 2026-09-06, from
+`stream_disconnected` to the next: **167, 167, 170, 174, 177, 180 and 181 minutes**. Each
+one cost about 18s with nothing recorded on `bbo` and `trades`, eight times a day.
+
+`venues.hyperliquid.ws_lifetime_s` is the shortest of those (167 min) and
+`ws_rotate_frac` is 0.9, so the replacement is opened at 150 minutes with 17 minutes of
+margin against the shortest lifetime ever seen. The two are separate on purpose: the
+lifetime is a measurement of Hyperliquid and should be corrected when Hyperliquid changes,
+the fraction is our safety margin.
+
+**Both sockets deliver during the changeover and the repeats are dropped**, rather than
+switching cleanly from one to the other. Two sockets subscribed to the same broadcast
+receive the same message a few milliseconds apart in no fixed order, so an instantaneous
+switch has a race that can lose a message as easily as duplicate one, and **a duplicate can
+be found in the lake afterwards while a missing row cannot**. The dedupe is keyed on the
+raw payload rather than on `(coin, ts_ms, tid)`, because the venue sends the same bytes to
+both sockets and one key then covers every table: `bbo` and `l2` carry no id of their own
+and a per-table key would have to invent one.
+
+Two boundaries are load-bearing and both were wrong first, caught by a test against a fake
+server that expires connections the way Hyperliquid does:
+
+- The dedupe goes on **before** the replacement can deliver anything, not after its
+  subscribe frames are sent.
+- It goes off only **after the retired socket's receive loop has drained**. `close()`
+  returns when the handshake is done, but frames already received are still queued in front
+  of that loop, and turning the dedupe off at the close let one through as a duplicate.
+
+**A rotation that cannot connect costs the hole it was meant to avoid and nothing else.**
+The old socket is untouched, Hyperliquid expires it on its own schedule, and the reconnect
+ladder in `run` takes over exactly as before.
+
+**One latent bug fell out of this.** `_close_on_stop` waited on the stop event alone, so a
+socket that closed on its own left that task pending forever and the `_pump` task group
+never emptied. On a venue with a ping loop the next ping raised on the dead socket and took
+the group down, which is what actually drove every reconnect; on a venue **without** one it
+did not, and `binance` is configured without a ping frame. A clean close there was a stream
+that silently stopped reconnecting for the life of the process. Every task belonging to a
+socket now ends when that socket closes, which the rotation needed anyway.

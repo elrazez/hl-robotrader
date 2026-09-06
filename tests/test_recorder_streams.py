@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from typing import Any
+from unittest import mock
 
 import pytest
+import websockets
 
 from liqfade.config import load_settings
 from liqfade.config.models import Recorder
@@ -13,6 +17,7 @@ from liqfade.recorder.streams.base import (
     CONTINUOUS_STREAMS,
     PER_COIN_GAP_STREAMS,
     PER_COIN_STREAMS,
+    ParsedRow,
     StreamStats,
     WSStream,
     backoff_delay,
@@ -43,7 +48,7 @@ def _stream(**kwargs: Any) -> tuple[WSStream, list[tuple[str, str, dict[str, Any
     rows: list[tuple[str, str, dict[str, Any]]] = []
     stream = WSStream(
         kwargs.pop("venue", "bybit"),
-        "wss://example.invalid/ws",
+        kwargs.pop("url", "wss://example.invalid/ws"),
         parse=kwargs.pop("parse", lambda msg, rx: [("liquidations", {"rx_ms": rx})]),
         sink=lambda table, venue, row: rows.append((table, venue, row)),
         cfg=CFG,
@@ -450,3 +455,135 @@ def test_the_stream_measures_the_lag_of_the_rows_it_parsed() -> None:
         stream.handle(b"{}", NOW_MS + step * 1_000)
 
     assert stream.stats["hyperliquid.trades"].delivery_lag_ms("DOGE") == 90_000
+
+
+# --- rotating the connection before the venue expires it -------------------------
+
+
+class ExpiringServer:
+    """A venue that broadcasts a numbered stream and expires every socket, as HL does.
+
+    One counter shared by every live connection, so a subscriber that misses a number
+    missed a message the venue sent, and a subscriber that sees one twice wrote a row
+    twice. That is the whole assertion of the tests below.
+    """
+
+    def __init__(self, expire_after_s: float, tick_s: float = 0.005) -> None:
+        self.expire_after_s = expire_after_s
+        self.tick_s = tick_s
+        self.seq = 0
+        self.connections = 0
+        self._live: set[Any] = set()
+        self._server: Any = None
+        self._broadcast: asyncio.Task[None] | None = None
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self._server.sockets[0].getsockname()[1]}"
+
+    async def _handler(self, ws: Any) -> None:
+        self.connections += 1
+        self._live.add(ws)
+        try:
+            await asyncio.sleep(self.expire_after_s)
+            await ws.close(1000, "Expired")
+        finally:
+            self._live.discard(ws)
+
+    async def _pump(self) -> None:
+        while True:
+            await asyncio.sleep(self.tick_s)
+            self.seq += 1
+            payload = str(self.seq)
+            for ws in list(self._live):
+                with contextlib.suppress(Exception):
+                    await ws.send(payload)
+
+    async def __aenter__(self) -> ExpiringServer:
+        self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
+        self._broadcast = asyncio.create_task(self._pump())
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self._broadcast is not None
+        self._broadcast.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._broadcast
+        self._server.close()
+        await self._server.wait_closed()
+
+
+def _seq_parse(raw: bytes, rx_ms: int) -> list[ParsedRow]:
+    return [("trades", {"coin": "BTC", "ts_ms": rx_ms, "rx_ms": rx_ms, "seq": int(raw)})]
+
+
+async def _run_for(stream: WSStream, seconds: float) -> None:
+    stop = asyncio.Event()
+    task = asyncio.create_task(stream.run(stop))
+    await asyncio.sleep(seconds)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+async def test_the_replacement_is_up_before_the_venue_expires_the_old_one() -> None:
+    """Hyperliquid closes every socket with `1000 (OK) Expired` after 167 to 181 minutes,
+    measured seven times on the box between 2026-09-05 and 2026-09-06, and each close cost
+    an 18s hole in bbo and trades. The replacement connects, subscribes and starts
+    delivering before the old one goes, so the changeover misses nothing."""
+    async with ExpiringServer(expire_after_s=0.5) as venue:
+        stream, rows = _stream(
+            venue="hyperliquid",
+            url=venue.url,
+            parse=_seq_parse,
+            tables=("trades",),
+            rotate_after_s=0.15,
+            rotate_overlap_s=0.05,
+        )
+        await _run_for(stream, 0.9)
+
+    seqs = [row[2]["seq"] for row in rows]
+    assert len(seqs) > 20, "the fake venue should have sent plenty"
+    assert seqs == sorted(seqs)
+    # Contiguous: no number missing (a hole) and none seen twice (a duplicate).
+    assert seqs == list(range(seqs[0], seqs[-1] + 1))
+    assert venue.connections > 1, "the stream should have rotated at least once"
+    # A rotation is not a reconnect: nothing went through the backoff ladder.
+    assert stream.stats["hyperliquid.trades"].feed_state(NOW_MS).reconnects_1h == 0
+
+
+async def test_a_rotation_that_cannot_connect_leaves_the_old_socket_working() -> None:
+    """The failure has to cost the hole the rotation was meant to avoid, never the feed."""
+    async with ExpiringServer(expire_after_s=5.0) as venue:
+        stream, rows = _stream(
+            venue="hyperliquid",
+            url=venue.url,
+            parse=_seq_parse,
+            tables=("trades",),
+            rotate_after_s=0.15,
+            rotate_overlap_s=0.05,
+        )
+        real_url, real_connect = venue.url, websockets.connect
+
+        def _connect_once_then_fail(url: str, **kwargs: Any) -> Any:
+            # Not `async def`: `run` uses the result as an async context manager and
+            # `_rotate` awaits it, which is what websockets.connect itself returns.
+            if venue.connections >= 1:
+                raise OSError("refused")
+            return real_connect(real_url, **kwargs)
+
+        with mock.patch.object(websockets, "connect", _connect_once_then_fail):
+            await _run_for(stream, 0.5)
+
+    seqs = [row[2]["seq"] for row in rows]
+    assert seqs == list(range(seqs[0], seqs[-1] + 1))
+    assert seqs[-1] - seqs[0] > 20, "the original socket kept delivering throughout"
+
+
+async def test_a_stream_with_no_rotation_configured_is_unchanged() -> None:
+    """Only Hyperliquid expires sockets on a clock. Everything else reconnects on close."""
+    async with ExpiringServer(expire_after_s=0.2) as venue:
+        stream, rows = _stream(venue="bybit", url=venue.url, parse=_seq_parse, tables=("trades",))
+        await _run_for(stream, 0.6)
+
+    assert rows, "it should still record"
+    assert stream.stats["bybit.trades"].feed_state(NOW_MS).reconnects_1h >= 1

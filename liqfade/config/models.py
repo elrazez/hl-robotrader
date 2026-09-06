@@ -45,8 +45,19 @@ class HyperliquidVenue(Base):
     api_url: str = Field(..., description="url: POST /info and /exchange base")
     ws_url: str = Field(..., description="url: websocket endpoint")
     ws_ping_s: Pos = Field(..., description="seconds between ping frames")
+    ws_lifetime_s: Pos = Field(
+        ..., description="seconds the venue keeps a websocket before closing it as Expired"
+    )
+    ws_rotate_frac: Frac = Field(
+        ..., description="fraction of ws_lifetime_s at which the replacement is opened"
+    )
     liq_weight: NonNeg = Field(..., description="weight in aggregated liquidation notional")
     complete: bool = Field(..., description="true when the venue publishes every liquidation")
+
+    @property
+    def ws_rotate_after_s(self) -> float:
+        """Seconds into a connection at which its replacement is opened."""
+        return float(self.ws_lifetime_s) * float(self.ws_rotate_frac)
 
 
 class WsVenue(Base):

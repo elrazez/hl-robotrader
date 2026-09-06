@@ -24,6 +24,14 @@ venues:
     api_url: https://api.hyperliquid.xyz
     ws_url: wss://api.hyperliquid.xyz/ws
     ws_ping_s: 20  # seconds: server closes idle connections after 60s
+    # Hyperliquid closes every websocket with "1000 (OK) Expired" on a clock, not on an
+    # error. Seven measured on the box between 2026-09-05 and 2026-09-06: 167, 167, 170,
+    # 174, 177, 180 and 181 minutes. Each close cost an 18s hole in bbo and trades, so the
+    # recorder opens and subscribes the replacement at ws_rotate_frac of the shortest
+    # measured lifetime and switches before the old one goes. 0.9 of 167 min is 150 min,
+    # which leaves 17 minutes of margin against the shortest lifetime ever seen.
+    ws_lifetime_s: 10020  # 167 minutes, the shortest measured
+    ws_rotate_frac: 0.9
     liq_weight: 1.0  # weight in aggregated liquidation notional; HL-exact is complete
     complete: false  # the free public feed does not flag liquidations, only the S3 pull does
   binance:

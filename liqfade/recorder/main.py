@@ -113,6 +113,9 @@ class Recorder:
                     ping_frame=hl.PING_FRAME,
                     pong_marker=hl.PONG_MARKER,
                     on_rtt_ms=self.latency.add_ws_ping,
+                    # Only Hyperliquid expires a socket on a clock. The other three close
+                    # on an error or not at all, and reconnect from the ladder in `run`.
+                    rotate_after_s=venues.hyperliquid.ws_rotate_after_s,
                 )
             )
         if venues.binance.enabled:
