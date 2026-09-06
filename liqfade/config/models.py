@@ -310,6 +310,12 @@ class Backtest(Base):
     maker_requires_trade_through: bool = Field(..., description="Alo needs a trade through to fill")
     slip_stale_bps: NonNeg = Field(..., description="bps added when the book snapshot is stale")
     stale_book_s: Pos = Field(..., description="seconds after which an L2 snapshot is stale")
+    window_warmup_s: NonNeg = Field(
+        300.0, description="seconds of tape replayed before a cascade candidate"
+    )
+    window_margin_s: NonNeg = Field(
+        60.0, description="seconds of slack after the last thing a cascade can cause"
+    )
     holdout_frac: Frac = Field(..., description="fraction of the chronological tail held out")
     walk_forward_refit_days: int = Field(..., gt=0, description="days between walk forward refits")
     bootstrap_samples: int = Field(..., gt=0, description="trade level bootstrap draws")

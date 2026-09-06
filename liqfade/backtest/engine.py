@@ -27,9 +27,8 @@ event stream breaks ties on a fixed key, so the same command twice writes byte-i
 from __future__ import annotations
 
 import random
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import polars as pl
 
@@ -42,9 +41,16 @@ from liqfade.backtest.data import (
     Liq,
     Trade,
     iter_events,
-    load_window,
+    utc_days,
 )
-from liqfade.backtest.features import build_feature_grid, iter_grid_rows
+from liqfade.backtest.features import (
+    active_mask,
+    build_feature_grid,
+    candidates,
+    cascade_windows,
+    iter_grid_rows,
+    merge_spans,
+)
 from liqfade.backtest.fills import (
     BookState,
     Fill,
@@ -58,6 +64,7 @@ from liqfade.backtest.fills import (
 from liqfade.backtest.portfolio import Portfolio
 from liqfade.backtest.portfolio import Trade as PortfolioTrade
 from liqfade.backtest.progress import ProgressWriter
+from liqfade.backtest.source import DAY_MS, Day, LakeSource, midnight_ms
 from liqfade.config.models import Settings
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
@@ -67,7 +74,12 @@ from liqfade.strategy.types import AssetMeta, FeatureRow, Intent
 
 log = get_logger(__name__)
 
-__all__ = ["BacktestResult", "RunInputs", "run_backtest"]
+# What `run_backtest` accepts. Two implementations, not an interface with one: the lake and
+# the frames a test builds. Both answer `days`, `grids`, `events` and `funding`, and both
+# carry the run's window, coins, starting equity and seed.
+type Source = LakeSource | RunInputs
+
+__all__ = ["BacktestResult", "RunInputs", "Source", "run_backtest"]
 
 # szDecimals and maxLeverage when `meta.universe` was not supplied. Five decimals is the
 # finest Hyperliquid uses, so it rounds least, and 3x is its most conservative leverage
@@ -81,14 +93,23 @@ DEFAULT_MAX_LEVERAGE = 3.0
 # chart, neither of which can use that resolution.
 EQUITY_SAMPLE_MS = 60_000
 
+# How often the equity curve is sampled through tape the run never replays. The portfolio
+# is flat there so the value does not move; the samples exist to keep the drawdown series
+# continuous and to give the risk engine a mark on every UTC day.
+HOUR_MS = 3_600_000
+
 
 @dataclass
 class RunInputs:
-    """Everything one replay reads. Frames rather than paths, so the engine does no I/O.
+    """Everything one replay reads, as frames a test built rather than a lake.
 
-    `run_backtest` is therefore a pure function of its inputs plus the config, which is
-    what makes the determinism and no-lookahead tests possible: a test builds the frames it
-    wants rather than a lake.
+    The in-memory twin of `backtest/source.py`'s `LakeSource`: it answers the same three
+    questions (which days, this day's grid, the events inside these windows) off frames it
+    already holds. `run_backtest` is therefore still a pure function of its inputs plus the
+    config, which is what makes the determinism and no-lookahead tests possible.
+
+    Nothing here streams, and nothing needs to: a fixture is minutes of tape. The real lake
+    goes through `LakeSource`, which never holds more than one day of one coin.
     """
 
     trades: pl.DataFrame
@@ -102,6 +123,72 @@ class RunInputs:
     meta: Mapping[str, AssetMeta] = field(default_factory=dict)
     starting_equity: float = 10_000.0
     seed: int = 0
+    _grid: pl.DataFrame | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def coins(self) -> tuple[str, ...]:
+        if self.trades.is_empty():
+            return ()
+        return tuple(sorted(self.trades["coin"].unique().to_list()))
+
+    def days(self) -> list[Day]:
+        return [
+            Day(
+                date=day,
+                start_ms=max(midnight_ms(day), self.start_ms),
+                end_ms=min(midnight_ms(day) + DAY_MS, self.end_ms),
+            )
+            for day in utc_days(self.start_ms, self.end_ms)
+        ]
+
+    def grids(
+        self, day: Day, settings: Settings, *, first: bool
+    ) -> Iterator[tuple[str, pl.DataFrame]]:
+        """One coin at a time, like the lake, but built over the whole window at once.
+
+        A fixture is minutes of tape, so splitting it by day would give every rolling
+        feature a cold start at midnight and move numbers the golden test derives on paper.
+        Built once and sliced per day instead, which is exactly the grid the non-streaming
+        engine had. `first` is therefore unused here; the lake needs it because its days
+        are built independently.
+        """
+        if self._grid is None:
+            self._grid = build_feature_grid(
+                settings=settings,
+                trades=self.trades,
+                liquidations=self.liquidations,
+                start_ms=self.start_ms,
+                end_ms=self.end_ms,
+                bbo=self.bbo,
+                l2=self.l2,
+                asset_ctx=self.asset_ctx,
+                levels=self.levels,
+            )
+        if self._grid.is_empty():
+            return
+        for coin in self.coins:
+            rows = self._grid.filter(
+                (pl.col("coin") == coin)
+                & pl.col("ts_ms").is_between(day.start_ms, day.end_ms, closed="left")
+            )
+            if not rows.is_empty():
+                yield coin, rows
+
+    def events(self, day: Day, spans: Mapping[str, Sequence[tuple[int, int]]]) -> Iterator[Event]:
+        return iter_events(
+            trades=_within(self.trades, spans),
+            liquidations=_within(self.liquidations, spans),
+            bbo=_or_none(_within(self.bbo, spans)),
+            l2=_or_none(_within(self.l2, spans)),
+            asset_ctx=_or_none(_within(self.asset_ctx, spans)),
+        )
+
+    def funding(self, day: Day) -> pl.DataFrame:
+        if self.asset_ctx is None:
+            return pl.DataFrame()
+        return self.asset_ctx.filter(
+            _known_expr().is_between(day.start_ms, day.end_ms, closed="left")
+        )
 
 
 @dataclass
@@ -122,6 +209,11 @@ class BacktestResult:
     end_ms: int = 0
     coins: tuple[str, ...] = ()
     last_equity_sample_ms: int = 0
+    # How much of the clock was actually replayed, and how many cascade windows it took.
+    # The report prints the share, which is the whole claim of the streaming engine: a year
+    # in which the strategy is idle 98% of the time should read about 3% of the tape.
+    replayed_ms: int = 0
+    windows: int = 0
 
 
 class _CoinState:
@@ -138,43 +230,20 @@ class _CoinState:
         self.reprices = 0
 
 
-def load_inputs(
-    data_dir: Path,
-    *,
-    settings: Settings,
-    coins: Sequence[str],
-    start_ms: int,
-    end_ms: int,
-    starting_equity: float,
-    seed: int = 0,
-) -> RunInputs:
-    """Read every table the run needs off the lake. The only I/O in the backtest package.
-
-    Liquidations are read across every venue and filtered by `cascade.trigger` inside
-    `build_feature_grid`, so switching triggers does not need a different read.
-    """
-    window = {"start_ms": start_ms, "end_ms": end_ms, "coins": list(coins)}
-    trades = load_window(data_dir, "trades", venue="hyperliquid", **window)  # type: ignore[arg-type]
-    return RunInputs(
-        trades=trades,
-        liquidations=load_window(data_dir, "liquidations", **window),  # type: ignore[arg-type]
-        bbo=_or_none(load_window(data_dir, "bbo", **window)),  # type: ignore[arg-type]
-        l2=_or_none(load_window(data_dir, "l2", **window)),  # type: ignore[arg-type]
-        asset_ctx=_or_none(load_window(data_dir, "asset_ctx", **window)),  # type: ignore[arg-type]
-        start_ms=start_ms,
-        end_ms=end_ms,
-        starting_equity=starting_equity,
-        seed=seed,
-    )
-
-
 def run_backtest(
-    inputs: RunInputs, settings: Settings, progress: ProgressWriter | None = None
+    source: Source, settings: Settings, progress: ProgressWriter | None = None
 ) -> BacktestResult:
     """Replay one window and return everything it produced.
 
+    Walks the source one UTC day at a time. For each day it builds (or reads from cache)
+    that day's feature grid one coin at a time, works out which stretches of tape a cascade
+    could involve, and replays only those. Outside them the portfolio is flat and no order
+    is working, which is asserted at every window end rather than assumed, so the tape there
+    holds nothing a decision could have used.
+
     Args:
-        inputs: the frames, the window, the asset metadata and the starting equity.
+        source: a `LakeSource` or a `RunInputs`. Anything answering `days`, `grids`,
+            `events` and `funding`.
         settings: resolved config. `cascade.trigger` picks the liquidation feed;
             `backtest.latency_ms` sets how late every order is.
         progress: where to report the replay clock once a second, for `liqfade watch`.
@@ -187,48 +256,16 @@ def run_backtest(
     # Seeded even though nothing currently draws from it: the fill model has no
     # stochastic component. It exists so that adding one later cannot silently break the
     # determinism guarantee, and it is not a cryptographic use.
-    random.Random(inputs.seed)  # noqa: S311
+    random.Random(source.seed)  # noqa: S311
 
-    coins = (
-        tuple(sorted(inputs.trades["coin"].unique().to_list()))
-        if not inputs.trades.is_empty()
-        else ()
-    )
-    meta = _resolve_meta(inputs.meta, coins, settings)
-    if progress is not None:
-        progress.set(
-            stage="features",
-            coins=list(coins),
-            window_start_ms=inputs.start_ms,
-            window_end_ms=inputs.end_ms,
-            starting_equity=inputs.starting_equity,
-            equity=inputs.starting_equity,
-        )
-    grid = build_feature_grid(
-        settings=settings,
-        trades=inputs.trades,
-        liquidations=inputs.liquidations,
-        start_ms=inputs.start_ms,
-        end_ms=inputs.end_ms,
-        bbo=inputs.bbo,
-        l2=inputs.l2,
-        asset_ctx=inputs.asset_ctx,
-        levels=inputs.levels,
-    )
-
-    portfolio = Portfolio(settings, starting_equity=inputs.starting_equity)
+    meta = _resolve_meta(source.meta, source.coins, settings)
+    portfolio = Portfolio(settings, starting_equity=source.starting_equity)
     strategy = StrategyEngine(settings, meta)
     # In memory: a replay starts from no halts and no cooldowns, and must never
     # read or write the live account's risk state.
     risk = RiskEngine(settings, path=None)
-    state: dict[str, _CoinState] = {coin: _CoinState() for coin in coins}
-
-    _load_funding(portfolio, inputs.asset_ctx)
-    # One entry per grid step, not per decision tick. The loop carries the last row
-    # forward, which is what makes a month of ten coins finish in minutes rather than
-    # spending most of its time rebuilding a mapping four times a second.
-    grid_rows = list(iter_grid_rows(grid, settings)) if not grid.is_empty() else []
-
+    state: dict[str, _CoinState] = {}
+    cloid = _CloidCounter()
     result = BacktestResult(
         trades=portfolio.trades,
         equity_curve=[],
@@ -236,31 +273,238 @@ def run_backtest(
         strategy=strategy,
         risk_blocks={},
         rejections=[],
-        start_ms=inputs.start_ms,
-        end_ms=inputs.end_ms,
-        coins=coins,
+        start_ms=source.start_ms,
+        end_ms=source.end_ms,
     )
-
-    events = iter_events(
-        trades=inputs.trades,
-        liquidations=inputs.liquidations,
-        bbo=inputs.bbo,
-        l2=inputs.l2,
-        asset_ctx=inputs.asset_ctx,
-    )
-    ticks = tick_times(inputs.start_ms, inputs.end_ms, settings.features.decision_cadence_ms)
-    cloid = _CloidCounter()
-
-    latest: dict[str, FeatureRow] = {}
-    next_row = 0
-    grid_step_ms = settings.backtest.feature_grid_ms
-    # How long a consumed grid row stays current. `active_mask` already keeps every row
-    # inside a cascade's window, so once rows stop arriving there is nothing for the
-    # detector to track and the tick can skip the strategy entirely. A stale cascade left
-    # in a detector is dropped by its own max_age check the moment rows resume.
-    active_until = -1
+    clock = _GridClock(settings)
     if progress is not None:
-        progress.set(stage="replaying", sim_ms=inputs.start_ms)
+        progress.set(
+            coins=list(source.coins),
+            window_start_ms=source.start_ms,
+            window_end_ms=source.end_ms,
+            starting_equity=source.starting_equity,
+            equity=source.starting_equity,
+        )
+
+    seen: set[str] = set()
+    # The previous day's cascade candidates, so a cascade that started at 23:59 keeps its
+    # rows and its window across midnight instead of being cut in half by the day loop.
+    carry: pl.DataFrame | None = None
+    spill: dict[str, list[tuple[int, int]]] = {}
+
+    for index, day in enumerate(source.days()):
+        if progress is not None:
+            progress.set(stage="features", sim_ms=day.start_ms)
+        rows, spans, found = _day_rows(source, day, settings, carry=carry, first=index == 0)
+        carry = found
+        seen.update(coin for coin, _ in spans.items())
+        seen.update(rows.keys())
+        spans = _with_spill(spans, spill)
+        spans, spill = _clip_to_day(spans, day)
+        _load_funding(portfolio, source.funding(day))
+
+        grid_rows = clock.day(rows, settings)
+        for start_ms, end_ms, closes in _segments(spans, day):
+            if progress is not None:
+                progress.set(stage="replaying", sim_ms=start_ms)
+            result.replayed_ms += end_ms - start_ms
+            result.windows += 1
+            _replay(
+                source.events(day, _clip_spans(spans, start_ms, end_ms)),
+                start_ms,
+                end_ms,
+                clock=clock,
+                grid_rows=grid_rows,
+                state=state,
+                portfolio=portfolio,
+                strategy=strategy,
+                risk=risk,
+                result=result,
+                meta=meta,
+                settings=settings,
+                cloid=cloid,
+                progress=progress,
+            )
+            if closes:
+                _assert_flat(end_ms, state, portfolio)
+        _sample_idle(day, spans, portfolio, risk, result, progress)
+
+    _close_out(source.end_ms, state, portfolio, result, settings)
+    result.rejections = strategy.take_rejections()
+    result.coins = tuple(sorted(seen))
+    # A day appends its in-window samples first and its idle hours afterwards, so the
+    # curve is built out of order. The drawdown walks it forward and cares.
+    result.equity_curve.sort()
+    if progress is not None:
+        progress.set(
+            stage="replaying",
+            sim_ms=source.end_ms,
+            trades=len(portfolio.trades),
+            net=sum(trade.net_pnl for trade in portfolio.trades),
+            intents=result.intents,
+        )
+    return result
+
+
+# --- the day loop -------------------------------------------------------------
+
+
+def _day_rows(
+    source: Source,
+    day: Day,
+    settings: Settings,
+    *,
+    carry: pl.DataFrame | None,
+    first: bool,
+) -> tuple[dict[str, pl.DataFrame], dict[str, list[tuple[int, int]]], pl.DataFrame]:
+    """One day's grid, reduced to the rows a cascade could involve, and its windows.
+
+    Per coin, so a day of 42 coins is never one three million row frame. Each coin's grid
+    is built, masked down to the rows the detector could act on, and the rest let go before
+    the next coin is read; what survives is a few thousand rows across the whole universe.
+    """
+    kept: dict[str, pl.DataFrame] = {}
+    found: list[pl.DataFrame] = []
+    for coin, grid in source.grids(day, settings, first=first):
+        has_carry = carry is not None and not carry.is_empty()
+        coin_carry = carry.filter(pl.col("coin") == coin) if has_carry else None
+        mask = active_mask(grid, settings, carry=coin_carry)
+        rows = grid.sort("coin", "ts_ms").filter(mask)
+        if not rows.is_empty():
+            kept[coin] = rows
+        found.append(candidates(grid, settings))
+    day_candidates = (
+        pl.concat(found).sort("ts_ms", "coin")
+        if found
+        else pl.DataFrame(schema={"coin": pl.String, "ts_ms": pl.Int64})
+    )
+    return kept, cascade_windows(day_candidates, settings), day_candidates
+
+
+def _with_spill(
+    spans: dict[str, list[tuple[int, int]]], spill: Mapping[str, list[tuple[int, int]]]
+) -> dict[str, list[tuple[int, int]]]:
+    """Fold yesterday's unfinished windows into today's, merging where they meet."""
+    if not spill:
+        return spans
+    out = {coin: list(coin_spans) for coin, coin_spans in spans.items()}
+    for coin, coin_spans in spill.items():
+        out.setdefault(coin, []).extend(coin_spans)
+    return {coin: merge_spans(coin_spans) for coin, coin_spans in sorted(out.items())}
+
+
+def _clip_to_day(
+    spans: Mapping[str, list[tuple[int, int]]], day: Day
+) -> tuple[dict[str, list[tuple[int, int]]], dict[str, list[tuple[int, int]]]]:
+    """Split each coin's windows into the part this day replays and the part that spills.
+
+    A window that runs past midnight is not shortened, it is continued: tomorrow's pass
+    picks up its remainder with tomorrow's grid and tomorrow's funding in hand, which is
+    the only order in which a position open at midnight can be priced correctly.
+    """
+    today: dict[str, list[tuple[int, int]]] = {}
+    spill: dict[str, list[tuple[int, int]]] = {}
+    for coin, coin_spans in spans.items():
+        for start, end in coin_spans:
+            start = max(start, day.start_ms)
+            if end <= day.start_ms:
+                continue
+            if start >= day.end_ms:
+                spill.setdefault(coin, []).append((start, end))
+                continue
+            today.setdefault(coin, []).append((start, min(end, day.end_ms)))
+            if end > day.end_ms:
+                spill.setdefault(coin, []).append((day.end_ms, end))
+    return today, spill
+
+
+def _segments(spans: Mapping[str, list[tuple[int, int]]], day: Day) -> list[tuple[int, int, bool]]:
+    """The stretches of clock to replay today, merged across coins.
+
+    Returns `(start_ms, end_ms, closes)`. `closes` is false when midnight cut the segment
+    short, because the window continues tomorrow and a position it opened is meant to still
+    be there. Only a segment that genuinely ends may be asserted flat.
+    """
+    flat = [span for coin_spans in spans.values() for span in coin_spans]
+    return [(start, end, end < day.end_ms) for start, end in merge_spans(flat)]
+
+
+def _clip_spans(
+    spans: Mapping[str, list[tuple[int, int]]], start_ms: int, end_ms: int
+) -> dict[str, list[tuple[int, int]]]:
+    """Each coin's windows, restricted to one segment of the clock."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    for coin, coin_spans in spans.items():
+        clipped = [
+            (max(start, start_ms), min(end, end_ms))
+            for start, end in coin_spans
+            if start < end_ms and end > start_ms
+        ]
+        if clipped:
+            out[coin] = clipped
+    return out
+
+
+class _GridClock:
+    """The rows the strategy has most recently seen, carried across segments and days.
+
+    The engine used to hold one list of grid rows for the whole run and an index into it.
+    The day loop rebuilds that list every day, so the *index* is per day but `latest` and
+    `active_until` are not: a cascade whose window straddles midnight must keep reading the
+    row it had at 23:59:59 until the next one arrives.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.latest: dict[str, FeatureRow] = {}
+        self.active_until = -1
+        self.step_ms = settings.backtest.feature_grid_ms
+        self.rows: list[tuple[int, dict[str, FeatureRow]]] = []
+        self.next = 0
+
+    def day(
+        self, kept: Mapping[str, pl.DataFrame], settings: Settings
+    ) -> list[tuple[int, dict[str, FeatureRow]]]:
+        """Merge this day's per-coin rows into one time-ordered list and start on it."""
+        frames = [rows for rows in kept.values() if not rows.is_empty()]
+        if not frames:
+            self.rows, self.next = [], 0
+            return self.rows
+        merged = pl.concat(frames)
+        # Already masked, coin by coin, with the previous day's candidates carried in;
+        # `iter_grid_rows` must not mask it a second time off a frame that cannot see them.
+        keep = pl.repeat(True, merged.height, eager=True)
+        self.rows = list(iter_grid_rows(merged, settings, keep=keep))
+        self.next = 0
+        return self.rows
+
+    def at(self, now_ms: int) -> Mapping[str, FeatureRow]:
+        """The rows in force at `now_ms`, or an empty mapping outside a cascade."""
+        while self.next < len(self.rows) and self.rows[self.next][0] <= now_ms:
+            self.latest.update(self.rows[self.next][1])
+            self.active_until = self.rows[self.next][0] + self.step_ms
+            self.next += 1
+        return self.latest if now_ms < self.active_until else {}
+
+
+def _replay(
+    events: Iterator[Event],
+    start_ms: int,
+    end_ms: int,
+    *,
+    clock: _GridClock,
+    grid_rows: list[tuple[int, dict[str, FeatureRow]]],
+    state: dict[str, _CoinState],
+    portfolio: Portfolio,
+    strategy: StrategyEngine,
+    risk: RiskEngine,
+    result: BacktestResult,
+    meta: Mapping[str, AssetMeta],
+    settings: Settings,
+    cloid: _CloidCounter,
+    progress: ProgressWriter | None,
+) -> None:
+    """One segment: events update state, ticks decide, in the fixed interleaved order."""
+    ticks = tick_times(start_ms, end_ms, settings.features.decision_cadence_ms)
     for item in merge(events, ticks):
         if isinstance(item, Tick):
             if progress is not None:
@@ -270,30 +514,68 @@ def run_backtest(
                     net=sum(trade.net_pnl for trade in portfolio.trades),
                     equity=result.equity_curve[-1][1]
                     if result.equity_curve
-                    else inputs.starting_equity,
+                    else portfolio.starting_equity,
                     intents=result.intents,
                 )
-            while next_row < len(grid_rows) and grid_rows[next_row][0] <= item.ts_ms:
-                latest.update(grid_rows[next_row][1])
-                active_until = grid_rows[next_row][0] + grid_step_ms
-                next_row += 1
-            rows = latest if item.ts_ms < active_until else {}
             _on_tick(
-                item.ts_ms, state, rows, portfolio, strategy, risk, result, meta, settings, cloid
+                item.ts_ms,
+                state,
+                clock.at(item.ts_ms),
+                portfolio,
+                strategy,
+                risk,
+                result,
+                meta,
+                settings,
+                cloid,
             )
         else:
             _on_event(item, state, portfolio, result, settings)
 
-    _close_out(inputs.end_ms, state, portfolio, result, settings)
-    result.rejections = strategy.take_rejections()
+
+def _assert_flat(end_ms: int, state: Mapping[str, _CoinState], portfolio: Portfolio) -> None:
+    """Nothing may survive a window. The bound on a window's end is
+    `exhaustion.max_age_s + intent.time_stop_s + backtest.window_margin_s` after the
+    candidate that opened it, which is past the last tick the cascade can signal on plus
+    the longest a position it opened can live. If this ever fires, the window maths and the
+    strategy's own limits have drifted apart and the skipped tape is no longer empty of
+    decisions, which is the one way this optimisation could silently change a result.
+    """
+    open_positions = sorted(portfolio.positions)
+    working = sorted(coin for coin, coin_state in state.items() if coin_state.entry is not None)
+    assert not open_positions and not working, (
+        f"window ending {end_ms} left {open_positions} open and {working} working; "
+        f"raise backtest.window_margin_s or check intent.time_stop_s"
+    )
+
+
+def _sample_idle(
+    day: Day,
+    spans: Mapping[str, list[tuple[int, int]]],
+    portfolio: Portfolio,
+    risk: RiskEngine,
+    result: BacktestResult,
+    progress: ProgressWriter | None,
+) -> None:
+    """One equity sample an hour through the tape this day never replayed.
+
+    The portfolio is flat outside a window, so equity there is cash and does not move; the
+    samples exist so the drawdown series is continuous rather than jumping from one cascade
+    to the next, and so the risk engine sees at least one mark per UTC day and rolls its
+    daily budget at midnight rather than at the first cascade of the day.
+    """
+    covered = merge_spans([span for coin_spans in spans.values() for span in coin_spans])
+    index = 0
+    for mark in range(day.start_ms, day.end_ms, HOUR_MS):
+        while index < len(covered) and covered[index][1] <= mark:
+            index += 1
+        if index < len(covered) and covered[index][0] <= mark < covered[index][1]:
+            continue
+        risk.on_equity(portfolio.cash, mark)
+        result.equity_curve.append((mark, portfolio.cash))
+        result.last_equity_sample_ms = mark
     if progress is not None:
-        progress.set(
-            sim_ms=inputs.end_ms,
-            trades=len(portfolio.trades),
-            net=sum(trade.net_pnl for trade in portfolio.trades),
-            intents=result.intents,
-        )
-    return result
+        progress.set(sim_ms=day.end_ms)
 
 
 # --- events -------------------------------------------------------------------
@@ -857,3 +1139,30 @@ def _load_funding(portfolio: Portfolio, asset_ctx: pl.DataFrame | None) -> None:
 
 def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:
     return None if frame.is_empty() else frame
+
+
+def _known_expr() -> pl.Expr:
+    """The timestamp a row became knowable. Mirrors `features/grid.py`'s `effective_ts`."""
+    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
+
+
+def _within(
+    frame: pl.DataFrame | None, spans: Mapping[str, Sequence[tuple[int, int]]]
+) -> pl.DataFrame:
+    """The rows of an in-memory table falling inside a coin's replay windows."""
+    if frame is None or frame.is_empty() or not spans:
+        return pl.DataFrame()
+    known = _known_expr()
+    return frame.filter(
+        pl.any_horizontal(
+            [
+                (pl.col("coin") == coin)
+                & pl.any_horizontal(
+                    [known.is_between(start, end, closed="left") for start, end in coin_spans]
+                )
+                for coin, coin_spans in sorted(spans.items())
+                if coin_spans
+            ]
+            or [pl.lit(False)]
+        )
+    )

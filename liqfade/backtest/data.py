@@ -13,15 +13,20 @@ says which is which. Ties break on a fixed key so a rerun produces the same orde
 therefore the same fills, which is what makes the determinism test possible.
 
 **Missing tables are allowed and are not an error.** The historical year has no `bbo` at
-all, `l2` only as hourly snapshots on four coins, and `asset_ctx` is missing two days the
-archive never published. A lake with a hole in it produces a degraded fill model and a
-report that says so, not a traceback: see `backtest/fills.py` for what "degraded" means and
-`no_book_fills` for how it is counted.
+all, `l2` covers four coins only, and `asset_ctx` is missing two days the archive never
+published. A lake with a hole in it produces a degraded fill model and a report that says
+so, not a traceback: see `backtest/fills.py` for what "degraded" means and `no_book_fills`
+for how it is counted.
+
+**`l2` is the largest table in the lake**, not the smallest: a snapshot roughly every
+0.55s on each of four coins, twenty levels a side, is 12.6 million rows a day. Reading it
+over a range is what killed the first year run, which is why `load_day` exists and
+`load_window` does not.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -37,7 +42,7 @@ __all__ = [
     "Trade",
     "day_files",
     "iter_events",
-    "load_window",
+    "load_day",
     "utc_days",
 ]
 
@@ -161,31 +166,64 @@ def day_files(data_dir: Path, table: str, day: str) -> list[Path]:
     return sorted(path for path in directory.glob("*.parquet") if not path.name.startswith("."))
 
 
-def load_window(
+def load_day(
     data_dir: Path,
     table: str,
+    day: str,
     *,
-    start_ms: int,
-    end_ms: int,
     coins: Sequence[str] | None = None,
     venue: str | None = None,
+    spans: Mapping[str, Sequence[tuple[int, int]]] | None = None,
 ) -> pl.DataFrame:
-    """Read one table over `[start_ms, end_ms)`, projected and filtered in the scan.
+    """Read **one UTC day** of one table, projected and filtered inside the scan.
 
-    Returns an empty frame when the table has no files in the window. Callers treat that as
-    absence rather than as an error: `bbo` is absent for the whole historical year and the
-    fill model has a documented answer for it.
+    One day, never a range. A year of trades is 1.79 billion rows and a year of `l2` is
+    over four billion; the first version of this engine handed `scan_parquet` every file in
+    the window and the OS killed the run twice. There is deliberately no function here that
+    takes a start and an end date, so that mistake cannot be made again by accident.
+
+    Args:
+        data_dir: lake root.
+        table: one of `COLUMNS`.
+        day: `YYYY-MM-DD`, one partition.
+        coins: restrict to these coins, or None for every coin in the file.
+        venue: restrict to one venue, where the table has the column.
+        spans: per coin, the `[from_ms, to_ms)` spans on `effective_ts` to keep. This is
+            the whole point of the streaming engine: outside a cascade window the tape is
+            never read at all, so a busy day whose cascades cover 3% of the clock reads
+            roughly 3% of its rows rather than fifty million and throwing them away. None
+            reads the whole day.
+
+    Returns:
+        The rows, or an empty frame when the day is absent or nothing survives the filters.
+        Absence is not an error: `bbo` is absent for the whole historical year and the fill
+        model has a documented answer for it.
     """
-    files = [path for day in utc_days(start_ms, end_ms) for path in day_files(data_dir, table, day)]
+    files = day_files(data_dir, table, day)
     if not files:
         return pl.DataFrame()
     frame = pl.scan_parquet(files).select(list(COLUMNS[table]))
-    known = _effective_ts()
-    frame = frame.filter(known.is_between(start_ms, end_ms, closed="left"))
     if coins is not None:
-        frame = frame.filter(pl.col("coin").is_in(list(coins)))
+        frame = frame.filter(pl.col("coin").is_in(sorted(set(coins))))
     if venue is not None and "venue" in COLUMNS[table]:
         frame = frame.filter(pl.col("venue") == venue)
+    if spans is not None:
+        if not spans:
+            return pl.DataFrame()
+        known = _effective_ts()
+        frame = frame.filter(
+            pl.any_horizontal(
+                [
+                    (pl.col("coin") == coin)
+                    & pl.any_horizontal(
+                        [known.is_between(start, end, closed="left") for start, end in coin_spans]
+                    )
+                    for coin, coin_spans in sorted(spans.items())
+                    if coin_spans
+                ]
+                or [pl.lit(False)]
+            )
+        )
     return frame.collect()
 
 

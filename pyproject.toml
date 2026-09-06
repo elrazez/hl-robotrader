@@ -108,8 +108,11 @@ strict = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-q --strict-markers -m 'not integration'"
-markers = ["integration: needs testnet keys and network; deselected by default"]
+addopts = "-q --strict-markers -m 'not integration and not lake'"
+markers = [
+  "integration: needs testnet keys and network; deselected by default",
+  "lake: needs the real Parquet lake at LIQFADE_DATA_DIR; deselected by default",
+]
 filterwarnings = [
     # polars emits this on every join_asof that passes `by=`, sorted or not, so it carries
     # no signal at all. A hundred copies of it hide the warnings that do.

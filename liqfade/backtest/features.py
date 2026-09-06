@@ -47,9 +47,14 @@ from liqfade.strategy.types import FeatureRow
 
 __all__ = [
     "FeatureWindows",
+    "active_mask",
     "build_feature_grid",
+    "candidates",
+    "cascade_windows",
     "iter_grid_rows",
     "iter_ticks",
+    "merge_spans",
+    "row_columns",
     "trigger_venues",
 ]
 
@@ -164,24 +169,17 @@ def build_feature_grid(
     return _with_levels(grid, levels, settings)
 
 
-def active_mask(grid: pl.DataFrame, settings: Settings) -> pl.Series:
-    """Which grid rows a cascade could possibly involve. A deliberate **superset**.
+def candidate_expr(settings: Settings) -> pl.Expr:
+    """The rows a cascade could possibly *start* on. A deliberate **superset**.
 
-    Almost every second of a year is a market in which nothing can happen: no forced flow,
-    no move, nothing for the detector to do but be handed a row and put it down. Building a
-    `FeatureRow` for each of those is most of a run's wall time, and this is what stops it.
-
-    The mask is a superset of the detector's own start conditions on purpose. It drops the
-    direction test that pairs the move with the liquidated side, and it takes either side's
-    z-score, so a row the detector *would* have acted on can never be filtered away. Being
-    too generous here costs a little speed; being too strict would silently change results,
+    A superset of the detector's own start conditions on purpose. It drops the direction
+    test that pairs the move with the liquidated side, and it takes either side's z-score,
+    so a row the detector *would* have acted on can never be filtered away. Being too
+    generous here costs a little speed; being too strict would silently change results,
     which is why the test asserts a filtered run matches an unfiltered one trade for trade.
-
-    Every row within `exhaustion.max_age_s` after a candidate is kept too, because that is
-    how long the detector can still be tracking the cascade that started there.
     """
     windows = FeatureWindows(settings)
-    cascade, exhaustion = settings.cascade, settings.exhaustion
+    cascade = settings.cascade
     w, rv_s = windows.cascade_s, windows.rv_s
 
     if cascade.trigger == "proxy":
@@ -198,25 +196,126 @@ def active_mask(grid: pl.DataFrame, settings: Settings) -> pl.Series:
     moved = (
         pl.col(f"ret_{w}s").abs() / pl.col(f"rv_{rv_s}s") >= cascade.ret_over_rv_min
     ).fill_null(False)
-    candidate = flow & moved & lopsided
-    # +1 step so the row that starts a cascade is itself inside the window it opens.
-    span = int(exhaustion.max_age_s * 1000 // windows.step_ms) + 1
+    return flow & moved & lopsided
+
+
+def candidates(grid: pl.DataFrame, settings: Settings) -> pl.DataFrame:
+    """`coin`, `ts_ms` of every row `candidate_expr` fires on, sorted by time."""
+    if grid.is_empty():
+        return pl.DataFrame(schema={"coin": pl.String, "ts_ms": pl.Int64})
+    return grid.filter(candidate_expr(settings)).select("coin", "ts_ms").sort("ts_ms", "coin")
+
+
+def active_mask(
+    grid: pl.DataFrame, settings: Settings, *, carry: pl.DataFrame | None = None
+) -> pl.Series:
+    """Which grid rows a cascade could possibly involve: a candidate, or within
+    `exhaustion.max_age_s` after one, because that is how long the detector can still be
+    tracking the cascade that started there.
+
+    Almost every second of a year is a market in which nothing can happen: no forced flow,
+    no move, nothing for the detector to do but be handed a row and put it down. Building a
+    `FeatureRow` for each of those is most of a run's wall time, and this is what stops it.
+
+    `carry` is `candidates` from *before* `grid` starts, which is how a day loop keeps a
+    cascade that began at 23:59 alive into the next day's grid. Without it the mask would
+    restart at every midnight and a cascade straddling one would lose the rows it was still
+    being tracked on. Rows are matched to the last candidate at or before them rather than
+    counted off a rolling window, so the carry needs only the candidates, not the previous
+    day's rows.
+    """
+    if grid.is_empty():
+        return pl.Series("_needed", [], dtype=pl.Boolean)
+    found = candidates(grid, settings)
+    if carry is not None and not carry.is_empty():
+        found = pl.concat([carry.select("coin", "ts_ms"), found]).sort("ts_ms", "coin")
+    if found.is_empty():
+        return pl.Series("_needed", [False] * grid.height, dtype=pl.Boolean)
+    max_age_ms = int(settings.exhaustion.max_age_s * 1000)
+    # `join_asof` wants the left frame sorted on the join key itself, not on (coin, key),
+    # and silently returns the wrong neighbour when it is not. The row index carries the
+    # caller's (coin, ts_ms) order through the reorder so the mask still lines up with it.
     return (
         grid.sort("coin", "ts_ms")
-        .with_columns(candidate.cast(pl.Int8).alias("_candidate"))
-        .with_columns(
-            pl.col("_candidate")
-            .rolling_max(window_size=span, min_samples=1)
-            .over("coin")
+        .with_row_index("_row")
+        .sort("ts_ms")
+        .join_asof(
+            found.select("coin", pl.col("ts_ms").alias("_candidate_ts")).sort("_candidate_ts"),
+            left_on="ts_ms",
+            right_on="_candidate_ts",
+            by="coin",
+            strategy="backward",
+        )
+        .sort("_row")
+        .select(
+            ((pl.col("ts_ms") - pl.col("_candidate_ts")) <= max_age_ms)
+            .fill_null(False)
             .alias("_needed")
         )
         .get_column("_needed")
-        .cast(pl.Boolean)
     )
 
 
+def cascade_windows(found: pl.DataFrame, settings: Settings) -> dict[str, list[tuple[int, int]]]:
+    """The stretches of tape a run has to replay, per coin, merged where they overlap.
+
+    A window opens `backtest.window_warmup_s` before a candidate, so the book, the tape and
+    the coin's `last_data_ms` are warm by the time the detector could act, and closes at
+    `exhaustion.max_age_s + intent.time_stop_s + backtest.window_margin_s` after it. That
+    end is an upper bound on the last thing the cascade can cause: the latest tick it can
+    still signal on is `max_age_s`, the position that signal opens is flattened by the time
+    stop `time_stop_s` later at the latest, and the margin covers the order latency and the
+    tick the exit lands on. Outside a window the portfolio is therefore flat and no order is
+    working, which `run_backtest` asserts rather than assumes.
+
+    Args:
+        found: `candidates` output, or any `coin`/`ts_ms` frame.
+        settings: resolved config.
+
+    Returns:
+        `{coin: [(from_ms, to_ms), ...]}`, half open, sorted and non-overlapping.
+    """
+    before = int(settings.backtest.window_warmup_s * 1000)
+    after = int(
+        (
+            settings.exhaustion.max_age_s
+            + settings.intent.time_stop_s
+            + settings.backtest.window_margin_s
+        )
+        * 1000
+    )
+    spans: dict[str, list[tuple[int, int]]] = {}
+    if found.is_empty():
+        return spans
+    for coin, ts_ms in zip(
+        found.get_column("coin").to_list(), found.get_column("ts_ms").to_list(), strict=True
+    ):
+        spans.setdefault(coin, []).append((ts_ms - before, ts_ms + after))
+    return {coin: merge_spans(found_spans) for coin, found_spans in sorted(spans.items())}
+
+
+def merge_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Collapse overlapping or touching `[from, to)` spans into as few as possible.
+
+    A busy day carries dozens of cascades whose padded windows overlap. Replaying the
+    overlap twice would apply the same prints to the same book twice, so this is
+    correctness, not only speed.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def iter_grid_rows(
-    grid: pl.DataFrame, settings: Settings, *, coins: Sequence[str] | None = None
+    grid: pl.DataFrame,
+    settings: Settings,
+    *,
+    coins: Sequence[str] | None = None,
+    keep: pl.Series | None = None,
 ) -> Iterator[tuple[int, dict[str, FeatureRow]]]:
     """Walk the grid one timestamp at a time, yielding the coins that updated at it.
 
@@ -229,13 +328,18 @@ def iter_grid_rows(
     which builds a dict per row. That is the difference between roughly 18 and roughly 3
     microseconds a row, and there are 86,400 rows per coin per day.
 
+    `keep` is the mask to apply, for a caller that already computed one over a wider frame
+    than `grid`: the day loop needs the previous day's candidates carried in, which
+    `active_mask` cannot see from the day alone.
+
     Yields `(ts_ms, {coin: FeatureRow})` in time order, coins within a timestamp in name
     order, so a replay is reproducible.
     """
     if grid.is_empty():
         return
     sorted_grid = grid.sort("coin", "ts_ms")
-    frame = sorted_grid.filter(active_mask(sorted_grid, settings)).sort("ts_ms", "coin")
+    mask = active_mask(sorted_grid, settings) if keep is None else keep
+    frame = sorted_grid.filter(mask).sort("ts_ms", "coin")
     if coins is not None:
         frame = frame.filter(pl.col("coin").is_in(sorted(set(coins))))
     if frame.is_empty():
@@ -421,6 +525,12 @@ def _with_levels(
             .drop("known_from", strict=False)
         )
     return out.sort("coin", "ts_ms")
+
+
+def row_columns(settings: Settings) -> tuple[str, ...]:
+    """Every grid column a `FeatureRow` reads. The complete read surface of the strategy,
+    so a cache that stores these and nothing else stores enough."""
+    return _row_columns(FeatureWindows(settings))
 
 
 def _row_columns(windows: FeatureWindows) -> tuple[str, ...]:

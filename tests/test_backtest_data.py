@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -15,7 +14,7 @@ from liqfade.backtest.data import (
     Bbo,
     Trade,
     iter_events,
-    load_window,
+    load_day,
     utc_days,
 )
 
@@ -163,8 +162,8 @@ class TestAbsence:
     def test_an_empty_trades_frame_yields_nothing(self) -> None:
         assert list(iter_events(trades=pl.DataFrame())) == []
 
-    def test_load_window_on_an_absent_table_returns_an_empty_frame(self, tmp_path: Path) -> None:
-        assert load_window(tmp_path, "bbo", start_ms=T0, end_ms=T0 + 1000).is_empty()
+    def test_load_day_on_an_absent_table_returns_an_empty_frame(self, tmp_path: Path) -> None:
+        assert load_day(tmp_path, "bbo", "2026-03-01").is_empty()
 
 
 class TestL2Assembly:
@@ -199,10 +198,8 @@ class TestRealFixtureLake:
     def test_it_reads_trades_bbo_l2_and_asset_ctx_off_the_lake(self) -> None:
         # Derived from the partition name rather than written as an epoch, so a
         # regenerated fixture on a different date does not need this number edited.
-        day_start = int(datetime.fromisoformat(f"{FIXTURE_DAY}T00:00:00+00:00").timestamp() * 1000)
-        window = {"start_ms": day_start, "end_ms": day_start + DAY_MS}
         loaded = {
-            table: load_window(FIXTURE_LAKE, table, **window)
+            table: load_day(FIXTURE_LAKE, table, FIXTURE_DAY)
             for table in ("trades", "bbo", "l2", "asset_ctx")
         }
         for table, frame in loaded.items():

@@ -264,6 +264,14 @@ backtest:
   maker_requires_trade_through: true  # an Alo fills only on trade through or queue exhaustion
   slip_stale_bps: 5.0  # bps added when the L2 snapshot used for a taker fill is over 1s old
   stale_book_s: 1.0  # seconds after which an L2 snapshot counts as stale
+  # The replay window around each cascade candidate. Outside it the portfolio is flat by
+  # construction, so the tape there is read at all only to prove nothing was missed, which
+  # it cannot be. Warmup is what the book, the tape and risk.stale_coin_s need to be current
+  # by the time the detector could act; the margin is slack past the last thing a cascade
+  # can cause (exhaustion.max_age_s + intent.time_stop_s), covering the order latency and
+  # the tick the exit lands on. Both are seconds. See docs/DECISIONS.md, 2026-09-06.
+  window_warmup_s: 300.0
+  window_margin_s: 60.0
   holdout_frac: 0.25  # fraction of the chronological tail held out of any fitting
   walk_forward_refit_days: 30  # days between refits in the walk forward split
   bootstrap_samples: 1000  # trade level bootstrap draws for confidence intervals

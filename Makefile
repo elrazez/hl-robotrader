@@ -1,5 +1,5 @@
 # All targets go through `uv run` so they behave identically on the laptop and the VPS.
-.PHONY: setup lint test test-int record backfill data-quality backtest paper panel status sync clean frontend
+.PHONY: setup lint test test-int test-lake record backfill data-quality backtest paper panel status sync clean frontend
 
 CFG ?= config/backtest/v0.yaml
 
@@ -18,6 +18,9 @@ test:
 # Needs a .env with testnet keys. Never run against mainnet.
 test-int:
 	uv run pytest -m integration
+
+test-lake:
+	uv run pytest -m lake
 
 record:
 	uv run liqfade record

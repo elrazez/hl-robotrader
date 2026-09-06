@@ -64,16 +64,23 @@ So: three identical trades, all `long`, all exiting on `target` at 99.333, enter
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import polars as pl
 
 __all__ = [
     "ANCHOR_PX",
     "CASCADE_STARTS",
+    "DAY_MS",
     "EXTREME_PX",
     "N_CASCADES",
     "build",
     "expected_target_px",
+    "write_lake",
 ]
+
+DAY_MS = 86_400_000
 
 COIN = "GOLD"
 START_MS = 1_772_323_200_000  # 2026-03-01T00:00:00Z
@@ -161,6 +168,36 @@ def build() -> tuple[pl.DataFrame, pl.DataFrame, int, int]:
             liquidations.append(_liq(start + index * 5_000, CASCADE_NOTIONAL))
 
     return pl.DataFrame(trades), pl.DataFrame(liquidations), START_MS, END_MS
+
+
+def write_lake(root: Path, days: int) -> tuple[int, int]:
+    """Write the same tape to a real Parquet lake, repeated over `days` UTC days.
+
+    Returns `(start_ms, end_ms)` of the whole window. Each day is an independent copy of
+    the one-day fixture, shifted by a whole day, so a run over three days must find
+    `3 * N_CASCADES` cascades and every one of them must produce the trade the golden
+    derivation above predicts. That is what makes a streaming run checkable: the day loop,
+    the cache and the window maths cannot quietly drop or duplicate a day without the
+    trade count saying so.
+
+    The tape runs to midnight rather than stopping at `END_MS`, so a day boundary falls in
+    the middle of quiet tape rather than in the middle of a cascade. A cascade that
+    straddled midnight would be a good test of the spill, and it is a separate one; this
+    fixture is the baseline the spill is measured against.
+    """
+    from liqfade.data.schemas import SOURCE_HL_S3
+    from liqfade.recorder.writer import write_rows
+
+    trades, liquidations, start_ms, _ = build()
+    parquet = Path(root) / "parquet"
+    day_start = datetime.fromtimestamp(START_MS / 1000, UTC).date()
+    for offset in range(days):
+        shift = offset * DAY_MS
+        date = (day_start + timedelta(days=offset)).isoformat()
+        for table, frame in (("trades", trades), ("liquidations", liquidations)):
+            rows = frame.with_columns(pl.col("ts_ms") + shift).to_dicts()
+            write_rows(parquet, (table, "hyperliquid", date, 0), rows, source=SOURCE_HL_S3)
+    return start_ms, start_ms + days * DAY_MS
 
 
 def _liq(ts_ms: int, notional: float) -> dict[str, object]:

@@ -514,13 +514,15 @@ def _run_backtest_command(
     import cProfile
     import pstats
 
-    from liqfade.backtest.engine import load_inputs, run_backtest
+    from liqfade.backtest.data import day_files
+    from liqfade.backtest.engine import run_backtest
     from liqfade.backtest.progress import ProgressWriter
     from liqfade.backtest.report import run_id_for, write_report
+    from liqfade.backtest.source import LakeSource
     from liqfade.backtest.validate import bump_n_trials
 
     assert isinstance(progress, ProgressWriter)
-    inputs = load_inputs(
+    source = LakeSource(
         settings.paths.data_dir,
         settings=settings,
         coins=coins,
@@ -528,8 +530,12 @@ def _run_backtest_command(
         end_ms=end_ms,
         starting_equity=args.equity,
         seed=args.seed,
+        cache=not args.no_cache,
     )
-    if inputs.trades.is_empty():
+    # Checked off the partition directories rather than by reading the tape: the whole
+    # point of the streaming engine is that a year of trades is never loaded to find out
+    # whether it is there.
+    if not any(day_files(settings.paths.data_dir, "trades", day.date) for day in source.days()):
         print(
             f"backtest error: no trades in the lake for {','.join(coins)} between "
             f"{args.start} and {args.end}. Check --coins and the date range, or run "
@@ -542,7 +548,7 @@ def _run_backtest_command(
     profiler = cProfile.Profile() if args.profile else None
     if profiler is not None:
         profiler.enable()
-    result = run_backtest(inputs, settings, progress)
+    result = run_backtest(source, settings, progress)
     if profiler is not None:
         profiler.disable()
 
@@ -557,7 +563,7 @@ def _run_backtest_command(
         lagged_ms = args.lagged_ms
         degraded = _with_latency(settings, args.lagged_ms)
         progress.set(phase="lagged", stage="replaying", trades=0, net=0.0, intents=0)
-        lagged = run_backtest(inputs, degraded, progress)
+        lagged = run_backtest(source, degraded, progress)
         lagged_net = sum(trade.net_pnl for trade in lagged.trades)
         # Fragile means an edge that the extra latency took away. A run with no edge to
         # begin with is not fragile, it is empty, and stamping it would put a scary
@@ -939,6 +945,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backtest.add_argument(
         "--profile", action="store_true", help=f"print the top {PROFILE_ROWS} cumulative frames"
+    )
+    backtest.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="rebuild every day's feature grid instead of reading the cache under "
+        "<data-dir>/cache/features/",
     )
     backtest.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
     backtest.add_argument(
