@@ -12,7 +12,6 @@ from liqfade.lab.configs import save_config
 from liqfade.lab.runs import THE_YEAR
 from tests.test_lab_results import write_run
 
-pytestmark = pytest.mark.asyncio
 LAKE = Path(__file__).resolve().parent / "fixtures"
 
 

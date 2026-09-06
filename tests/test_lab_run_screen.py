@@ -10,7 +10,6 @@ import pytest
 from liqfade.lab.app import LabApp
 from liqfade.lab.configs import save_config
 
-pytestmark = pytest.mark.asyncio
 LAKE = Path(__file__).resolve().parent / "fixtures"
 
 

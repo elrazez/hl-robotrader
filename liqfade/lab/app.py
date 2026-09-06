@@ -18,6 +18,7 @@ from liqfade.lab.runs import RunQueue
 from liqfade.lab.screen_configs import ConfigsPane
 from liqfade.lab.screen_results import ResultsPane
 from liqfade.lab.screen_run import RunPane
+from liqfade.lab.screen_status import StatusPane
 
 LAB_CSS = """
 Screen { layout: vertical; }
@@ -39,6 +40,7 @@ ReportScreen, CompareScreen { align: center middle; }
     padding: 1 2;
 }
 #report-funnel { padding: 0 0 1 0; }
+#status-body { padding: 1 1; }
 #configs-status { color: $text-muted; padding: 0 1; }
 ConfigViewScreen, ConfigEditScreen, ConfirmScreen, ConfigNameScreen {
     align: center middle;
@@ -85,6 +87,9 @@ class LabApp(App[None]):
         self.reports_dir = Path(reports_dir)
         self.data_dir = Path(data_dir) if data_dir else Path("data")
         self.core_coins = core_coins
+        # The snapshot the recorder and the live loop write. Named here rather than read
+        # from Settings so the lab can be pointed at a synced copy of the VPS's data dir.
+        self.state_path = self.data_dir / "state.json"
         self.queue = RunQueue(self.reports_dir)
 
     def compose(self) -> ComposeResult:
@@ -102,6 +107,8 @@ class LabApp(App[None]):
                     self.queue,
                     self.core_coins,
                 )
+            with TabPane("Status", id="tab-status"):
+                yield StatusPane(self.state_path)
         yield Footer()
 
     def action_tab(self, name: str) -> None:

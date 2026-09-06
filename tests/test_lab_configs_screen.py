@@ -13,8 +13,6 @@ import pytest
 from liqfade.lab.app import LabApp
 from liqfade.lab.configs import read_config, save_config
 
-pytestmark = pytest.mark.asyncio
-
 
 def text_of(widget: object) -> str:
     """Whatever a Static is currently showing, as plain text."""

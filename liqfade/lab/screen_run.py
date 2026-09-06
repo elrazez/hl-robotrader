@@ -64,7 +64,7 @@ class RunPane(VerticalScroll):
     def compose(self) -> ComposeResult:
         configs = list_configs(self.config_dir)
         options = [(config.name, str(config.path)) for config in configs]
-        first = options[0][1] if options else Select.BLANK
+        first = options[0][1] if options else Select.NULL
         with Horizontal(classes="run-row"):
             yield Label("config", classes="run-key")
             yield Select(options, value=first, allow_blank=not options, id="run-config")
@@ -118,7 +118,7 @@ class RunPane(VerticalScroll):
         chosen = self.query_one("#run-config", Select).value
         start = self.query_one("#run-start", Input).value.strip()
         end = self.query_one("#run-end", Input).value.strip()
-        if chosen is Select.BLANK or not start or not end:
+        if chosen is Select.NULL or not start or not end:
             return None
         coins = tuple(
             part.strip().upper()
