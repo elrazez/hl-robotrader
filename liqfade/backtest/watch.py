@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from liqfade.backtest.progress import ProgressState
+from liqfade.backtest.progress import ProgressState, process_alive
 
 BOLD, DIM, GREEN, RED, CYAN, RESET = (
     "\x1b[1m",
@@ -96,7 +96,13 @@ def render(state: ProgressState | None, now: float, *, width: int = 100, path: P
         lines.append(f"{GREEN}report: {state.report_dir}{RESET}")
     if state.stage == "failed":
         lines.append(f"{RED}{state.error}{RESET}")
-    stale = now - state.updated_at
-    if state.stage not in ("done", "failed") and stale > 30:
-        lines.append(f"{DIM}no update for {_hms(stale)}: the run may be dead{RESET}")
+    if state.stage not in ("done", "failed"):
+        alive = process_alive(state.pid)
+        stale = now - state.updated_at
+        if alive is False:
+            lines.append(f"{RED}the run is gone (pid {state.pid} no longer exists){RESET}")
+        elif state.stage in ("loading", "features"):
+            lines.append(f"{DIM}this stage reports no progress; the process is alive{RESET}")
+        elif stale > 30:
+            lines.append(f"{DIM}no update for {_hms(stale)}, the process is alive{RESET}")
     return "\n".join(lines)

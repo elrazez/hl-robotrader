@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -124,3 +125,8 @@ def test_the_frame_shows_the_bar_the_eta_and_the_numbers() -> None:
     )
     assert "100.0%" in done and "reports/run" in done
     assert "no backtest running" in render(None, now=0.0, path=Path("nowhere"))
+    # A loading stage is not dead just because it is quiet; a vanished pid is.
+    loading = ProgressState(stage="loading", pid=os.getpid(), updated_at=0.0)
+    assert "process is alive" in render(loading, now=999.0, path=Path("x"))
+    gone = ProgressState(stage="replaying", pid=2**22 - 1, updated_at=0.0)
+    assert "the run is gone" in render(gone, now=999.0, path=Path("x"))

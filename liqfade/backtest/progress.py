@@ -49,6 +49,7 @@ class ProgressState:
     lagged_ms: int | None = None
     report_dir: str = ""
     error: str = ""
+    pid: int = 0
 
     @property
     def fraction(self) -> float:
@@ -67,7 +68,9 @@ class ProgressWriter:
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
-        self.state = ProgressState(started_at=time.time(), phase_started_at=time.time())
+        self.state = ProgressState(
+            started_at=time.time(), phase_started_at=time.time(), pid=os.getpid()
+        )
         self._next_sim_ms = 0
         self._next_wall = 0.0
         self._failed = False
@@ -109,6 +112,19 @@ class ProgressWriter:
         except OSError:
             # The bar is not worth the run. Stop trying rather than fail every second.
             self._failed = True
+
+
+def process_alive(pid: int) -> bool | None:
+    """True or False when the pid can be checked, None when it is unknown (zero)."""
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def read_progress(path: Path) -> ProgressState | None:
