@@ -321,11 +321,26 @@ class Intent:
 
     @property
     def edge_frac(self) -> float:
-        """Expected move to target as a fraction of entry, always positive.
+        """Expected move to target as a fraction of entry, **signed in the trade's own
+        direction**: positive when the target is ahead of the entry, negative when it has
+        already been passed.
 
-        Signed the same way for both sides: a long's target is above entry and a short's
-        is below, and both are edge.
+        It was `abs()`, and that was a defect rather than a convenience. A long's target is
+        normally above its entry and a short's below, so the absolute value agreed with the
+        signed one on every trade the fixed-delay entry produced. Under
+        `exhaustion.mode: rule`, and more so with the `level_reclaim` rule, the entry lands
+        after the bounce has started: with `intent.target_from: extreme` the target sits at
+        a fixed point on the way back to the anchor and price can already be past it, and
+        `abs()` then reported the distance *back* to a target behind us as edge. The year
+        run of 2026-09-06 took 31 such trades whose median hold was 1.4 seconds, every one
+        of them a loss by construction. `filters.edge_too_small` now blocks a non-positive
+        edge outright, with its own reason, so it can never be mistaken for a small one.
         """
         if self.entry_px <= 0:
             return 0.0
-        return abs(self.target_px - self.entry_px) / self.entry_px
+        ahead = (
+            self.target_px - self.entry_px
+            if self.side == "long"
+            else self.entry_px - self.target_px
+        )
+        return ahead / self.entry_px

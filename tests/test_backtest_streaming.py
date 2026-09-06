@@ -292,12 +292,21 @@ class TestACascadeThatStraddlesMidnight:
 # on the same commit it produced the digest below. A run whose funnel shows a
 # `kill_switch` block with no KILL file on disk has hit the same thing and is not a
 # reference.
+#
+# **Re-pinned on 2026-09-06, from seven trades to four.** The digest above it was taken
+# before `Intent.edge_frac` was signed, and the reference run carried the same defect the
+# 04c year run found: three of its seven trades had a target *behind* the entry, which
+# `abs()` reported as edge and which `filters.min_edge_multiple` therefore let through. They
+# were losses on the tick they opened. The streaming engine is still byte-identical to the
+# engine it replaced; what changed is that three trades nothing should ever have taken are
+# gone. A digest that had survived this change would have meant the fix did nothing.
+# docs/DECISIONS.md, 2026-09-06.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",
     "coins": "BTC,ETH,SOL,HYPE",
-    "sha256": "a945c9a7295d24f9a41ba27b6dda43fed9e1bfe43f02eaa3e4047f75d2372f00",
-    "trades": 7,
+    "sha256": "ee18f6c2164c84e97e785439cecdd80f94d3099b98dcd5a01bd9979e93e10496",
+    "trades": 4,
 }
 
 

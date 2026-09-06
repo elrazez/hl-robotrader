@@ -373,6 +373,56 @@ class TestFilters:
         assert run_to_signal(engine) == []
         assert engine.take_rejections()[0].reason == "edge_too_small"
 
+    def test_a_target_behind_the_entry_is_zero_edge_and_names_itself(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The ETH short from the year run of 2026-09-06: entry 4369.2, target 4394.5.
+
+        A short whose target sits *above* its entry loses on the tick it opens. Under the
+        old `abs()` that read as 58 bps of edge, cleared `min_edge_multiple` and became a
+        trade with a 1.4 second hold; 31 of that run's 33 target exits were exactly this.
+        The reason is its own, because a funnel filing these under `edge_too_small` says the
+        threshold is too high when what is wrong is the target.
+        """
+        from dataclasses import replace
+
+        from liqfade.strategy.filters import edge_too_small
+
+        behind = Intent(
+            coin="ETH",
+            side="short",
+            entry_px=4369.2,
+            target_px=4394.5,
+            stop_px=4300.0,
+            time_stop_s=900.0,
+            urgency="normal",
+            ts_ms=START_MS,
+        )
+        assert behind.edge_frac == pytest.approx(-25.3 / 4369.2)
+        assert edge_too_small(behind.edge_frac, settings_factory()) == "target_behind"
+
+        # The same distance the right way round is edge, and clears the fee multiple.
+        ahead = replace(behind, target_px=4343.9)
+        assert ahead.edge_frac == pytest.approx(25.3 / 4369.2)
+        assert edge_too_small(ahead.edge_frac, settings_factory()) is None
+
+    def test_a_long_reads_the_mirror_of_that(self, settings_factory: SettingsFactory) -> None:
+        """A long's target below its entry is the same fault with both signs flipped."""
+        from liqfade.strategy.filters import edge_too_small
+
+        behind = Intent(
+            coin="ETH",
+            side="long",
+            entry_px=4674.0,
+            target_px=4656.6,
+            stop_px=4600.0,
+            time_stop_s=900.0,
+            urgency="normal",
+            ts_ms=START_MS,
+        )
+        assert behind.edge_frac < 0
+        assert edge_too_small(behind.edge_frac, settings_factory()) == "target_behind"
+
     def test_funding_gate_is_off_by_default_and_fires_when_set(
         self, settings_factory: SettingsFactory
     ) -> None:

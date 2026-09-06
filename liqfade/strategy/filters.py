@@ -49,7 +49,9 @@ def check_filters(
     Args:
         row: the coin's features at the decision tick.
         side: the position the intent would take.
-        edge_frac: `abs(target - entry) / entry`, the expected move to the target.
+        edge_frac: `Intent.edge_frac`, the move to the target as a fraction of entry,
+            signed in the trade's direction. Zero or less means the target is behind the
+            entry and the trade is a loss before costs.
         meta: the coin's venue and universe metadata.
         settings: resolved config.
         btc_cascade_side: which side BTC is currently cascading on, or None. The engine
@@ -102,13 +104,23 @@ def spread_too_wide(row: FeatureRow, meta: AssetMeta, settings: Settings) -> str
 
 
 def edge_too_small(edge_frac: float, settings: Settings) -> str | None:
-    """The move to the target does not clear a multiple of the round trip fee.
+    """The move to the target is backwards, or does not clear a multiple of the round trip.
+
+    Two reasons out of one check because they are two different faults. `target_behind` is
+    a target price already passed, which no threshold can rescue; `edge_too_small` is a real
+    move that is too small to pay for itself.
 
     The round trip is priced as taker in and maker out, which is how the entry and exit
     policy actually works: entries rest as `Alo` and only high urgency falls back to
     taking, while the target exit is a resting order. Using two taker legs would be a
     stricter gate than the strategy incurs and would drop trades that pay.
     """
+    if edge_frac <= 0:
+        # Not a small edge, a negative one: the target is behind the entry, so the position
+        # would be opened and closed at a loss on the next tick. Its own reason, because a
+        # funnel that files these under `edge_too_small` says the threshold is too high
+        # when what is wrong is the target. See `Intent.edge_frac`.
+        return "target_behind"
     fees = settings.backtest.taker_fee_frac + settings.backtest.maker_fee_frac
     return "edge_too_small" if edge_frac < settings.filters.min_edge_multiple * fees else None
 
