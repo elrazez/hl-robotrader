@@ -107,10 +107,15 @@ class RiskStateStore:
 
     Not async and not buffered. The write happens a handful of times per trade, and the
     cost of an fsync there is nothing against the cost of a limit that forgot itself.
+
+    **`path=None` means in memory**, and that is what a backtest uses. A replay has no
+    prior state: inheriting the live account's halts and cooldowns would make a backtest
+    depend on what the bot did this morning, and writing them back could clear a halt
+    nobody had resolved. Persistence belongs to the live loop, which passes a real path.
     """
 
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | None) -> None:
+        self.path = Path(path) if path is not None else None
         self.state = self._load()
 
     def _load(self) -> RiskState:
@@ -120,12 +125,14 @@ class RiskStateStore:
         starting over would clear a halt the owner has not resolved, and the halt is the
         thing most likely to matter at the moment a file gets corrupted.
         """
-        if not self.path.exists():
+        if self.path is None or not self.path.exists():
             return RiskState()
         return RiskState.model_validate(orjson.loads(self.path.read_bytes()))
 
     def save(self) -> None:
-        """Write the state atomically, 0600, in the directory it lives in."""
+        """Write the state atomically, 0600, in the directory it lives in. No-op in memory."""
+        if self.path is None:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         payload = orjson.dumps(self.state.model_dump(mode="json"), option=orjson.OPT_INDENT_2)

@@ -1,0 +1,788 @@
+"""The replay loop: events update state, ticks make decisions, orders become fills.
+
+One pass over the merged stream from `backtest/data.py`, interleaved with decision ticks
+from `backtest/clock.py`. Events maintain the book and tape per coin; a tick reads the
+precomputed feature grid, asks the strategy, sizes, checks risk, and places orders. Orders
+fill against the events that follow them, never against the ones that preceded them.
+
+The order of operations inside a tick matters and is fixed:
+
+1. mark equity from the current mids, and tell the risk engine
+2. expire and reprice resting entries whose `entry_ttl_s` has elapsed
+3. check exits on every open position: target, stop, time stop
+4. ask the strategy for intents
+5. size, gate, and place
+
+Exits are checked before entries so that a position closed on this tick frees its slot for
+an entry on the same tick, which is what live would do, and so that the risk engine sees
+the post-exit book when it counts concurrent positions.
+
+**Determinism is a hard requirement, not an aspiration.** Nothing here reads a clock, and
+the only source of randomness is the `--seed` the CLI passes, which currently nothing
+consumes: the model has no stochastic component. Coins are iterated in sorted order and the
+event stream breaks ties on a fixed key, so the same command twice writes byte-identical
+`trades.parquet`. `tests/test_backtest_engine.py` asserts it.
+"""
+
+from __future__ import annotations
+
+import random
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import polars as pl
+
+from liqfade.backtest.clock import Tick, merge, tick_times
+from liqfade.backtest.data import (
+    L2,
+    AssetCtx,
+    Bbo,
+    Event,
+    Liq,
+    Trade,
+    iter_events,
+    load_window,
+)
+from liqfade.backtest.features import build_feature_grid, iter_ticks
+from liqfade.backtest.fills import (
+    BookState,
+    Fill,
+    OrderKind,
+    SimOrder,
+    fill_maker,
+    fill_taker,
+    gapped_stop_order,
+    stop_triggered,
+)
+from liqfade.backtest.portfolio import Portfolio
+from liqfade.backtest.portfolio import Trade as PortfolioTrade
+from liqfade.config.models import Settings
+from liqfade.log import get_logger
+from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
+from liqfade.sizing import LiquidityStats, size_intent
+from liqfade.strategy.engine import Rejection, StrategyEngine
+from liqfade.strategy.types import AssetMeta, FeatureRow, Intent
+
+log = get_logger(__name__)
+
+__all__ = ["BacktestResult", "RunInputs", "run_backtest"]
+
+# szDecimals and maxLeverage when `meta.universe` was not supplied. Five decimals is the
+# finest Hyperliquid uses, so it rounds least, and 3x is its most conservative leverage
+# tier. Both are deliberately the choice that constrains the backtest most: a run that
+# invented a generous asset spec would report sizes the venue would have refused.
+DEFAULT_SZ_DECIMALS = 5
+DEFAULT_MAX_LEVERAGE = 3.0
+
+
+@dataclass
+class RunInputs:
+    """Everything one replay reads. Frames rather than paths, so the engine does no I/O.
+
+    `run_backtest` is therefore a pure function of its inputs plus the config, which is
+    what makes the determinism and no-lookahead tests possible: a test builds the frames it
+    wants rather than a lake.
+    """
+
+    trades: pl.DataFrame
+    liquidations: pl.DataFrame
+    start_ms: int
+    end_ms: int
+    bbo: pl.DataFrame | None = None
+    l2: pl.DataFrame | None = None
+    asset_ctx: pl.DataFrame | None = None
+    levels: pl.DataFrame | None = None
+    meta: Mapping[str, AssetMeta] = field(default_factory=dict)
+    starting_equity: float = 10_000.0
+    seed: int = 0
+
+
+@dataclass
+class BacktestResult:
+    """What a run produced, before any of it is written down."""
+
+    trades: list[PortfolioTrade]
+    equity_curve: list[tuple[int, float]]
+    portfolio: Portfolio
+    strategy: StrategyEngine
+    risk_blocks: dict[str, int]
+    rejections: list[Rejection]
+    intents: int = 0
+    entries_placed: int = 0
+    sizing_blocks: dict[str, int] = field(default_factory=dict)
+    depth_capped_entries: int = 0
+    start_ms: int = 0
+    end_ms: int = 0
+    coins: tuple[str, ...] = ()
+
+
+class _CoinState:
+    """Per-coin book, tape and the orders working against them."""
+
+    __slots__ = ("book", "entry", "exit_order", "intent", "last_data_ms", "reprices")
+
+    def __init__(self) -> None:
+        self.book = BookState()
+        self.entry: SimOrder | None = None
+        self.exit_order: SimOrder | None = None
+        self.intent: Intent | None = None
+        self.last_data_ms: int | None = None
+        self.reprices = 0
+
+
+def load_inputs(
+    data_dir: Path,
+    *,
+    settings: Settings,
+    coins: Sequence[str],
+    start_ms: int,
+    end_ms: int,
+    starting_equity: float,
+    seed: int = 0,
+) -> RunInputs:
+    """Read every table the run needs off the lake. The only I/O in the backtest package.
+
+    Liquidations are read across every venue and filtered by `cascade.trigger` inside
+    `build_feature_grid`, so switching triggers does not need a different read.
+    """
+    window = {"start_ms": start_ms, "end_ms": end_ms, "coins": list(coins)}
+    trades = load_window(data_dir, "trades", venue="hyperliquid", **window)  # type: ignore[arg-type]
+    return RunInputs(
+        trades=trades,
+        liquidations=load_window(data_dir, "liquidations", **window),  # type: ignore[arg-type]
+        bbo=_or_none(load_window(data_dir, "bbo", **window)),  # type: ignore[arg-type]
+        l2=_or_none(load_window(data_dir, "l2", **window)),  # type: ignore[arg-type]
+        asset_ctx=_or_none(load_window(data_dir, "asset_ctx", **window)),  # type: ignore[arg-type]
+        start_ms=start_ms,
+        end_ms=end_ms,
+        starting_equity=starting_equity,
+        seed=seed,
+    )
+
+
+def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
+    """Replay one window and return everything it produced.
+
+    Args:
+        inputs: the frames, the window, the asset metadata and the starting equity.
+        settings: resolved config. `cascade.trigger` picks the liquidation feed;
+            `backtest.latency_ms` sets how late every order is.
+
+    Returns:
+        A `BacktestResult`. The trade list is the run's output; everything else exists so
+        the report can say why there were not more of them.
+    """
+    # Seeded even though nothing currently draws from it: the fill model has no
+    # stochastic component. It exists so that adding one later cannot silently break the
+    # determinism guarantee, and it is not a cryptographic use.
+    random.Random(inputs.seed)  # noqa: S311
+
+    coins = (
+        tuple(sorted(inputs.trades["coin"].unique().to_list()))
+        if not inputs.trades.is_empty()
+        else ()
+    )
+    meta = _resolve_meta(inputs.meta, coins, settings)
+    grid = build_feature_grid(
+        settings=settings,
+        trades=inputs.trades,
+        liquidations=inputs.liquidations,
+        start_ms=inputs.start_ms,
+        end_ms=inputs.end_ms,
+        bbo=inputs.bbo,
+        l2=inputs.l2,
+        asset_ctx=inputs.asset_ctx,
+        levels=inputs.levels,
+    )
+
+    portfolio = Portfolio(settings, starting_equity=inputs.starting_equity)
+    strategy = StrategyEngine(settings, meta)
+    # In memory: a replay starts from no halts and no cooldowns, and must never
+    # read or write the live account's risk state.
+    risk = RiskEngine(settings, path=None)
+    state: dict[str, _CoinState] = {coin: _CoinState() for coin in coins}
+
+    _load_funding(portfolio, inputs.asset_ctx)
+    rows_by_tick = dict(iter_ticks(grid, settings)) if not grid.is_empty() else {}
+
+    result = BacktestResult(
+        trades=portfolio.trades,
+        equity_curve=[],
+        portfolio=portfolio,
+        strategy=strategy,
+        risk_blocks={},
+        rejections=[],
+        start_ms=inputs.start_ms,
+        end_ms=inputs.end_ms,
+        coins=coins,
+    )
+
+    events = iter_events(
+        trades=inputs.trades,
+        liquidations=inputs.liquidations,
+        bbo=inputs.bbo,
+        l2=inputs.l2,
+        asset_ctx=inputs.asset_ctx,
+    )
+    ticks = tick_times(inputs.start_ms, inputs.end_ms, settings.features.decision_cadence_ms)
+    cloid = _CloidCounter()
+
+    for item in merge(events, ticks):
+        if isinstance(item, Tick):
+            _on_tick(
+                item.ts_ms,
+                state,
+                rows_by_tick,
+                portfolio,
+                strategy,
+                risk,
+                result,
+                meta,
+                settings,
+                cloid,
+            )
+        else:
+            _on_event(item, state, portfolio, result, settings)
+
+    _close_out(inputs.end_ms, state, portfolio, result, settings)
+    result.rejections = strategy.take_rejections()
+    return result
+
+
+# --- events -------------------------------------------------------------------
+
+
+def _on_event(
+    event: Event,
+    state: dict[str, _CoinState],
+    portfolio: Portfolio,
+    result: BacktestResult,
+    settings: Settings,
+) -> None:
+    """Apply one market event: update the book, then let it fill resting orders."""
+    coin = event.coin
+    coin_state = state.get(coin)
+    if coin_state is None:
+        coin_state = state[coin] = _CoinState()
+    coin_state.last_data_ms = event.ts_ms
+
+    if isinstance(event, L2):
+        coin_state.book = BookState(
+            bids=event.bids,
+            asks=event.asks,
+            snapshot_ms=event.ts_ms,
+            last_px=coin_state.book.last_px,
+            last_trade_ms=coin_state.book.last_trade_ms,
+        )
+    elif isinstance(event, Bbo):
+        # A quote is a one-level book. It is better than the last trade price and worse
+        # than a full snapshot, and the walk degrades naturally when it runs out of levels.
+        coin_state.book = BookState(
+            bids=((event.bid_px, event.bid_sz),),
+            asks=((event.ask_px, event.ask_sz),),
+            snapshot_ms=event.ts_ms,
+            last_px=coin_state.book.last_px,
+            last_trade_ms=coin_state.book.last_trade_ms,
+        )
+    elif isinstance(event, Trade):
+        coin_state.book = BookState(
+            bids=coin_state.book.bids,
+            asks=coin_state.book.asks,
+            snapshot_ms=coin_state.book.snapshot_ms,
+            last_px=event.px,
+            last_trade_ms=event.ts_ms,
+        )
+        _fill_against_print(event, coin_state, portfolio, result, settings)
+    elif isinstance(event, AssetCtx):
+        portfolio.funding.add_sample(coin, event.ts_ms, event.funding)
+    elif isinstance(event, Liq):
+        # Liquidations only feed the feature grid, which was built before the loop. They
+        # still stamp `last_data_ms`, because a liquidation print is data arriving.
+        pass
+
+
+def _fill_against_print(
+    trade: Trade,
+    coin_state: _CoinState,
+    portfolio: Portfolio,
+    result: BacktestResult,
+    settings: Settings,
+) -> None:
+    """Offer one print to whichever resting maker orders this coin has."""
+    is_buy = trade.side == "buy"
+    entry = coin_state.entry
+    if entry is not None and entry.kind is OrderKind.ALO:
+        fill = fill_maker(
+            entry,
+            trade_px=trade.px,
+            trade_sz=trade.sz,
+            trade_is_buy=is_buy,
+            now_ms=trade.ts_ms,
+            settings=settings,
+        )
+        if fill is not None and coin_state.intent is not None:
+            portfolio.apply_entry(fill, coin_state.intent)
+            if entry.remaining <= 0:
+                coin_state.entry = None
+
+    exit_order = coin_state.exit_order
+    if exit_order is not None and exit_order.kind is OrderKind.ALO:
+        fill = fill_maker(
+            exit_order,
+            trade_px=trade.px,
+            trade_sz=trade.sz,
+            trade_is_buy=is_buy,
+            now_ms=trade.ts_ms,
+            settings=settings,
+        )
+        if fill is not None:
+            _book_exit(fill, exit_order, coin_state, portfolio, result)
+
+
+# --- ticks --------------------------------------------------------------------
+
+
+def _on_tick(
+    now_ms: int,
+    state: dict[str, _CoinState],
+    rows_by_tick: Mapping[int, Mapping[str, FeatureRow]],
+    portfolio: Portfolio,
+    strategy: StrategyEngine,
+    risk: RiskEngine,
+    result: BacktestResult,
+    meta: Mapping[str, AssetMeta],
+    settings: Settings,
+    cloid: _CloidCounter,
+) -> None:
+    """One decision tick, in the fixed order the module docstring names."""
+    mids = {coin: coin_state.book.mid() for coin, coin_state in state.items()}
+    equity = portfolio.equity(mids)
+    result.equity_curve.append((now_ms, equity))
+    risk.on_equity(equity, now_ms)
+
+    _cross_taker_entries(now_ms, state, portfolio, settings)
+    _expire_entries(now_ms, state, portfolio, result, settings)
+    _check_exits(now_ms, state, mids, portfolio, result, settings, cloid)
+
+    rows = rows_by_tick.get(now_ms)
+    if not rows:
+        return
+    intents = strategy.on_tick(now_ms, rows)
+    result.intents += len(intents)
+    for intent in intents:
+        _place_entry(
+            intent, now_ms, state, rows, mids, portfolio, risk, result, meta, settings, cloid
+        )
+
+
+def _place_entry(
+    intent: Intent,
+    now_ms: int,
+    state: dict[str, _CoinState],
+    rows: Mapping[str, FeatureRow],
+    mids: Mapping[str, float | None],
+    portfolio: Portfolio,
+    risk: RiskEngine,
+    result: BacktestResult,
+    meta: Mapping[str, AssetMeta],
+    settings: Settings,
+    cloid: _CloidCounter,
+) -> None:
+    """Size an intent, gate it, and rest an order if it survives both."""
+    coin_state = state.setdefault(intent.coin, _CoinState())
+    if coin_state.entry is not None or intent.coin in portfolio.positions:
+        # Already working or already on. The live order policy reprices rather than
+        # stacking a second entry on the same cascade.
+        return
+
+    row = rows[intent.coin]
+    asset = meta[intent.coin]
+    decision = size_intent(
+        intent,
+        equity=portfolio.equity(mids),
+        stats=LiquidityStats(
+            traded_usd_window=row.traded_usd_vol_window,
+            depth_usd=row.depth(intent.side),
+        ),
+        meta=asset,
+        settings=settings,
+        coin_exposure_usd=portfolio.coin_exposure(intent.coin, mids.get(intent.coin)),
+        total_exposure_usd=portfolio.gross_exposure(mids),
+    )
+    if decision.reason is not None:
+        result.sizing_blocks[decision.reason] = result.sizing_blocks.get(decision.reason, 0) + 1
+        return
+    if decision.depth_cap_applied:
+        result.depth_capped_entries += 1
+
+    request = EntryRequest(
+        coin=intent.coin,
+        side=intent.side,
+        notional_usd=decision.notional_usd,
+        now_ms=now_ms,
+    )
+    verdict = risk.check_entry(
+        request,
+        AccountView(
+            equity=portfolio.equity(mids),
+            open_sides=portfolio.open_sides(),
+            coin_last_data_ms={
+                coin: cs.last_data_ms for coin, cs in state.items() if cs.last_data_ms is not None
+            },
+            global_last_data_ms=max(
+                (cs.last_data_ms for cs in state.values() if cs.last_data_ms is not None),
+                default=None,
+            ),
+        ),
+    )
+    if not verdict.allowed:
+        assert verdict.reason is not None
+        result.risk_blocks[verdict.reason] = result.risk_blocks.get(verdict.reason, 0) + 1
+        return
+
+    risk.on_entry(request)
+    coin_state.intent = intent
+    coin_state.reprices = 0
+    coin_state.entry = _entry_order(
+        intent, float(decision.size), coin_state, now_ms, settings, cloid
+    )
+    result.entries_placed += 1
+
+
+def _entry_order(
+    intent: Intent,
+    size: float,
+    coin_state: _CoinState,
+    now_ms: int,
+    settings: Settings,
+    cloid: _CloidCounter,
+) -> SimOrder:
+    """Build the entry order, with the queue we assume is ahead of us.
+
+    Whether it crosses is `execution.entry_tif`, plus the high-urgency exception in
+    `intent.allow_taker_entry_high_urgency`.
+
+    **This choice decides whether the run has any trades at all, and the default is the
+    strict one.** Under `Alo` with `exhaustion.mode: fixed_delay`, the entry is placed 120s
+    after the cascade started, by which time the reversion the strategy is trying to catch
+    is already underway; a passive bid sits behind a rising market, misses through all
+    `execution.max_reprices`, and is abandoned. That is what the policy in
+    `docs/STRATEGY_AND_RISK.md` section 3 actually implies, and the report counts every
+    abandonment so it is visible rather than mysterious.
+
+    Phase 3 measured something different. Q1's net-stress figure prices the first print
+    after the extreme plus one second and subtracts a full effective spread **per side**,
+    which is a crossing entry. Reproducing those numbers therefore needs
+    `execution.entry_tif: Ioc` in the run config. The two are both defensible and they are
+    not the same strategy, so the key is honoured here rather than hardcoded either way.
+    """
+    taker = settings.execution.entry_tif == "Ioc" or (
+        intent.urgency == "high" and settings.intent.allow_taker_entry_high_urgency
+    )
+    levels = coin_state.book.levels(intent.side)
+    # Everything displayed at our price is assumed to be ahead of us. With no book we
+    # assume an empty queue, which is optimistic, and the no-book fills are counted so a
+    # reader knows how much of the run rested on that assumption.
+    queue = next((sz for px, sz in levels if px == intent.entry_px), 0.0)
+    return SimOrder(
+        cloid=cloid.next(),
+        coin=intent.coin,
+        side=intent.side,
+        kind=OrderKind.IOC if taker else OrderKind.ALO,
+        px=intent.entry_px,
+        size=size,
+        visible_ms=now_ms + settings.backtest.latency_ms,
+        queue_ahead=queue,
+        tag="entry",
+    )
+
+
+def _cross_taker_entries(
+    now_ms: int,
+    state: dict[str, _CoinState],
+    portfolio: Portfolio,
+    settings: Settings,
+) -> None:
+    """Execute a high urgency entry against the book as soon as it becomes visible.
+
+    `Ioc` means fill what is there and cancel the rest, so unlike an `Alo` it never rests
+    waiting for a print to come to it. Whatever the book cannot fill is cancelled rather
+    than left working: an Ioc that quietly stayed on the book would be a different order
+    type than the one the strategy asked for, and would fill later at a price the urgency
+    flag exists to avoid waiting for.
+    """
+    for coin in sorted(state):
+        coin_state = state[coin]
+        entry = coin_state.entry
+        if entry is None or entry.kind is not OrderKind.IOC or now_ms < entry.visible_ms:
+            continue
+        fill = fill_taker(entry, coin_state.book, now_ms=now_ms, settings=settings)
+        if fill is not None and coin_state.intent is not None:
+            portfolio.apply_entry(fill, coin_state.intent)
+        else:
+            # Nothing to fill against, which on this lake means no book and no tape yet.
+            portfolio.abandoned_entries += 1
+            coin_state.intent = None
+        coin_state.entry = None
+
+
+def _expire_entries(
+    now_ms: int,
+    state: dict[str, _CoinState],
+    portfolio: Portfolio,
+    result: BacktestResult,
+    settings: Settings,
+) -> None:
+    """Reprice a resting entry past its TTL, and abandon it past `max_reprices`.
+
+    The same policy the live order manager will run. A backtest that let entries rest
+    forever would report a maker fill rate nobody is going to achieve.
+    """
+    ttl_ms = int(settings.execution.entry_ttl_s * 1000)
+    for coin_state in state.values():
+        entry = coin_state.entry
+        # Only a resting Alo expires. An Ioc is crossed or cancelled the moment it becomes
+        # visible, by _cross_taker_entries, and never reaches here.
+        if entry is None or entry.kind is not OrderKind.ALO:
+            continue
+        if now_ms < entry.visible_ms + ttl_ms:
+            continue
+        if coin_state.reprices >= settings.execution.max_reprices:
+            coin_state.entry = None
+            coin_state.intent = None
+            portfolio.abandoned_entries += 1
+            continue
+        coin_state.reprices += 1
+        touch = _touch(coin_state.book, entry.side)
+        if touch is None:
+            continue
+        levels = coin_state.book.levels(entry.side)
+        entry.px = touch
+        entry.queue_ahead = next((sz for px, sz in levels if px == touch), 0.0)
+        entry.traded_at_px = 0.0
+        entry.visible_ms = now_ms + settings.backtest.latency_ms
+
+
+def _check_exits(
+    now_ms: int,
+    state: dict[str, _CoinState],
+    mids: Mapping[str, float | None],
+    portfolio: Portfolio,
+    result: BacktestResult,
+    settings: Settings,
+    cloid: _CloidCounter,
+) -> None:
+    """Target, stop and time stop, in that order of preference.
+
+    The stop is checked against mid and, when it has gapped, fills at the gapped price.
+    The target rests as a maker order, because that is what the live policy does with a
+    profit target and it is where the maker rebate comes from.
+    """
+    for coin in sorted(portfolio.positions):
+        position = portfolio.positions[coin]
+        coin_state = state.get(coin)
+        if coin_state is None:
+            continue
+        mid = mids.get(coin)
+        if mid is None:
+            continue
+        intent = position.intent
+
+        if stop_triggered(side=position.side, stop_px=intent.stop_px, mid=mid):
+            _take_exit(
+                coin,
+                coin_state,
+                asked_px=intent.stop_px,
+                mid=mid,
+                reason="stop",
+                now_ms=now_ms,
+                portfolio=portfolio,
+                settings=settings,
+                cloid=cloid,
+            )
+            continue
+        age_s = (now_ms - position.opened_ms) / 1000.0
+        if age_s >= intent.time_stop_s:
+            _take_exit(
+                coin,
+                coin_state,
+                asked_px=mid,
+                mid=mid,
+                reason="time_stop",
+                now_ms=now_ms,
+                portfolio=portfolio,
+                settings=settings,
+                cloid=cloid,
+            )
+            continue
+        if coin_state.exit_order is None:
+            coin_state.exit_order = SimOrder(
+                cloid=cloid.next(),
+                coin=coin,
+                # A long position exits by selling, which rests on the offer.
+                side="short" if position.is_long else "long",
+                kind=OrderKind.ALO,
+                px=intent.target_px,
+                size=position.size,
+                visible_ms=now_ms + settings.backtest.latency_ms,
+                reduce_only=True,
+                tag="target",
+            )
+
+
+def _take_exit(
+    coin: str,
+    coin_state: _CoinState,
+    *,
+    asked_px: float,
+    mid: float,
+    reason: str,
+    now_ms: int,
+    portfolio: Portfolio,
+    settings: Settings,
+    cloid: _CloidCounter,
+) -> None:
+    """Cross out of a position now, at whatever the market is actually offering."""
+    position = portfolio.positions.get(coin)
+    if position is None:
+        return
+    order = SimOrder(
+        cloid=cloid.next(),
+        coin=coin,
+        side="short" if position.is_long else "long",
+        kind=OrderKind.IOC,
+        px=asked_px,
+        size=position.size,
+        # Visible immediately: the stop and the time stop are decisions the engine takes at
+        # this tick against a price it has already observed, and the crossing order is the
+        # reaction. The entry carries the latency because that is where the edge is;
+        # delaying the exit too would double-count it.
+        visible_ms=now_ms,
+        reduce_only=True,
+        tag=reason,
+    )
+    if reason == "stop":
+        order = gapped_stop_order(order, mid=mid)
+    fill = fill_taker(order, coin_state.book, now_ms=now_ms, settings=settings)
+    if fill is None:
+        return
+    coin_state.exit_order = None
+    portfolio.apply_exit(fill, reason)
+
+
+def _book_exit(
+    fill: Fill,
+    order: SimOrder,
+    coin_state: _CoinState,
+    portfolio: Portfolio,
+    result: BacktestResult,
+) -> None:
+    portfolio.apply_exit(fill, order.tag)
+    if order.remaining <= 0:
+        coin_state.exit_order = None
+
+
+def _close_out(
+    end_ms: int,
+    state: dict[str, _CoinState],
+    portfolio: Portfolio,
+    result: BacktestResult,
+    settings: Settings,
+) -> None:
+    """Flatten whatever is still open when the window ends.
+
+    Marked out at the last known price rather than left open. A run that ended holding
+    positions would report an equity curve whose last point was a guess, and the trade
+    count would not match the number of round trips.
+    """
+    for coin in sorted(portfolio.positions):
+        coin_state = state.get(coin)
+        if coin_state is None:
+            continue
+        mid = coin_state.book.mid()
+        if mid is None:
+            continue
+        position = portfolio.positions[coin]
+        order = SimOrder(
+            cloid="close-out",
+            coin=coin,
+            side="short" if position.is_long else "long",
+            kind=OrderKind.IOC,
+            px=mid,
+            size=position.size,
+            visible_ms=end_ms,
+            reduce_only=True,
+            tag="window_end",
+        )
+        fill = fill_taker(order, coin_state.book, now_ms=end_ms, settings=settings)
+        if fill is not None:
+            portfolio.apply_exit(fill, "window_end")
+
+
+# --- helpers ------------------------------------------------------------------
+
+
+class _CloidCounter:
+    """Monotonic client order ids. Deterministic, so a rerun produces the same log.
+
+    CLAUDE.md requires every order to carry a cloid and be tracked, and a simulated order
+    is no exception: a fill in `trades.parquet` has to be traceable to the order that
+    produced it.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+
+    def next(self) -> str:
+        self._n += 1
+        return f"bt-{self._n:08d}"
+
+
+def _touch(book: BookState, side: str) -> float | None:
+    """The price a `side` entry would rest at: the bid to buy, the offer to sell."""
+    levels = book.bids if side == "long" else book.asks
+    if levels:
+        return levels[0][0]
+    return book.last_px
+
+
+def _resolve_meta(
+    provided: Mapping[str, AssetMeta], coins: Sequence[str], settings: Settings
+) -> dict[str, AssetMeta]:
+    """Fill in metadata for any coin the caller did not describe.
+
+    The defaults are the choices that constrain the run most: the finest `szDecimals`
+    Hyperliquid uses, and its most conservative leverage tier. A backtest that invented a
+    generous asset spec would report sizes the venue would have refused.
+
+    `listing_days` defaults to just over `universe.min_listing_days`, because a historical
+    window has no listing dates and refusing every coin for being undateable would produce
+    a run with no trades and no explanation.
+    """
+    core = set(settings.universe.core_coins)
+    resolved = dict(provided)
+    for coin in coins:
+        if coin in resolved:
+            continue
+        resolved[coin] = AssetMeta(
+            coin=coin,
+            sz_decimals=DEFAULT_SZ_DECIMALS,
+            max_leverage=DEFAULT_MAX_LEVERAGE,
+            tier="core" if coin in core else "major",
+            listing_days=float(settings.universe.min_listing_days + 1),
+        )
+    return resolved
+
+
+def _load_funding(portfolio: Portfolio, asset_ctx: pl.DataFrame | None) -> None:
+    """Preload the funding book so a position closing early in the run can price itself."""
+    if asset_ctx is None or asset_ctx.is_empty():
+        return
+    for row in asset_ctx.iter_rows(named=True):
+        stamp = row["rx_ms"] if row.get("rx_ms") else row["ts_ms"]
+        portfolio.funding.add_sample(str(row["coin"]), int(stamp), row.get("funding"))
+
+
+def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:
+    return None if frame.is_empty() else frame

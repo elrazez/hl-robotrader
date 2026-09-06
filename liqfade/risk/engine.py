@@ -105,11 +105,13 @@ class RiskEngine:
         """
         Args:
             settings: resolved config.
-            path: where the state lives. Defaults to `Settings.risk_state_path`, which is
-                `data/risk_state.json`.
+            path: where the state lives. **None means in memory**, which is what a backtest
+                wants: a replay has no prior halts or cooldowns, and inheriting the live
+                account's would make it depend on what the bot did this morning. The live
+                loop passes `settings.risk_state_path` explicitly.
         """
         self.settings = settings
-        self.store = RiskStateStore(path or settings.risk_state_path)
+        self.store = RiskStateStore(path)
 
     @property
     def state(self) -> RiskState:
