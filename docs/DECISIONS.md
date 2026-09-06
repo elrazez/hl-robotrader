@@ -1614,3 +1614,116 @@ Those stay open against Phase 5's DoD.
 
 Reverse this entry if the trigger question resolves before the plumbing lands, in which
 case Phase 5 proceeds as written rather than as two halves.
+
+## 2026-09-06 (05a: the paper loop, the drills and what is still owed)
+
+The plumbing Phase 5 needs is built and drilled. Phase 5 itself stays blocked: the seven
+day acceptance run needs a trigger the live bot can see, which is Q4 at sixty recorder
+days on 2026-11-04, and the testnet half of everything below needs Phase 0 item 4.
+
+**Paper mode is the backtest engine on a live clock, not a second implementation.**
+`live/paper.py` imports `backtest/engine.py`'s tick functions rather than reimplementing
+entries, exits and the fill model against a live feed. They are private to that module and
+are imported anyway: the DoD asks whether paper lands in a plausible band of the backtest
+for the same days, and that question is meaningless if the two are different code. A
+drifted twin is a worse thing to own than a private import. If those functions need to
+change shape they change once.
+
+**The live feature engine recomputes the same definitions incrementally**, because the
+z-score wants a 24h lookback and rebuilding an 86,400 row grid per coin per second costs
+more than the strategy it feeds. `tests/test_live_features.py` sends one synthetic tape
+through both pipelines and compares every field the enabled config path reads. That test
+is the contract, and it caught two things that reading the code did not:
+
+- A quote wins over a fresher print however stale it is, because `build_grid` coalesces
+  two backward asof joins in that order.
+- The first minute sample of a coin's life contributes **no** deviation. Its own rolling
+  median is undefined, polars carries a null, and the rolling mean behind the fallback
+  scale skips it rather than counting it. Appending a zero divided by one too many and
+  inflated every z-score by a third, which would have made the cross-venue trigger fire
+  about a third too easily on a fresh process.
+
+**What the live engine will not compute, it refuses.** Open interest deltas, VWAP
+displacement, the mark-to-mid percentile, the proxy and the levels are `None`; every rule
+that reads one ships disabled, and `LiveFeatureEngine.unsupported()` makes the constructor
+raise on a config that turns one on. A rule reading `None` either vetoes every intent or
+passes every one, and both look like the strategy working. `cascade.trigger: exact` is
+refused the same way: those liquidations arrive through a next-day S3 pull, so a live loop
+on that trigger runs with the intensity columns empty forever and looks healthy doing it.
+
+**The trigger is set by the unit, not by `config/paper.yaml`.** That file is also the base
+for `liqfade backtest`, whose ceiling runs are taken on `exact`; the first attempt pinned
+`crossvenue` there and moved every research number, which eight engine tests caught.
+`liqfade-paper.service` carries `LIQFADE_CASCADE__TRIGGER=crossvenue` and the CLI refuses
+an unsupported trigger up front, naming the fix.
+
+**Deploying a branch without rolling back another one.** The box runs the recorder from
+`/srv/liqfade/app` on `01c-recorder`, five commits ahead of main with the WebSocket
+rotation fixes it is currently exercising live. Deploying this branch there would have
+handed the recorder pre-fix code: nothing restarts it today, and everything picks it up at
+the next reboot. `LIQFADE_APP_DIR` puts a checkout elsewhere; an isolated deploy must name
+its units in `LIQFADE_UNITS`, installs only those, and rewrites their `/srv/liqfade/app`
+paths to its own directory. 05a-paper runs from `/srv/liqfade/paper`, and the deploy
+printed `skipped liqfade-recorder.service`.
+
+### The drills
+
+Local, against live Hyperliquid feeds, 2026-09-06:
+
+| Drill | Result |
+| --- | --- |
+| Inject, size, gate, rest, fill | SOL long filled as maker against a real print, reduce-only target rested at the target price |
+| `/kill` over the control socket | **1.8 ms**: 1 order cancelled, 1 position closed, flag written |
+| `data/KILL` file appears | **0.695 s** to `kill_fired`, one second of which is the watcher's poll interval; the work itself took 7 ms |
+| Watchdog, loop process killed | one alert 6.0 s later at a 5 s threshold and a 2 s poll, silent before it |
+
+On the VPS, 2026-09-06, paper running from `/srv/liqfade/paper`:
+
+| Drill | Result |
+| --- | --- |
+| Watchdog, `systemctl stop` for 22 s | alert at 11.6 s stale, Telegram accepted it, recovery posted 0.8 s after restart |
+| Watchdog, `SIGKILL` the loop | systemd restarted it inside 20 s (NRestarts 1) and the watchdog correctly stayed quiet: the heartbeat never went stale |
+| `/kill` over the control socket | **778.7 ms** including the Telegram confirmation from Tokyo: 1 order cancelled, 1 position closed |
+| The flag against `Restart=always` | the unit failed its `ExecStartPre` 9 times in a row and never started. A kill survives systemd |
+| `data/KILL` file appears | flag written 20:54:23, kill sequence at 20:54:24.6, confirmation posted by 20:54:25.3 |
+
+Every one of these is well inside CLAUDE.md rule 5's five seconds.
+
+**A real unit bug the box found.** `Environment=LIQFADE_WATCH_LABEL=paper loop` is
+rejected by systemd with "Invalid environment assignment, ignoring: loop", and the unit
+starts anyway, so the label silently fell back to its default and every alert would have
+named the wrong process. Quoted now, and a test walks every `Environment=` line in every
+unit and requires quotes around any value with a space.
+
+**A finding left as a recommendation, not a change.** After a kill the unit retries every
+three seconds forever; each attempt is one `/usr/bin/test`, so it is cheap, but the
+journal fills. `StartLimitBurst` with `StartLimitIntervalSec` would let it give up into
+`failed` instead. Restart policy on the trading loop is the owner's call, so it is written
+down rather than changed.
+
+### What 05a does not deliver
+
+- **The six testnet probes are written and unrun.** `scripts/probe/hl_testnet.py` holds
+  all six as subcommands and refuses any URL without "testnet" in it. Both
+  `HL_TESTNET_*` variables are empty in the box `.env`, checked by name and length, so
+  every row of the table in `docs/HYPERLIQUID.md` still says "not run". Phase 0 item 4.
+- **No testnet order has ever been placed**, so the TP/SL grouping, the reject strings,
+  the submit-to-ack distribution and the reconciliation of a real `clearinghouseState`
+  are all unmeasured. `execution/hl.py`'s parsers are tested against the shapes the docs
+  describe, which is not the same as against the venue.
+- **The position half of reconciliation is not exercised.** Paper has no venue account, so
+  `venue_positions` has no second source; the order half runs every 60 s and compares the
+  sqlite registry against the engine's working orders, which is what catches the mirror
+  drifting.
+- **The watchdog does not cancel.** `docs/STRATEGY_AND_RISK.md` wants a stale heartbeat to
+  cancel every resting order, which needs the agent key and a second process able to sign.
+  The `scheduleCancel` probe decides whether that half belongs at the venue or here.
+- **`reload_config` is refused by the paper backend.** Reloading mid-session would swap
+  the windows the feature engine's buffers were filled under, and a half-reloaded engine
+  is worse than one that says no.
+- **The seven day acceptance run has not started** and must not be read as started. What
+  runs now is a plumbing soak.
+
+Reverse the paper-imports-engine decision if `backtest/engine.py`'s tick functions ever
+need a live-only branch inside them, which is the moment CLAUDE.md's rule about live-only
+branches in shared code would start being broken rather than honoured.
