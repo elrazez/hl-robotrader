@@ -110,13 +110,14 @@ One file per UTC day, holding every coin the run covered, at
 strategy actually reads. `feature_hash` is a sha256 over the config keys a feature column
 depends on and nothing else: `features.*`, `cascade.*`, `venues.*`,
 `backtest.feature_grid_ms`, `sizing.vol_window_s`, `exhaustion.mark_mid_pct_threshold`,
-`exhaustion.max_age_s` and `strategy.rules.zone_proximity.*`. That is what makes a
-parameter sweep affordable: changing a stop, a target, a sizing fraction or a risk limit
-reads the year back and builds nothing, while changing a window length, a threshold, the
-grid step or the trigger builds a new tree beside the old one. The list lives in
-`HASHED_KEYS` in `liqfade/backtest/source.py`; a key the grid reads and the hash does not
-cover would silently hand a run someone else's features, so it is pinned by a test in both
-directions.
+`exhaustion.max_age_s`, and one key per rule in `strategy.rules.LEVEL_RULES`, which are the
+rules that make the grid join price levels at all. That is what makes a parameter sweep
+affordable: changing a stop, a target, a sizing fraction or a risk limit reads the year
+back and builds nothing, while changing a window length, a threshold, the grid step or the
+trigger builds a new tree beside the old one. The list lives in `HASHED_KEYS` in
+`liqfade/backtest/source.py`; a key the grid reads and the hash does not cover would
+silently hand a run someone else's features, so it is pinned by a test in both directions
+and **anything that teaches the grid to read a new config key has to be added there**.
 
 Two things it deliberately does not do. **The run's first day is never cached**: every
 other day is built with the previous day in front of it so its rolling windows and its 24h
@@ -125,6 +126,12 @@ its grid is a function of where the run started rather than of the date. **A cac
 for a narrower coin set is not read by a wider run**: the coin list is stamped in the
 file's Parquet metadata, because a coin that never printed that day leaves no rows and
 "covered and empty" cannot otherwise be told from "never asked about".
+
+**What it costs on disk.** A year of four coins is 6.8 GB, so roughly 1.7 GB per coin per
+year at the 1s default; the 42-coin research universe is therefore around 70 GB a year.
+That is the price of a parameter sweep not rebuilding a year of features every time, and
+it is why the directory is disposable rather than precious. `backtest.feature_grid_ms: 250`
+multiplies it by four, as it does the wall time and the memory.
 
 `liqfade backtest --no-cache` rebuilds every day and writes nothing.
 
