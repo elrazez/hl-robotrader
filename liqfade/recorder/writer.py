@@ -18,8 +18,11 @@ would break the atomicity guarantee above.
 
 from __future__ import annotations
 
+import heapq
 import os
+from collections.abc import Iterator
 from datetime import UTC, datetime
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -44,14 +47,11 @@ COMPRESSION = "zstd"
 DAY_SUFFIX = "_day.parquet"
 QUARANTINE_DIR = "quarantine"
 
-# How far an hour's first `ts_ms` may fall behind the previous hour's last before
-# compaction refuses to write the file. The recorder partitions by `rx_ms` and sorts by
-# `ts_ms`, so an event that happened at 10:59:59.9 and arrived at 11:00:00.1 is in hour
-# 11's file and legitimately predates the end of hour 10 by the feed's latency. A minute
-# is far more than any feed's latency and far less than a mis-parsed hour, which is the
-# mistake worth catching. Backfilled rows all carry `rx_ms = 0` and partition on `ts_ms`,
-# so for them the overlap is always zero.
-ORDER_TOLERANCE_MS = 60_000
+# Rows held at once while merging: one batch per input file being read, plus one chunk
+# being written. A day is at most a few dozen files, so the ceiling is a few hundred
+# thousand rows however long the day is or how far behind the feed fell.
+MERGE_READ_ROWS = 8_192
+MERGE_WRITE_ROWS = 65_536
 
 
 def partition_dir(root: Path, table: str, date: str) -> Path:
@@ -173,67 +173,67 @@ def lake_files(directory: Path) -> list[Path]:
     return [p for p in directory.glob("*.parquet") if not p.name.startswith(".")]
 
 
-def _hour_of(path: Path) -> int:
-    """UTC hour from a partition file name, which is always `{venue}_{HH}[_...].parquet`.
+def _sorted_copy(table_name: str, path: Path, tmp_dir: Path) -> Path:
+    """A `ts_ms`-ordered copy of one input file, so the merge below can stream it.
 
-    The suffixes come from the second flush of an hour (`_{n}`) and from the backfill's
-    staging mover (`_{key stem}_{batch}`), so the hour is always the second field. An
-    unrecognisable name raises: guessing hour 0 would put its rows at the front of a file
-    that claims to be sorted by time, which is worse than refusing to compact the day.
+    One input file at a time is held in memory, which is what the previous compaction
+    already did per hour. Refusing a null `ts_ms` is the only refusal compaction has
+    left: such a row has no place in a file that claims to be sorted by that column and
+    no honest place to put it, and it means the writer that produced the file was wrong.
     """
-    fields = path.stem.split("_")
-    if len(fields) >= 2 and len(fields[1]) == 2 and fields[1].isdigit() and int(fields[1]) < 24:
-        return int(fields[1])
-    raise RuntimeError(f"cannot read the hour from {path}; move it aside to compact this day")
+    # partitioning=None: the directory is named date=..., and hive discovery would
+    # otherwise append a `date` column that is not in the canonical schema.
+    arrow = pq.read_table(path, partitioning=None)
+    validate_table(table_name, arrow)
+    if arrow.column("ts_ms").null_count:
+        raise RuntimeError(f"{path}: ts_ms is null on some rows, so the file cannot be ordered")
+    out = tmp_dir / f".{path.stem}.sorted.{os.getpid()}.tmp"
+    pq.write_table(arrow.sort_by([("ts_ms", "ascending")]), out, compression=COMPRESSION)
+    return out
+
+
+def _merged_rows(paths: list[Path]) -> Iterator[dict[str, Any]]:
+    """Every row of already-sorted files, in one global `ts_ms` order.
+
+    `heapq.merge` is the k-way merge, and each file is pulled one row group at a time, so
+    a day that arrived hours late costs no more memory than a day that arrived on time.
+
+    ponytail: rows go through Python dicts, which is a few seconds a day for a job that
+    runs once a night. Merge arrow slices instead if compaction ever shows up in a
+    profile.
+    """
+
+    def rows_of(path: Path) -> Iterator[dict[str, Any]]:
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=MERGE_READ_ROWS):
+            yield from batch.to_pylist()
+
+    return heapq.merge(*(rows_of(path) for path in paths), key=lambda row: row["ts_ms"])
 
 
 def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> int:
-    """Fold one partition into one file, holding at most one hour in memory.
+    """Fold one partition into one file ordered by `ts_ms`, streaming. Returns the rows.
 
-    Returns the row count. Hours are written in ascending order into a single
-    `ParquetWriter`, one row group each. The recorder and the backfill both partition by
-    the UTC hour of the row (liqfade/recorder/buffer.py), so an hour's rows all fall
-    inside that hour and hour-ordered output is globally ordered by `ts_ms`. That is an
-    assumption about the writers, so it is asserted rather than trusted.
+    A k-way merge rather than hour after hour, because the recorder partitions by `rx_ms`
+    and an event delivered late is filed in the hour it *arrived*: Hyperliquid replayed
+    DOGE trades 356s old after a reconnect on 2026-09-05, so hour 23's file began before
+    hour 22's ended and the day would not compact at all. There is no bound on how late a
+    venue can be, so there is no tolerance to tune; the merge is right at any lateness.
     """
-    venues = {path.name.split("_")[0] for path in inputs}
+    # `stem`, not `name`: a file with no hour suffix at all is now compactable, and
+    # `"hyperliquid.parquet".split("_")[0]` kept the extension and read as a second venue.
+    venues = {path.stem.split("_")[0] for path in inputs}
     name = "all" if (len(venues) > 1 or table_name in MULTI_VENUE_TABLES) else venues.pop()
     output = directory / f"{name}{DAY_SUFFIX}"
-
-    by_hour: dict[int, list[Path]] = {}
-    for path in inputs:
-        by_hour.setdefault(_hour_of(path), []).append(path)
     expected = sum(int(pq.read_metadata(path).num_rows) for path in inputs)
+    schema = schema_for(table_name)
 
     tmp = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-    writer = pq.ParquetWriter(tmp, schema_for(table_name), compression=COMPRESSION)
+    writer = pq.ParquetWriter(tmp, schema, compression=COMPRESSION)
+    sorted_inputs: list[Path] = []
     try:
-        last_ts: int | None = None
-        for hour in sorted(by_hour):
-            # partitioning=None: the directory is named date=..., and hive discovery would
-            # otherwise append a `date` column that is not in the canonical schema.
-            arrow = pa.concat_tables(
-                [pq.read_table(path, partitioning=None) for path in by_hour[hour]]
-            )
-            validate_table(table_name, arrow)
-            if arrow.num_rows == 0:
-                continue
-            arrow = arrow.sort_by([("ts_ms", "ascending")])
-            stamps = arrow.column("ts_ms")
-            first = stamps[0].as_py()
-            if last_ts is not None and first < last_ts:
-                overlap = last_ts - first
-                if overlap > ORDER_TOLERANCE_MS:
-                    raise RuntimeError(
-                        f"{directory}: hour {hour:02d} starts at ts_ms {first}, {overlap} ms "
-                        f"before the end of the previous hour; refusing to write a "
-                        f"misordered file"
-                    )
-                log.warning(
-                    "compaction_hour_overlap", path=str(directory), hour=hour, overlap_ms=overlap
-                )
-            last_ts = stamps[-1].as_py()
-            writer.write_table(arrow, row_group_size=arrow.num_rows)
+        sorted_inputs = [_sorted_copy(table_name, path, directory) for path in inputs]
+        for chunk in batched(_merged_rows(sorted_inputs), MERGE_WRITE_ROWS):
+            writer.write_table(pa.Table.from_pylist(list(chunk), schema=schema))
         writer.close()
         # The row count is checked on the temp file first: a short output must never
         # replace the inputs, not even for the moment before the check fails.
@@ -243,8 +243,9 @@ def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> 
         os.replace(tmp, output)
     finally:
         writer.close()  # idempotent; the failure path needs it before the unlink
-        if tmp.exists():
-            tmp.unlink()
+        for path in [tmp, *sorted_inputs]:
+            if path.exists():
+                path.unlink()
 
     after = pq.read_metadata(output).num_rows
     if after != expected:
@@ -291,6 +292,18 @@ def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> di
             continue
         if len(inputs) == 1 and inputs[0].name.endswith(DAY_SUFFIX):
             continue  # already compacted, and re-running must be a no-op
+        if any(path.name.endswith(DAY_SUFFIX) for path in inputs):
+            # A compacted file beside loose ones. Compaction does not dedupe, and the day
+            # file is already the fold of a day, so folding it again with files that may
+            # hold the same rows writes them twice. `liqfade derive candles` leaves
+            # exactly this: its `hyperliquid_day.parquet` next to the `hl_api` bars of the
+            # same minutes. This is what `_hour_of` used to refuse by accident, said out
+            # loud. Move the day file aside to fold genuinely new rows into it.
+            raise RuntimeError(
+                f"{directory}: a compacted day file beside "
+                f"{sorted(p.name for p in inputs if not p.name.endswith(DAY_SUFFIX))}; "
+                f"compaction does not dedupe, so move it aside before folding these in"
+            )
 
         rows = _compact_partition(table_name, directory, inputs)
         written[table_name] = rows

@@ -184,8 +184,6 @@ def test_compaction_streams_suffixed_files_across_hours_into_one_sorted_file(
     table = read(directory / "hyperliquid_day.parquet")
     validate_table("bbo", table)
     assert table.column("ts_ms").to_pylist() == sorted(expected)
-    # One row group per hour, which is what makes an hour range scan cheap.
-    assert pq.read_metadata(directory / "hyperliquid_day.parquet").num_row_groups == 3
 
 
 def test_a_day_holding_backfilled_and_recorded_rows_compacts_to_all_day(tmp_path: Path) -> None:
@@ -203,11 +201,25 @@ def test_a_day_holding_backfilled_and_recorded_rows_compacts_to_all_day(tmp_path
     ]
 
 
-def test_an_unreadable_hour_in_a_file_name_is_an_error_not_hour_zero(tmp_path: Path) -> None:
+def test_a_file_name_that_carries_no_hour_is_folded_like_any_other(tmp_path: Path) -> None:
+    """Order comes from ts_ms now, so nothing downstream reads the hour off a name."""
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(2)])
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    write_atomic(rows_to_table("bbo", [bbo(1)], "recorder"), directory / "hyperliquid.parquet")
+
+    assert compact_day(tmp_path, DATE) == {"bbo": 2}
+    assert read(directory / "hyperliquid_day.parquet").column("ts_ms").to_pylist() == [1, 2]
+
+
+def test_a_compacted_file_beside_loose_ones_is_refused(tmp_path: Path) -> None:
+    """Compaction does not dedupe, and a day file is already a day's fold, so folding it
+    again with files that may hold the same rows writes them twice. `liqfade derive
+    candles` leaves exactly this. `_hour_of` used to refuse it by accident."""
     write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
     directory = partition_dir(tmp_path, "bbo", DATE)
-    write_atomic(rows_to_table("bbo", [bbo(2)], "recorder"), directory / "hyperliquid.parquet")
-    with pytest.raises(RuntimeError, match="cannot read the hour"):
+    write_atomic(rows_to_table("bbo", [bbo(1)], "recorder"), directory / "hyperliquid_day.parquet")
+
+    with pytest.raises(RuntimeError, match="compacted day file beside"):
         compact_day(tmp_path, DATE)
     assert len(list(directory.glob("*.parquet"))) == 2
 
@@ -272,14 +284,61 @@ def test_receive_time_partitioning_may_straddle_an_hour_by_the_feed_latency(
     assert compact_day(tmp_path, DATE) == {"bbo": 4}
 
 
-def test_an_hour_that_holds_the_wrong_hours_rows_is_refused(tmp_path: Path) -> None:
-    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(10 * 3_600_000)])
+def test_a_late_delivery_of_any_length_merges_instead_of_refusing(tmp_path: Path) -> None:
+    """The real 2026-09-05 shape on the box, which compact_day refused.
+
+    Hyperliquid replayed DOGE trades up to 356s old after a reconnect at 22:42 UTC, so
+    hour 23's file starts at ts 22:57:46, 132,942 ms before the end of hour 22. Under
+    ORDER_TOLERANCE_MS that was `compaction_failed` and the day's 14 hourly files stayed
+    on disk. Late delivery is a fact about the feed, not a corrupt file: the rows are
+    real, they are simply out of order across files, and a merge on ts_ms orders them.
+    """
+    hour_22, hour_23 = 22 * 3_600_000, 23 * 3_600_000
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 22), [bbo(hour_22), bbo(hour_23 - 1)])
+    # Sent at 22:57:46, delivered in hour 23. 132,942 ms behind the previous hour's end.
+    late = hour_23 - 1 - 132_942
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 23), [bbo(late), bbo(hour_23 + 5)])
+
+    assert compact_day(tmp_path, DATE) == {"bbo": 4}
     directory = partition_dir(tmp_path, "bbo", DATE)
-    # Named hour 11, but the rows are from hour 3: a mis-parsed name, not feed latency.
-    write_atomic(
-        rows_to_table("bbo", [bbo(3 * 3_600_000)], "recorder"), directory / "hyperliquid_11.parquet"
+    stamps = read(directory / "hyperliquid_day.parquet").column("ts_ms").to_pylist()
+    assert stamps == sorted(stamps)
+    assert stamps == [hour_22, late, hour_23 - 1, hour_23 + 5]
+
+
+def test_a_day_of_hourly_files_merges_in_exchange_time_across_every_one(tmp_path: Path) -> None:
+    """Interleave 24 hours so no file's rows are contiguous: a merge orders them, and
+    writing the files one after another in hour order could not."""
+    for hour in range(24):
+        write_rows(
+            tmp_path,
+            ("bbo", "hyperliquid", DATE, hour),
+            [bbo(stamp) for stamp in range(hour, 2_400, 24)],
+        )
+
+    assert compact_day(tmp_path, DATE) == {"bbo": 2_400}
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    assert read(directory / "hyperliquid_day.parquet").column("ts_ms").to_pylist() == list(
+        range(2_400)
     )
-    with pytest.raises(RuntimeError, match="refusing to write a misordered file"):
+
+
+def test_a_file_whose_own_rows_cannot_be_ordered_is_the_only_refusal_left(
+    tmp_path: Path,
+) -> None:
+    """A null ts_ms has no place in a file that claims to be sorted by it, and no honest
+    place to put it. The hourly files stay so a human can look at the one that is wrong."""
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1)])
+    directory = partition_dir(tmp_path, "bbo", DATE)
+    broken = rows_to_table("bbo", [bbo(2)], "recorder")
+    broken = broken.set_column(
+        broken.schema.get_field_index("ts_ms"),
+        broken.schema.field("ts_ms"),
+        pa.array([None], type=pa.int64()),
+    )
+    write_atomic(broken, directory / "hyperliquid_11.parquet")
+
+    with pytest.raises(RuntimeError, match="ts_ms is null"):
         compact_day(tmp_path, DATE)
     assert len(list(directory.glob("*.parquet"))) == 2
 

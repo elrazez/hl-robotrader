@@ -18,8 +18,7 @@ import pytest
 
 from liqfade.data.ingest import common
 from liqfade.data.ingest.common import Manifest, merge_staged, parallel_pull, write_partitioned
-from liqfade.recorder.writer import _hour_of as writer_hour_of
-from liqfade.recorder.writer import lake_files
+from liqfade.recorder.writer import compact_day, lake_files
 from tests.conftest import FakeS3
 
 BUCKET = "fake-bucket"
@@ -251,7 +250,7 @@ def test_an_hours_batches_sort_in_the_order_the_parser_wrote_them(tmp_path: Path
     assert len(files) == 12
     stamps = [pq.read_table(path).column("ts_ms")[0].as_py() for path in files]
     assert stamps == [BASE + batch for batch in range(12)]
-    assert len({writer_hour_of(path) for path in files}) == 1  # still compactable
+    assert compact_day(lake, "2026-06-01") == {"trades": 12}  # still compactable
 
 
 def test_running_the_same_object_twice_leaves_one_copy(tmp_path: Path) -> None:
