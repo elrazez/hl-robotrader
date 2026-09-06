@@ -28,6 +28,7 @@ ALL_COMMANDS = {
     "status",
     "sync",
     "config",
+    "watch",
 }
 
 

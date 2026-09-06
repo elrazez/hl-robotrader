@@ -444,13 +444,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     the same window at a worse latency, and stamps the report "latency fragile" when the
     edge does not survive it, per the roadmap's Phase 4 definition of done.
     """
-    import cProfile
-    import pstats
     from datetime import UTC, datetime
 
-    from liqfade.backtest.engine import load_inputs, run_backtest
-    from liqfade.backtest.report import run_id_for, write_report
-    from liqfade.backtest.validate import bump_n_trials
+    from liqfade.backtest.progress import PROGRESS_FILE, ProgressWriter
     from liqfade.data.ingest.common import BackfillError, parse_day
     from liqfade.log import setup_logging
 
@@ -482,6 +478,48 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         coins = list(settings.universe.core_coins)
 
     reports_dir = Path(args.out) if args.out else settings.paths.reports_dir
+    progress_path = (
+        None
+        if args.progress_file == "-"
+        else Path(args.progress_file)
+        if args.progress_file
+        else reports_dir / PROGRESS_FILE
+    )
+    progress = ProgressWriter(progress_path)
+    progress.set(
+        stage="loading",
+        coins=coins,
+        window_start_ms=start_ms,
+        window_end_ms=end_ms,
+        starting_equity=args.equity,
+        equity=args.equity,
+        lagged_ms=args.lagged_ms,
+    )
+    try:
+        return _run_backtest_command(args, settings, coins, start_ms, end_ms, reports_dir, progress)
+    except Exception as exc:
+        progress.set(stage="failed", error=f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _run_backtest_command(
+    args: argparse.Namespace,
+    settings: Settings,
+    coins: list[str],
+    start_ms: int,
+    end_ms: int,
+    reports_dir: Path,
+    progress: object,
+) -> int:
+    import cProfile
+    import pstats
+
+    from liqfade.backtest.engine import load_inputs, run_backtest
+    from liqfade.backtest.progress import ProgressWriter
+    from liqfade.backtest.report import run_id_for, write_report
+    from liqfade.backtest.validate import bump_n_trials
+
+    assert isinstance(progress, ProgressWriter)
     inputs = load_inputs(
         settings.paths.data_dir,
         settings=settings,
@@ -498,12 +536,13 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             f"`liqfade backfill` first.",
             file=sys.stderr,
         )
+        progress.set(stage="failed", error="no trades in the lake for that window")
         return EXIT_ERROR
 
     profiler = cProfile.Profile() if args.profile else None
     if profiler is not None:
         profiler.enable()
-    result = run_backtest(inputs, settings)
+    result = run_backtest(inputs, settings, progress)
     if profiler is not None:
         profiler.disable()
 
@@ -517,7 +556,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.lagged_ms is not None:
         lagged_ms = args.lagged_ms
         degraded = _with_latency(settings, args.lagged_ms)
-        lagged = run_backtest(inputs, degraded)
+        progress.set(phase="lagged", stage="replaying", trades=0, net=0.0, intents=0)
+        lagged = run_backtest(inputs, degraded, progress)
         lagged_net = sum(trade.net_pnl for trade in lagged.trades)
         # Fragile means an edge that the extra latency took away. A run with no edge to
         # begin with is not fragile, it is empty, and stamping it would put a scary
@@ -534,6 +574,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             )
 
     run_id = run_id_for(settings)
+    progress.set(stage="report")
     directory = write_report(
         result,
         settings,
@@ -544,6 +585,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         latency_fragile=latency_fragile,
     )
 
+    progress.set(stage="done", report_dir=str(directory), trades=len(result.trades), net=net)
     print(f"{directory}")
     print(
         f"trigger={settings.cascade.trigger} coins={len(result.coins)} "
@@ -567,6 +609,33 @@ def _with_latency(settings: Settings, latency_ms: int) -> Settings:
     payload = settings.model_dump()
     payload["backtest"]["latency_ms"] = latency_ms
     return Settings.model_validate(payload)
+
+
+# --- watch --------------------------------------------------------------------
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Draw the progress file until the run says done or failed. Ctrl-C leaves it running."""
+    import shutil
+    import time
+
+    from liqfade.backtest.progress import PROGRESS_FILE, read_progress
+    from liqfade.backtest.watch import render
+
+    settings = _settings(args)
+    path = Path(args.file) if args.file else settings.paths.reports_dir / PROGRESS_FILE
+    while True:
+        state = read_progress(path)
+        width = shutil.get_terminal_size((100, 20)).columns
+        frame = render(state, time.time(), width=width, path=path)
+        if args.once:
+            print(frame)
+            return 0
+        sys.stdout.write("\x1b[2J\x1b[H" + frame + "\n")
+        sys.stdout.flush()
+        if state is not None and state.stage in ("done", "failed"):
+            return 0 if state.stage == "done" else EXIT_ERROR
+        time.sleep(0.5)
 
 
 # --- status -------------------------------------------------------------------
@@ -872,6 +941,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile", action="store_true", help=f"print the top {PROFILE_ROWS} cumulative frames"
     )
     backtest.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+    backtest.add_argument(
+        "--progress-file",
+        default=None,
+        help="where `liqfade watch` reads progress (default: <reports>/.progress.json; "
+        "'-' disables it)",
+    )
+
+    watch = sub.add_parser(
+        "watch", parents=[common], help="live progress of a running backtest, in this terminal"
+    )
+    watch.add_argument(
+        "--file", default=None, help="the progress file (default: <reports>/.progress.json)"
+    )
+    watch.add_argument("--once", action="store_true", help="print one frame and exit")
 
     compact = sub.add_parser(
         "compact", parents=[common], help="fold a range of days into one file per table"
@@ -931,6 +1014,7 @@ HANDLERS = {
     "record": cmd_record,
     "compact": cmd_compact,
     "status": cmd_status,
+    "watch": cmd_watch,
     "sync": cmd_sync,
     "panel": cmd_panel,
 }

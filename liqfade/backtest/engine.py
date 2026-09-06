@@ -57,6 +57,7 @@ from liqfade.backtest.fills import (
 )
 from liqfade.backtest.portfolio import Portfolio
 from liqfade.backtest.portfolio import Trade as PortfolioTrade
+from liqfade.backtest.progress import ProgressWriter
 from liqfade.config.models import Settings
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
@@ -167,13 +168,17 @@ def load_inputs(
     )
 
 
-def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
+def run_backtest(
+    inputs: RunInputs, settings: Settings, progress: ProgressWriter | None = None
+) -> BacktestResult:
     """Replay one window and return everything it produced.
 
     Args:
         inputs: the frames, the window, the asset metadata and the starting equity.
         settings: resolved config. `cascade.trigger` picks the liquidation feed;
             `backtest.latency_ms` sets how late every order is.
+        progress: where to report the replay clock once a second, for `liqfade watch`.
+            None runs silent.
 
     Returns:
         A `BacktestResult`. The trade list is the run's output; everything else exists so
@@ -190,6 +195,15 @@ def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
         else ()
     )
     meta = _resolve_meta(inputs.meta, coins, settings)
+    if progress is not None:
+        progress.set(
+            stage="features",
+            coins=list(coins),
+            window_start_ms=inputs.start_ms,
+            window_end_ms=inputs.end_ms,
+            starting_equity=inputs.starting_equity,
+            equity=inputs.starting_equity,
+        )
     grid = build_feature_grid(
         settings=settings,
         trades=inputs.trades,
@@ -245,8 +259,20 @@ def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
     # detector to track and the tick can skip the strategy entirely. A stale cascade left
     # in a detector is dropped by its own max_age check the moment rows resume.
     active_until = -1
+    if progress is not None:
+        progress.set(stage="replaying", sim_ms=inputs.start_ms)
     for item in merge(events, ticks):
         if isinstance(item, Tick):
+            if progress is not None:
+                progress.tick(
+                    item.ts_ms,
+                    trades=len(portfolio.trades),
+                    net=sum(trade.net_pnl for trade in portfolio.trades),
+                    equity=result.equity_curve[-1][1]
+                    if result.equity_curve
+                    else inputs.starting_equity,
+                    intents=result.intents,
+                )
             while next_row < len(grid_rows) and grid_rows[next_row][0] <= item.ts_ms:
                 latest.update(grid_rows[next_row][1])
                 active_until = grid_rows[next_row][0] + grid_step_ms
@@ -260,6 +286,13 @@ def run_backtest(inputs: RunInputs, settings: Settings) -> BacktestResult:
 
     _close_out(inputs.end_ms, state, portfolio, result, settings)
     result.rejections = strategy.take_rejections()
+    if progress is not None:
+        progress.set(
+            sim_ms=inputs.end_ms,
+            trades=len(portfolio.trades),
+            net=sum(trade.net_pnl for trade in portfolio.trades),
+            intents=result.intents,
+        )
     return result
 
 
