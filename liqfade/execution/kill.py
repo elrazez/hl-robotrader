@@ -1,0 +1,207 @@
+"""The kill switch: cancel everything, close everything, stop, confirm. Within 5 seconds.
+
+CLAUDE.md rule 5, and the module it names as having to stand on its own. Two things follow
+from "this path must not depend on the strategy module", and the second is the one that
+matters:
+
+1. Nothing here imports `strategy/`, and a test walks the import graph to prove it rather
+   than reading the file, because that dependency arrives through a helper two modules away.
+2. Nothing here needs the trading loop to be healthy. The switch is a handful of
+   callables handed in at construction, so it fires from the Telegram bot, from the file
+   watcher and from a wedged loop's own signal handler with the same code.
+
+**Order of operations, and why.** The flag is written first, before a single cancel. The
+live systemd unit carries `Restart=always` and gates on the flag in `ExecStartPre`, so a
+kill that only stopped the process is undone three seconds later, and a crash halfway
+through flattening leaves nothing behind at all. Then cancels and closes, all of them
+fanned out concurrently: sixty serialised round trips at a Tokyo RTT is most of the five
+second budget spent queueing, and the budget is the requirement.
+
+**Every failure is survived, not raised.** One venue error must not stop the close that
+the whole switch exists to perform, so each call is awaited independently, failures are
+counted, and the confirmation says what actually happened. A kill that reports success it
+did not achieve is worse than one that failed loudly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
+
+from liqfade.control.backend import kill_not_persisted, write_kill_file
+from liqfade.control.protocol import KillResult
+from liqfade.log import get_logger
+
+log = get_logger(__name__)
+
+__all__ = ["KillSwitch", "KillWatcher"]
+
+DEFAULT_POLL_S = 1.0  # the flag is checked this often; the budget is 5s and this leaves room
+
+
+class KillSwitch:
+    """Fires once, from any trigger, and reports exactly what it managed to do."""
+
+    def __init__(
+        self,
+        *,
+        kill_file: Path,
+        open_orders: Callable[[], Awaitable[Sequence[str]]],
+        cancel_all: Callable[[str], Awaitable[None]],
+        open_positions: Callable[[], Awaitable[Mapping[str, float]]],
+        close_position: Callable[[str, float], Awaitable[None]],
+        alert: Callable[[str], Awaitable[bool]] | None = None,
+        stop: asyncio.Event | None = None,
+    ) -> None:
+        """
+        Args:
+            kill_file: the flag. Written first, and never removed by this class.
+            open_orders: cloids of everything that could still fill.
+            cancel_all: cancel one cloid.
+            open_positions: coin to signed size, positive long.
+            close_position: close one coin's signed size with an IOC reduce-only order.
+            alert: Telegram. Optional, so the switch works with Telegram down.
+            stop: the process shutdown event, set after the flattening, so the loop stops
+                only once there is nothing left for it to manage.
+        """
+        self.kill_file = Path(kill_file)
+        self._open_orders = open_orders
+        self._cancel = cancel_all
+        self._open_positions = open_positions
+        self._close = close_position
+        self._alert = alert
+        self._stop = stop
+        self.fired = False
+        self._lock = asyncio.Lock()
+
+    async def fire(self, reason: str | None = None) -> KillResult:
+        """Kill. Safe to call repeatedly; the second call re-runs the sweep and reports.
+
+        Deliberately not a no-op on the second call: an order that arrived between the
+        first kill and the second is exactly what a second `/kill` is for.
+        """
+        async with self._lock:
+            written = write_kill_file(self.kill_file, reason)
+            self.fired = True
+
+            cancelled, cancel_failures = await self._cancel_everything()
+            closed, close_failures = await self._close_everything()
+
+            if self._stop is not None:
+                self._stop.set()
+
+            parts = [reason] if reason else []
+            if cancel_failures:
+                parts.append(f"{cancel_failures} cancel(s) failed")
+            if close_failures:
+                parts.append(f"{close_failures} close(s) failed")
+            detail = "; ".join(parts) or None
+            if not written:
+                detail = kill_not_persisted(self.kill_file, detail)
+
+            log.warning(
+                "kill_fired",
+                reason=reason,
+                flag_written=written,
+                canceled=cancelled,
+                closed=closed,
+                cancel_failures=cancel_failures,
+                close_failures=close_failures,
+            )
+            result = KillResult(
+                killed=written,
+                canceled_orders=cancelled,
+                closed_positions=closed,
+                reason=detail,
+            )
+            await self._confirm(result)
+            return result
+
+    async def _cancel_everything(self) -> tuple[int, int]:
+        try:
+            cloids = list(await self._open_orders())
+        except Exception as exc:
+            log.error("kill_open_orders_failed", error=f"{type(exc).__name__}: {exc}")
+            return 0, 1
+        if not cloids:
+            return 0, 0
+        outcomes = await asyncio.gather(
+            *(self._cancel(cloid) for cloid in cloids), return_exceptions=True
+        )
+        return _count(outcomes, "kill_cancel_failed")
+
+    async def _close_everything(self) -> tuple[int, int]:
+        try:
+            positions = dict(await self._open_positions())
+        except Exception as exc:
+            log.error("kill_open_positions_failed", error=f"{type(exc).__name__}: {exc}")
+            return 0, 1
+        if not positions:
+            return 0, 0
+        outcomes = await asyncio.gather(
+            *(self._close(coin, size) for coin, size in positions.items()),
+            return_exceptions=True,
+        )
+        return _count(outcomes, "kill_close_failed")
+
+    async def _confirm(self, result: KillResult) -> None:
+        if self._alert is None:
+            return
+        text = (
+            f"KILL fired. Cancelled {result.canceled_orders} order(s), "
+            f"closed {result.closed_positions} position(s). "
+            f"{'Flag written.' if result.killed else 'FLAG NOT WRITTEN.'}"
+        )
+        if result.reason:
+            text += f" {result.reason}"
+        with contextlib.suppress(Exception):
+            # Telegram being down cannot be allowed to raise into a kill that worked.
+            await self._alert(text)
+
+
+def _count(outcomes: Sequence[object], event: str) -> tuple[int, int]:
+    done = failures = 0
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            failures += 1
+            log.error(event, error=f"{type(outcome).__name__}: {outcome}")
+        else:
+            done += 1
+    return done, failures
+
+
+class KillWatcher:
+    """Polls for the kill flag and fires the switch when it appears.
+
+    Polling rather than inotify: one `stat` a second costs nothing, works over every
+    filesystem the data dir might live on, and has no watch to lose on a remount. The
+    switch itself is idempotent, so a flag that is still there next second changes nothing.
+    """
+
+    def __init__(self, switch: KillSwitch, *, poll_s: float = DEFAULT_POLL_S) -> None:
+        self.switch = switch
+        self.poll_s = poll_s
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            if not self.switch.fired and self._present():
+                log.warning("kill_file_seen", path=str(self.switch.kill_file))
+                await self.switch.fire(reason=f"kill file at {self.switch.kill_file}")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
+
+    def _present(self) -> bool:
+        """True when the flag is there, and true when we cannot tell.
+
+        Same rule as `Settings.kill_switch_present`: the kill switch fails closed, so an
+        unreadable data dir counts as killed rather than as clear.
+        """
+        try:
+            self.switch.kill_file.stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
