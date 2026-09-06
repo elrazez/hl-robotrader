@@ -210,14 +210,16 @@ class LakeSource:
         """Every event inside `spans` on this day, merged into one time-ordered stream."""
         if not spans:
             return iter(())
+        # Trades are Hyperliquid only, matching what the grid was built on; liquidations
+        # come from every venue and `cascade.trigger` picks among them inside the grid.
         read = {
-            table: load_day(self.data_dir, table, day.date, spans=spans, **extra)
-            for table, extra in (
-                ("trades", {"venue": "hyperliquid"}),
-                ("liquidations", {}),
-                ("bbo", {}),
-                ("l2", {}),
-                ("asset_ctx", {}),
+            table: load_day(self.data_dir, table, day.date, spans=spans, venue=venue)
+            for table, venue in (
+                ("trades", "hyperliquid"),
+                ("liquidations", None),
+                ("bbo", None),
+                ("l2", None),
+                ("asset_ctx", None),
             )
         }
         return iter_events(
@@ -263,8 +265,14 @@ class LakeSource:
             liquidations=self._read(days, "liquidations", coin),
             start_ms=grid_start,
             end_ms=day.midnight_ms + DAY_MS,
-            bbo=_or_none(self._read(days, "bbo", coin)),
-            l2=_or_none(self._read(days, "l2", coin)),
+            # The book tables carry only their last snapshot from the previous day. Both
+            # reach the grid through a backward as-of join and nothing else, so the latest
+            # snapshot before midnight is the only row of that day any grid row can ever
+            # select; the rest cannot change an answer. It is worth the special case
+            # because `l2` is the largest table in the lake, 3.1 million rows per coin per
+            # day, and reading two days of it per day of the run was most of the memory.
+            bbo=_or_none(self._read(days, "bbo", coin, tail_carry=True)),
+            l2=_or_none(self._read(days, "l2", coin, tail_carry=True)),
             asset_ctx=_or_none(self._read(days, "asset_ctx", coin)),
             levels=self.levels,
         )
@@ -276,14 +284,32 @@ class LakeSource:
         keep = [name for name in wanted if name in grid.columns]
         return grid.filter(pl.col("ts_ms") >= day.midnight_ms).select(keep)
 
-    def _read(self, days: Sequence[str], table: str, coin: str, **extra: object) -> pl.DataFrame:
-        parts = [
-            frame
-            for partition in days
-            if not (
-                frame := load_day(self.data_dir, table, partition, coins=[coin], **extra)  # type: ignore[arg-type]
-            ).is_empty()
-        ]
+    def _read(
+        self,
+        days: Sequence[str],
+        table: str,
+        coin: str,
+        *,
+        tail_carry: bool = False,
+        venue: str | None = None,
+    ) -> pl.DataFrame:
+        """One coin's rows across `days`, the last of which is the day being built.
+
+        `tail_carry` keeps only the last snapshot of every day but the last, for the tables
+        that reach the grid through a backward as-of join alone.
+        """
+        parts = []
+        for index, partition in enumerate(days):
+            frame = load_day(
+                self.data_dir,
+                table,
+                partition,
+                coins=[coin],
+                venue=venue,
+                tail_only=tail_carry and index < len(days) - 1,
+            )
+            if not frame.is_empty():
+                parts.append(frame)
         return pl.concat(parts) if parts else pl.DataFrame()
 
     def _cached(self, cache_root: Path, day: Day) -> pl.LazyFrame | None:

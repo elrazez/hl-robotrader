@@ -24,7 +24,7 @@ consumed. Three degradations, in order of how much they cost us:
    too large.
 3. **no snapshot at all**: fill at the last trade price plus `slip_stale_bps`, and count it
    in `no_book_fills`. This is the normal case for the historical year, where `l2` exists
-   as hourly snapshots on four coins, so the report prints the share of fills that used it
+   on four coins only, so the report prints the share of fills that used it
    and the holdout comparison flags any split where the share differs by more than ten
    points. A number produced this way is an estimate with a name, not a measurement.
 

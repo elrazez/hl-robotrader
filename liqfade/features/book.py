@@ -1,8 +1,8 @@
 """Spread, depth and book imbalance from L2 snapshots.
 
 **These columns are null for almost the whole research window, and that is not a bug.** The
-historical year has no `bbo` at all, and `l2` is hourly snapshots on four coins, so for a
-backfilled window the honest answer to "what was the spread" is that nobody recorded it. The
+historical year has no `bbo` at all, and `l2` covers four coins only, so for every other
+coin the honest answer to "what was the spread" is that nobody recorded it. The
 cost model handles that by subtracting an estimated effective spread built from Hyperliquid's
 own impact prices in `asset_ctx` (see `scripts/research/_lib.py`), which is why the research
 can proceed without this module.

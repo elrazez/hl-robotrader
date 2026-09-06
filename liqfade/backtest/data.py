@@ -174,6 +174,7 @@ def load_day(
     coins: Sequence[str] | None = None,
     venue: str | None = None,
     spans: Mapping[str, Sequence[tuple[int, int]]] | None = None,
+    tail_only: bool = False,
 ) -> pl.DataFrame:
     """Read **one UTC day** of one table, projected and filtered inside the scan.
 
@@ -193,6 +194,13 @@ def load_day(
             never read at all, so a busy day whose cascades cover 3% of the clock reads
             roughly 3% of its rows rather than fifty million and throwing them away. None
             reads the whole day.
+        tail_only: keep only the rows sharing the day's last `effective_ts`, which for
+            `bbo` and `l2` is its last snapshot. For a table that reaches its consumer
+            through a backward as-of join alone, that is the only row of the day a later
+            timestamp can select, and the filter is pushed into the scan so the rest of the
+            day is never materialised. `l2` is 3.1 million rows per coin per day, so this
+            is the difference between a year of four coins peaking over two gigabytes and
+            under.
 
     Returns:
         The rows, or an empty frame when the day is absent or nothing survives the filters.
@@ -223,6 +231,13 @@ def load_day(
                 ]
                 or [pl.lit(False)]
             )
+        )
+    if tail_only:
+        latest = _effective_ts().alias("_known")
+        frame = (
+            frame.with_columns(latest)
+            .filter(pl.col("_known") == pl.col("_known").max())
+            .drop("_known")
         )
     return frame.collect()
 
