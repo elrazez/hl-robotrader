@@ -119,6 +119,9 @@ ROTATE_OVERLAP_S = 5.0
 # close it on shutdown and to ping it; both have to end when the socket does, or a rotated
 # out connection leaves tasks behind and `_pump` never returns to reconnect.
 SOCKET_POLL_S = 0.25
+# How long a retired socket's receive loop is given to hand over the frames it had already
+# been sent, before the changeover's dedupe is turned off.
+RETIRE_DRAIN_S = 5.0
 
 
 def backoff_delay(attempt: int, cfg: Recorder) -> float:
@@ -442,7 +445,9 @@ class WSStream:
         # Raw payloads seen while two sockets overlap, so the changeover writes no row
         # twice. Empty and unused the rest of the time, which is all but a few seconds
         # every rotate_after_s.
-        self._overlapping = False
+        # Rotations currently overlapping, not a flag: a drain that runs long could
+        # otherwise have one rotation's `finally` turn off the dedupe the next is using.
+        self._overlaps = 0
         self._overlap_seen: set[bytes] = set()
 
     # --- stats ---------------------------------------------------------------
@@ -567,14 +572,16 @@ class WSStream:
 
     def _serve(self, group: asyncio.TaskGroup, ws: Any, stop: asyncio.Event) -> None:
         """Start the tasks one live socket needs. Every one of them ends when it closes."""
-        group.create_task(self._recv_loop(ws), name=f"{self.venue}-recv")
+        recv = group.create_task(self._recv_loop(ws), name=f"{self.venue}-recv")
         if self.ping_s and self.ping_frame is not None:
             group.create_task(self._ping_loop(ws, stop), name=f"{self.venue}-ping")
         group.create_task(self._close_on_stop(ws, stop), name=f"{self.venue}-stop")
         if self.rotate_after_s:
-            group.create_task(self._rotate(group, ws, stop), name=f"{self.venue}-rotate")
+            group.create_task(self._rotate(group, ws, recv, stop), name=f"{self.venue}-rotate")
 
-    async def _rotate(self, group: asyncio.TaskGroup, old: Any, stop: asyncio.Event) -> None:
+    async def _rotate(
+        self, group: asyncio.TaskGroup, old: Any, old_recv: asyncio.Task[None], stop: asyncio.Event
+    ) -> None:
         """Replace this socket before the venue expires it, so the swap loses no rows.
 
         Hyperliquid closes every connection with `1000 (OK) Expired` after 167 to 181
@@ -593,18 +600,21 @@ class WSStream:
             return
         if old.close_code is not None:  # the venue got there first
             return
+        # The dedupe goes on before the replacement is even connected, and comes off only
+        # once the retired socket has handed over everything it was sent, so there is no
+        # moment where two sockets are sinked and the repeats are not recognised.
+        #
+        # Both ends of that were wrong first and a test against a fake expiring venue
+        # caught them. The venue starts broadcasting to a socket the moment its handshake
+        # completes, which happens inside the connect await while this task is still
+        # suspended there, so one message reached both sockets with the dedupe still off:
+        # the old socket's copy was sinked and the replacement's then looked like a first
+        # sight. try/finally, because a dedupe left on would grow without bound.
+        self._overlaps += 1
         try:
-            new = await websockets.connect(
-                self.url, max_size=None, open_timeout=15, close_timeout=5
-            )
-        except Exception as exc:
-            log.warning("stream_rotate_failed", venue=self.venue, error=_describe(exc))
-            return
-        # On before the replacement can deliver anything and off only once the old socket
-        # is shut, so there is no moment where both are sinked and the repeats are not
-        # recognised. try/finally, because a dedupe left on would grow without bound.
-        self._overlapping = True
-        try:
+            new = await self._connect_standby()
+            if new is None:
+                return
             self._ws = new
             self._serve(group, new, stop)
             for frame in self.on_connect(self.symbols):
@@ -612,9 +622,25 @@ class WSStream:
             log.info("stream_rotated", venue=self.venue, overlap_s=self.rotate_overlap_s)
             await _sleep_unless(stop, self.rotate_overlap_s)
             await old.close()
+            # `close()` returns once the handshake is done, but frames the socket had
+            # already received are still queued in front of its receive loop. The dedupe
+            # has to outlive them: turning it off at the close let one of those through as
+            # a duplicate of a message the replacement had already delivered.
+            await asyncio.wait([old_recv], timeout=RETIRE_DRAIN_S)
         finally:
-            self._overlapping = False
-            self._overlap_seen.clear()
+            self._overlaps -= 1
+            if not self._overlaps:
+                self._overlap_seen.clear()
+
+    async def _connect_standby(self) -> Any:
+        """The replacement socket, or None with the reason logged and the old one kept."""
+        try:
+            return await websockets.connect(
+                self.url, max_size=None, open_timeout=15, close_timeout=5
+            )
+        except Exception as exc:
+            log.warning("stream_rotate_failed", venue=self.venue, error=_describe(exc))
+            return None
 
     async def _close_on_stop(self, ws: Any, stop: asyncio.Event) -> None:
         """Close this socket on shutdown, and end when it closes for any other reason.
@@ -653,7 +679,7 @@ class WSStream:
 
     def handle(self, raw: bytes, rx_ms: int) -> None:
         """Parse one message and sink its rows. Never raises: a bad message is dropped."""
-        if self._overlapping and self._duplicate_of_the_overlap(raw):
+        if self._overlaps and self._duplicate_of_the_overlap(raw):
             return
         if self.pong_marker is not None and self.pong_marker in raw:
             self._record_pong()

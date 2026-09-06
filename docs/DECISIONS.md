@@ -1657,14 +1657,23 @@ raw payload rather than on `(coin, ts_ms, tid)`, because the venue sends the sam
 both sockets and one key then covers every table: `bbo` and `l2` carry no id of their own
 and a per-table key would have to invent one.
 
-Two boundaries are load-bearing and both were wrong first, caught by a test against a fake
-server that expires connections the way Hyperliquid does:
+Two boundaries are load-bearing and both were wrong first. A test against a fake server
+that expires connections the way Hyperliquid does caught them, at about one duplicate row
+per four rotations, and a traced harness said which socket delivered each copy and what the
+dedupe's state was at the time. Reasoning about it had twice pointed at the wrong end.
 
-- The dedupe goes on **before** the replacement can deliver anything, not after its
-  subscribe frames are sent.
-- It goes off only **after the retired socket's receive loop has drained**. `close()`
-  returns when the handshake is done, but frames already received are still queued in front
-  of that loop, and turning the dedupe off at the close let one through as a duplicate.
+- **On before the replacement is connected**, not after it. The venue starts broadcasting
+  to a socket the moment its handshake completes, which is *inside* the `connect` await
+  while the rotating task is still suspended there. So one message reached both sockets
+  with the dedupe still off: the old socket's copy was sinked without being recorded, and
+  the replacement's then looked like a first sight.
+- **Off only after the retired socket's receive loop has drained.** `close()` returns when
+  the closing handshake is done, but frames the socket had already received are still
+  queued in front of that loop, and turning the dedupe off at the close let one of them
+  through as a duplicate of a message the replacement had already delivered.
+
+The overlap is counted rather than flagged, so a drain that runs long cannot have one
+rotation's cleanup turn off the dedupe a later one is still using.
 
 **A rotation that cannot connect costs the hole it was meant to avoid and nothing else.**
 The old socket is untouched, Hyperliquid expires it on its own schedule, and the reconnect
