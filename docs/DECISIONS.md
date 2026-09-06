@@ -1697,3 +1697,29 @@ the group down, which is what actually drove every reconnect; on a venue **witho
 did not, and `binance` is configured without a ping frame. A clean close there was a stream
 that silently stopped reconnecting for the life of the process. Every task belonging to a
 socket now ends when that socket closes, which the rotation needed anyway.
+
+### What the changeover actually does, measured against live Hyperliquid
+
+Waiting 167 minutes for an `Expired` close is a slow way to test a rotation, so it was
+measured instead with a 12 minute recorder against the real venue with
+`LIQFADE_VENUES__HYPERLIQUID__WS_LIFETIME_S=300`, writing to a scratch lake so the live
+recorder and its data were untouched. Same code, same venue, sooner.
+
+The first run found the bug the fake server could not: Hyperliquid does not answer our
+close frame, so closing the retired socket raised `ConnectionClosedError` out of its
+receive loop, that left the `_pump` task group, and the group took the replacement's tasks
+with it. Both rotations were followed by a full reconnect, so the changeover was still
+paying the hole and the resubscribe snapshot it exists to avoid, and the 20 duplicate `l2`
+rows were that reconnect's snapshot rather than the overlap.
+
+| over 12 minutes, 2 rotations | before the teardown fix | after |
+| --- | --- | --- |
+| reconnects following a rotation | 2 | **0** |
+| `trades` duplicates on `(coin, ts_ms, tid)` | 0 of 14,744 | 0 of 13,732 |
+| `bbo` duplicates on `(coin, ts_ms)` | 0 of 49,274 | 0 of 50,029 |
+| `l2` duplicates on `(coin, ts_ms, level)` | 20 of 52,780 | **0 of 52,060** |
+| longest gap between `bbo` messages | 767 ms | **619 ms**, p99 341 ms |
+
+Against about 18,000 ms of nothing recorded on every `Expired` close before, eight times a
+day. The raw-payload dedupe is enough once there is no spurious reconnect behind it, so the
+per-table key dedupe the overlap was going to need was not built.
