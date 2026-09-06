@@ -30,6 +30,7 @@ from liqfade.strategy.types import (
     Intent,
     LiqSide,
     Side,
+    Tier,
     Urgency,
     fade_side,
 )
@@ -138,9 +139,18 @@ class StrategyEngine:
     # --- internals ------------------------------------------------------------
 
     def _detector(self, coin: str) -> CascadeDetector:
+        """This coin's detector, built on first sight and carrying its tier.
+
+        The tier is what `cascade.liq_usd_min` is looked up by, the same way
+        `filters.max_spread_bps` is. A coin with no metadata gets `AssetMeta`'s own default
+        of `minor`; it cannot be traded anyway, because `_consider` drops a signal on a coin
+        it cannot price.
+        """
         detector = self._detectors.get(coin)
         if detector is None:
-            detector = CascadeDetector(coin, self.settings)
+            meta = self.meta.get(coin)
+            tier: Tier = meta.tier if meta is not None else "minor"
+            detector = CascadeDetector(coin, self.settings, tier=tier)
             self._detectors[coin] = detector
         return detector
 

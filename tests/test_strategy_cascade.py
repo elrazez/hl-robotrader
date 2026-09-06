@@ -100,6 +100,89 @@ class TestTrigger:
         assert detector.active("long") is not None
 
 
+class TestNotionalFloor:
+    """`cascade.liq_usd_min`, the USD floor, and the z-score becoming optional."""
+
+    def floors(self, **over: float) -> dict[str, float]:
+        values = {"core": 5_000_000.0, "major": 2_000_000.0, "minor": 1_000_000.0}
+        values.update(over)
+        return values
+
+    def test_the_floor_is_read_from_the_coins_own_tier(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """`falling_row` liquidates 4m USD: over the major floor, under the core one.
+
+        The same row, the same config, two tiers, two answers. That is the whole point of
+        the mapping, and it is the same lookup `filters.max_spread_bps` uses.
+        """
+        settings = settings_factory(
+            **{"cascade.liq_usd_min": self.floors(), "cascade.liq_z_min": None}
+        )
+        major = CascadeDetector("ETH", settings, tier="major")
+        major.on_tick(falling_row(START_MS, 100.0))
+        assert major.active("long") is not None
+
+        core = CascadeDetector("BTC", settings, tier="core")
+        core.on_tick(falling_row(START_MS, 100.0))
+        assert core.active("long") is None
+
+    def test_a_null_z_score_no_longer_blocks_the_start(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The reason the floor exists: the z is null on most real rows, the notional is not."""
+        settings = settings_factory(
+            **{"cascade.liq_usd_min": self.floors(), "cascade.liq_z_min": None}
+        )
+        detector = CascadeDetector("ETH", settings, tier="major")
+        detector.on_tick(falling_row(START_MS, 100.0, liq_z_long_w=None))
+        assert detector.active("long") is not None
+
+    def test_both_conditions_apply_when_both_are_set(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """Neither subsumes the other, so setting both means both."""
+        settings = settings_factory(**{"cascade.liq_usd_min": self.floors()})
+        detector = CascadeDetector("ETH", settings, tier="major")
+        detector.on_tick(falling_row(START_MS, 100.0, liq_z_long_w=2.0))
+        assert detector.active("long") is None, "z under liq_z_min, floor cleared"
+
+        detector = CascadeDetector("ETH", settings, tier="major")
+        detector.on_tick(falling_row(START_MS, 100.0, liq_long_usd_w=1_000.0))
+        assert detector.active("long") is None, "z cleared, notional under the floor"
+
+    def test_the_floor_reads_the_liquidated_side(self, settings_factory: SettingsFactory) -> None:
+        """A short-side floor is judged on short notional, which here is under it."""
+        settings = settings_factory(
+            **{"cascade.liq_usd_min": self.floors(), "cascade.liq_z_min": None}
+        )
+        detector = CascadeDetector("ETH", settings, tier="major")
+        detector.on_tick(
+            falling_row(
+                START_MS,
+                100.0,
+                liq_short_usd_w=1_000.0,
+                liq_imbalance_w=-0.8,
+                ret_w=0.01,
+            )
+        )
+        assert detector.active("short") is None
+
+    def test_an_unplaced_coin_falls_back_to_the_minor_floor(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """`AssetMeta`'s own default tier, so the detector and the filters agree."""
+        settings = settings_factory(
+            **{
+                "cascade.liq_usd_min": self.floors(minor=10_000_000.0),
+                "cascade.liq_z_min": None,
+            }
+        )
+        detector = CascadeDetector("WIF", settings)
+        detector.on_tick(falling_row(START_MS, 100.0))
+        assert detector.active("long") is None
+
+
 class TestTracking:
     def test_extreme_follows_the_lowest_mid_of_a_falling_cascade(
         self, settings_factory: SettingsFactory

@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from liqfade.config.models import Settings
-from liqfade.strategy.types import CascadeState, FeatureRow, LiqSide
+from liqfade.strategy.types import CascadeState, FeatureRow, LiqSide, Tier
 
 __all__ = ["CascadeDetector", "CascadeSignal"]
 
@@ -71,9 +71,18 @@ class CascadeDetector:
     it without a branch.
     """
 
-    def __init__(self, coin: str, settings: Settings) -> None:
+    def __init__(self, coin: str, settings: Settings, *, tier: Tier = "minor") -> None:
+        """
+        Args:
+            coin: the Hyperliquid symbol.
+            settings: resolved config, read on every tick rather than snapshotted.
+            tier: which `cascade.liq_usd_min` entry applies, from the coin's `AssetMeta`.
+                The same lookup `filters.max_spread_bps` uses. Defaults to `minor`, which
+                is `AssetMeta`'s own default for a coin the universe cannot place.
+        """
         self.coin = coin
         self.settings = settings
+        self.tier = tier
         self._active: dict[LiqSide, CascadeState] = {}
 
     def active(self, side: LiqSide) -> CascadeState | None:
@@ -125,9 +134,18 @@ class CascadeDetector:
     def _trigger_fires(self, side: LiqSide, row: FeatureRow) -> bool:
         """The configured feed says forced flow is extreme.
 
-        A null is not a pass. An undefined z-score means the trailing distribution is not
+        Two conditions, each applied only when its config key is set, and `Cascade` refuses
+        a config where both are null. They ask different questions and neither subsumes the
+        other: `liq_z_min` asks how unusual this flow is for this coin, which travels across
+        a universe whose notional spans two orders of magnitude, and `liq_usd_min` asks
+        whether it is large enough in dollars to have moved price at all, which a z-score
+        cannot say on a series that is quiet most of the time.
+
+        A null z is not a pass. An undefined z-score means the trailing distribution is not
         full yet, which is a statement that we do not know how unusual this is, and trading
-        on "we do not know" is how a backtest finds an edge in its own warm-up period.
+        on "we do not know" is how a backtest finds an edge in its own warm-up period. The
+        notional has no such state: no liquidations recorded is zero notional, and zero
+        fails any floor above it.
         """
         cascade = self.settings.cascade
         if cascade.trigger == "proxy":
@@ -135,8 +153,15 @@ class CascadeDetector:
             return proxy is not None and proxy >= cascade.proxy_min
         # exact and crossvenue read the same column; the trigger chose which venues filled
         # it when the feature grid was built.
-        z = row.liq_z(side)
-        return z is not None and z >= cascade.liq_z_min
+        if cascade.liq_z_min is not None:
+            z = row.liq_z(side)
+            if z is None or z < cascade.liq_z_min:
+                return False
+        if cascade.liq_usd_min is not None:
+            floor: float = getattr(cascade.liq_usd_min, self.tier)
+            if row.liq_usd_w(side) < floor:
+                return False
+        return True
 
     def _move_is_big_enough(self, side: LiqSide, row: FeatureRow) -> bool:
         """Price has moved with the liquidations by `ret_over_rv_min` volatilities."""

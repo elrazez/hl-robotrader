@@ -188,9 +188,21 @@ def candidate_expr(settings: Settings) -> pl.Expr:
         flow = long_side.fill_null(False) | short_side.fill_null(False)
         lopsided = pl.lit(True)
     else:
-        long_side = pl.col(f"liq_long_usd_{w}s_z") >= cascade.liq_z_min
-        short_side = pl.col(f"liq_short_usd_{w}s_z") >= cascade.liq_z_min
-        flow = long_side.fill_null(False) | short_side.fill_null(False)
+        flow = pl.lit(True)
+        if cascade.liq_z_min is not None:
+            long_z = pl.col(f"liq_long_usd_{w}s_z") >= cascade.liq_z_min
+            short_z = pl.col(f"liq_short_usd_{w}s_z") >= cascade.liq_z_min
+            flow = flow & (long_z.fill_null(False) | short_z.fill_null(False))
+        if cascade.liq_usd_min is not None:
+            # The most permissive tier, because this expression cannot see which coin a row
+            # belongs to and a floor higher than the coin's own would filter away a row the
+            # detector would have acted on. Being generous here costs a little speed; being
+            # strict would silently change results.
+            floors = cascade.liq_usd_min
+            floor = min(floors.core, floors.major, floors.minor)
+            long_usd = pl.col(f"liq_long_usd_{w}s") >= floor
+            short_usd = pl.col(f"liq_short_usd_{w}s") >= floor
+            flow = flow & (long_usd.fill_null(False) | short_usd.fill_null(False))
         lopsided = (pl.col(f"liq_imbalance_{w}s").abs() >= cascade.imbalance_min).fill_null(False)
 
     moved = (

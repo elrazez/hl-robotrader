@@ -31,7 +31,7 @@ import pytest
 
 from liqfade.backtest.data import load_day, utc_days
 from liqfade.backtest.engine import RunInputs, run_backtest
-from liqfade.backtest.features import cascade_windows
+from liqfade.backtest.features import candidates, cascade_windows
 from liqfade.backtest.source import LakeSource, feature_hash
 from liqfade.config.models import Settings
 
@@ -339,6 +339,75 @@ class TestNothingMoved:
             "the streaming engine changed a number the old engine produced; "
             f"got {digest}, expected {REFERENCE['sha256']}"
         )
+
+
+class TestTheCandidateSuperset:
+    """`candidate_expr` must never filter away a row the detector would have acted on.
+
+    It is the one optimisation in the streaming engine that can silently change a result:
+    a row dropped here is a cascade that never happens, and nothing downstream would say
+    so. The USD floor is the first condition whose threshold depends on the coin, and this
+    expression cannot see which coin a row belongs to.
+    """
+
+    def grid(self) -> pl.DataFrame:
+        """Three rows: a big cascade with a null z, a small one, and a quiet one."""
+        return pl.DataFrame(
+            {
+                "coin": ["BTC", "BTC", "BTC"],
+                "ts_ms": [1_000, 2_000, 3_000],
+                "liq_long_usd_60s": [4_000_000.0, 5_000.0, 0.0],
+                "liq_short_usd_60s": [0.0, 0.0, 0.0],
+                "liq_long_usd_60s_z": [None, None, None],
+                "liq_short_usd_60s_z": [None, None, None],
+                "liq_imbalance_60s": [1.0, 1.0, 0.0],
+                "ret_60s": [-0.01, -0.01, 0.0],
+                "rv_300s": [0.002, 0.002, 0.002],
+            },
+            schema_overrides={"liq_long_usd_60s_z": pl.Float64, "liq_short_usd_60s_z": pl.Float64},
+        )
+
+    def test_a_null_z_and_a_notional_floor_still_finds_the_row(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        settings = settings_factory(
+            **{
+                "cascade.liq_z_min": None,
+                "cascade.liq_usd_min": {
+                    "core": 1_000_000.0,
+                    "major": 500_000.0,
+                    "minor": 100_000.0,
+                },
+            }
+        )
+        found = candidates(self.grid(), settings)
+        assert found.get_column("ts_ms").to_list() == [1_000]
+
+    def test_the_most_permissive_tier_is_the_one_applied(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """A BTC row under the core floor but over the minor one must survive the filter.
+
+        The expression cannot tell BTC from a minor coin, and a run whose universe held
+        both would otherwise drop the minor coin's cascades.
+        """
+        settings = settings_factory(
+            **{
+                "cascade.liq_z_min": None,
+                "cascade.liq_usd_min": {
+                    "core": 9_000_000.0,
+                    "major": 9_000_000.0,
+                    "minor": 1_000.0,
+                },
+            }
+        )
+        assert candidates(self.grid(), settings).get_column("ts_ms").to_list() == [1_000, 2_000]
+
+    def test_a_null_floor_leaves_the_z_score_expression_alone(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The shipped default. Every z here is null, so nothing is a candidate."""
+        assert candidates(self.grid(), settings_factory()).is_empty()
 
 
 class TestTheWindowMaths:

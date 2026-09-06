@@ -140,17 +140,45 @@ CascadeTrigger = Literal["exact", "proxy", "crossvenue"]
 ExhaustionMode = Literal["fixed_delay", "rule"]
 
 
+class LiqUsdFloors(Base):
+    """USD liquidated in `cascade.window_s` that qualifies a cascade, per universe tier.
+
+    Same shape and the same tier lookup as `filters.max_spread_bps`, because it is the same
+    question asked of size rather than of spread: what counts as a lot on this coin.
+    """
+
+    core: NonNeg = Field(..., description="USD: floor for core coins")
+    major: NonNeg = Field(..., description="USD: floor for major coins")
+    minor: NonNeg = Field(..., description="USD: floor for minor coins")
+
+
 class Cascade(Base):
     # One detector behind all three values; the trigger picks which feed fills the
     # liquidation columns and which condition the detector consults. `exact` is the
     # historical ceiling and cannot be traded: Settings refuses it on mainnet and
     # live_trading_block_reason names it. docs/DECISIONS.md, 2026-09-06.
     trigger: CascadeTrigger = Field("exact", description="which liquidation feed the trigger reads")
-    liq_z_min: float = Field(..., description="z-score: liquidation notional over window_s")
+    # The two liquidation conditions. Each is applied when it is set and skipped when it is
+    # null; the validator below refuses both null, which would admit every row on the tape.
+    liq_z_min: float | None = Field(
+        ..., description="z-score: liquidation notional over window_s; null does not apply it"
+    )
+    liq_usd_min: LiqUsdFloors | None = Field(
+        None, description="USD per tier: liquidated notional over window_s; null is off"
+    )
     proxy_min: NonNeg = Field(..., description="multiple: hl_forced_proxy alternative trigger")
     ret_over_rv_min: NonNeg = Field(..., description="ratio: abs(ret_w) / rv_5m")
     imbalance_min: Frac = Field(..., description="ratio: liq_imbalance favouring the side")
     window_s: Pos = Field(..., description="seconds: window the conditions are evaluated over")
+
+    @model_validator(mode="after")
+    def _one_liquidation_condition_at_least(self) -> Cascade:
+        if self.liq_z_min is None and self.liq_usd_min is None:
+            raise ValueError(
+                "cascade needs liq_z_min or liq_usd_min; with both null every row on the "
+                "tape passes the liquidation condition"
+            )
+        return self
 
 
 class Exhaustion(Base):

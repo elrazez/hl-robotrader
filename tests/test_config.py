@@ -93,6 +93,19 @@ def test_cross_field_validators_reject_inconsistent_risk(tmp_path: Path) -> None
         load_settings("paper", extra_files=[extra], environ={})
 
 
+def test_a_cascade_with_no_liquidation_condition_is_rejected(tmp_path: Path) -> None:
+    """Both of `cascade.liq_z_min` and `cascade.liq_usd_min` null admits every row.
+
+    Each is allowed to be null on its own, which is what makes a notional-only run
+    expressible, so the only thing standing between the owner and a config that trades
+    every second of the tape is this validator.
+    """
+    extra = tmp_path / "no_trigger.yaml"
+    extra.write_text("cascade:\n  liq_z_min: null\n  liq_usd_min: null\n")
+    with pytest.raises(ConfigError, match="liq_z_min or liq_usd_min"):
+        load_settings("paper", extra_files=[extra], environ={})
+
+
 def test_flatten_produces_dotted_keys() -> None:
     merged, _ = resolve("paper", environ={})
     flat = flatten(merged)
