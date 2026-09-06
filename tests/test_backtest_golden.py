@@ -84,6 +84,40 @@ def result(lake: tuple[object, object, int, int], settings: Settings) -> object:
     )
 
 
+def test_a_kill_file_on_disk_does_not_stop_a_backtest(
+    lake: tuple[object, object, int, int],
+    settings_factory: SettingsFactory,
+    tmp_path: Path,
+) -> None:
+    """A replay places no orders, so there is nothing for a kill switch to stop.
+
+    The gate itself is unchanged and still fails closed for the live loop, which is what
+    `tests/test_risk.py` pins. What changed is that the backtest never asks it: on
+    2026-09-06 a USB timeout on the lake's drive was read as a kill file by
+    `Settings.kill_switch_present`, which fails closed on any OSError, and cost a research
+    run an entry. Two runs of one command disagreed, which is the property a backtest most
+    needs to keep.
+    """
+    kill = tmp_path / "KILL"
+    kill.write_text("")
+    settings = settings_factory(**{"features.z_lookback_h": 1.0, "paths.data_dir": str(tmp_path)})
+    assert settings.kill_switch_present, "the fixture has to actually place the file"
+
+    trades, liquidations, start_ms, end_ms = lake
+    result = run_backtest(
+        RunInputs(
+            trades=trades,  # type: ignore[arg-type]
+            liquidations=liquidations,  # type: ignore[arg-type]
+            start_ms=start_ms,
+            end_ms=end_ms,
+            starting_equity=EQUITY,
+        ),
+        settings,
+    )
+    assert len(result.trades) == golden_lake.N_CASCADES
+    assert "kill_switch" not in result.risk_blocks
+
+
 class TestGoldenRun:
     def test_it_finds_exactly_the_cascades_the_fixture_contains(self, result: object) -> None:
         assert result.intents == golden_lake.N_CASCADES  # type: ignore[attr-defined]

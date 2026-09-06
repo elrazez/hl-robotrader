@@ -270,7 +270,12 @@ def run_backtest(
     strategy = StrategyEngine(settings, meta)
     # In memory: a replay starts from no halts and no cooldowns, and must never
     # read or write the live account's risk state.
-    risk = RiskEngine(settings, path=None)
+    # A replay places no orders, so the one control that outranks everything else has
+    # nothing to stop, and asking it costs a `stat` of `data/KILL` on every entry check.
+    # `Settings.kill_switch_present` fails closed on any OSError, which is correct for a
+    # live account and wrong here: a USB timeout on the lake's drive is not a kill switch,
+    # and it made two runs of the same command disagree twice on 2026-09-06.
+    risk = RiskEngine(settings, path=None, kill_switch=lambda: None)
     state: dict[str, _CoinState] = {}
     cloid = _CloidCounter()
     result = BacktestResult(

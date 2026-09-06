@@ -16,7 +16,7 @@ at all.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -101,7 +101,13 @@ class RiskVerdict:
 class RiskEngine:
     """Holds the persisted state and applies every gate to it."""
 
-    def __init__(self, settings: Settings, *, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        path: Path | None = None,
+        kill_switch: Callable[[], str | None] | None = None,
+    ) -> None:
         """
         Args:
             settings: resolved config.
@@ -109,9 +115,21 @@ class RiskEngine:
                 wants: a replay has no prior halts or cooldowns, and inheriting the live
                 account's would make it depend on what the bot did this morning. The live
                 loop passes `settings.risk_state_path` explicitly.
+            kill_switch: what to consult for the kill switch, called once per entry check.
+                None is the real thing, `gates.kill_switch` over `data/KILL`, and is what
+                the live loop gets. **A backtest passes a check that never fires**, because
+                a replay places no orders and there is nothing on disk for a kill file to
+                stop. `Settings.kill_switch_present` fails closed on any `OSError`, which is
+                right for a live account and wrong for a research run: both chats of
+                2026-09-06 watched a USB timeout on the lake's drive become a `kill_switch`
+                block that cost a run an entry and made two runs of the same command
+                disagree. The gate is not softened; it is simply not asked.
         """
         self.settings = settings
         self.store = RiskStateStore(path)
+        self._kill_switch: Callable[[], str | None] = (
+            kill_switch if kill_switch is not None else lambda: gates.kill_switch(settings)
+        )
 
     @property
     def state(self) -> RiskState:
@@ -131,7 +149,7 @@ class RiskEngine:
         self._expire_halt(now)
 
         reasons = (
-            gates.kill_switch(settings),
+            self._kill_switch(),
             gates.halted(state, now),
             gates.drawdown(state, account.equity, settings),
             gates.daily_loss(state, settings),
@@ -217,7 +235,7 @@ class RiskEngine:
         Refuses while the kill file is present: `/resume` must not be a way to trade
         through a kill switch, and the file is the one control that outranks every other.
         """
-        if self.settings.kill_switch_present:
+        if self._kill_switch() is not None:
             return None
         reason = self.state.halt_reason
         self.state.halt_reason = None
