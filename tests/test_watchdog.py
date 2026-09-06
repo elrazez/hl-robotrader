@@ -1,0 +1,124 @@
+"""The watchdog: what happens when the loop stops breathing.
+
+It is a separate process on purpose, so its tests drive the two things it can see, the
+heartbeat file and the control socket, and never the loop itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from liqfade.execution.watchdog import Watchdog, heartbeat_age_s, read_heartbeat
+
+
+def write_heartbeat(path: Path, ms: int) -> None:
+    path.write_text(f"{ms}\n")
+
+
+def test_a_missing_heartbeat_is_not_a_young_one(tmp_path: Path) -> None:
+    """Absent must never read as fresh: that is the failure the watchdog exists for."""
+    assert read_heartbeat(tmp_path / "heartbeat") is None
+    assert heartbeat_age_s(tmp_path / "heartbeat", now_ms=1_000) is None
+
+
+def test_an_unreadable_heartbeat_is_also_none(tmp_path: Path) -> None:
+    path = tmp_path / "heartbeat"
+    path.write_text("not a number\n")
+    assert read_heartbeat(path) is None
+
+
+def test_the_age_is_seconds_since_the_stamp(tmp_path: Path) -> None:
+    path = tmp_path / "heartbeat"
+    write_heartbeat(path, 10_000)
+    assert heartbeat_age_s(path, now_ms=13_500) == pytest.approx(3.5)
+
+
+async def test_a_fresh_heartbeat_raises_nothing(tmp_path: Path) -> None:
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=10.0)
+    write_heartbeat(tmp_path / "heartbeat", _now())
+
+    assert await dog.check() is True
+    assert posted == []
+    assert dog.alerts == 0
+
+
+async def test_a_stale_heartbeat_alerts_once_not_every_tick(tmp_path: Path) -> None:
+    """A wedged loop is one outage. Five hundred identical messages is not monitoring."""
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+    write_heartbeat(tmp_path / "heartbeat", _now() - 60_000)
+
+    assert await dog.check() is False
+    assert await dog.check() is False
+
+    assert len(posted) == 1
+    assert "heartbeat" in posted[0]
+    assert dog.alerts == 1
+
+
+async def test_it_says_so_when_the_loop_comes_back(tmp_path: Path) -> None:
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+    write_heartbeat(tmp_path / "heartbeat", _now() - 60_000)
+    await dog.check()
+
+    write_heartbeat(tmp_path / "heartbeat", _now())
+    assert await dog.check() is True
+
+    assert len(posted) == 2
+    assert "recovered" in posted[1].lower()
+
+
+async def test_a_missing_heartbeat_alerts_like_a_stale_one(tmp_path: Path) -> None:
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+
+    assert await dog.check() is False
+    assert "no heartbeat" in posted[0].lower()
+
+
+async def test_it_never_alerts_while_the_kill_flag_is_there(tmp_path: Path) -> None:
+    """A killed box has a dead loop on purpose. Paging about it is noise at 3am."""
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+    (tmp_path / "KILL").write_text("killed_at: deliberately\n")
+
+    assert await dog.check() is True
+    assert posted == []
+
+
+async def test_the_run_loop_polls_until_stopped(tmp_path: Path) -> None:
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0, poll_s=0.02)
+    write_heartbeat(tmp_path / "heartbeat", _now())
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(dog.run(stop))
+    await asyncio.sleep(0.1)
+    stop.set()
+    await task
+
+    assert dog.checks >= 3
+
+
+def _now() -> int:
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _a_watchdog(tmp_path: Path, posted: list[str], **kwargs: float) -> Watchdog:
+    async def alert(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    return Watchdog(
+        heartbeat=tmp_path / "heartbeat",
+        kill_file=tmp_path / "KILL",
+        alert=alert,
+        **kwargs,  # type: ignore[arg-type]
+    )

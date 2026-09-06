@@ -139,17 +139,21 @@ def test_deploy_enables_only_the_units_this_phase_runs() -> None:
     """A unit whose code arrives in a later phase crash loops from the first deploy on."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
     assert 'UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"' in text
-    assert 'NEVER_ENABLE="liqfade-live liqfade-watchdog"' in text
+    # Only the mainnet loop is denied outright now. paper and the watchdog have code
+    # behind them as of 05a, place no real order between them, and are what Phase 5
+    # drills, so LIQFADE_UNITS may name either. Neither is in the default set.
+    assert 'NEVER_ENABLE="liqfade-live"' in text
+    assert "liqfade-paper" not in text.split("UNITS=")[1].split("\n")[0]
     # The denylist is consulted first, so LIQFADE_UNITS cannot talk the script into
     # starting the trading loop.
     assert text.index("for candidate in $NEVER_ENABLE") < text.index("for candidate in $UNITS")
     assert text.index('if ! runnable "$name"') < text.index('systemctl enable "$name"')
 
 
-def test_deploy_never_starts_the_trading_loop_or_the_watchdog() -> None:
+def test_deploy_never_starts_the_mainnet_trading_loop() -> None:
     """It may print the command in the closing note, but must never run it."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
-    for unit in ("liqfade-live", "liqfade-watchdog"):
+    for unit in ("liqfade-live",):
         for command in ("systemctl enable", "systemctl enable --now", "systemctl start"):
             assert f"\n{command} {unit}" not in text
     assert "    systemctl enable --now liqfade-live" in text  # the note says how, by hand
