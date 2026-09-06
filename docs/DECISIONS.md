@@ -1727,3 +1727,43 @@ down rather than changed.
 Reverse the paper-imports-engine decision if `backtest/engine.py`'s tick functions ever
 need a live-only branch inside them, which is the moment CLAUDE.md's rule about live-only
 branches in shared code would start being broken rather than honoured.
+
+## 2026-09-06 (05a: what deploying it found, and the soak that is now running)
+
+Three defects surfaced only once the code was on the box, which is the argument for
+drilling rather than declaring done.
+
+**A kill flag we did not write is still a kill.** The file-path drill created
+`/srv/liqfade/data/KILL` as root over ssh; the service user could not overwrite it, so
+`write_kill_file` returned False and the kill reported "NOT written, a restart will not
+stay killed" about a file sitting right there. The owner would have been told the opposite
+of the truth in the one moment the message has to be trusted. Presence is what matters, not
+authorship, so a failed write now re-checks. Present means a regular file we can actually
+see: the bias is the opposite of `Settings.kill_switch_present` on purpose, because that
+gate asks whether the kill is on (unknown means yes) and this asks whether the flag
+survived (unknown means no).
+
+**An OKX liquidation with no notional raised on every one of them.** The feature engine had
+already been taught that such a row is not a liquidation of zero; the order book path had
+not, because the edit was written against a line ruff had already wrapped and nothing
+asserted the pattern matched. It passed every test and the box logged
+`paper_ingest_failed` every few minutes. Both paths drop the row now and both have a test.
+The lesson is narrower than it looks: an edit applied by pattern needs an assertion that
+the pattern was found, or it is a silent no-op.
+
+**systemd starts a unit whose `Environment=` line it could not parse.** Covered in the
+entry above; it is listed again here because all three share a shape. Each passed locally,
+each was caught by putting the thing on the machine it runs on, and none would have been
+found by another test at the same seam.
+
+**The soak.** `liqfade-paper` and `liqfade-watchdog` run from `/srv/liqfade/paper` on
+05a-paper at `2a71440`, started **2026-09-06 21:10 UTC**, so twenty four hours lands on
+**2026-09-07 21:10 UTC**. At the start: 20 coins, Hyperliquid trades, bbo, l2 and
+`asset_ctx` all flowing, Bybit and OKX liquidations arriving, Binance off by the box's own
+env override, reconciliation clean on its 60s interval, watchdog silent, 86 MB resident
+against 3 GB free. The recorder's own unit was untouched throughout and its process has run
+continuously since 20:34 UTC on its own branch.
+
+This is a plumbing soak and not the Phase 5 acceptance run. Read it for reconnects,
+reconciliation differences, memory and whether cross-venue cascades produce intents at all;
+do not read it as seven days of paper trading.
