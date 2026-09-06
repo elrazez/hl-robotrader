@@ -295,10 +295,11 @@ def run_backtest(
     for index, day in enumerate(source.days()):
         if progress is not None:
             progress.set(stage="features", sim_ms=day.start_ms)
-        rows, spans, found = _day_rows(source, day, settings, carry=carry, first=index == 0)
+        rows, spans, found, traded = _day_rows(source, day, settings, carry=carry, first=index == 0)
         carry = found
-        seen.update(coin for coin, _ in spans.items())
-        seen.update(rows.keys())
+        # Every coin that had a grid, not only the ones that cascaded. It is what the
+        # report's coin list has always meant: the universe the run actually covered.
+        seen.update(traded)
         spans = _with_spill(spans, spill)
         spans, spill = _clip_to_day(spans, day)
         _load_funding(portfolio, source.funding(day))
@@ -356,7 +357,7 @@ def _day_rows(
     *,
     carry: pl.DataFrame | None,
     first: bool,
-) -> tuple[dict[str, pl.DataFrame], dict[str, list[tuple[int, int]]], pl.DataFrame]:
+) -> tuple[dict[str, pl.DataFrame], dict[str, list[tuple[int, int]]], pl.DataFrame, list[str]]:
     """One day's grid, reduced to the rows a cascade could involve, and its windows.
 
     Per coin, so a day of 42 coins is never one three million row frame. Each coin's grid
@@ -365,7 +366,9 @@ def _day_rows(
     """
     kept: dict[str, pl.DataFrame] = {}
     found: list[pl.DataFrame] = []
+    traded: list[str] = []
     for coin, grid in source.grids(day, settings, first=first):
+        traded.append(coin)
         coin_carry = (
             None if carry is None or carry.is_empty() else carry.filter(pl.col("coin") == coin)
         )
@@ -379,7 +382,7 @@ def _day_rows(
         if found
         else pl.DataFrame(schema={"coin": pl.String, "ts_ms": pl.Int64})
     )
-    return kept, cascade_windows(day_candidates, settings), day_candidates
+    return kept, cascade_windows(day_candidates, settings), day_candidates, traded
 
 
 def _with_spill(
