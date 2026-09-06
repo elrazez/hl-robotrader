@@ -1,0 +1,90 @@
+# Backtest run config v1: a discretionary setup made objective.
+# Layered on config/default.yaml by
+#   liqfade backtest --config config/backtest/v1_confluence.yaml ...
+#
+# The liquidation is the signal and it is required. Everything else here exists to say
+# "the bottom (or top) is in" more objectively than v0's bare rules did, and it is
+# confluence rather than a set of vetoes: the setup enters when the liquidation is there
+# and at least two of the confluences agree, which is what produces tens of trades a week
+# by hand rather than the handful an all-AND stack would leave.
+#   required: enough liquidated notional, a USD floor rather than a z-score
+#   required: the cascade has exhausted (the exhaustion rule, not a flat 120 s delay)
+#   vote:     open interest was flushed
+#   vote:     price is stretched away from VWAP
+#   vote:     the cascade swept a level and reclaimed it
+#   vote:     the extreme landed on a level that already existed
+env: paper
+
+cascade:
+  trigger: exact
+  # The USD floor is the gate, and the z-score is not applied at all. A z says how unusual
+  # the flow is for this coin; on a series that is zero 82% of the time that turns out to
+  # be a weak statement, and what a trader actually reads is the dollar size of the
+  # liquidation. Per tier, like filters.max_spread_bps. docs/DECISIONS.md, 2026-09-06.
+  liq_z_min: null
+  liq_usd_min:
+    core: 500000.0
+    major: 250000.0
+    minor: 100000.0
+
+exhaustion:
+  # Wait for the cascade to actually stop instead of entering 120 s after it started:
+  # liquidations down to a quarter of their peak, flow flipped, mark back near mid, no new
+  # extreme for 10 s, all of it three ticks in a row. Q2 measured this costing PnL against
+  # the flat delay on the pooled episodes; here it is the "bottom is in" test, on purpose.
+  mode: rule
+
+strategy:
+  # The setup enters when the liquidation is there and at least two of the confluences
+  # agree. None of the four below can veto a trade on its own; together they have to carry
+  # two votes. The report prints each one's pass rate, which is the evidence for promoting
+  # one to required or dropping it.
+  min_confluence: 2
+  rules:
+    min_cascade_notional:
+      # Required. The liquidation is the signal: without it there is nothing to fade.
+      enabled: true
+      required: true
+      min_notional_usd: 250000.0  # USD liquidated in the cascade so far
+    oi_flush:
+      # Vote: open interest fell at least 1% over the last 300 s, so positions were forced
+      # out rather than price merely moving. The build half stays off for this run.
+      enabled: true
+      required: false
+      drop_min_frac: 0.01
+      build_min_frac: null
+    vwap_stretch:
+      # Vote: mid at least 30 bps below the session VWAP for a long, above it for a short.
+      enabled: true
+      required: false
+      reference: day
+      min_disp_bps: 30.0
+    level_reclaim:
+      # Vote: the cascade traded at least 5 bps through a level that already existed, and
+      # mid is back on the near side of it now. The swing failure and the three tap.
+      enabled: true
+      required: false
+      sweep_min_bps: 5.0
+      reclaim_min_bps: 0.0
+    zone_proximity:
+      # Vote: the extreme landed within 30 bps of a level, the weaker form of the same
+      # idea level_reclaim tests. Q7 measured in-zone episodes reverting worse (+36 vs
+      # +146 bps), which is why it is a vote and not a veto; the pass rate table says
+      # whether it agreed with the others often enough to matter.
+      enabled: true
+      required: false
+      zone_width_bps: 30.0
+
+intent:
+  # Exit: target 80% of the way back to the anchor, stop one 5 min vol beyond the
+  # extreme, time stop 15 min. Unchanged from v0. Change here to try other exits.
+  k_target: 0.8
+  k_stop: 1.0
+  time_stop_s: 900
+
+# risk.max_dd_frac is 0.10 in default.yaml. The v0 year hit it in month three and the
+# other nine months replayed halted. Raising it here for a tuning run is the owner's call.
+
+backtest:
+  latency_ms: 1000
+  holdout_frac: 0.25

@@ -106,6 +106,41 @@ def test_a_cascade_with_no_liquidation_condition_is_rejected(tmp_path: Path) -> 
         load_settings("paper", extra_files=[extra], environ={})
 
 
+def test_the_shipped_backtest_configs_load_and_say_what_they_switch_on() -> None:
+    """Every run config in `config/backtest/` must validate against the real models.
+
+    A run config is the only place the owner turns rules on, and a typo in one is a rule
+    that silently never ran. `extra="forbid"` makes an unknown key an error; this makes a
+    known key with the wrong value visible, by naming the exact rule set v1 claims.
+    """
+    for path in sorted(Path("config/backtest").glob("*.yaml")):
+        load_settings("paper", extra_files=[path], environ={})
+
+    v1 = load_settings(
+        "paper", extra_files=[Path("config/backtest/v1_confluence.yaml")], environ={}
+    )
+    rules = v1.strategy.rules
+    names = type(rules).model_fields
+    assert {name for name in names if getattr(rules, name).enabled} == {
+        "min_cascade_notional",
+        "oi_flush",
+        "vwap_stretch",
+        "level_reclaim",
+        "zone_proximity",
+    }
+    # The liquidation is the only thing that blocks on its own; the rest are votes.
+    assert {
+        name for name in names if getattr(rules, name).enabled and getattr(rules, name).required
+    } == {"min_cascade_notional"}
+    assert v1.strategy.min_confluence == 2
+    assert v1.cascade.liq_z_min is None
+    assert v1.cascade.liq_usd_min is not None
+    assert v1.cascade.liq_usd_min.core == 500_000.0
+    assert v1.exhaustion.mode == "rule"
+    # The default is what commit 2 fixed; a run config overriding it back would hide that.
+    assert v1.features.z_robust is True
+
+
 def test_flatten_produces_dotted_keys() -> None:
     merged, _ = resolve("paper", environ={})
     flat = flatten(merged)
