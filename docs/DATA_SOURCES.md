@@ -99,6 +99,36 @@ All tables carry `ts_ms` (exchange time), `rx_ms` (local receive time, 0 for his
 
 Partition: `data/parquet/{table}/date=YYYY-MM-DD/{venue}_{hour}.parquet`. Hourly flush from the recorder, nightly compaction into one file per table per day. A buffer that fills before the hour is out writes `{venue}_{hour}_{n}.parquet` alongside it rather than rewriting the hour file; readers glob the partition and compaction folds the day into one file, so nothing downstream needs to know.
 
+## The backtest's feature cache
+
+`data/cache/features/{feature_hash}/date=YYYY-MM-DD/grid.parquet`, written by
+`liqfade backtest` and read by the next run. Derived, disposable and gitignored: deleting
+the whole `cache/` directory costs wall time on the next run and nothing else.
+
+One file per UTC day, holding every coin the run covered, at
+`backtest.feature_grid_ms` resolution (1s by default) and carrying only the columns the
+strategy actually reads. `feature_hash` is a sha256 over the config keys a feature column
+depends on and nothing else: `features.*`, `cascade.*`, `venues.*`,
+`backtest.feature_grid_ms`, `sizing.vol_window_s`, `exhaustion.mark_mid_pct_threshold`,
+`exhaustion.max_age_s` and `strategy.rules.zone_proximity.*`. That is what makes a
+parameter sweep affordable: changing a stop, a target, a sizing fraction or a risk limit
+reads the year back and builds nothing, while changing a window length, a threshold, the
+grid step or the trigger builds a new tree beside the old one. The list lives in
+`HASHED_KEYS` in `liqfade/backtest/source.py`; a key the grid reads and the hash does not
+cover would silently hand a run someone else's features, so it is pinned by a test in both
+directions.
+
+Two things it deliberately does not do. **The run's first day is never cached**: every
+other day is built with the previous day in front of it so its rolling windows and its 24h
+z-score lookback are full, and the first day has no previous day inside the run window, so
+its grid is a function of where the run started rather than of the date. **A cache written
+for a narrower coin set is not read by a wider run**: the coin list is stamped in the
+file's Parquet metadata, because a coin that never printed that day leaves no rows and
+"covered and empty" cannot otherwise be told from "never asked about".
+
+`liqfade backtest --no-cache` rebuilds every day and writes nothing.
+
+
 ## What the wire actually sends
 
 Captured live on 2026-08-30 with `scripts/probe/ws_payloads.py`. Where this differs from the endpoint notes above, the wire wins and the parsers follow it.

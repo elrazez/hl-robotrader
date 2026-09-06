@@ -1179,3 +1179,73 @@ forty would assume.
 **Reverse this entry** if the owner decides the ceiling numbers are being read as forecasts,
 or if Q3's re-cut and Q4 both fail on 2026-11-04, in which case the engine built here has no
 trigger and the momentum variant needs its own Phase 3.
+
+
+## 2026-09-06: the backtester streams the lake and replays only where the cascades are
+
+**`load_inputs` is gone. Nothing in `backtest/` reads a date range into one frame.** The
+year run on four coins was killed by the OS twice on an 8 GB machine, and the reason was
+not the strategy: `load_inputs` handed one `scan_parquet` every file in the window. The
+sizes are worth writing down because the docstrings had them wrong. `l2` is not hourly
+snapshots on four coins, it is a snapshot roughly every 0.55s, twenty levels a side, 12.6
+million rows a day; a year is over four billion rows and a single month needs about 50 GB.
+`load_day` takes one partition and there is deliberately no range version of it, so the
+mistake cannot be made again by accident.
+
+**A day's feature grid is built per coin, not per day.** Forty-two coins on a 1s grid is
+3.6 million rows and about a gigabyte of float columns before any transform makes a copy.
+Every function in `features/` is already `.over("coin")` or `by="coin"`, so building one
+coin at a time changes no number and lets each coin's grid go before the next is read. What
+survives the day is the few thousand rows a cascade could involve.
+
+**Each day is built with the previous day in front of it, and cached.** `rv_300s`, the CVD
+slope and `traded_usd_300s` reach back minutes; `robust_z` reaches back a full 24 hours and
+`with_ctx`'s mark-divergence percentile exactly 24 hours, so one previous day is enough and
+two would be waste. That is the same previous-day carry `scripts/research/q3_proxy.py`
+uses. The result goes to `data/cache/features/{hash}/date=.../grid.parquet`, documented in
+`docs/DATA_SOURCES.md`. The run's first day is never cached, because it has no previous day
+inside the window and its grid is therefore a function of where the run started rather than
+of the date.
+
+**Raw tape is replayed only inside cascade windows.** A window opens
+`backtest.window_warmup_s` (300s) before a candidate and closes
+`exhaustion.max_age_s + intent.time_stop_s + backtest.window_margin_s` (900 + 900 + 60s)
+after it. That end is an upper bound on the last thing the cascade can cause: the latest
+tick it can signal on is `max_age_s`, the position that signal opens is flattened by the
+time stop at the latest, and the margin covers the order latency and the tick the exit
+lands on. Outside a window the portfolio is flat and no order is working, so the tape there
+holds nothing a decision could have used. **The engine asserts that at every window end
+rather than assuming it**, because it is the one way this optimisation could silently
+change a result, and the report prints the share of the clock actually replayed so a run
+creeping back towards 100% is visible as a number rather than as a wall clock that quietly
+got worse.
+
+`active_mask` now matches each row to the last candidate at or before it instead of
+counting a rolling window of rows. Same answer, and it is the form that can take the
+previous day's candidates as a carry, which a cascade starting at 23:59 needs.
+
+**Proof.** `trades.parquet` is byte-identical to the engine this replaces, on the golden
+fixture and on `2025-10-09` to `2025-10-11` of the real lake for `BTC,ETH,SOL,HYPE`; the
+digest and the command are pinned in `tests/test_backtest_streaming.py`. Three days: 8.6
+minutes and 2.39 GB before (3.14 GB on a re-run), 37 seconds and 1.59 GB after.
+
+**Two things found along the way that are not this change's to fix.**
+
+Under the shipped `features.z_robust: true` the liquidation z-score is null on every row of
+real data, so the `exact` trigger never fires and a backtest over the lake finds nothing.
+`liq_long_usd_60s` is zero in 82% of grid seconds, so its 24h rolling median is zero and
+the median absolute deviation of a mostly-zero series is also zero; `robust_z` correctly
+refuses to divide by a zero scale and returns null, and the detector correctly refuses to
+trade on null. Every part behaves as documented and the composition finds nothing: a full
+run over 2025-10-09 to 2025-10-11, which carries the busiest cascade day of the year for
+these four coins, produced zero intents and zero trades, and every `liq_*_z` on BTC's grid
+over that window is null. With `features.z_robust: false` the same window gives 246
+candidate rows and seven trades. The reference run above is therefore taken with the non-robust z, so that it
+has fills to be identical about. **Phase 5 is blocked on this**, and the fix is a scale that
+is defined for a series that is zero most of the time, not a lower threshold.
+
+`Settings.kill_switch_present` fails closed on any `OSError` from `os.stat`, which is
+right, and the lake's USB drive produced one during an eight-minute run. The risk engine
+recorded a `kill_switch` block and that run lost an entry it should have taken. Nothing to
+change in the gate: a run whose funnel shows a `kill_switch` block with no KILL file on
+disk has hit a drive hiccup and is not a reference.
