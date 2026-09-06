@@ -64,7 +64,7 @@ from liqfade.backtest.fills import (
 from liqfade.backtest.portfolio import Portfolio
 from liqfade.backtest.portfolio import Trade as PortfolioTrade
 from liqfade.backtest.progress import ProgressWriter
-from liqfade.backtest.source import DAY_MS, Day, LakeSource, midnight_ms
+from liqfade.backtest.source import DAY_MS, Day, LakeSource, feature_hash, midnight_ms
 from liqfade.config.models import Settings
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
@@ -124,6 +124,7 @@ class RunInputs:
     starting_equity: float = 10_000.0
     seed: int = 0
     _grid: pl.DataFrame | None = field(default=None, repr=False, compare=False)
+    _grid_hash: str = field(default="", repr=False, compare=False)
 
     @property
     def coins(self) -> tuple[str, ...]:
@@ -151,8 +152,14 @@ class RunInputs:
         Built once and sliced per day instead, which is exactly the grid the non-streaming
         engine had. `first` is therefore unused here; the lake needs it because its days
         are built independently.
+
+        Rebuilt when the settings that decide a feature column change, because one source
+        is replayed twice by `--lagged-ms` and the second run must not inherit the first
+        run's grid if it asked for different features.
         """
-        if self._grid is None:
+        digest = feature_hash(settings)
+        if self._grid is None or self._grid_hash != digest:
+            self._grid_hash = digest
             self._grid = build_feature_grid(
                 settings=settings,
                 trades=self.trades,

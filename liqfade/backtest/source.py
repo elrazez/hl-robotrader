@@ -144,7 +144,6 @@ class LakeSource:
         self.meta: Mapping[str, AssetMeta] = {}
         self.levels: pl.DataFrame | None = None
         self._cache = cache
-        self._cache_root = self.data_dir / CACHE_DIR / feature_hash(settings)
         self.grids_built = 0
         self.grids_cached = 0
 
@@ -176,13 +175,18 @@ class LakeSource:
         which is why a 42 coin year fits in memory at all.
 
         `first` says this is the run's first day, which is built without the previous day
-        in front of it and is neither read from nor written to the cache. `settings` is the
-        engine's, and is the same object this source was built with; it is passed so that
-        the in-memory `RunInputs` can answer the same call without holding one.
+        in front of it and is neither read from nor written to the cache.
+
+        `settings` comes from the engine rather than from this source's constructor, and
+        everything below reads it rather than `self.settings`. One source is replayed twice
+        by `--lagged-ms`, and if the second settings ever differ in a key the grid reads,
+        the second run has to build its own grid under its own hash rather than silently
+        inherit the first one's.
         """
-        cached = None if first or not self._cache else self._cached(day)
+        cache_root = self.data_dir / CACHE_DIR / feature_hash(settings)
+        cached = None if first or not self._cache else self._cached(cache_root, day)
         writer = (
-            _CacheWriter(self._cache_path(day), self.coins)
+            _CacheWriter(_cache_path(cache_root, day), self.coins)
             if self._cache and not first and cached is None
             else None
         )
@@ -192,7 +196,7 @@ class LakeSource:
                     grid = cached.filter(pl.col("coin") == coin).collect()
                     self.grids_cached += 1
                 else:
-                    grid = self._build(day, coin, first=first)
+                    grid = self._build(day, coin, settings, first=first)
                     self.grids_built += 1
                     if writer is not None:
                         writer.add(grid)
@@ -239,7 +243,7 @@ class LakeSource:
 
     # --- internals ------------------------------------------------------------
 
-    def _build(self, day: Day, coin: str, *, first: bool) -> pl.DataFrame:
+    def _build(self, day: Day, coin: str, settings: Settings, *, first: bool) -> pl.DataFrame:
         """One coin's grid for one day, built with the previous day in front of it.
 
         The carry is what makes a day's grid a function of the date rather than of where
@@ -254,7 +258,7 @@ class LakeSource:
         if trades.is_empty():
             return pl.DataFrame()
         grid = build_feature_grid(
-            settings=self.settings,
+            settings=settings,
             trades=trades,
             liquidations=self._read(days, "liquidations", coin),
             start_ms=grid_start,
@@ -268,7 +272,7 @@ class LakeSource:
             return grid
         # The strategy's whole read surface and nothing else, so a cached day is as small
         # as it can be while still being enough to replay from.
-        wanted = ("coin", "ts_ms", *row_columns(self.settings))
+        wanted = ("coin", "ts_ms", *row_columns(settings))
         keep = [name for name in wanted if name in grid.columns]
         return grid.filter(pl.col("ts_ms") >= day.midnight_ms).select(keep)
 
@@ -282,12 +286,9 @@ class LakeSource:
         ]
         return pl.concat(parts) if parts else pl.DataFrame()
 
-    def _cache_path(self, day: Day) -> Path:
-        return self._cache_root / f"date={day.date}" / CACHE_FILE
-
-    def _cached(self, day: Day) -> pl.LazyFrame | None:
+    def _cached(self, cache_root: Path, day: Day) -> pl.LazyFrame | None:
         """The day's cached grid, or None when it is absent or covers too few coins."""
-        path = self._cache_path(day)
+        path = _cache_path(cache_root, day)
         if not path.is_file():
             return None
         try:
@@ -354,6 +355,10 @@ def _cached_coins(path: Path) -> set[str] | None:
 
 
 DAY_MS = 86_400_000
+
+
+def _cache_path(cache_root: Path, day: Day) -> Path:
+    return cache_root / f"date={day.date}" / CACHE_FILE
 
 
 def midnight_ms(day: str) -> int:

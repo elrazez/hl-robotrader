@@ -24,6 +24,7 @@ import shutil
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
@@ -137,6 +138,34 @@ class TestTheLakeIsReadOneDayAtATime:
         result = run_backtest(source(day_lake, settings, cache=False), settings)
         assert result.trades, "a run that read nothing would pass this test vacuously"
         assert len(set(single_day_reads)) > 1, "the fixture spans days; the run must too"
+
+
+class TestARerunOnTheSameSourceDoesNotInheritItsGrid:
+    """`--lagged-ms` replays one source twice. The second run must build its own features
+    when it asks for different ones, and reuse them when it does not."""
+
+    def test_a_lagged_rerun_reuses_the_grid_it_already_built(
+        self, fresh_lake: tuple[Path, int, int], settings: Settings, settings_factory: Any
+    ) -> None:
+        """Latency is not a feature key, so the second replay reads the cache the first
+        one wrote. Only the run's first day is rebuilt, because that one is never cached."""
+        lake = source(fresh_lake, settings)
+        run_backtest(lake, settings)
+        built, cached = lake.grids_built, lake.grids_cached
+        degraded = settings_factory(**{"features.z_lookback_h": 1.0, "backtest.latency_ms": 30_000})
+        run_backtest(lake, degraded)
+        assert lake.grids_built == built + 1, "only the uncacheable first day may rebuild"
+        assert lake.grids_cached == cached + LAKE_DAYS - 1
+
+    def test_a_rerun_with_different_features_builds_its_own(
+        self, fresh_lake: tuple[Path, int, int], settings: Settings, settings_factory: Any
+    ) -> None:
+        lake = source(fresh_lake, settings)
+        run_backtest(lake, settings)
+        built = lake.grids_built
+        other = settings_factory(**{"features.z_lookback_h": 2.0})
+        run_backtest(lake, other)
+        assert lake.grids_built == built + LAKE_DAYS, "every day must be rebuilt"
 
 
 class TestTheReportSaysHowMuchWasReplayed:
