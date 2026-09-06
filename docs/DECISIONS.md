@@ -1228,28 +1228,49 @@ previous day's candidates as a carry, which a cascade starting at 23:59 needs.
 fixture and on `2025-10-09` to `2025-10-11` of the real lake for `BTC,ETH,SOL,HYPE`; the
 digest and the command are pinned in `tests/test_backtest_streaming.py`.
 
-Measured on the owner's machine, `/usr/bin/time -l`, nothing else running, four coins,
-`features.z_robust: false` so that the runs have fills to be identical about:
+Measured on the owner's machine, `/usr/bin/time -l`, nothing else running, with
+`features.z_robust: false` so that the runs have fills to be identical about.
+
+The three reference days, `2025-10-09` to `2025-10-11`:
 
 | run | wall | peak RSS |
 | --- | --- | --- |
-| three days, the engine this replaces | 8.6 min | 2.39 GB (3.14 GB on a re-run) |
-| three days, streaming | 37 s | 1.59 GB |
-| the year, `2025-09-01` to `2026-08-30`, cold cache | 60.7 min | 2.64 GB |
-| the year, warm cache | 32.0 min | 1.96 GB |
+| four coins, the engine this replaces | 8.6 min | 2.39 GB (3.14 GB on a re-run) |
+| four coins, streaming | 37 s | 1.59 GB |
+| four coins, streaming, `--no-cache`, with `tail_only` | 37 s | **1.44 GB** |
+| the 42-coin research universe, `--no-cache`, with `tail_only` | 46 s | **1.31 GB** |
+
+The year, `2025-09-01` to `2026-08-30`, four coins:
+
+| run | wall | peak RSS |
+| --- | --- | --- |
+| cold cache | 60.7 min | 2.64 GB |
+| warm cache | 32.0 min | 1.96 GB |
+
+**The universe costs almost nothing.** Ten times the coins is 23% more wall clock and
+*less* memory, 1.31 GB against 1.44 GB. Both halves of that are the per-coin day loop
+doing what it was built for: the working set is one coin-day whatever the universe size,
+and `l2` (the largest table in the lake by an order of magnitude) exists for four coins
+only, so the thirty-eight extra coins bring trades and nothing else. Four of the
+forty-two had no tape at all in that window and simply have no grid, which is the right
+answer rather than an error. Three days is the honest window for this: peak RSS here is
+bounded per coin-day, so a year reaches the same working set.
 
 The year replayed **10.4% of the tape in 1,376 windows**, skipping 28,193,589 simulated
-seconds. The warm run saves 28.7 minutes, 47% of the wall clock, and writes a
-`trades.parquet` byte-identical to the cold run's (`703d0a95…`), which is a second proof of
-the cache on top of the unit tests: a year of features read back off disk produces the same
-sixty-four trades as a year of features built from the tape. A year of four coins costs
-6.8 GB of cache.
+seconds; the three reference days replay 14.1% on four coins and 29.7% on the universe,
+which is what a busy stretch looks like. The warm run saves 28.7 minutes, 47% of the wall
+clock, and writes a `trades.parquet` byte-identical to the cold run's (`703d0a95…`), which
+is a second proof of the cache on top of the unit tests: a year of features read back off
+disk produces the same sixty-four trades as a year of features built from the tape. A year
+of four coins costs 6.8 GB of cache, about 1.7 GB per coin-year.
 
-The cold run's 2.64 GB is over the 2 GB the task asked for and the warm run's 1.96 GB is
-under it, which places the excess in the grid build rather than the replay. `load_day`'s
-`tail_only` is the answer to that and is proven result-identical on the three day
-reference; **the cold year has not been re-measured with it, and the 42-coin universe has
-not been run at all.** Both are outstanding.
+**What is still over budget.** The year's cold run was 2.64 GB against the 2 GB the task
+asked for, and its warm run 1.96 GB. `tail_only` takes 0.15 GB off the per-day working set
+and the year has not been re-measured with it, so the honest statement is that the working
+set is comfortably under 2 GB and a cold year is not: the difference between the 1.59 GB
+three-day peak and the 2.64 GB year peak is allocator high-water mark accumulated over 364
+days of differently sized frames, not a bigger working set. Every run after the first is a
+warm one.
 
 **Two things found along the way that were not this change's to fix.**
 
@@ -1279,3 +1300,155 @@ right, and the lake's USB drive produced one during an eight-minute run. The ris
 recorded a `kill_switch` block and that run lost an entry it should have taken. Nothing to
 change in the gate: a run whose funnel shows a `kill_switch` block with no KILL file on
 disk has hit a drive hiccup and is not a reference.
+
+## 2026-09-06: 04c, a discretionary confluence made objective, and counted rather than ANDed
+
+**What this phase encodes.** A trader runs this setup by hand and takes tens of trades a
+week. The liquidation is the signal; everything else exists to say "the bottom (or top) is
+in" objectively instead of by eye. Five conditions became switches, and one deliberate
+non-condition stayed out.
+
+- `min_cascade_notional`, already shipped, is the liquidation itself and is the only rule
+  the run config marks `required`.
+- `oi_flush`: open interest down by `drop_min_frac` over the rv window, so positions were
+  forced out rather than price merely moving, and optionally still up by `build_min_frac`
+  over the build window, which is the crowding that was there to flush. The build half is
+  measured to now rather than to the cascade start, so it is already net of the flush.
+- `vwap_stretch`: mid at least `min_disp_bps` past a VWAP, on the side the cascade pushed
+  it. `reference: day` is the session VWAP from 00:00 UTC, which is what a discretionary
+  trader watches; `anchor` is the fixed pre-cascade window. There is no mode for the
+  opposite sign. Fading when price is on the trend side of VWAP is a momentum rule and is
+  out of scope for v0, so if the sign is wrong it is a sign flip and not a setting.
+- `level_reclaim`: the swing failure and the three tap. The cascade extreme at least
+  `sweep_min_bps` through a level that already existed, and mid `reclaim_min_bps` back on
+  the near side of it now.
+- `zone_proximity`, already shipped and off since Q7, is enabled by the run config as a
+  vote rather than a veto.
+
+**Order blocks are skipped on purpose.** They are in the same price-action primer as the
+range, the swing point and the swing failure, and unlike those they have no definition two
+readers would agree on. Encoding one means inventing a rule and then measuring the
+invention. Nothing here is worse for their absence: the swept-and-reclaimed level is the
+part of the idea that can be stated as arithmetic.
+
+**Rules are required or optional, and the optional ones are counted.** An all-AND stack was
+the wrong shape and would have been the expensive kind of wrong, because it produces a small
+number that looks like a measurement. A trader's hand rate is tens of trades a week, and
+the reason is that the corroborating conditions are corroboration: any one of them being
+absent is normal. Every rule section gained `required`, defaulting true so nothing existing
+moved, and `strategy.min_confluence` says how many of the enabled optional rules must pass.
+Zero evaluates and reports them without ever blocking, which is how a rule earns its place
+before it is allowed to cost a trade, and a config asking for more votes than there are
+optional rules is refused rather than silently blocking everything. The report separates
+"blocked by required rule X" from "blocked by the confluence count", which is nobody's fault
+in particular, and prints each optional rule's pass rate. That pass rate is the evidence for
+promoting a rule to required or dropping it, and it is the number to read first.
+
+**The cascade trigger takes a USD floor and the z-score became optional.**
+`cascade.liq_usd_min` is a per-tier mapping looked up exactly as `filters.max_spread_bps`
+is; `cascade.liq_z_min` may be null; a validator refuses both null, which would admit every
+row on the tape. The two ask different questions. A z says how unusual this flow is for this
+coin, which is what travels across a universe whose notional spans two orders of magnitude.
+A dollar floor says whether the liquidation was large enough to have moved price at all,
+which is what a trader actually reads and which a z cannot say on a series that is quiet
+most of the time. `candidate_expr` applies the most permissive tier, because it cannot see
+which coin a row belongs to and a row it drops is a cascade that silently never happens.
+
+**The robust z-score now has a scale, and the scale is not worth a threshold.** The defect
+recorded on this date under the streaming change was that `features.z_robust: true` gave a
+null z on every row of real data: `liq_long_usd_60s` is zero in 82% of grid seconds, so its
+rolling median is zero and the median of the absolute deviations from it is zero too.
+`robust_z` now falls back to the **mean** absolute deviation about the same median where the
+MAD is zero, and an all-zero lookback still scores null.
+
+Measured on the three reference days (2025-10-09 to 2025-10-11, BTC/ETH/SOL/HYPE) the fix
+does what it was meant to and no more:
+
+| scale | z defined | p99 of z on rows with liquidations | candidate rows at `liq_z_min` 3.0 |
+|---|---|---|---|
+| `z_robust: false` | 95.8% | 8.69 | 288 |
+| `z_robust: true`, fixed | 95.8% | 1.8e11 | 316 |
+
+The z exists again, so the `exact` trigger fires. But **`liq_z_min: 3.0` does not mean
+anything on this scale.** The candidate count is 316 at 3.0, 292 at 20, 199 at 50, 110 at
+100, and does not reach zero until 1e12: the mean absolute deviation collapses towards zero
+whenever the trailing day is almost all zeros with one small burst, and the ratio explodes.
+About 20 reproduces the old count (292 against 288) but does it by the flatness of the curve
+rather than by selecting comparable events, so it is not a threshold and is not recorded as
+one. `config/default.yaml` is left alone: the measurement justifies no value. The answer is
+the notional floor, which is what `config/backtest/v1_confluence.yaml` uses, and the standing
+question for Phase 5 is whether `z_robust` should default to false rather than to a scale
+that is defined and meaningless.
+
+**Two defects found on the way, both of which would have made this phase's numbers a
+fiction.**
+
+`LakeSource.levels` was never filled. On any run over the real lake `support_px` and
+`resistance_px` were null on every row, so `zone_proximity` failed every candidate it saw.
+It has been switched off since Q7, so nothing noticed, and `level_reclaim` reads the same
+two columns. `LakeSource` now builds the level set once from `candles_1m`, the run plus a
+fortnight in front of it, and only when a rule that reads levels is enabled, so a default
+run still reads no candles at all.
+
+The level join also took the most recently **formed** level of each kind rather than the
+nearest one to price. For a rule asking whether the cascade traded through a level and came
+back, that is a question about an arbitrary level, and the rule would have fired at close to
+random. It now takes the nearest level below mid and the nearest above it, within
+`features.levels.max_dist_bps`. That makes `level_reclaim` an existential test: its two
+conditions together require the level to sit between the extreme and the current mid, and
+the highest level under mid is the only candidate for that, so the rule passes exactly when
+some level satisfies it. The cost is that it sees one level and not all of them, so where a
+shallower level sits between the swept one and mid, that shallower one is what gets judged.
+
+**Levels are those knowable at the start of the row's UTC day.** A fractal is confirmed
+`fractal_n` bars after it prints, so an intraday swing becomes usable a quarter of an hour
+after it forms, and honouring that exactly needs a lookup over both price and time on every
+grid row. The day boundary buys one as-of join per day per side instead. It is a restriction
+and never a lookahead: the day's start is earlier than every row it serves. A swing formed
+this morning is not a level until tomorrow, which is close to what the rules are asking
+about anyway, a level a trader would have drawn beforehand.
+
+**What the year said, and why the number is not a measurement of the setup.** The run
+(`config/backtest/v1_confluence.yaml`, 2025-09-01 to 2026-08-30, BTC/ETH/SOL/HYPE, 10,000
+USD, `--lagged-ms 3000`) produced 776 candidates at the rule layer, 180 intents and 39
+trades for **-1,083.41 USD**, and the 10% drawdown halt fired on **2025-11-21**, in month
+three, after which the other nine months replayed halted. The 3s lagged rerun gave 39
+trades and -1,137.20 USD, so nothing here is latency fragile; there was no positive
+expectancy to lose.
+
+**It is not a measurement of the setup, because the exit was behind the entry.** Of the 33
+trades that exited at their target, **31 had the target on the wrong side of the entry**,
+and the median hold on a target exit was **1.4 seconds**: the position opened and closed
+immediately at a loss. An ETH short entered at 4369.2 and "hit its target" at 4394.5.
+
+The cause is a real defect and it is not in this phase's code. `intent.target_px` is
+`extreme + k_target * (anchor - extreme)`, a fixed point on the way back to the anchor,
+and `Intent.edge_frac` measures the distance to it as `abs(target_px - entry_px)`. With
+`exhaustion.mode: fixed_delay` the entry is 120s after the cascade starts and price is
+usually still near the extreme, so the target is ahead and the absolute value is harmless.
+With `exhaustion.mode: rule` the entry waits for the cascade to actually stop, and
+`level_reclaim` waits further, until price is back above the level that was swept. By then
+the reversion the target names has largely happened, the target is *behind* the entry, and
+`abs()` reports the distance back to it as edge. `filters.min_edge_multiple` then passes an
+intent whose expected move is negative by construction.
+
+So the rule layer did its job and the exit undid it. **The fix is to make `edge_frac`
+signed** so a target already passed is zero edge and `min_edge_multiple` drops the intent,
+and only then is a run under `exhaustion.mode: rule` worth reading. Left unfixed here
+because it is outside 04c and because a one line change to the intent maths deserves its
+own commit, its own test and its own rerun rather than being folded into a phase whose
+numbers it changes.
+
+**What the rules themselves said**, over the 776 candidates that reached them:
+`min_cascade_notional` (the only required rule) killed none, the confluence count killed 77,
+and the pass rates were `vwap_stretch` 92.7%, `level_reclaim` 69.5%, `zone_proximity` 67.4%,
+`oi_flush` 22.6%. `vwap_stretch` at 92.7% is close to not being a condition at all: a
+cascade that has moved price by two volatilities is nearly always 30 bps from the session
+VWAP, so at this threshold it votes yes almost always. That is what the pass rate table is
+for, and it is the first thing to revisit. Peak RSS 2.30 GB, 78 minutes, 6.2% of the clock
+replayed across 843 windows.
+
+**Reverse this entry** if the confluence count turns out to be a way of admitting trades no
+single rule would have justified, which is what the pass-rate table exists to make visible:
+a rule that passes on almost everything is not corroboration, it is a rule that should be
+dropped rather than counted.
