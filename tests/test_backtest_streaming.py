@@ -119,11 +119,19 @@ class TestTheLakeIsReadOneDayAtATime:
 # config would be an empty file proving nothing about fills. With the non-robust z the
 # same window produces seven trades, entries and exits, stops and targets. That is a
 # separate bug, recorded in docs/DECISIONS.md; it is not this change's to fix.
+#
+# The first attempt at this reference produced a different digest, and the difference was
+# not the engine: `Settings.kill_switch_present` fails closed on any OSError from
+# `os.stat`, and eight minutes of hammering the lake's USB drive produced one, which the
+# risk engine recorded as a `kill_switch` block and which cost that run an entry. Re-run
+# on the same commit it produced the digest below. A run whose funnel shows a
+# `kill_switch` block with no KILL file on disk has hit the same thing and is not a
+# reference.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",
     "coins": "BTC,ETH,SOL,HYPE",
-    "sha256": "a7e37189771731957a6ed1b0f97e30e26aa62b82349641cb8a84f713126051ff",
+    "sha256": "a945c9a7295d24f9a41ba27b6dda43fed9e1bfe43f02eaa3e4047f75d2372f00",
     "trades": 7,
 }
 
