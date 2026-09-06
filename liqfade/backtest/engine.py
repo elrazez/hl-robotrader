@@ -311,7 +311,7 @@ def run_backtest(
         spans, spill = _clip_to_day(spans, day)
         _load_funding(portfolio, source.funding(day))
 
-        grid_rows = clock.day(rows, settings)
+        clock.day(rows, settings)
         for start_ms, end_ms, closes in _segments(spans, day):
             if progress is not None:
                 progress.set(stage="replaying", sim_ms=start_ms)
@@ -322,7 +322,6 @@ def run_backtest(
                 start_ms,
                 end_ms,
                 clock=clock,
-                grid_rows=grid_rows,
                 state=state,
                 portfolio=portfolio,
                 strategy=strategy,
@@ -503,7 +502,6 @@ def _replay(
     end_ms: int,
     *,
     clock: _GridClock,
-    grid_rows: list[tuple[int, dict[str, FeatureRow]]],
     state: dict[str, _CoinState],
     portfolio: Portfolio,
     strategy: StrategyEngine,

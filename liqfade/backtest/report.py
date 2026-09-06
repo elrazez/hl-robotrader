@@ -289,7 +289,7 @@ def _coverage(result: BacktestResult) -> str:
     skipped_s = max(result.end_ms - result.start_ms - result.replayed_ms, 0) // 1000
     return (
         f"{100 * _replayed_frac(result):.1f}% of the tape in {result.windows:,} "
-        f"cascade windows, skipping {skipped_s:,}s"
+        f"replay windows, skipping {skipped_s:,}s"
     )
 
 
