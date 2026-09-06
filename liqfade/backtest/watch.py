@@ -23,7 +23,7 @@ BOLD, DIM, GREEN, RED, CYAN, RESET = (
 STAGE_TEXT = {
     "starting": "starting",
     "loading": "loading the lake",
-    "features": "building features",
+    "features": "features, one day",
     "replaying": "replaying",
     "report": "writing the report",
     "done": "done",
@@ -66,19 +66,27 @@ def render(state: ProgressState | None, now: float, *, width: int = 100, path: P
         head += f"  {DIM}then again at {state.lagged_ms} ms{RESET}"
 
     phase_elapsed = now - state.phase_started_at
-    fraction = state.fraction if state.stage in ("replaying", "report", "done") else 0.0
+    # `features` now runs once per UTC day rather than once per run, and carries that
+    # day's clock, so it moves the bar like `replaying` does instead of resetting it to
+    # zero three hundred and sixty times over a year.
+    on_the_clock = ("features", "replaying", "report", "done")
+    fraction = state.fraction if state.stage in on_the_clock else 0.0
     if state.stage == "done":
         fraction = 1.0
     bar_width = max(10, min(50, width - 46))
     pct = f"{100 * fraction:5.1f}%"
-    where = _day(state.sim_ms) if state.stage == "replaying" else STAGE_TEXT.get(state.stage, "")
+    where = (
+        _day(state.sim_ms)
+        if state.stage in ("features", "replaying")
+        else STAGE_TEXT.get(state.stage, "")
+    )
     stage = STAGE_TEXT.get(state.stage, state.stage)
     colour = RED if state.stage == "failed" else GREEN if state.stage == "done" else CYAN
     middle = (
         f"{colour}{state.phase:6s} {stage:19s}{RESET} [{bar(fraction, bar_width)}] {pct}  {where}"
     )
 
-    if state.stage == "replaying" and 0 < fraction < 1:
+    if state.stage in ("features", "replaying") and 0 < fraction < 1:
         eta = _hms(phase_elapsed / fraction - phase_elapsed)
     elif state.stage in ("done", "failed"):
         eta = "-"
@@ -101,7 +109,7 @@ def render(state: ProgressState | None, now: float, *, width: int = 100, path: P
         stale = now - state.updated_at
         if alive is False:
             lines.append(f"{RED}the run is gone (pid {state.pid} no longer exists){RESET}")
-        elif state.stage in ("loading", "features"):
+        elif state.stage == "loading":
             lines.append(f"{DIM}this stage reports no progress; the process is alive{RESET}")
         elif stale > 30:
             lines.append(f"{DIM}no update for {_hms(stale)}, the process is alive{RESET}")

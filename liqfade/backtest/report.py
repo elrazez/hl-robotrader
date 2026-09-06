@@ -264,7 +264,33 @@ def _summary(
             "applied_hours": result.portfolio.funding.applied_hours,
             "missing_hours": result.portfolio.funding.missing_hours,
         },
+        "coverage": {
+            "windows": result.windows,
+            "replayed_ms": result.replayed_ms,
+            "skipped_ms": max(result.end_ms - result.start_ms - result.replayed_ms, 0),
+            "replayed_frac": _replayed_frac(result),
+        },
     }
+
+
+def _replayed_frac(result: BacktestResult) -> float:
+    span = result.end_ms - result.start_ms
+    return result.replayed_ms / span if span > 0 else 0.0
+
+
+def _coverage(result: BacktestResult) -> str:
+    """How much of the clock the run actually read, and in how many pieces.
+
+    The engine replays raw tape only inside the windows a cascade candidate opens; outside
+    them the portfolio is flat by construction and there is nothing to simulate. This line
+    says how much that saved, and it is also the sanity check: a run reporting close to
+    100% is reading the whole tape again and something has gone wrong with the windows.
+    """
+    skipped_s = max(result.end_ms - result.start_ms - result.replayed_ms, 0) // 1000
+    return (
+        f"{100 * _replayed_frac(result):.1f}% of the tape in {result.windows:,} "
+        f"cascade windows, skipping {skipped_s:,}s"
+    )
 
 
 # --- report.md ----------------------------------------------------------------
@@ -312,6 +338,7 @@ def _markdown(
         f"- latency: {settings.backtest.latency_ms} ms"
         + (f" (lagged rerun, requested {lagged_ms} ms)" if lagged_ms else ""),
         f"- starting equity: {result.portfolio.starting_equity:,.2f} USD",
+        f"- replayed: {_coverage(result)}",
         "",
         "Every number below is net of fees and funding. There is no gross headline; "
         "`gross_pnl` appears once, beside the costs it paid.",

@@ -19,6 +19,7 @@ The reference test at the bottom is the same claim against real data.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from collections.abc import Callable, Iterator
@@ -136,6 +137,30 @@ class TestTheLakeIsReadOneDayAtATime:
         result = run_backtest(source(day_lake, settings, cache=False), settings)
         assert result.trades, "a run that read nothing would pass this test vacuously"
         assert len(set(single_day_reads)) > 1, "the fixture spans days; the run must too"
+
+
+class TestTheReportSaysHowMuchWasReplayed:
+    def test_the_coverage_line_names_the_share_and_the_windows(
+        self, day_lake: tuple[Path, int, int], settings: Settings, tmp_path: Path
+    ) -> None:
+        """A reader has to be able to see that the run skipped most of the tape, and a
+        run that stopped skipping has to be visible as a number rather than as a wall
+        clock that quietly got worse."""
+        from liqfade.backtest.report import write_report
+
+        result = run_backtest(source(day_lake, settings, cache=False), settings)
+        directory = write_report(result, settings, reports_dir=tmp_path, run_id="test")
+        report = (directory / "report.md").read_text()
+        summary = json.loads((directory / "summary.json").read_text())
+
+        assert "% of the tape in" in report
+        assert summary["coverage"]["windows"] == result.windows
+        assert summary["coverage"]["replayed_ms"] == result.replayed_ms
+        assert 0 < summary["coverage"]["replayed_frac"] < 0.5
+        assert (
+            summary["coverage"]["replayed_ms"] + summary["coverage"]["skipped_ms"]
+            == result.end_ms - result.start_ms
+        )
 
 
 class TestACascadeThatStraddlesMidnight:
