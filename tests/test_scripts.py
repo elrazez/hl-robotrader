@@ -40,9 +40,10 @@ def _parse(path: Path) -> configparser.ConfigParser:
     return parser
 
 
-def test_all_four_units_exist() -> None:
+def test_every_unit_exists() -> None:
     assert {p.name for p in UNITS} == {
         "liqfade-recorder.service",
+        "liqfade-paper.service",
         "liqfade-live.service",
         "liqfade-watchdog.service",
         "liqfade-panel.service",
@@ -64,9 +65,19 @@ def test_unit_starts_from_the_synced_venv_not_through_uv(unit: Path) -> None:
     assert "uv run" not in exec_start
 
 
-def test_live_unit_refuses_to_start_while_the_kill_flag_exists() -> None:
-    service = _parse(UNIT_DIR / "liqfade-live.service")["Service"]
+@pytest.mark.parametrize("name", ["liqfade-live.service", "liqfade-paper.service"])
+def test_a_trading_unit_refuses_to_start_while_the_kill_flag_exists(name: str) -> None:
+    """Paper places no real order and still gates on the flag: a kill some units ignore
+    is not a kill switch, and the drill has to exercise the live unit's own path."""
+    service = _parse(UNIT_DIR / name)["Service"]
     assert service["ExecStartPre"] == "/usr/bin/test ! -e /srv/liqfade/data/KILL"
+
+
+def test_the_paper_unit_has_its_own_socket_and_state_file() -> None:
+    """Three units on one box, and the control server takes an exclusive lock per socket."""
+    text = (UNIT_DIR / "liqfade-paper.service").read_text()
+    assert "LIQFADE_CONTROL__SOCKET_PATH=control-paper.sock" in text
+    assert "LIQFADE_CONTROL__STATE_FILE=state-paper.json" in text
 
 
 def test_watchdog_does_not_depend_on_the_process_it_watches() -> None:

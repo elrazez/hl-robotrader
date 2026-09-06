@@ -27,6 +27,7 @@ CommandName = Literal[
     "kill",
     "reload_config",
     "get_metrics",
+    "inject_intent",
 ]
 
 
@@ -189,6 +190,16 @@ class ReloadResult(Base):
     error: str | None = Field(None, description="set when the new config failed validation")
 
 
+class InjectResult(Base):
+    """What an `inject_intent` drill produced. Refused outright when env is mainnet."""
+
+    injected: bool
+    coin: str | None = None
+    side: str | None = None
+    entry_px: float | None = None
+    reason: str | None = Field(None, description="why it was refused, None when it was not")
+
+
 class MetricsResult(Base):
     feeds: list[FeedState] = Field(default_factory=list)
     latency: LatencyState = Field(default_factory=LatencyState)
@@ -204,7 +215,8 @@ Result = Annotated[
     | FlatResult
     | KillResult
     | ReloadResult
-    | MetricsResult,
+    | MetricsResult
+    | InjectResult,
     Field(description="the command specific payload"),
 ]
 
@@ -217,6 +229,7 @@ RESULT_MODELS: dict[str, type[BaseModel]] = {
     "kill": KillResult,
     "reload_config": ReloadResult,
     "get_metrics": MetricsResult,
+    "inject_intent": InjectResult,
 }
 
 

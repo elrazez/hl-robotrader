@@ -21,6 +21,7 @@ from liqfade.control.backend import kill_not_persisted, write_kill_file
 from liqfade.control.protocol import (
     FeedState,
     FlatResult,
+    InjectResult,
     KillResult,
     LatencyState,
     MetricsResult,
@@ -153,6 +154,9 @@ class RecorderBackend:
         if self._alert is not None:
             await self._alert(f"recorder: {failed}")
         return KillResult(killed=False, reason=failed)
+
+    async def inject_intent(self, **args: Any) -> InjectResult:
+        raise RuntimeError(NOT_SUPPORTED)
 
     async def reload_config(self) -> ReloadResult:
         return await self._reload()

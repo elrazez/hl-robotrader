@@ -362,3 +362,27 @@ def test_buffers_stay_bounded_over_a_long_run() -> None:
         if index % 2 == 0:
             engine.advance(ts)
     assert engine.buffer_rows("ETH") < 5_000
+
+
+def test_a_liquidation_with_no_notional_is_dropped_not_counted_as_zero() -> None:
+    """OKX sends these for contracts it has no price for. Counting one as zero is a lie."""
+    engine = LiveFeatureEngine(crossvenue_settings())
+    engine.ingest(
+        "liquidations",
+        "okx",
+        {"coin": "ETH", "rx_ms": START, "ts_ms": START, "side": "long", "notional_usd": None},
+    )
+    engine.ingest(
+        "liquidations",
+        "okx",
+        {
+            "coin": "ETH",
+            "rx_ms": START + 100,
+            "ts_ms": START,
+            "side": "long",
+            "notional_usd": 5_000.0,
+        },
+    )
+    engine.advance(START + 1_000)
+
+    assert engine.row("ETH", START + 1_000).liq_long_usd_w == pytest.approx(5_000.0)

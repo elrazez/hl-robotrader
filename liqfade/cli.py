@@ -24,10 +24,14 @@ from liqfade.config.models import Settings
 
 # Subcommands that later phases fill in. Value is the phase number in docs/ROADMAP.md.
 NOT_YET: dict[str, int] = {
-    "paper": 5,
     "testnet": 5,
     "live": 6,
 }
+
+# Paper's opening balance, USD, when --equity is not given. The same kind of number as
+# DEFAULT_BACKTEST_EQUITY below and not capital: every sizing fraction is applied to it,
+# so the run reports percentages that scale to any account.
+DEFAULT_PAPER_EQUITY = 10_000.0
 
 # Default starting equity for a backtest, USD. The one number in the package that looks
 # like capital, and it is not: it is the denominator every sizing fraction is applied to,
@@ -799,6 +803,38 @@ def cmd_panel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paper(args: argparse.Namespace) -> int:
+    """Run the paper loop: live feeds, simulated fills, real alerts and a real kill switch."""
+    from liqfade.live.loop import PaperLoop
+    from liqfade.log import setup_logging
+    from liqfade.runtime import run_main, shutdown_event
+
+    settings = _settings(args)
+    setup_logging(proc="paper", env=settings.env, level=settings.logging.level)
+    if settings.env == "mainnet":
+        # Paper simulates every fill. Running it under the mainnet config would read the
+        # mainnet risk limits and report a paper equity curve as if it were the account.
+        print("paper mode refuses --env mainnet: use paper or testnet", file=sys.stderr)
+        return EXIT_ERROR
+
+    from liqfade.live.features import LiveFeatureEngine
+
+    unsupported = LiveFeatureEngine.unsupported(settings)
+    if unsupported:
+        # Raised here rather than deep inside setup, so the message names the fix. The
+        # usual one is cascade.trigger: `exact` reads S3 liquidations a live bot cannot
+        # see, and the unit sets LIQFADE_CASCADE__TRIGGER=crossvenue for that reason.
+        print("paper mode cannot run this config:", file=sys.stderr)
+        for reason in unsupported:
+            print(f"  - {reason}", file=sys.stderr)
+        print("Set LIQFADE_CASCADE__TRIGGER=crossvenue, or disable the rule.", file=sys.stderr)
+        return EXIT_ERROR
+
+    loop = PaperLoop(settings, starting_equity=args.equity, minutes=args.minutes)
+    run_main(lambda: loop.run(shutdown_event()))
+    return 0
+
+
 # --- placeholders --------------------------------------------------------------
 
 
@@ -987,7 +1023,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"required above {CONFIRM_ABOVE_DAYS} days: this deletes the files it folds",
     )
     compact.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
-    sub.add_parser("paper", parents=[common], help="live feeds, simulated fills (Phase 5)")
+    paper = sub.add_parser(
+        "paper", parents=[common], help="live feeds, simulated fills, Telegram and kill switch"
+    )
+    paper.add_argument(
+        "--equity",
+        type=float,
+        default=DEFAULT_PAPER_EQUITY,
+        help=f"paper starting equity in USD (default {DEFAULT_PAPER_EQUITY:,.0f})",
+    )
+    paper.add_argument(
+        "--minutes", type=float, default=None, help="stop after N minutes, for smoke tests"
+    )
     sub.add_parser("testnet", parents=[common], help="live loop against testnet (Phase 5)")
     sub.add_parser("live", parents=[common], help="live loop against mainnet (Phase 6)")
 
@@ -1029,6 +1076,7 @@ HANDLERS = {
     "watch": cmd_watch,
     "sync": cmd_sync,
     "panel": cmd_panel,
+    "paper": cmd_paper,
 }
 
 

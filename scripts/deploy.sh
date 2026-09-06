@@ -16,8 +16,9 @@ BRANCH="${LIQFADE_BRANCH:-main}"
 # phase would otherwise crash loop every RestartSec seconds from the first deploy on.
 UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"
 # Never enabled here whatever UNITS says. Starting the trading loop is a decision the owner
-# makes on the box, not a side effect of deploying a branch, and the watchdog has no module
-# behind it until Phase 5.
+# makes on the box, not a side effect of deploying a branch. liqfade-paper is absent from
+# this list on purpose: it places no real order and is the unit Phase 5 drills, so it can
+# be deployed by putting it in LIQFADE_UNITS. It is still not in the default set.
 NEVER_ENABLE="liqfade-live liqfade-watchdog"
 SERVICE_USER="liqfade"
 APP_ROOT="/srv/liqfade"
@@ -109,7 +110,8 @@ echo "  left disabled, by design: $NEVER_ENABLE"
 
 log "status"
 systemctl --no-pager --lines=0 status \
-  liqfade-recorder liqfade-live liqfade-watchdog liqfade-panel 2>&1 | grep -E 'liqfade|Active' || true
+  liqfade-recorder liqfade-paper liqfade-live liqfade-watchdog liqfade-panel 2>&1 \
+  | grep -E 'liqfade|Active' || true
 
 cat <<'NOTE'
 

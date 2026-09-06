@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 from liqfade.control.protocol import (
     FeedState,
     FlatResult,
+    InjectResult,
     KillResult,
     LatencyState,
     MetricsResult,
@@ -89,6 +90,8 @@ class ControlBackend(Protocol):
     async def reload_config(self) -> ReloadResult: ...
 
     async def get_metrics(self) -> MetricsResult: ...
+
+    async def inject_intent(self, **args: Any) -> InjectResult: ...
 
 
 class NoopBackend:
@@ -174,3 +177,8 @@ class NoopBackend:
     async def get_metrics(self) -> MetricsResult:
         self._record("get_metrics")
         return MetricsResult(counters={"intents": 0, "fills": 0, "rejects": 0})
+
+    async def inject_intent(self, **args: Any) -> InjectResult:
+        """A no-op backend has no book to price a drill against, so it refuses."""
+        self._record("inject_intent", **args)
+        return InjectResult(injected=False, reason="no trading loop behind this backend")

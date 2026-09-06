@@ -153,6 +153,13 @@ class LiveFeatureEngine:
                 reasons.append(f"strategy.rules.{name} needs {feature}")
         if settings.cascade.trigger == "proxy":
             reasons.append("cascade.trigger 'proxy' needs hl_forced_proxy")
+        if settings.cascade.trigger == "exact":
+            # Not a missing feature but a missing feed: Hyperliquid's own liquidations
+            # reach us through a next-day S3 pull. A live loop on this trigger runs with
+            # the intensity columns empty forever and looks healthy doing it.
+            reasons.append(
+                "cascade.trigger 'exact' reads hl_s3 liquidations, which no live feed carries"
+            )
         if settings.exhaustion.mode == "rule":
             reasons.append("exhaustion.mode 'rule' needs the mark-to-mid trailing percentile")
         if settings.filters.funding_extreme_bps_8h is not None:
@@ -203,9 +210,14 @@ class LiveFeatureEngine:
             elif table == "l2":
                 self._ingest_level(state, bucket_ts, row)
             elif table == "liquidations":
-                if venue in self.venues:
-                    weighted = float(row["notional_usd"]) * self.weights.get(venue, 1.0)
-                    state.liqs.append((known, str(row["side"]), weighted))
+                # A liquidation with no notional cannot be weighed or summed. OKX sends
+                # them for contracts it has no price for, roughly one an hour, and
+                # counting one as zero is the same as dropping it while looking like data.
+                notional = _maybe_float(row.get("notional_usd"))
+                if venue in self.venues and notional is not None:
+                    state.liqs.append(
+                        (known, str(row["side"]), notional * self.weights.get(venue, 1.0))
+                    )
             elif table == "asset_ctx":
                 bucket.ctx = (
                     _maybe_float(row.get("open_interest")),

@@ -654,3 +654,16 @@ class TestBacktestCommand:
         from liqfade.cli import NOT_YET
 
         assert "backtest" not in NOT_YET
+
+
+def test_paper_refuses_a_trigger_no_live_feed_carries(capsys: pytest.CaptureFixture[str]) -> None:
+    """`exact` reads S3 liquidations that arrive a day late. Paper says so and stops."""
+    assert main(["paper", "--env", "paper"]) == 1
+    error = capsys.readouterr().err
+    assert "cascade.trigger 'exact'" in error
+    assert "LIQFADE_CASCADE__TRIGGER=crossvenue" in error
+
+
+def test_paper_refuses_mainnet(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["paper", "--env", "mainnet"]) == 1
+    assert "refuses --env mainnet" in capsys.readouterr().err

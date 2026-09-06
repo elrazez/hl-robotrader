@@ -65,6 +65,8 @@ async def dispatch(backend: ControlBackend, request: Request) -> Response:
                 result = await backend.reload_config()
             case "get_metrics":
                 result = await backend.get_metrics()
+            case "inject_intent":
+                result = await backend.inject_intent(**args)
             case _:  # pragma: no cover - Request validation rejects unknown names first
                 return Response.failure(request.id, f"unknown command {request.cmd!r}")
     except Exception as exc:
