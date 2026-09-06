@@ -97,8 +97,6 @@ class LabApp(App[None]):
         with TabbedContent(id="tabs", initial="tab-configs"):
             with TabPane("Configs", id="tab-configs"):
                 yield ConfigsPane(self.config_dir)
-            with TabPane("Results", id="tab-results"):
-                yield ResultsPane(self.reports_dir, self.data_dir, self.queue)
             with TabPane("Run", id="tab-run"):
                 yield RunPane(
                     self.config_dir,
@@ -107,6 +105,8 @@ class LabApp(App[None]):
                     self.queue,
                     self.core_coins,
                 )
+            with TabPane("Results", id="tab-results"):
+                yield ResultsPane(self.reports_dir, self.data_dir, self.queue)
             with TabPane("Status", id="tab-status"):
                 yield StatusPane(self.state_path)
         yield Footer()
