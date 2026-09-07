@@ -22,6 +22,14 @@ looping on it.
 back to PARTIAL, because a cancel that raced a fill did not stop the fill and pretending
 otherwise means the position book and the venue disagree in the direction that hurts.
 
+**Rounding happens here and nowhere else.** The strategy works in floats and does not
+know an asset's `szDecimals`; `submit` is the last thing to touch a price before the wire,
+so it is the only thing that rounds one, through `execution/rounding.py`. The rounded
+values replace the asked-for ones on the intent, so the registry records what was actually
+sent rather than what we wanted, and `wire_px`/`wire_size` carry the exact Decimal-derived
+spelling for the transport. A coin with no `szDecimals` is refused rather than rounded on
+a guessed grid, and so is a size that rounds away to zero.
+
 Nothing here talks to Hyperliquid. `OrderTransport` is the seam, so the same manager runs
 against the venue in live and testnet and against the backtest fill model in paper, and
 paper orders get the same cloid, the same state machine and the same persistence.
@@ -32,7 +40,8 @@ from __future__ import annotations
 import asyncio
 import random
 import secrets
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, Self
@@ -40,6 +49,7 @@ from typing import Protocol, Self
 import aiosqlite
 
 from liqfade.control.protocol import OrderState, now_ms
+from liqfade.execution.rounding import RoundingError, round_price, round_size
 from liqfade.log import get_logger
 
 log = get_logger(__name__)
@@ -105,6 +115,10 @@ class OrderIntent:
         tag: `entry`, `target`, `stop` or `time_stop`, carried into the trade log.
         trigger_px: set for a trigger order, None for a plain limit.
         tpsl: `tp` or `sl` when this is a trigger order.
+        wire_px: the rounded price as the venue spells it, set by `OrderManager.submit`.
+            Empty until then, and empty on an intent read back from the registry, because
+            a persisted order is never submitted a second time.
+        wire_size: the same for the size.
     """
 
     cloid: str
@@ -117,6 +131,22 @@ class OrderIntent:
     tag: str = "entry"
     trigger_px: float | None = None
     tpsl: str | None = None
+    wire_px: str = ""
+    wire_size: str = ""
+
+    @property
+    def wire(self) -> tuple[str, str]:
+        """Price and size as the venue spells them. Raises if nothing rounded them.
+
+        A transport calls this rather than reading `px` and `size`, so an intent that
+        reached the wire without going through `OrderManager.submit` is a loud failure
+        rather than an order on the wrong grid.
+        """
+        if not self.wire_px or not self.wire_size:
+            raise RejectError(
+                f"{self.cloid} was not rounded: OrderManager.submit is the only door to a venue"
+            )
+        return self.wire_px, self.wire_size
 
 
 @dataclass(slots=True)
@@ -345,6 +375,7 @@ class OrderManager:
         store: OrderStore,
         transport: OrderTransport,
         *,
+        sz_decimals: Mapping[str, int],
         retries: int = 3,
         backoff_s: float = 0.25,
     ) -> None:
@@ -352,6 +383,9 @@ class OrderManager:
         Args:
             store: the sqlite registry, already opened.
             transport: the venue, or the paper simulator.
+            sz_decimals: coin to `meta.universe[i].szDecimals`, which is what both
+                rounding rules are computed from. A coin missing from it is refused: a
+                guessed grid is how a bug becomes an order.
             retries: retries after the first attempt, on transient errors only. From
                 `execution.transient_retries`.
             backoff_s: base delay; each retry waits `backoff_s * 2**attempt` times a
@@ -360,6 +394,7 @@ class OrderManager:
         """
         self.store = store
         self.transport = transport
+        self.sz_decimals = dict(sz_decimals)
         self.retries = retries
         self.backoff_s = backoff_s
         self._orders: dict[str, Order] = {}
@@ -406,6 +441,14 @@ class OrderManager:
                 )
                 return existing
 
+            try:
+                intent = self._rounded(intent)
+            except RoundingError as exc:
+                order = Order(intent=intent, status=OrderStatus.REJECTED, reject_reason=str(exc))
+                self._orders[intent.cloid] = order
+                await self._persist(order, "order_rejected", reason=str(exc), source="rounding")
+                return order
+
             order = Order(intent=intent, status=OrderStatus.SUBMITTED)
             self._orders[intent.cloid] = order
             await self._persist(
@@ -418,6 +461,38 @@ class OrderManager:
                 tag=intent.tag,
             )
             return await self._place_with_retries(order)
+
+    def _rounded(self, intent: OrderIntent) -> OrderIntent:
+        """The same intent on the venue's grid. The one place rounding happens.
+
+        The rounded values replace the asked-for ones, so the registry row and every
+        reconciliation of it are about the order that was actually sent.
+
+        Raises:
+            RoundingError: the coin has no `szDecimals`, a price will not round, or the
+                size rounds away to zero. Zero is a size the venue would take and nobody
+                meant, so it is refused rather than sent.
+        """
+        decimals = self.sz_decimals.get(intent.coin)
+        if decimals is None:
+            raise RoundingError(
+                f"no szDecimals for {intent.coin}: refusing to round it onto a guessed grid"
+            )
+        px = round_price(intent.px, decimals)
+        size = round_size(intent.size, decimals)
+        if size <= 0:
+            raise RoundingError(
+                f"{intent.coin} size {intent.size} rounds to zero at szDecimals {decimals}"
+            )
+        trigger = round_price(intent.trigger_px, decimals) if intent.trigger_px else None
+        return replace(
+            intent,
+            px=float(px),
+            size=float(size),
+            trigger_px=float(trigger) if trigger is not None else None,
+            wire_px=str(px),
+            wire_size=str(size),
+        )
 
     async def _place_with_retries(self, order: Order) -> Order:
         last: TransientTransportError | None = None

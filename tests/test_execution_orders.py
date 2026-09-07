@@ -48,6 +48,15 @@ class FakeTransport:
         self.cancelled.append((coin, cloid))
 
 
+# Real Hyperliquid szDecimals, so the rounding these tests assert is the rounding the
+# venue would do. ETH is 4, BTC 5, SOL 2.
+SZ_DECIMALS = {"ETH": 4, "BTC": 5, "SOL": 2}
+
+
+def a_manager(store: OrderStore, transport: Any = None, **kwargs: Any) -> OrderManager:
+    return OrderManager(store, transport or FakeTransport(), sz_decimals=SZ_DECIMALS, **kwargs)
+
+
 @pytest.fixture
 async def store(tmp_path: Path):
     store = await OrderStore.open(tmp_path / "orders.sqlite")
@@ -81,7 +90,7 @@ async def test_a_cloid_is_sixteen_bytes_of_hex() -> None:
 
 
 async def test_submit_places_once_and_lands_acked(store: OrderStore) -> None:
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     order = await manager.submit(an_intent())
 
     assert order.status is OrderStatus.ACKED
@@ -92,7 +101,7 @@ async def test_submit_places_once_and_lands_acked(store: OrderStore) -> None:
 async def test_the_same_cloid_is_never_placed_twice(store: OrderStore) -> None:
     """Idempotency by cloid. A retry at a higher layer must not double the position."""
     transport = FakeTransport()
-    manager = OrderManager(store, transport)
+    manager = a_manager(store, transport)
     intent = an_intent()
 
     first = await manager.submit(intent)
@@ -104,7 +113,7 @@ async def test_the_same_cloid_is_never_placed_twice(store: OrderStore) -> None:
 
 async def test_a_transient_error_retries_and_then_succeeds(store: OrderStore) -> None:
     transport = FakeTransport(acks=[TransientTransportError("connection reset"), 4242])
-    manager = OrderManager(store, transport, retries=3, backoff_s=0.0)
+    manager = a_manager(store, transport, retries=3, backoff_s=0.0)
 
     order = await manager.submit(an_intent())
 
@@ -116,7 +125,7 @@ async def test_a_transient_error_retries_and_then_succeeds(store: OrderStore) ->
 async def test_transient_errors_give_up_after_the_configured_retries(store: OrderStore) -> None:
     failures = [TransientTransportError("timeout") for _ in range(9)]
     transport = FakeTransport(acks=failures)
-    manager = OrderManager(store, transport, retries=3, backoff_s=0.0)
+    manager = a_manager(store, transport, retries=3, backoff_s=0.0)
 
     with pytest.raises(TransientTransportError):
         await manager.submit(an_intent())
@@ -128,7 +137,7 @@ async def test_transient_errors_give_up_after_the_configured_retries(store: Orde
 async def test_a_reject_is_never_retried(store: OrderStore) -> None:
     """docs/HYPERLIQUID.md: rejects are never retried. Retrying one is how a bug repeats."""
     transport = FakeTransport(acks=[RejectError("Post only order would have immediately matched")])
-    manager = OrderManager(store, transport, retries=3, backoff_s=0.0)
+    manager = a_manager(store, transport, retries=3, backoff_s=0.0)
 
     order = await manager.submit(an_intent())
 
@@ -139,7 +148,7 @@ async def test_a_reject_is_never_retried(store: OrderStore) -> None:
 
 
 async def test_partial_fills_accumulate_and_close_at_full_size(store: OrderStore) -> None:
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     order = await manager.submit(an_intent(size=1.0))
 
     await manager.record_fill(order.cloid, size=0.25, px=100.0, ts_ms=1, fee=0.01)
@@ -159,7 +168,7 @@ async def test_partial_fills_accumulate_and_close_at_full_size(store: OrderStore
 async def test_a_fill_arriving_after_a_cancel_is_still_recorded(store: OrderStore) -> None:
     """The venue is the truth. A cancel that raced a fill did not stop the fill."""
     transport = FakeTransport()
-    manager = OrderManager(store, transport)
+    manager = a_manager(store, transport)
     order = await manager.submit(an_intent(size=1.0))
 
     await manager.cancel(order.cloid)
@@ -173,7 +182,7 @@ async def test_a_fill_arriving_after_a_cancel_is_still_recorded(store: OrderStor
 
 async def test_cancel_reaches_the_transport_and_is_idempotent(store: OrderStore) -> None:
     transport = FakeTransport()
-    manager = OrderManager(store, transport)
+    manager = a_manager(store, transport)
     order = await manager.submit(an_intent())
 
     await manager.cancel(order.cloid)
@@ -184,7 +193,7 @@ async def test_cancel_reaches_the_transport_and_is_idempotent(store: OrderStore)
 
 async def test_reduce_only_and_tif_reach_the_transport_untouched(store: OrderStore) -> None:
     transport = FakeTransport()
-    manager = OrderManager(store, transport)
+    manager = a_manager(store, transport)
     await manager.submit(an_intent(reduce_only=True, tif="Ioc"))
 
     assert transport.placed[0].reduce_only is True
@@ -192,7 +201,7 @@ async def test_reduce_only_and_tif_reach_the_transport_untouched(store: OrderSto
 
 
 async def test_open_orders_lists_only_live_ones(store: OrderStore) -> None:
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     resting = await manager.submit(an_intent())
     done = await manager.submit(an_intent(size=1.0))
     await manager.record_fill(done.cloid, size=1.0, px=10.0, ts_ms=1, fee=0.0)
@@ -205,7 +214,7 @@ async def test_state_survives_a_restart(tmp_path: Path) -> None:
     """The registry is the sqlite file, not the process. A restart must find its orders."""
     path = tmp_path / "orders.sqlite"
     store = await OrderStore.open(path)
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     order = await manager.submit(an_intent(size=2.0))
     await manager.record_fill(order.cloid, size=0.5, px=7.0, ts_ms=1, fee=0.0)
     await store.close()
@@ -223,7 +232,7 @@ async def test_state_survives_a_restart(tmp_path: Path) -> None:
 
 async def test_every_transition_logs_one_event(store: OrderStore) -> None:
     """CLAUDE.md: every intent, submission, ack, fill, cancel and reject is one line."""
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     with structlog.testing.capture_logs() as entries:
         order = await manager.submit(an_intent(size=1.0))
         await manager.record_fill(order.cloid, size=1.0, px=1.0, ts_ms=1, fee=0.0)
@@ -237,7 +246,7 @@ async def test_every_transition_logs_one_event(store: OrderStore) -> None:
 
 async def test_an_unknown_cloid_is_reported_not_invented(store: OrderStore) -> None:
     """A fill for an order we never placed is a reconciliation problem, not a new order."""
-    manager = OrderManager(store, FakeTransport())
+    manager = a_manager(store)
     with pytest.raises(KeyError):
         await manager.record_fill("0x" + "9" * 32, size=1.0, px=1.0, ts_ms=1, fee=0.0)
 
@@ -245,9 +254,75 @@ async def test_an_unknown_cloid_is_reported_not_invented(store: OrderStore) -> N
 async def test_concurrent_submits_of_one_cloid_place_once(store: OrderStore) -> None:
     """Two tasks, one cloid. The registry has to be the gate, not a check-then-act race."""
     transport = FakeTransport()
-    manager = OrderManager(store, transport)
+    manager = a_manager(store, transport)
     intent = an_intent()
 
     await asyncio.gather(manager.submit(intent), manager.submit(intent))
 
     assert len(transport.placed) == 1
+
+
+async def test_an_unrounded_intent_reaches_the_venue_rounded(store: OrderStore) -> None:
+    """CLAUDE.md: rounding lives in one place. That place is the boundary, not the caller.
+
+    The strategy works in floats and does not know szDecimals. `submit` is the last thing
+    that touches a price before the wire, so it is the only thing that rounds one.
+    """
+    transport = FakeTransport()
+    manager = a_manager(store, transport)
+
+    await manager.submit(an_intent(coin="ETH", px=3000.123456789, size=0.0123456789))
+
+    sent = transport.placed[0]
+    assert sent.wire_px == "3000.1"  # five significant figures, two decimals at szDecimals 4
+    assert sent.wire_size == "0.0123"
+    assert sent.px == pytest.approx(3000.1)
+    assert sent.size == pytest.approx(0.0123)
+
+
+async def test_the_registry_records_what_was_actually_sent(store: OrderStore) -> None:
+    """A row holding the price we asked for rather than the one we sent reconciles wrong."""
+    manager = a_manager(store)
+
+    order = await manager.submit(an_intent(coin="BTC", px=104999.987654, size=0.123456789))
+
+    row = await store.get(order.cloid)
+    assert row.intent.px == pytest.approx(105000.0)  # five significant figures
+    assert row.intent.size == pytest.approx(0.12346)  # BTC szDecimals is 5
+
+
+async def test_a_trigger_price_is_rounded_too(store: OrderStore) -> None:
+    transport = FakeTransport()
+    manager = a_manager(store, transport)
+
+    await manager.submit(
+        an_intent(coin="ETH", px=3000.0, size=1.0, trigger_px=2991.987654, tpsl="sl", tif="Ioc")
+    )
+
+    # Five significant figures, which for this price lands on the whole number.
+    assert transport.placed[0].trigger_px == pytest.approx(2992.0)
+
+
+async def test_a_coin_with_no_szdecimals_is_refused_rather_than_guessed(
+    store: OrderStore,
+) -> None:
+    """Guessing the grid is how a bug becomes an order. There is no safe default here."""
+    transport = FakeTransport()
+    manager = a_manager(store, transport)
+
+    order = await manager.submit(an_intent(coin="DOGE", px=0.1234567, size=100.0))
+
+    assert order.status is OrderStatus.REJECTED
+    assert "szDecimals" in (order.reject_reason or "")
+    assert transport.placed == []
+
+
+async def test_a_size_that_rounds_away_is_refused(store: OrderStore) -> None:
+    """Zero is a size the venue would take and nobody meant."""
+    transport = FakeTransport()
+    manager = a_manager(store, transport)
+
+    order = await manager.submit(an_intent(coin="SOL", px=150.0, size=0.001))
+
+    assert order.status is OrderStatus.REJECTED
+    assert transport.placed == []
