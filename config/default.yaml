@@ -62,10 +62,19 @@ recorder:
   # The memory ceiling is this times the number of files being filled at once, which is
   # roughly the number of tables times venues, and does not grow with the universe.
   ring_buffer_rows: 200000
-  gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap (Phase 1 DoD)
+  # The Phase 1 DoD is "zero gaps longer than 5s per stream per day", and 5s turned out to
+  # be under the cadence of the feeds themselves, so no stream is judged at 5s any more.
+  # What each one is actually judged at, and why, is the three settings below:
+  #   hyperliquid.l2      about 16s   l2_gap_multiple x the cadence it is delivering at
+  #   hyperliquid.trades       180s   trades_gap_s, per coin
+  #   everything else            5s   gap_alert_s, which is where this number still bites
+  # gap_alert_s is also the stand-in cadence for a cadence stream in the first seconds of
+  # a process, before it has measured itself. The DoD text in CLAUDE.md still says 5s
+  # across the board; these are the numbers in force.
+  gap_alert_s: 5.0  # seconds of silence on a stream that counts as a gap
   # `hyperliquid.l2` pushes one snapshot per coin every 5.4s (measured on the box
   # 2026-09-05: BTC interval p50 5,390 ms, p90 5,511 ms, every coin the same), so
-  # gap_alert_s of 5s sits under the feed's own cadence and counted 1,192 gaps in 24h.
+  # gap_alert_s of 5s sat under the feed's own cadence and counted 1,192 gaps in 24h.
   # The threshold is this multiple of the cadence the stream is actually delivering at,
   # so about 16s, which no normal snapshot reaches and a stalled book does.
   l2_gap_multiple: 3.0

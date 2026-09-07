@@ -457,6 +457,51 @@ def test_the_stream_measures_the_lag_of_the_rows_it_parsed() -> None:
     assert stream.stats["hyperliquid.trades"].delivery_lag_ms("DOGE") == 90_000
 
 
+def test_a_box_clock_behind_the_exchange_cannot_break_state_json() -> None:
+    """`FeedState.delivery_lag_ms` is `ge=0`, so a negative median raised ValidationError
+    inside `feed_state` and took out state.json and `liqfade status` with it. A clock a
+    few seconds behind the venue is a box problem, not a coin arriving from the future."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    for _ in range(40):
+        stat.record_message(NOW_MS, lags_ms={"DOGE": -5_000})
+
+    assert stat.delivery_lag_ms("DOGE") == 0
+    assert stat.worst_delivery() == (None, 0)
+    assert stat.feed_state(NOW_MS).delivery_lag_ms == 0
+
+
+def test_a_coin_still_reads_late_when_the_clock_is_only_a_little_behind() -> None:
+    """Clamping the number must not hide a coin that is genuinely behind."""
+    stat = StreamStats(name="hyperliquid.trades", continuous=True, per_coin=True)
+    for _ in range(40):
+        stat.record_message(NOW_MS, lags_ms={"BTC": -200, "DOGE": 90_000})
+
+    assert stat.worst_delivery() == ("DOGE", 90_000)
+
+
+def test_a_row_with_no_exchange_time_is_not_a_zero_lag_sample() -> None:
+    """Coinalyze rows and the l2 snapshot carry no usable ts_ms. Feeding a 0 for them
+    halved the median the lag alert reads, so a coin 90s behind reported 45s."""
+    stream, _ = _stream(
+        venue="hyperliquid",
+        parse=lambda msg, rx: [
+            ("trades", {"coin": "DOGE", "ts_ms": rx - 90_000, "rx_ms": rx})
+            if msg == b"timed"
+            else ("trades", {"coin": "DOGE", "ts_ms": None, "rx_ms": rx})
+        ],
+        tables=("trades",),
+    )
+    for step in range(20):
+        stream.handle(b"timed", NOW_MS + step * 1_000)
+        stream.handle(b"untimed", NOW_MS + step * 1_000)
+
+    stat = stream.stats["hyperliquid.trades"]
+    assert stat.delivery_lag_ms("DOGE") == 90_000
+    # The coin still counts as delivering: an untimed row is a row, and per-coin gap
+    # accounting is what would otherwise call the subscription dead.
+    assert stat.silent_s(NOW_MS + 19_000, coin="DOGE") == 0.0
+
+
 # --- rotating the connection before the venue expires it -------------------------
 
 

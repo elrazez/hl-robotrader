@@ -167,7 +167,7 @@ class StreamStats:
         rx_ms: int,
         coins: Iterable[str] = (),
         *,
-        lags_ms: Mapping[str, int] | None = None,
+        lags_ms: Mapping[str, int | None] | None = None,
         now: float | None = None,
     ) -> None:
         """One received message for this stream, and the coins it carried rows for.
@@ -176,8 +176,9 @@ class StreamStats:
         `msgs_1m` for `hyperliquid.l2` read twenty times the real message rate.
 
         `lags_ms` is each coin's `rx_ms - ts_ms` on this message, where the row carried an
-        exchange timestamp to measure against. Passing it also names the coins, so a
-        caller that has it does not pass `coins` as well.
+        exchange timestamp to measure against, and None for a coin whose rows on this
+        message carried none. Passing it also names the coins, so a caller that has it
+        does not pass `coins` as well, and a None still counts the coin as delivering.
         """
         if lags_ms is not None and not coins:
             coins = lags_ms
@@ -289,7 +290,12 @@ class StreamStats:
         samples = self._coin_lags.get(coin)
         if not samples or len(samples) < LAG_SAMPLES // 2:
             return 0
-        return int(median(samples))
+        # Clamped: a box clock a few seconds behind the venue makes every sample negative,
+        # and `FeedState.delivery_lag_ms` is `ge=0`, so the raw median raised
+        # ValidationError inside `feed_state` and took state.json and `liqfade status`
+        # down with it. A coin cannot arrive before it was sent; that is a clock, not a
+        # feed, and chrony on the box is what fixes it.
+        return max(0, int(median(samples)))
 
     def worst_delivery(self) -> tuple[str | None, int]:
         """The coin arriving furthest behind, and by how many ms."""
@@ -753,7 +759,7 @@ class WSStream:
         # coin -> the worst delivery lag this message carried for it, per table. The
         # worst rather than the last, because one message can hold a burst of replayed
         # trades and the oldest of them is the one worth measuring.
-        seen: dict[str, dict[str, int]] = {}
+        seen: dict[str, dict[str, int | None]] = {}
         for table, row in rows:
             stat = self._stat(table)
             if row is None:
@@ -763,10 +769,15 @@ class WSStream:
             lags = seen.setdefault(table, {})
             ts_ms = row.get("ts_ms")
             lag = rx_ms - int(ts_ms) if row.get("rx_ms") and ts_ms is not None else None
-            if lag is not None:
-                lags[coin] = max(lags.get(coin, lag), lag)
+            if lag is None:
+                # The coin is named either way, because an untimed row is still a row and
+                # per-coin gap accounting would otherwise call the subscription dead. It
+                # carries no lag: a 0 for it used to go into the median the alert reads,
+                # so twenty untimed rows beside twenty rows 90s late reported 45s.
+                lags.setdefault(coin, None)
             else:
-                lags.setdefault(coin, 0)
+                previous = lags.get(coin)
+                lags[coin] = lag if previous is None else max(previous, lag)
             self.sink(table, self.venue, row)
         for table, lags in seen.items():
             self._stat(table).record_message(rx_ms, lags_ms=lags)
