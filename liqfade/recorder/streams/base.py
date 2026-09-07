@@ -373,11 +373,22 @@ def silence_threshold_s(stat: StreamStats, cfg: Recorder) -> float:
     return max(cfg.silence_alert_s, gap_threshold_s(stat, cfg))
 
 
-async def _sleep_unless(stop: asyncio.Event, seconds: float) -> bool:
-    """Wait `seconds`. False when the recorder was told to stop instead."""
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(stop.wait(), timeout=seconds)
-    return not stop.is_set()
+async def _sleep_unless(stop: asyncio.Event, seconds: float, *also: asyncio.Event) -> bool:
+    """Wait `seconds`. False when `stop` or one of `also` fired first instead.
+
+    `stop` is the recorder shutting down. `also` is how a task that belongs to one socket
+    is told that socket has gone: without it a task sleeping on a long timer holds the
+    `_pump` task group open long after its connection died, and the stream neither
+    delivers nor reconnects for the rest of the sleep.
+    """
+    events = (stop, *also)
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        await asyncio.wait(waiters, timeout=seconds, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+    return not any(event.is_set() for event in events)
 
 
 def _describe(exc: BaseException) -> str:
@@ -571,16 +582,33 @@ class WSStream:
             self._serve(group, ws, stop)
 
     def _serve(self, group: asyncio.TaskGroup, ws: Any, stop: asyncio.Event) -> None:
-        """Start the tasks one live socket needs. Every one of them ends when it closes."""
+        """Start the tasks one live socket needs. Every one of them ends when it closes.
+
+        `closed` is set the moment this socket's reader ends, however it ended, and every
+        other task of the socket waits on it alongside its own timer. Hyperliquid's
+        `1000 (OK) Expired` reaches us as a clean end of `async for`, and it can arrive
+        before the rotation point rather than after it, so the rotation timer is a sleep
+        of up to ws_rotate_after_s (9018s on the box) that nothing else would interrupt:
+        the group stayed open, `run` never reconnected, and the stream was simply dead.
+        """
+        closed = asyncio.Event()
         recv = group.create_task(self._recv_loop(ws), name=f"{self.venue}-recv")
+        recv.add_done_callback(lambda _task: closed.set())
         if self.ping_s and self.ping_frame is not None:
-            group.create_task(self._ping_loop(ws, stop), name=f"{self.venue}-ping")
+            group.create_task(self._ping_loop(ws, stop, closed), name=f"{self.venue}-ping")
         group.create_task(self._close_on_stop(ws, stop), name=f"{self.venue}-stop")
         if self.rotate_after_s:
-            group.create_task(self._rotate(group, ws, recv, stop), name=f"{self.venue}-rotate")
+            group.create_task(
+                self._rotate(group, ws, recv, stop, closed), name=f"{self.venue}-rotate"
+            )
 
     async def _rotate(
-        self, group: asyncio.TaskGroup, old: Any, old_recv: asyncio.Task[None], stop: asyncio.Event
+        self,
+        group: asyncio.TaskGroup,
+        old: Any,
+        old_recv: asyncio.Task[None],
+        stop: asyncio.Event,
+        closed: asyncio.Event,
     ) -> None:
         """Replace this socket before the venue expires it, so the swap loses no rows.
 
@@ -596,7 +624,7 @@ class WSStream:
         the reconnect ladder in `run` takes over as it did before.
         """
         after_s = self.rotate_after_s or 0.0  # `_serve` only starts this task when it is set
-        if not after_s or not await _sleep_unless(stop, after_s):
+        if not after_s or not await _sleep_unless(stop, after_s, closed):
             return
         if old.close_code is not None:  # the venue got there first
             return
@@ -654,10 +682,10 @@ class WSStream:
             await _sleep_unless(stop, SOCKET_POLL_S)
         await ws.close()
 
-    async def _ping_loop(self, ws: Any, stop: asyncio.Event) -> None:
+    async def _ping_loop(self, ws: Any, stop: asyncio.Event, closed: asyncio.Event) -> None:
         every_s = self.ping_s or 0.0  # `_serve` only starts this task when it is set
         while every_s and not stop.is_set() and ws.close_code is None:
-            if not await _sleep_unless(stop, every_s):
+            if not await _sleep_unless(stop, every_s, closed):
                 return
             # Only the socket the stream is actually using is pinged. A standby is by
             # definition fresh, and a retired one is about to go; pinging either would

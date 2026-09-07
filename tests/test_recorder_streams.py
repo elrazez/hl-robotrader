@@ -579,6 +579,28 @@ async def test_a_rotation_that_cannot_connect_leaves_the_old_socket_working() ->
     assert seqs[-1] - seqs[0] > 20, "the original socket kept delivering throughout"
 
 
+async def test_a_socket_the_venue_closes_before_its_rotation_point_reconnects_at_once() -> None:
+    """Hyperliquid's `1000 (OK) Expired` arrives as a clean end of the receive loop, and it
+    can arrive early: the rotation point is 90% of the shortest lifetime we have measured,
+    so a shorter one closes the socket first. Every task that belongs to a socket has to
+    end when its reader ends, or the rotation sleep holds the task group open and the
+    stream sits there dead for the rest of ws_rotate_after_s, 9018s on the box."""
+    async with ExpiringServer(expire_after_s=0.2) as venue:
+        stream, _ = _stream(
+            venue="hyperliquid",
+            url=venue.url,
+            parse=_seq_parse,
+            tables=("trades",),
+            rotate_after_s=30.0,  # never reached: the venue expires the socket long first
+            rotate_overlap_s=0.05,
+            ping_s=30.0,  # the ping timer is the same trap, and the live venues all set it
+            ping_frame={"method": "ping"},
+        )
+        await _run_for(stream, 1.2)
+
+    assert venue.connections > 1, "the expired socket should have been replaced at once"
+
+
 async def test_a_stream_with_no_rotation_configured_is_unchanged() -> None:
     """Only Hyperliquid expires sockets on a clock. Everything else reconnects on close."""
     async with ExpiringServer(expire_after_s=0.2) as venue:
