@@ -26,6 +26,7 @@ event stream breaks ties on a fixed key, so the same command twice writes byte-i
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -93,6 +94,10 @@ DEFAULT_MAX_LEVERAGE = 3.0
 # 126 million points over a year for a curve whose only consumers are the drawdown and a
 # chart, neither of which can use that resolution.
 EQUITY_SAMPLE_MS = 60_000
+# Risk refusals kept with their coin, for a live process to drain and post. Bounded
+# because a backtest fills it and never reads it; a quarter of an hour of refusals at one
+# a tick is far more than a Telegram message would ever quote.
+RECENT_BLOCKS = 256
 
 # How often the equity curve is sampled through tape the run never replays. The portfolio
 # is flat there so the value does not move; the samples exist to keep the drawdown series
@@ -209,6 +214,14 @@ class BacktestResult:
     strategy: StrategyEngine
     risk_blocks: dict[str, int]
     rejections: list[Rejection]
+    # The last few refusals with the coin and the gate attached, for a live process that
+    # has to say which coin was refused and why. The counters are what a report reads;
+    # this is what Telegram reads, and it is bounded because a backtest produces millions
+    # of them and nobody drains it. Sizing and risk both land here: they are two gates to
+    # us and one event to an owner watching an intent produce no order.
+    recent_blocks: deque[tuple[int, str, str, str]] = field(
+        default_factory=lambda: deque(maxlen=RECENT_BLOCKS)
+    )
     intents: int = 0
     entries_placed: int = 0
     sizing_blocks: dict[str, int] = field(default_factory=dict)
@@ -816,6 +829,7 @@ def _place_entry(
     )
     if decision.reason is not None:
         result.sizing_blocks[decision.reason] = result.sizing_blocks.get(decision.reason, 0) + 1
+        result.recent_blocks.append((now_ms, intent.coin, "sizing", decision.reason))
         return
     if decision.depth_cap_applied:
         result.depth_capped_entries += 1
@@ -843,6 +857,7 @@ def _place_entry(
     if not verdict.allowed:
         assert verdict.reason is not None
         result.risk_blocks[verdict.reason] = result.risk_blocks.get(verdict.reason, 0) + 1
+        result.recent_blocks.append((now_ms, intent.coin, "risk", verdict.reason))
         return
 
     risk.on_entry(request)

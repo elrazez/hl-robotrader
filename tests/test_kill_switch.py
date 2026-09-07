@@ -260,3 +260,111 @@ def test_a_flag_that_is_neither_writable_nor_present_is_a_failure(
 
     monkeypatch.setattr(Path, "write_text", refuse)
     assert write_kill_file(tmp_path / "KILL", "nowhere to write") is False
+
+
+class Hanging(FakeExecutor):
+    """A venue that accepted the request and will never answer. The worst case."""
+
+    async def cancel(self, cloid: str) -> None:
+        await asyncio.Event().wait()
+
+    async def close_position(self, coin: str, size: float) -> None:
+        await asyncio.Event().wait()
+
+
+async def test_a_hung_venue_does_not_cost_the_kill_its_budget(tmp_path: Path) -> None:
+    """CLAUDE.md rule 5 promises five seconds. An untimed venue call promises nothing."""
+    executor = Hanging(orders=["0xa", "0xb"], positions={"ETH": 1.0})
+    posted: list[str] = []
+    switch = a_switch(tmp_path, executor, posted, budget_s=0.4)
+
+    started = time.monotonic()
+    result = await switch.fire(reason="hung venue")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert result.killed is True
+    assert (tmp_path / "KILL").exists()
+    assert result.canceled_orders == 0
+    assert result.closed_positions == 0
+    # Abandoned, and named. A kill that silently gave up on an order is worse than one
+    # that says which order it gave up on.
+    assert "0xa" in (result.reason or "")
+    assert "ETH" in (result.reason or "")
+    assert posted and "0xa" in posted[0]
+
+
+async def test_a_hung_cancel_does_not_stop_the_close_from_being_tried(tmp_path: Path) -> None:
+    """The close is the half that carries the risk, so it gets its own share of the budget."""
+
+    class HangingCancel(FakeExecutor):
+        async def cancel(self, cloid: str) -> None:
+            await asyncio.Event().wait()
+
+    executor = HangingCancel(orders=["0xa"], positions={"ETH": 1.0})
+    switch = a_switch(tmp_path, executor, budget_s=0.4)
+
+    result = await switch.fire(reason="hung cancel")
+
+    assert executor.closed == [("ETH", 1.0)]
+    assert result.closed_positions == 1
+    assert result.canceled_orders == 0
+
+
+async def test_a_second_kill_during_one_joins_it_rather_than_waiting_for_it(
+    tmp_path: Path,
+) -> None:
+    """A retried /kill during a slow kill must answer with the one in flight.
+
+    The lock made the second caller wait for the first sweep and then run a second, which
+    is two budgets for one question, from a caller who has already
+    typed /kill twice.
+    """
+    executor = FakeExecutor(orders=["0xa"], positions={"ETH": 1.0}, slow_s=0.2)
+    switch = a_switch(tmp_path, executor, budget_s=2.0)
+
+    started = time.monotonic()
+    first, second = await asyncio.gather(switch.fire(reason="one"), switch.fire(reason="two"))
+    elapsed = time.monotonic() - started
+
+    assert first == second
+    assert elapsed < 0.6  # one sweep, not two queued behind each other
+    assert executor.cancelled == ["0xa"]
+    assert executor.closed == [("ETH", 1.0)]
+
+
+def test_the_kill_budget_has_to_leave_room_inside_the_deadline() -> None:
+    """The budget bounds the venue calls; the deadline is what rule 5 promises the owner."""
+    from pydantic import ValidationError
+
+    from liqfade.config import resolve
+    from liqfade.config.models import Settings
+
+    merged, _ = resolve("paper")
+    assert Settings.model_validate(merged).risk.kill_budget_s < merged["risk"]["kill_deadline_s"]
+
+    merged["risk"]["kill_budget_s"] = merged["risk"]["kill_deadline_s"]
+    with pytest.raises(ValidationError, match="kill_budget_s"):
+        Settings.model_validate(merged)
+
+
+async def test_the_confirmation_names_a_few_abandoned_targets_and_counts_the_rest(
+    tmp_path: Path,
+) -> None:
+    """The drill of 2026-09-07 found this one.
+
+    Sixty hanging calls put sixty 34 character cloids in the Telegram confirmation, which
+    is two thousand characters of hex in the one message that has to be read at a glance.
+    The count is the number that matters and a few examples are what makes it actionable;
+    the full list stays in the log line, where a machine reads it.
+    """
+    executor = Hanging(orders=[f"0x{i:032x}" for i in range(40)])
+    posted: list[str] = []
+    switch = a_switch(tmp_path, executor, posted, budget_s=0.2)
+
+    result = await switch.fire(reason="many")
+
+    assert "40" in (result.reason or "")
+    assert posted
+    assert len(posted[0]) < 400, f"confirmation is {len(posted[0])} characters"
+    assert "0x" + "0" * 32 in posted[0]  # still names some of them

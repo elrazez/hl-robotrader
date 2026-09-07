@@ -12,20 +12,29 @@ alternative is a second implementation of the entry, exit and repricing rules th
 drift from the first within a week, and a drifted twin is a worse thing to own than a
 private import. If they ever need to change shape, they change in one place.
 
-**Nothing here can place a real order.** `PaperTransport` is the only transport, the
-positions live in a `Portfolio`, and the fills come from `backtest/fills.py`. The orders
-are still real in every way that costs nothing: each carries a cloid, is reduce-only aware
-and is written to `data/orders.sqlite`, so the panel, `/status` and reconciliation all see
-the same rows they will see on testnet.
+**Nothing here can place a real order.** `PaperTransport` is the only transport: it hands
+back an order id and touches nothing. The positions live in a `Portfolio` and the fills
+come from `backtest/fills.py`.
+
+The orders are still real in every way that costs nothing. They go through the same
+`OrderManager` a testnet order goes through, so each one is rounded onto the venue's grid,
+walks SUBMITTED to ACKED to PARTIAL to FILLED or CANCELED, is refused if the kill flag is
+there, and writes both the orders table and the fills table of `data/orders.sqlite`. The
+panel, `/status` and reconciliation therefore see the rows they will see on testnet rather
+than a subset of them written by hand.
 
 `inject_intent` exists for drills, because a cross-venue cascade may not happen on the
 afternoon you want to test the plumbing. It builds an intent from the current book and
 pushes it through sizing, the risk gate and the order path exactly as the strategy's own
-intents go, and it is refused outright when the environment is mainnet.
+intents go, and it is refused outright when the environment is mainnet **or** when
+`LIQFADE_LIVE_TRADING` is set. The env is only one of the three gates in CLAUDE.md rule 3,
+and a box that has been armed is not a box to open a position on with no signal behind it,
+whatever its env file says.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -40,12 +49,18 @@ from liqfade.backtest.engine import (
     _resolve_meta,
     _take_exit,
 )
-from liqfade.backtest.fills import SimOrder
+from liqfade.backtest.fills import OrderKind, SimOrder
 from liqfade.backtest.portfolio import Portfolio
 from liqfade.config.models import Settings
 from liqfade.control.protocol import OrderState, PositionState
 from liqfade.control.protocol import now_ms as wall_ms
-from liqfade.execution.orders import Order, OrderIntent, OrderStatus, OrderStore, new_cloid
+from liqfade.execution.orders import (
+    OrderIntent,
+    OrderManager,
+    OrderStatus,
+    OrderStore,
+    new_cloid,
+)
 from liqfade.live.features import LiveFeatureEngine
 from liqfade.log import get_logger
 from liqfade.risk.engine import RiskEngine
@@ -69,21 +84,61 @@ class _HexCloids(_CloidCounter):
         return new_cloid()
 
 
+class PaperTransport:
+    """The `OrderTransport` paper runs against. Answers, and does nothing else.
+
+    The order it is asked to place already exists as a `SimOrder` in the engine, which is
+    what fills it. This exists so the manager's state machine, its persistence and its
+    idempotence are the ones paper exercises, rather than a second implementation of them
+    that would drift from the first.
+    """
+
+    def __init__(self) -> None:
+        self.oid = 0
+        self.placed: list[OrderIntent] = []
+        self.cancelled: list[tuple[str, str]] = []
+
+    async def place(self, intent: OrderIntent) -> int:
+        self.placed.append(intent)
+        self.oid += 1
+        return self.oid
+
+    async def cancel(self, coin: str, cloid: str) -> None:
+        self.cancelled.append((coin, cloid))
+
+
 class _RecordingStrategy(StrategyEngine):
     """The real engine, remembering the intents of the last tick so they can be posted.
 
     `_on_tick` places intents itself and returns nothing, and Telegram has to see every
     one of them including those the risk gate then refuses. Recording them here is six
     lines against copying the tick function to add a hook.
+
+    It is also where a pause is applied. `allow_intents` False still runs the detectors
+    and then throws their intents away, so the pause costs nothing but the new entries:
+    skipping the tick instead would leave every cascade detector blind for the length of
+    the pause and make a resume a cold start.
     """
 
     def __init__(self, settings: Settings, meta: Mapping[str, AssetMeta]) -> None:
         super().__init__(settings, meta)
         self.last_intents: list[Intent] = []
+        self.allow_intents = True
+        self.dropped_intents = 0
 
     def on_tick(self, now_ms: int, features_by_coin: Mapping[str, FeatureRow]) -> list[Intent]:
-        self.last_intents = super().on_tick(now_ms, features_by_coin)
-        return self.last_intents
+        intents = super().on_tick(now_ms, features_by_coin)
+        if not self.allow_intents and intents:
+            self.dropped_intents += len(intents)
+            log.warning(
+                "intent_dropped_while_paused",
+                coins=sorted(intent.coin for intent in intents),
+                count=len(intents),
+                dropped_total=self.dropped_intents,
+            )
+            intents = []
+        self.last_intents = intents
+        return intents
 
 
 class PaperSession:
@@ -112,6 +167,20 @@ class PaperSession:
         self.store = store
         self.features = LiveFeatureEngine(settings)
         self.meta = _resolve_meta(dict(meta), sorted(meta), settings)
+        self.transport = PaperTransport()
+        # The real manager, with the real kill check. A paper order that skipped it would
+        # be drilling something other than the thing that runs on the box.
+        self.orders = (
+            OrderManager(
+                store,
+                self.transport,
+                sz_decimals=self._sz_decimals(),
+                killed=lambda: settings.kill_switch_present,
+                retries=settings.execution.transient_retries,
+            )
+            if store is not None
+            else None
+        )
         self.strategy = _RecordingStrategy(settings, self.meta)
         self.portfolio = Portfolio(settings, starting_equity=starting_equity)
         # The real gate, with the real kill switch: a paper loop that ignored the kill file
@@ -130,9 +199,43 @@ class PaperSession:
         self.intents: list[Intent] = []
         self.fills: list[tuple[int, str, str, float, float]] = []
         self._known_orders: dict[str, OrderStatus] = {}
-        self._seen_orders: dict[str, tuple[SimOrder, _CoinState]] = {}
+        self._seen_orders: dict[str, SimOrder] = {}
+        self._recorded_fill: dict[str, float] = {}
         self._trades_seen = 0
         self._positions_seen: set[str] = set()
+
+    async def _record_taker_exit(self, trade: Any, now_ms: int) -> None:
+        """One crossing exit into the registry: submitted, acked, filled, all at once."""
+        if self.orders is None:
+            return
+        cloid = new_cloid()
+        intent = OrderIntent(
+            cloid=cloid,
+            coin=trade.coin,
+            # A long position exits by selling. `trade.side` is the position's side.
+            is_buy=trade.side != "long",
+            px=trade.exit_px,
+            size=trade.size,
+            tif="Ioc",
+            reduce_only=True,
+            tag=trade.exit_reason,
+        )
+        placed = await self.orders.submit(intent)
+        if placed.status is OrderStatus.REJECTED:
+            return
+        self._known_orders[cloid] = placed.status
+        updated = await self.orders.record_fill(
+            cloid,
+            size=placed.intent.size,
+            px=placed.intent.px,
+            ts_ms=trade.exit_ms or now_ms,
+            fee=placed.intent.px * placed.intent.size * self.settings.backtest.taker_fee_frac,
+            maker=False,
+        )
+        self._known_orders[cloid] = updated.status
+
+    def _sz_decimals(self) -> dict[str, int]:
+        return {coin: asset.sz_decimals for coin, asset in self.meta.items()}
 
     # --- feeds ---------------------------------------------------------------
 
@@ -157,10 +260,19 @@ class PaperSession:
 
     # --- the clock -----------------------------------------------------------
 
-    async def tick(self, now_ms: int) -> list[Intent]:
-        """One decision tick. Returns the intents the strategy emitted, for Telegram."""
+    async def tick(self, now_ms: int, *, allow_entries: bool = True) -> list[Intent]:
+        """One decision tick. Returns the intents the strategy emitted, for Telegram.
+
+        Args:
+            now_ms: the decision timestamp.
+            allow_entries: False while the loop is paused. The tick still runs in full,
+                because `_on_tick` is the only path to the stop, the time stop and the
+                entry expiry; only the new intents are dropped. A pause stops new risk,
+                it does not abandon the risk already on the book.
+        """
         self.features.advance(now_ms)
         rows = {coin: self.features.row(coin, now_ms) for coin in self.features.coins}
+        self.strategy.allow_intents = allow_entries
         self.strategy.last_intents = []
         _on_tick(
             now_ms,
@@ -176,8 +288,8 @@ class PaperSession:
         )
         intents = list(self.strategy.last_intents)
         self.intents.extend(intents)
-        await self._sync_orders(now_ms)
-        self._note_trades()
+        await self.sync_orders(now_ms)
+        await self._note_trades(now_ms)
         return intents
 
     # --- drills --------------------------------------------------------------
@@ -200,13 +312,19 @@ class PaperSession:
         invented entry price is an invented drill.
 
         Raises:
-            PermissionError: the environment is mainnet. A drill command that can open a
-                real position is not a drill command.
+            PermissionError: the environment is mainnet, or LIQFADE_LIVE_TRADING is set.
+                A drill command that can open a real position is not a drill command, and
+                the env is only one of the three gates that decide whether it can.
         """
         if self.settings.env == "mainnet":
             raise PermissionError(
                 "inject_intent is refused on mainnet: it opens a position with no signal "
                 "behind it. Run it in paper or on testnet."
+            )
+        if os.environ.get("LIQFADE_LIVE_TRADING"):
+            raise PermissionError(
+                "inject_intent is refused while LIQFADE_LIVE_TRADING is set: this process "
+                "has been armed for live trading, whatever its env says. Unset it first."
             )
         coin_state = self.state.get(coin)
         mid = coin_state.book.mid() if coin_state else None
@@ -238,6 +356,9 @@ class PaperSession:
         rows = {intent.coin: self.features.row(intent.coin, now_ms)}
         if intent.coin not in self.meta:
             self.meta = _resolve_meta(self.meta, [intent.coin], self.settings)
+            if self.orders is not None:
+                # `_resolve_meta` returns a new dict, so the manager's copy has to be told.
+                self.orders.sz_decimals = self._sz_decimals()
         _place_entry(
             intent,
             now_ms,
@@ -272,7 +393,10 @@ class PaperSession:
                     setattr(coin_state, name, None)
                     if name == "entry":
                         coin_state.intent = None
-                    await self._record(cloid, OrderStatus.CANCELED, order, coin_state)
+                    self._seen_orders.pop(cloid, None)
+                    if self.orders is not None and cloid in self._known_orders:
+                        cancelled = await self.orders.cancel(cloid)
+                        self._known_orders[cloid] = cancelled.status
                     return
 
     async def cancel_all(self) -> int:
@@ -324,7 +448,7 @@ class PaperSession:
             )
             if name not in self.portfolio.positions:
                 closed.append(name)
-        self._note_trades()
+        await self._note_trades(now_ms)
         return closed
 
     async def aclose(self) -> None:
@@ -385,51 +509,48 @@ class PaperSession:
 
     # --- the registry mirror -------------------------------------------------
 
-    async def _sync_orders(self, now_ms: int) -> None:
-        """Write the engine's working orders into the registry, transitions and all.
+    async def sync_orders(self, now_ms: int) -> None:
+        """Push the engine's working orders through the order manager, transitions and all.
 
-        A simulated order is acked the moment it exists, so the state machine it walks is
-        ACKED, then PARTIAL as prints reach it, then FILLED or CANCELED. Every row carries
-        the same cloid the fill model used, so the trade log and the registry agree.
+        The engine owns the simulated orders and fills them; the manager owns the registry
+        and the state machine. Each tick is a diff: an order the manager has never seen is
+        submitted, an order whose filled size grew is a fill, and an order that left the
+        coin state without being cancelled filled the rest of the way, because the engine
+        drops an order the moment nothing is left of it. The `SimOrder` is kept for exactly
+        that last case, so the closing fill carries its real size.
         """
-        if self.store is None:
+        if self.orders is None:
             return
-        live: dict[str, tuple[SimOrder, _CoinState]] = {}
+        live: dict[str, SimOrder] = {}
         for coin_state in self.state.values():
             for order in (coin_state.entry, coin_state.exit_order):
                 if order is not None:
-                    live[order.cloid] = (order, coin_state)
+                    live[order.cloid] = order
+
+        for cloid, order in live.items():
+            if cloid not in self._known_orders:
+                await self._submit(order)
+            await self._book_fill(order, now_ms)
 
         self._seen_orders.update(live)
-        for cloid, (order, coin_state) in live.items():
-            status = OrderStatus.ACKED
-            if order.remaining <= 0:
-                status = OrderStatus.FILLED
-            elif order.filled > 0:
-                status = OrderStatus.PARTIAL
-            if self._known_orders.get(cloid) != status:
-                await self._record(cloid, status, order, coin_state)
-
-        for cloid, status in list(self._known_orders.items()):
-            if cloid in live or status in {OrderStatus.FILLED, OrderStatus.CANCELED}:
+        for cloid in list(self._known_orders):
+            if cloid in live or self._known_orders[cloid] in {
+                OrderStatus.FILLED,
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+            }:
                 continue
-            # It left the coin state without us cancelling it, which means it filled: the
-            # engine drops an order the moment nothing is left of it. The SimOrder is kept
-            # around for exactly this, so the final row carries its real filled size.
-            order, coin_state = self._seen_orders[cloid]
-            await self._record(cloid, OrderStatus.FILLED, order, coin_state)
-            self._seen_orders.pop(cloid, None)
+            gone = self._seen_orders.pop(cloid, None)
+            if gone is not None:
+                gone.filled = gone.size
+                await self._book_fill(gone, now_ms)
 
-    async def _record(
-        self, cloid: str, status: OrderStatus, order: SimOrder, coin_state: _CoinState
-    ) -> None:
-        if self.store is None:
-            return
-        previous = self._known_orders.get(cloid)
-        self._known_orders[cloid] = status
-        row = Order(
-            intent=OrderIntent(
-                cloid=cloid,
+    async def _submit(self, order: SimOrder) -> None:
+        """One simulated order into the registry, through the real submit path."""
+        assert self.orders is not None
+        placed = await self.orders.submit(
+            OrderIntent(
+                cloid=order.cloid,
                 coin=order.coin,
                 is_buy=order.is_buy,
                 px=order.px,
@@ -437,28 +558,57 @@ class PaperSession:
                 tif=order.kind.value,
                 reduce_only=order.reduce_only,
                 tag=order.tag,
-            ),
-            status=status,
-            filled=order.filled,
-            avg_px=order.px,
-            submitted_ms=order.visible_ms,
+            )
         )
-        await self.store.upsert(row)
+        self._known_orders[order.cloid] = placed.status
+        self._recorded_fill.setdefault(order.cloid, 0.0)
         log.info(
             "paper_order",
-            cloid=cloid,
+            cloid=order.cloid,
             coin=order.coin,
-            status=str(status),
-            previous=str(previous) if previous else None,
+            status=str(placed.status),
             px=order.px,
             size=order.size,
-            filled=order.filled,
             tag=order.tag,
             reduce_only=order.reduce_only,
         )
 
-    def _note_trades(self) -> None:
-        """Record fills and closed trades since the last call, for Telegram and counters."""
+    async def _book_fill(self, order: SimOrder, now_ms: int) -> None:
+        """Record whatever filled since the last look, if anything did.
+
+        The fee is the same one the portfolio charged, computed from the same config
+        fractions, so the registry's fills add up to the trade log's costs. Maker or taker
+        is the order kind: an `Alo` rested and an `Ioc` crossed.
+        """
+        assert self.orders is not None
+        if self._known_orders.get(order.cloid) in {OrderStatus.FILLED, OrderStatus.CANCELED}:
+            return
+        delta = order.filled - self._recorded_fill.get(order.cloid, 0.0)
+        if delta <= 0:
+            return
+        self._recorded_fill[order.cloid] = order.filled
+        maker = order.kind is not OrderKind.IOC
+        costs = self.settings.backtest
+        fee_frac = costs.maker_fee_frac if maker else costs.taker_fee_frac
+        updated = await self.orders.record_fill(
+            order.cloid,
+            size=delta,
+            px=order.px,
+            ts_ms=now_ms,
+            fee=order.px * delta * fee_frac,
+            maker=maker,
+        )
+        self._known_orders[order.cloid] = updated.status
+
+    async def _note_trades(self, now_ms: int) -> None:
+        """Record fills and closed trades since the last call, for Telegram and counters.
+
+        A crossing exit (a stop, a time stop, a flat) is built, filled and discarded inside
+        the engine and never rests in the coin state, so `sync_orders` cannot see it. It is
+        still an order the venue would have received and a fill the panel has to show, so
+        it is written here from the closed trade. The resting target exit is not: that one
+        rests, and `sync_orders` already has it.
+        """
         for coin, position in self.portfolio.positions.items():
             if coin not in self._positions_seen:
                 self._positions_seen.add(coin)
@@ -481,6 +631,8 @@ class PaperSession:
             self.fills.append(
                 (trade.exit_ms, trade.coin, trade.exit_reason, trade.exit_px, trade.size)
             )
+            if trade.exit_reason != "target":
+                await self._record_taker_exit(trade, now_ms)
             log.info(
                 "paper_trade",
                 coin=trade.coin,

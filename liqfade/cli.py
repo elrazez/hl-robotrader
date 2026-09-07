@@ -359,7 +359,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 return hl_candles.run(
                     client,
                     data_dir,
-                    settings.venues.hyperliquid.api_url,
+                    settings.venues.hyperliquid.info_base,
                     start,
                     end,
                     coins=coins or None,
@@ -853,13 +853,16 @@ def cmd_paper(args: argparse.Namespace) -> int:
     from liqfade.log import setup_logging
     from liqfade.runtime import run_main, shutdown_event
 
+    # Forced, not defaulted. Paper simulates every fill, so a run under any other config
+    # would read that environment's risk limits and report a simulated equity curve as if
+    # it were the account. The env is also one of CLAUDE.md rule 3's three gates, and the
+    # process that can never place an order is the one that must never look like it can.
+    asked = getattr(args, "env", None)
+    args.env = "paper"
     settings = _settings(args)
     setup_logging(proc="paper", env=settings.env, level=settings.logging.level)
-    if settings.env == "mainnet":
-        # Paper simulates every fill. Running it under the mainnet config would read the
-        # mainnet risk limits and report a paper equity curve as if it were the account.
-        print("paper mode refuses --env mainnet: use paper or testnet", file=sys.stderr)
-        return EXIT_ERROR
+    if asked and asked != "paper":
+        print(f"paper mode ignores --env {asked} and runs with env=paper", file=sys.stderr)
 
     from liqfade.live.features import LiveFeatureEngine
 

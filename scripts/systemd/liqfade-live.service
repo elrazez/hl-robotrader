@@ -1,9 +1,12 @@
 [Unit]
 Description=liqfade trading loop
 Documentation=file:/srv/liqfade/app/CLAUDE.md
+# After= only, no Requires=, for the reason spelled out in liqfade-paper.service: the loop
+# opens its own feeds and a Requires= on the recorder makes every recorder restart restart
+# the trading loop. That cost a soak on 2026-09-07 in paper; in live it would flatten
+# nothing and reconcile everything for no reason at all.
 After=network-online.target chrony.service liqfade-recorder.service
 Wants=network-online.target
-Requires=liqfade-recorder.service
 
 [Service]
 Type=simple

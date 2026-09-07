@@ -58,6 +58,7 @@ def build_streams(
     sink: RowSink,
     *,
     on_rtt_ms: Callable[[float], None] | None = None,
+    on_reconnect: Callable[[str], None] | None = None,
 ) -> list[WSStream]:
     """Every enabled venue stream, pointed at one sink.
 
@@ -84,6 +85,7 @@ def build_streams(
                 ping_frame=hl.PING_FRAME,
                 pong_marker=hl.PONG_MARKER,
                 on_rtt_ms=on_rtt_ms,
+                on_reconnect=on_reconnect,
                 # Only Hyperliquid expires a socket on a clock. The other three close
                 # on an error or not at all, and reconnect from the ladder in `run`.
                 rotate_after_s=venues.hyperliquid.ws_rotate_after_s,
@@ -99,6 +101,7 @@ def build_streams(
                 cfg=cfg,
                 tables=binance.TABLES,
                 on_connect=binance.on_connect,
+                on_reconnect=on_reconnect,
             )
         )
     if venues.bybit.enabled:
@@ -115,6 +118,7 @@ def build_streams(
                 on_universe_change=on_change,
                 ping_s=bybit.PING_S,
                 ping_frame=bybit.PING_FRAME,
+                on_reconnect=on_reconnect,
             )
         )
     if venues.okx.enabled:
@@ -129,6 +133,7 @@ def build_streams(
                 on_connect=okx.on_connect,
                 ping_s=okx.PING_S,
                 ping_frame=okx.PING_FRAME,
+                on_reconnect=on_reconnect,
             )
         )
     return streams
@@ -183,7 +188,7 @@ class Recorder:
         self.poller = CoinalyzePoller(settings.venues.coinalyze, self.sink)
         self.universe = UniverseManager(
             settings.universe,
-            settings.venues.hyperliquid.api_url,
+            settings.venues.hyperliquid.info_base,
             on_change=self._apply_universe,
             on_rtt_ms=self.latency.add_rest,
         )

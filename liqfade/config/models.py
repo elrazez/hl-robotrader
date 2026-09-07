@@ -42,7 +42,9 @@ class Universe(Base):
 
 class HyperliquidVenue(Base):
     enabled: bool
-    api_url: str = Field(..., description="url: POST /info and /exchange base")
+    api_url: str = Field(..., description="url: base for /info and /exchange unless split")
+    info_url: str = Field("", description="url: /info base; empty means api_url")
+    exchange_url: str = Field("", description="url: /exchange base; empty means api_url")
     ws_url: str = Field(..., description="url: websocket endpoint")
     ws_ping_s: Pos = Field(..., description="seconds between ping frames")
     ws_lifetime_s: Pos = Field(
@@ -53,6 +55,21 @@ class HyperliquidVenue(Base):
     )
     liq_weight: NonNeg = Field(..., description="weight in aggregated liquidation notional")
     complete: bool = Field(..., description="true when the venue publishes every liquidation")
+
+    @property
+    def info_base(self) -> str:
+        """Where `/info` is read from. Public, keyless, and safe to point elsewhere."""
+        return self.info_url or self.api_url
+
+    @property
+    def exchange_base(self) -> str:
+        """Where a signed `/exchange` action goes.
+
+        Separate from `info_base` because deciding where an order is sent is not the same
+        decision as deciding where a price is read, and only one of them costs money when
+        it is wrong. They are the same host today, which is why both default to `api_url`.
+        """
+        return self.exchange_url or self.api_url
 
     @property
     def ws_rotate_after_s(self) -> float:
@@ -419,6 +436,9 @@ class Risk(Base):
         ..., description="seconds of heartbeat staleness before cancel all"
     )
     kill_deadline_s: Pos = Field(..., description="seconds within which /kill must have flattened")
+    kill_budget_s: Pos = Field(
+        4.0, description="seconds the kill sweep's venue calls get, inside kill_deadline_s"
+    )
 
     @model_validator(mode="after")
     def _stale_ordered(self) -> Risk:
@@ -428,6 +448,11 @@ class Risk(Base):
             )
         if self.watchdog_stale_s <= self.heartbeat_s:
             raise ValueError("risk.watchdog_stale_s must be > heartbeat_s")
+        if self.kill_budget_s >= self.kill_deadline_s:
+            # The budget bounds the venue calls; the deadline is the promise CLAUDE.md
+            # rule 5 makes. The confirmation, the alert and the logging happen in between,
+            # so a budget at the deadline is a promise already broken.
+            raise ValueError("risk.kill_budget_s must be < kill_deadline_s")
         return self
 
 

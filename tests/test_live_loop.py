@@ -49,14 +49,14 @@ async def loop(tmp_path: Path) -> AsyncIterator[PaperLoop]:
         await paper.aclose()
 
 
-def a_market(loop: PaperLoop, px: float = 3000.0) -> None:
+def a_market(loop: PaperLoop, px: float = 3000.0, at: int = START) -> None:
     loop.sink(
         "bbo",
         "hyperliquid",
         {
             "coin": COIN,
-            "ts_ms": START,
-            "rx_ms": START,
+            "ts_ms": at,
+            "rx_ms": at,
             "bid_px": px - 0.5,
             "bid_sz": 50.0,
             "ask_px": px + 0.5,
@@ -68,8 +68,8 @@ def a_market(loop: PaperLoop, px: float = 3000.0) -> None:
         "hyperliquid",
         {
             "coin": COIN,
-            "ts_ms": START,
-            "rx_ms": START,
+            "ts_ms": at,
+            "rx_ms": at,
             "px": px,
             "sz": 5.0,
             "side": "sell",
@@ -89,11 +89,17 @@ async def test_status_reports_paper_and_never_live_trading(loop: PaperLoop) -> N
     assert state.risk.equity == pytest.approx(5_000.0)
 
 
-async def test_pause_stops_the_tick_from_deciding(loop: PaperLoop) -> None:
+async def test_pause_drops_new_intents_and_still_ticks(loop: PaperLoop) -> None:
+    """Pause is about new risk. The tick itself has to keep running: it is the only path
+    to the exit checks, so a loop that stops ticking stops honouring its own stops."""
+    from liqfade.control.protocol import now_ms
     from liqfade.live.loop import PaperBackend
 
     backend = PaperBackend(loop)
-    a_market(loop)
+    # Stamped on the wall clock, because `tick_loop` reads it. The feature engine buckets
+    # on rx_ms, so a fixture stamped years ago would have one tick walk every second in
+    # between.
+    a_market(loop, at=now_ms())
     await backend.pause(reason="test")
 
     stop = asyncio.Event()
@@ -104,6 +110,52 @@ async def test_pause_stops_the_tick_from_deciding(loop: PaperLoop) -> None:
 
     assert loop.ticks > 0
     assert loop.session.intents == []
+    # The tick reached the engine rather than being skipped, which is what keeps the
+    # exit checks alive. `_on_tick` samples equity, so a sample is the evidence.
+    assert loop.session.result.equity_curve
+
+
+async def test_pause_does_not_abandon_the_stop_on_a_position_already_open(
+    tmp_path: Path,
+) -> None:
+    """The defect this replaces: a paused loop with a position stopped checking its stop.
+
+    `_on_tick` is the only path to `_check_exits` and `_expire_entries`, so skipping the
+    tick while paused leaves an open position with no stop and no time stop, which is the
+    opposite of what a pause is for.
+    """
+    from liqfade.control.protocol import now_ms
+    from liqfade.live.loop import PaperBackend
+
+    paper = PaperLoop(
+        paper_settings(tmp_path, **{"execution.entry_tif": "Ioc"}), starting_equity=5_000.0
+    )
+    await paper.setup()
+    try:
+        at = now_ms()
+        a_market(paper, 3000.0, at=at)
+        await paper.session.tick(at + 1_000)
+        paper.session.inject_intent(coin=COIN, side="long", now_ms=at + 1_000, stop_bps=30.0)
+        # The entry is visible one latency later, and the book has to be fresh when it
+        # crosses: a stale book is a guess, and the fill model refuses to fill on one.
+        a_market(paper, 3000.0, at=at + 2_900)
+        await paper.session.tick(at + 3_000)
+        assert COIN in paper.session.portfolio.positions
+
+        await PaperBackend(paper).pause(reason="drill")
+        # Through the stop at 3000 * (1 - 0.003) = 2991.
+        a_market(paper, 2_900.0, at=at + 3_500)
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(paper.tick_loop(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+        assert COIN not in paper.session.portfolio.positions
+        assert [t.exit_reason for t in paper.session.portfolio.trades] == ["stop"]
+    finally:
+        await paper.aclose()
 
 
 async def test_inject_intent_over_the_control_socket(loop: PaperLoop, sock_dir: Path) -> None:
@@ -182,7 +234,9 @@ async def test_reconcile_is_clean_when_the_registry_matches_the_engine(
     loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
     await loop.session.tick(START + 1_250)
 
-    assert await loop.reconcile_once("test") == 0
+    result = await loop.reconciler.check("test")
+
+    assert result is not None and result.clean
 
 
 async def test_reconcile_reports_a_registry_row_the_engine_does_not_have(
@@ -201,8 +255,55 @@ async def test_reconcile_reports_a_registry_row_the_engine_does_not_have(
         )
     )
 
-    assert await loop.reconcile_once("test") == 1
-    assert loop.reconcile_differences == 1
+    result = await loop.reconciler.check("test")
+
+    assert result is not None and [d.kind for d in result.differences] == ["missing_order"]
+    assert loop.counters()["reconcile_differences"] == 1
+
+
+async def test_paper_never_reports_its_own_position_as_one_the_venue_lost(
+    loop: PaperLoop,
+) -> None:
+    """Paper has no venue account, so the position half has no second source at all.
+
+    Comparing it against nothing would call every open position `missing_position`, which
+    is a HALT, every sixty seconds. Not checked is the honest answer.
+    """
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
+    await loop.session.tick(START + 1_250)
+
+    result = await loop.reconciler.check("test")
+
+    assert result is not None
+    assert result.checked_positions == 0
+    assert not [d for d in result.differences if "position" in d.kind]
+
+
+async def test_a_stream_reconnect_reconciles_without_waiting_for_the_interval(
+    loop: PaperLoop,
+) -> None:
+    """CLAUDE.md rule 4: reconciliation runs on every WebSocket reconnect.
+
+    The loop counted reconnects and triggered nothing, while the class that implements
+    the trigger was used by nothing but its own tests.
+    """
+    assert loop.streams and all(stream.on_reconnect is not None for stream in loop.streams)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.reconciler.run(stop, reconnected=loop.reconnected))
+    try:
+        await asyncio.sleep(0.02)
+        assert loop.reconciler.runs == 1  # startup
+
+        loop.streams[0].on_reconnect("hyperliquid")  # what WSStream.run calls on the way back
+        await asyncio.sleep(0.02)
+
+        assert loop.reconciler.runs == 2
+    finally:
+        stop.set()
+        await task
 
 
 async def test_the_heartbeat_file_is_written(loop: PaperLoop) -> None:
@@ -219,3 +320,310 @@ async def test_the_heartbeat_file_is_written(loop: PaperLoop) -> None:
 async def test_the_counters_are_what_the_daily_report_reads(loop: PaperLoop) -> None:
     counters = loop.counters()
     assert set(counters) >= {"ticks", "intents", "fills", "trades", "reconcile_differences"}
+
+
+async def test_a_risk_block_records_the_coin_it_blocked(loop: PaperLoop) -> None:
+    """A count keyed on the reason alone cannot say which coin was refused."""
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    # Six seconds after the last HL row, past risk.stale_coin_s of five.
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000)
+
+    assert loop.session.result.risk_blocks == {"stale_coin_data": 1}
+    assert [
+        (coin, gate, reason) for _ts, coin, gate, reason in loop.session.result.recent_blocks
+    ] == [(COIN, "risk", "stale_coin_data")]
+
+
+async def test_a_risk_block_is_logged_and_posted_once_per_reason(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent refusal in the live process is a strategy that looks like it stopped."""
+    import structlog
+
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    for n in range(3):
+        loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000 + n)
+
+    with structlog.testing.capture_logs() as logs:
+        await loop.report_risk_blocks()
+
+    events = [entry for entry in logs if entry["event"] == "risk_block"]
+    assert len(events) == 3  # every one is logged
+    assert events[0]["reason"] == "stale_coin_data"
+    assert events[0]["coin"] == COIN
+    # And posted once, because three identical refusals in one second are one thing to say.
+    assert len(posted) == 1
+    assert "stale_coin_data" in posted[0]
+    assert COIN in posted[0]
+    # The counter the report reads is untouched.
+    assert loop.session.result.risk_blocks["stale_coin_data"] == 3
+
+
+async def test_the_same_risk_reason_is_not_posted_again_inside_its_window(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000)
+    await loop.report_risk_blocks()
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 8_000)
+    await loop.report_risk_blocks()
+
+    assert len(posted) == 1
+
+
+async def test_two_identical_simulated_fills_are_both_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`loop.post` used to send every line through the ten minute dedupe.
+
+    Two identical fills inside ten minutes are two trades, and the second one being
+    swallowed loses it from the only record the owner watches in real time.
+    """
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper.session.fills.append((START, COIN, "entry", 3000.0, 0.1))
+        paper.session.fills.append((START + 1, COIN, "entry", 3000.0, 0.1))
+
+        posted = await paper._post_fills(0)
+
+        assert posted == 2
+        assert len(sent) == 2
+        assert sent[0][0] == sent[1][0]  # identical text, both sent
+        assert all(dedupe is False for _text, dedupe in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_recorder_style_condition_alert_keeps_its_dedupe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything that is not an event still repeats the same words every tick it holds."""
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        await paper.post("[paper] RECONCILE interval: missing_order")
+
+        assert sent == [("[paper] RECONCILE interval: missing_order", True)]
+    finally:
+        await paper.aclose()
+
+
+def _recorder(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Capture what the loop would have posted to Telegram."""
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    return sent
+
+
+async def test_a_stream_reconnect_is_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLAUDE.md section 5 lists reconnect among the things that go to Telegram."""
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper._on_reconnect("hyperliquid")
+        await asyncio.sleep(0.01)
+
+        assert any("RECONNECT" in text and "hyperliquid" in text for text, _ in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_tick_that_raises_is_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error the loop swallowed into a log line is an error nobody sees."""
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+
+        async def boom(*_args: object, **_kwargs: object) -> list[Any]:
+            raise RuntimeError("the book fell over")
+
+        monkeypatch.setattr(paper.session, "tick", boom)
+        stop = asyncio.Event()
+        task = asyncio.create_task(paper.tick_loop(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+        assert any("ERROR" in text and "the book fell over" in text for text, _ in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_halt_is_posted_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper.session.risk.state.halt_reason = "drawdown"
+        await paper.report_halt()
+        await paper.report_halt()
+
+        halts = [text for text, _ in sent if "HALT" in text]
+        assert len(halts) == 1
+        assert "drawdown" in halts[0]
+    finally:
+        await paper.aclose()
+
+
+async def test_inject_intent_is_refused_when_live_trading_is_armed(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`env != mainnet` is not the whole gate. An armed box is not a drill box.
+
+    The drill opens a position with no signal behind it. Doing that on a process that has
+    been told live trading is on is exactly the mistake the three gates exist to stop,
+    whatever the env file happens to say.
+    """
+    monkeypatch.setenv("LIQFADE_LIVE_TRADING", "1")
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+
+    from liqfade.live.loop import PaperBackend
+
+    result = await PaperBackend(loop).inject_intent(coin=COIN, side="long")
+
+    assert result.injected is False
+    assert "LIQFADE_LIVE_TRADING" in (result.reason or "")
+
+
+async def test_a_paper_fill_is_written_to_the_fills_table(loop: PaperLoop) -> None:
+    """Paper writes the registry a testnet run writes, or it is drilling something else.
+
+    The bare `OrderStore.upsert` wrote the orders table and nothing else, so `data/
+    orders.sqlite` had no fills in it at all and the panel's fills history, which is one of
+    the things Phase 5 is supposed to be exercising, had nothing to show.
+    """
+    from liqfade.control.protocol import now_ms
+
+    assert loop.store is not None
+    from liqfade.live.loop import PaperBackend
+
+    at = now_ms()
+    a_market(loop, 3000.0, at=at)
+    await loop.session.tick(at + 1_000)
+    # Driven the way the owner drives it, because the backend is what syncs the registry
+    # after an order placed outside a tick.
+    assert (await PaperBackend(loop).inject_intent(coin=COIN, side="long")).injected
+    a_market(loop, 3000.0, at=at + 2_900)
+    await loop.session.tick(at + 3_000)
+
+    fills = await loop.store.fills()
+
+    assert fills, "a simulated fill left no row in the fills table"
+    assert fills[0]["size"] > 0
+    assert fills[0]["px"] > 0
+
+
+async def test_a_paper_order_walks_the_real_state_machine(loop: PaperLoop) -> None:
+    """SUBMITTED then ACKED, through `OrderManager`, not a status computed on the side."""
+    from liqfade.execution.orders import OrderStatus
+
+    assert loop.store is not None
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
+    await loop.session.tick(START + 1_250)
+
+    rows = await loop.store.all_orders()
+
+    assert [row.status for row in rows] == [OrderStatus.ACKED]
+    assert rows[0].oid is not None  # the manager records what the transport answered
+
+
+async def test_a_sizing_refusal_is_reported_like_a_risk_one(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by the box drill of 2026-09-07, not by reading the code.
+
+    An injected entry produced `intent_injected` and then nothing at all: no order, no
+    refusal, no line. Sizing returns before the risk gate is ever reached, so covering
+    only `risk_blocks` left half the refusals as silent as they were before. To an owner
+    watching Telegram the two are the same event, which is a drill that reported success
+    and rested no order.
+    """
+    import structlog
+
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    # A coin that is quoted and has never traded. Sizing caps on the traded volume in the
+    # window, so it refuses before the risk gate is consulted, which is the whole point.
+    loop.sink(
+        "bbo",
+        "hyperliquid",
+        {
+            "coin": "BTC",
+            "ts_ms": START,
+            "rx_ms": START,
+            "bid_px": 60_000.0,
+            "bid_sz": 5.0,
+            "ask_px": 60_001.0,
+            "ask_sz": 5.0,
+        },
+    )
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin="BTC", side="long", now_ms=START + 1_100)
+
+    assert loop.session.result.sizing_blocks, "expected sizing to refuse this one"
+    with structlog.testing.capture_logs() as logs:
+        await loop.report_risk_blocks()
+
+    events = [entry for entry in logs if entry["event"] == "risk_block"]
+    assert len(events) == 1
+    assert events[0]["coin"] == "BTC"
+    assert events[0]["gate"] == "sizing"
+    assert posted and "RISK BLOCK" in posted[0]

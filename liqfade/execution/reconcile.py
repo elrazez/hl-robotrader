@@ -30,14 +30,28 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Protocol
 
-from liqfade.execution.hl import InfoReader, VenueOrder, VenuePosition
+from liqfade.execution.hl import AccountSnapshot, VenueOrder, VenuePosition
 from liqfade.execution.orders import LIVE, Order
 from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["Difference", "Reconciler", "Reconciliation", "Severity", "reconcile"]
+__all__ = ["BookReader", "Difference", "Reconciler", "Reconciliation", "Severity", "reconcile"]
+
+
+class BookReader(Protocol):
+    """The second opinion. `InfoReader` is one; the paper loop's own engine is the other.
+
+    Narrow on purpose: the reconciler needs two questions answered and nothing else, so
+    paper can answer them from the simulated book without an account at the venue.
+    """
+
+    async def account(self, address: str) -> AccountSnapshot: ...
+
+    async def open_orders(self, address: str) -> Sequence[VenueOrder]: ...
+
 
 # Positions are compared with a tolerance: szDecimals rounding, and the venue's own
 # arithmetic, make the last digit disagree on a book that is perfectly correct.
@@ -225,28 +239,45 @@ class Reconciler:
     def __init__(
         self,
         *,
-        reader: InfoReader,
+        reader: BookReader,
         address: str,
         orders: Callable[[], Awaitable[Sequence[Order]]],
-        positions: Callable[[], Mapping[str, float]],
+        positions: Callable[[], Mapping[str, float]] = dict,
         interval_s: float = 60.0,
         alert: Callable[[str], Awaitable[bool]] | None = None,
+        compare_positions: bool = True,
     ) -> None:
+        """
+        Args:
+            reader: the second opinion. `InfoReader` against the venue, the engine's own
+                working orders in paper.
+            address: the main wallet, passed to the reader. Ignored by a paper reader.
+            orders: our registry's orders.
+            positions: our positions, coin to signed size.
+            interval_s: seconds between checks, from `execution.reconcile_s`.
+            alert: Telegram. Optional.
+            compare_positions: False in paper, where there is no venue account and so no
+                second source for a position. Comparing against nothing would report every
+                open position as one the venue lost, which is a HALT, every interval. Not
+                checked is the honest answer, and `checked_positions` then says zero.
+        """
         self.reader = reader
         self.address = address
         self._orders = orders
         self._positions = positions
         self.interval_s = interval_s
         self._alert = alert
+        self.compare_positions = compare_positions
         self.runs = 0
         self.failures = 0
+        self.differences = 0
         self.last: Reconciliation | None = None
 
     async def check(self, trigger: str) -> Reconciliation | None:
         """One comparison. Returns None when the venue could not be read."""
         try:
-            account = await self.reader.account(self.address)
             venue_orders = await self.reader.open_orders(self.address)
+            account = await self.reader.account(self.address) if self.compare_positions else None
         except Exception as exc:
             self.failures += 1
             log.error(
@@ -260,10 +291,11 @@ class Reconciler:
         result = reconcile(
             our_orders=await self._orders(),
             venue_orders=venue_orders,
-            our_positions=self._positions(),
-            venue_positions=account.positions,
+            our_positions=self._positions() if account is not None else {},
+            venue_positions=account.positions if account is not None else {},
         )
         self.runs += 1
+        self.differences += len(result.differences)
         self.last = result
 
         if result.clean:
@@ -272,7 +304,7 @@ class Reconciler:
                 trigger=trigger,
                 orders=result.checked_orders,
                 positions=result.checked_positions,
-                equity=account.equity,
+                equity=account.equity if account is not None else None,
             )
             return result
 

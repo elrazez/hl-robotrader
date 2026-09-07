@@ -270,7 +270,18 @@ class HyperliquidTransport:
         self._exchange = signer.exchange()
 
     async def place(self, intent: OrderIntent) -> int:
+        """Send one already rounded intent. Nothing here rounds anything.
+
+        `intent.wire` is the Decimal-derived spelling `OrderManager.submit` produced, and
+        reading it is what makes an unrounded intent a loud refusal rather than an order
+        on a grid the venue will reject. The SDK's signature takes floats and does its own
+        `float_to_wire`, so the strings are parsed back one line before the call; the
+        value is the venue's, not a binary fraction of the strategy's.
+        """
         from hyperliquid.utils.types import Cloid
+
+        wire_px, wire_size = intent.wire
+        px, size = float(wire_px), float(wire_size)
 
         order_type: dict[str, Any]
         if intent.trigger_px is not None:
@@ -289,8 +300,8 @@ class HyperliquidTransport:
                 self._exchange.order,
                 intent.coin,
                 intent.is_buy,
-                intent.size,
-                intent.px,
+                size,
+                px,
                 order_type,
                 intent.reduce_only,
                 Cloid.from_str(intent.cloid),

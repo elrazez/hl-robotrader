@@ -386,3 +386,129 @@ def test_a_liquidation_with_no_notional_is_dropped_not_counted_as_zero() -> None
     engine.advance(START + 1_000)
 
     assert engine.row("ETH", START + 1_000).liq_long_usd_w == pytest.approx(5_000.0)
+
+
+HOUR_MS = 3_600_000
+
+
+def make_long_tape(*, hours: int, coin: str = "ETH") -> dict[str, list[dict[str, Any]]]:
+    """A sparse tape long enough for the z-score's 24 hour lookback to roll over.
+
+    One quote and one trade a minute rather than two a second: the z-score samples once a
+    minute and what is being exercised here is the lookback, not the tape. Liquidations
+    land on a schedule whose sizes change across the day, so a window that dropped the
+    wrong samples would score the same minute differently from the backtest.
+    """
+    trades, bbo, liqs = [], [], []
+    end = START + hours * HOUR_MS
+    for minute, ts in enumerate(range(START, end, 60_000)):
+        px = 3000.0 + 20.0 * math.sin(minute / 37.0)
+        trades.append(
+            {
+                "venue": "hyperliquid",
+                "coin": coin,
+                "ts_ms": ts,
+                "rx_ms": ts,
+                "source": "recorder",
+                "px": px,
+                "sz": 0.5,
+                "side": "buy" if minute % 3 else "sell",
+                "tid": minute + 1,
+            }
+        )
+        bbo.append(
+            {
+                "coin": coin,
+                "ts_ms": ts,
+                "rx_ms": ts,
+                "source": "recorder",
+                "bid_px": px - 0.5,
+                "bid_sz": 10.0,
+                "ask_px": px + 0.5,
+                "ask_sz": 12.0,
+            }
+        )
+        # Every seventh minute, at a size that drifts across the day. A lookback that kept
+        # or dropped the wrong end of the window would centre and scale on the wrong
+        # distribution, which is exactly what this is looking for.
+        if minute % 7 == 0:
+            liqs.append(
+                {
+                    "venue": "bybit",
+                    "coin": coin,
+                    "venue_symbol": "ETHUSDT",
+                    "ts_ms": ts + 100,
+                    "rx_ms": ts + 100,
+                    "source": "recorder",
+                    "side": "long" if minute % 14 == 0 else "short",
+                    "px": px - 20.0,
+                    "sz": 1.0,
+                    "notional_usd": 10_000.0 + 500.0 * (minute % 23),
+                    "method": "market",
+                    "complete": True,
+                }
+            )
+    return {"trades": trades, "bbo": bbo, "liquidations": liqs}
+
+
+def test_the_engine_agrees_with_the_grid_after_the_z_lookback_has_rolled_over() -> None:
+    """Twelve minutes never reaches the 24 hour lookback, so nothing was ever dropped.
+
+    `_trim` is the only code that decides which samples the z-score's centre and scale are
+    computed from, and until the window is full it does nothing at all. This runs 25 hours
+    so that it does, and compares the z against the backtest grid on the far side of the
+    rollover, where the two pipelines disagree if they trim differently.
+    """
+    settings = crossvenue_settings()
+    hours = 25
+    end = START + hours * HOUR_MS
+    tape = make_long_tape(hours=hours)
+    assert settings.features.z_lookback_h < hours, "the tape has to outlast the lookback"
+
+    engine = LiveFeatureEngine(settings)
+    events = sorted(
+        ((row["rx_ms"], table, row) for table, rows in tape.items() for row in rows),
+        key=lambda item: (item[0], item[1]),
+    )
+    # The last hour only: the interesting rows are the ones whose lookback has already
+    # dropped samples, and capturing all 90,000 would be a slow way to compare 60.
+    from_ms = end - HOUR_MS
+    index = 0
+    live: dict[int, Any] = {}
+    for now in range(START, end + STEP_MS, STEP_MS):
+        while index < len(events) and events[index][0] < now:
+            _, table, row = events[index]
+            engine.ingest(table, row.get("venue", "hyperliquid"), row)
+            index += 1
+        engine.advance(now)
+        if now >= from_ms and now % 60_000 == 0:
+            live[now] = engine.row("ETH", now)
+
+    grid = build_feature_grid(
+        settings=settings,
+        trades=pl.DataFrame(tape["trades"]),
+        liquidations=pl.DataFrame(tape["liquidations"]),
+        bbo=pl.DataFrame(tape["bbo"]),
+        start_ms=START + STEP_MS,
+        end_ms=end,
+    )
+    compared = 0
+    for stamp, rows in iter_grid_rows(grid, settings, keep=pl.Series([True] * grid.height)):
+        want = rows.get("ETH")
+        got = live.get(stamp)
+        if want is None or got is None:
+            continue
+        compared += 1
+        for field in ("liq_z_long_w", "liq_z_short_w", "liq_long_usd_w", "liq_short_usd_w"):
+            mine, theirs = getattr(got, field), getattr(want, field)
+            if theirs is None:
+                assert mine is None, f"{field} at {stamp}: live has {mine}, backtest none"
+            else:
+                assert mine is not None, f"{field} at {stamp}: live none, backtest {theirs}"
+                assert mine == pytest.approx(theirs, rel=1e-9, abs=1e-9), f"{field} at {stamp}"
+    assert compared >= 30, f"only compared {compared} rows past the rollover"
+    # And the lookback really did roll: a full window is z_lookback_h * 60 samples, so a
+    # deque holding every sample the run produced would be half as long again.
+    samples = engine.coins["ETH"].samples["long"]
+    assert len(samples) <= settings.features.z_lookback_h * 60 + 1
+    assert len(samples) < hours * 60

@@ -6,7 +6,9 @@ strategy, sizing, risk and backtest parameter that appears here.
 
 from liqfade.config.loader import (
     ConfigError,
+    ConfigLayer,
     config_dir,
+    config_layers,
     flatten,
     load_settings,
     resolve,
@@ -15,8 +17,10 @@ from liqfade.config.models import Settings
 
 __all__ = [
     "ConfigError",
+    "ConfigLayer",
     "Settings",
     "config_dir",
+    "config_layers",
     "flatten",
     "load_settings",
     "resolve",

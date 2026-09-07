@@ -2084,6 +2084,9 @@ down rather than changed.
   is worse than one that says no.
 - **The seven day acceptance run has not started** and must not be read as started. What
   runs now is a plumbing soak.
+- **What Phase 5 does not have at all** is listed in the 2026-09-07 (05b) entry below,
+  under "What Phase 5 still owes, named". This section says what 05a built and did not
+  measure; that one says what is not built.
 
 Reverse the paper-imports-engine decision if `backtest/engine.py`'s tick functions ever
 need a live-only branch inside them, which is the moment CLAUDE.md's rule about live-only
@@ -2291,3 +2294,130 @@ independent reasons for the same conclusion.
 `coin_cooldown` and the owner would rather tune with the gates off. That is a config
 decision (`risk.coin_cooldown_after_exit_min: 0` in that file) and not a reason to leave
 three risk gates unable to fire.
+## 2026-09-07 (05b: what the review of 05a found, and what Phase 5 still owes)
+
+The 2026-09-07 review of `main` at `6d4626b` found ten things. Nine are fixed on
+`05b-live-review`; the tenth is this entry. The commits carry the reasoning individually
+and are not repeated here. What is worth keeping is the shape they share and the list at
+the end, because the list is the thing 05a should have written down and did not.
+
+**The shape.** Every one of them is a decision made once and then trusted, or a fact
+recorded where nobody reads it.
+
+- Pause skipped the whole tick, and `_on_tick` is the only path to the exit checks, so a
+  paused loop holding a position stopped honouring its own stop. Pause stops new risk; it
+  never had authority over the risk already on.
+- The kill switch's cancels and closes ran over an untimed SDK call. Five seconds is the
+  promise in rule 5 and a call with no deadline promises nothing, so a venue that accepted
+  the request and never answered held the kill open indefinitely.
+- Reconciliation knew startup and the interval. The reconnect trigger rule 4 asks for was
+  implemented, in a class used by nothing but its own tests, whose interval loop was a
+  second copy of the loop's own.
+- Rounding lived in one place, as CLAUDE.md asks, and nothing called it. `OrderIntent`'s
+  docstring said "already rounded" and no code made that true.
+- A risk refusal incremented a counter a backtest report reads. In the live process that
+  is silence, and a strategy the gate has quietly stopped looks exactly like one that has
+  found nothing to trade.
+- The alert dedupe, right for a condition, was applied to events, so two identical fills
+  inside ten minutes lost the second.
+- Reconnect, halt and error are in CLAUDE.md section 5's list and none were sent.
+- The watchdog's unit said it cancels everything and the process only posted, while the
+  threshold it judged the loop by lived in a systemd `Environment=` line next to a
+  validated config field of the same name that nothing read.
+
+Two of them, the pause and the kill budget, are the kind that only matter on the day they
+matter. Both now have a test that fails without the fix, and both have a drill.
+
+**A test that could not fail.** The live-versus-backtest feature equivalence test is the
+one carrying CLAUDE.md's most important design constraint, and it ran twelve minutes of
+one coin. The z-score's lookback is 24 hours, so the code that decides which samples the
+centre and scale are computed from did nothing at all for the length of the test. Made a
+no-op, `_trim` still passes it. The 25 hour test added here fails on `liq_z_short_w`. The
+lesson is the general one: a test over a window shorter than the code's own window
+exercises the window's absence.
+
+### What Phase 5 still owes, named
+
+Everything in 05a's own "What 05a does not deliver" still stands. These are the pieces of
+Phase 5 that are not built at all, as distinct from built and unmeasured. Each was checked
+against the tree at `142f2fb` rather than remembered.
+
+- **The entry policy.** `docs/STRATEGY_AND_RISK.md` section 3 describes `Alo` at the touch
+  with a TTL, a bounded number of reprices, modify preferred over cancel-and-replace, and
+  an `Ioc` fallback. `execution.entry_ttl_s` and `execution.max_reprices` are read by
+  `backtest/engine.py`'s `_expire_entries` and by nothing in `live/` or `execution/`. The
+  live order path that would honour them does not exist yet: paper's orders are the
+  engine's, and the order manager places and cancels but never reprices.
+- **TP/SL grouping with `positionTpsl`.** `execution/hl.py` builds a trigger order type
+  and never sets `grouping`, so a take profit and a stop attached to one position would
+  not cancel each other. Probe 3 in `docs/HYPERLIQUID.md` is the one that settles the
+  payload shape and it has not been run.
+- **`execution/ratelimit.py` and the action budget.** `execution.action_budget_per_hour`
+  is 600 in `config/default.yaml` and is read by nothing. `RiskState.actions_remaining`
+  exists in `control/protocol.py` and the panel renders it as "actions left"; nothing ever
+  sets it, so the panel shows a dash for a limit that is not being counted. Either the
+  budget is enforced or both should go.
+- **Panel v3.** `docs/ROADMAP.md` Phase 5 asks for live positions and orders, fills
+  history, PnL and equity, submit-to-ack percentiles, pause/resume/flat buttons and the
+  settings page with diff preview, typed confirmation on risk fields, an audit log and a
+  Telegram notification per change. The panel is still v2. `/api/config` now returns the
+  layered view the settings page needs, and it is still read only.
+- **`scripts/research/paper_vs_backtest.py`.** The Phase 5 DoD asks whether paper results
+  land in a plausible band of the backtest's over the same days. Nothing compares them.
+- **The WebSocket user-stream client.** `userFills` and `orderUpdates` are parsed and
+  polled over REST by `InfoReader`; nothing subscribes to them. Until it does, a fill is
+  learned about on the next reconciliation rather than when it happens, and
+  `OrderManager.record_fill` and `record_reject`, which exist for the push, are called by
+  the paper session and by tests only.
+
+All six are the next prompt, and all six want the testnet agent key on the box first
+(Phase 0 item 4). None of them is started here.
+
+## 2026-09-07 (05b: what deploying and drilling it found)
+
+Four things, and three of them were found by running the code on the box rather than by
+reading it. That is the same lesson as 05a's deploy entry, arriving again.
+
+**A drill that reported success and rested no order.** The pause drill injects an intent
+over the control socket. The first run worked. The second logged `intent_injected`, posted
+"INTENT INJECTED" to Telegram, and then produced nothing at all: no order row, no refusal,
+no line anywhere. Sizing had capped it on the traded volume in the window, and sizing
+returns before the risk gate is ever consulted, so the commit that made risk refusals
+visible had covered only half of them, and the visible half was the rarer one. Both gates
+report now. They are two gates to us and one event to an owner watching an intent produce
+no order.
+
+`inject_intent` still answers `injected=True` when the gates then refuse the entry, which
+is literally true (the intent was injected and pushed through the real path, which is what
+the drill exercises) and reads as success. It is left alone because the refusal is now
+loud; if a later drill is confused by it again, the answer should carry the gate's verdict.
+
+**A recorder restart restarted the trading loop.** `liqfade-paper.service` carried
+`Requires=liqfade-recorder.service`. Every recorder restart therefore stopped and started
+the paper loop; it happened twice on 2026-09-07 and split one soak into three runs. The
+binding was never true: the loop opens its own feeds through `build_streams` and reads
+neither the recorder's process nor its Parquet. `After=` is kept for a predictable boot
+order. `liqfade-live.service` carried the same line and is fixed with it, before the first
+live run inherits a trading loop that restarts whenever an unrelated unit does.
+
+**What the seven day acceptance clock counts.** Continuous *coverage*, not one unbroken
+process. A clean restart, meaning the loop stopped with its positions closed out and came
+back reconciling clean, does not reset the clock; a gap in the feeds, an unclean stop, or a
+kill does. Recorded because the alternative reading makes every deploy restart the clock,
+which would mean never deploying during an acceptance run, which would mean not fixing
+anything found during one. The soak that was running before this branch is not the
+acceptance run in either reading.
+
+**A kill message nobody could read.** Against a venue hanging on every call, the
+confirmation named all sixty abandoned cloids: 1,555 characters of hex in the one message
+that has to be read at a glance. Five and a count now, with the full list in the log line.
+Found by running the drill and looking at what came out of it, which is the argument for
+drilling rather than asserting.
+
+### For the next backtest prompt, not fixed here
+
+The backtest engine raises when the feature cache directory cannot be created, instead of
+falling back to running without a cache. Seen on 2026-09-07 against a read-only lake mount.
+A cache is an optimisation and its absence is not an error; a read-only lake is a normal
+way to mount someone else's data. Reported by the recorder chat; it belongs to whoever
+next touches `backtest/`, not to this branch.

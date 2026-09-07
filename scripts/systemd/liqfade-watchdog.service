@@ -1,5 +1,5 @@
 [Unit]
-Description=liqfade watchdog: cancels everything if the trading loop stops breathing
+Description=liqfade watchdog: writes the kill flag if the trading loop stops breathing
 Documentation=file:/srv/liqfade/app/docs/STRATEGY_AND_RISK.md
 After=network-online.target
 Wants=network-online.target
@@ -11,17 +11,19 @@ Type=simple
 # reads data/heartbeat and data/KILL and nothing else, which is why it needs no socket, no
 # key and no config beyond the env file.
 #
-# Restarting the loop is systemd's own Restart=always, not this process. What the watchdog
-# adds is that somebody is told. Cancelling on a stale heartbeat, which
-# docs/STRATEGY_AND_RISK.md also asks for, needs the agent key and is owed until Phase 0
-# item 4 lands: see docs/DECISIONS.md, 2026-09-06 (05a).
+# On a stale heartbeat it writes data/KILL, which is where the loop's own watcher and the
+# loop unit's ExecStartPre both look, so it cancels, flattens and stops the restart with
+# nothing but a filesystem. It does not restart the loop: that is systemd's own
+# Restart=always, and two things racing to restart one unit is worse than one.
+#
+# Cancelling at the venue, for orders resting when the whole box is gone, still needs the
+# agent key and is owed until Phase 0 item 4 lands: see docs/DECISIONS.md, 2026-09-06 (05a).
 ExecStart=/srv/liqfade/app/.venv/bin/python -m liqfade.execution.watchdog
 User=liqfade
 Group=liqfade
 EnvironmentFile=/srv/liqfade/.env
-# Seconds of silence before it pages. The loop writes the heartbeat every second, so ten
-# is nine missed writes and not a slow disk.
-Environment=LIQFADE_WATCH_STALE_S=10
+# Seconds of silence before it kills is risk.watchdog_stale_s in the config, validated
+# against risk.heartbeat_s, and is deliberately not set here: one definition of it.
 Environment="LIQFADE_WATCH_LABEL=paper loop"
 WorkingDirectory=/srv/liqfade/app
 Restart=always

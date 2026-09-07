@@ -122,3 +122,82 @@ def _a_watchdog(tmp_path: Path, posted: list[str], **kwargs: float) -> Watchdog:
         alert=alert,
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+def a_dog(tmp_path: Path, posted: list[str] | None = None, **kwargs: object) -> Watchdog:
+    async def alert(text: str) -> bool:
+        if posted is not None:
+            posted.append(text)
+        return True
+
+    return Watchdog(
+        heartbeat=tmp_path / "heartbeat",
+        kill_file=tmp_path / "KILL",
+        alert=alert,
+        stale_s=10.0,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+async def test_a_stale_heartbeat_writes_the_kill_flag(tmp_path: Path) -> None:
+    """The unit says it cancels everything. Writing the flag is how it does that.
+
+    The watchdog has no key and cannot cancel at the venue. What it can do is put the flag
+    where the loop's own watcher and the unit's ExecStartPre both look, which cancels,
+    flattens and stops the restart, and needs nothing but a filesystem.
+    """
+    posted: list[str] = []
+    write_heartbeat(tmp_path / "heartbeat", 1_000)
+    dog = a_dog(tmp_path, posted)
+
+    assert await dog.check(now_ms=60_000) is False
+
+    assert (tmp_path / "KILL").exists()
+    assert "stale" in (tmp_path / "KILL").read_text().lower()
+    assert any("KILL" in text for text in posted)
+
+
+async def test_a_missing_heartbeat_writes_the_kill_flag_too(tmp_path: Path) -> None:
+    """Never having breathed is staler than having stopped."""
+    dog = a_dog(tmp_path)
+
+    assert await dog.check(now_ms=60_000) is False
+
+    assert (tmp_path / "KILL").exists()
+
+
+async def test_a_healthy_loop_is_never_killed(tmp_path: Path) -> None:
+    write_heartbeat(tmp_path / "heartbeat", 59_000)
+    dog = a_dog(tmp_path)
+
+    assert await dog.check(now_ms=60_000) is True
+
+    assert not (tmp_path / "KILL").exists()
+
+
+async def test_the_flag_is_written_once_not_every_poll(tmp_path: Path) -> None:
+    """The edge is what is worth acting on. Rewriting the flag would move its timestamp."""
+    write_heartbeat(tmp_path / "heartbeat", 1_000)
+    dog = a_dog(tmp_path)
+
+    await dog.check(now_ms=60_000)
+    first = (tmp_path / "KILL").read_text()
+    await dog.check(now_ms=61_000)
+
+    assert (tmp_path / "KILL").read_text() == first
+
+
+def test_the_stale_threshold_comes_from_the_config_not_an_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One definition of it. `risk.watchdog_stale_s` is validated against heartbeat_s."""
+    from liqfade.config import load_settings
+    from liqfade.execution.watchdog import build_watchdog
+
+    monkeypatch.setenv("LIQFADE_WATCH_STALE_S", "999")
+    settings = load_settings("paper")
+
+    dog = build_watchdog(settings)
+
+    assert dog.stale_s == settings.risk.watchdog_stale_s
+    assert dog.stale_s != 999.0
