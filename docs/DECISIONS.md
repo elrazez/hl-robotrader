@@ -2554,3 +2554,25 @@ the submit-to-ack latency distribution the cost model wants, the `orderUpdates` 
 shape the user-stream client must parse, and the kill drill from a state with a resting
 order and an open testnet position. Every one of them needs margin. Work stopped here
 rather than building the order path against a venue that says yes to everything.
+
+## 2026-09-07 (05c: the seven day paper acceptance run, started and qualified)
+
+Started **2026-09-07 17:51:34 UTC** on `05c-phase5`, from `/srv/liqfade/paper`, with the
+watchdog fix in it. Seven days of continuous coverage land on **2026-09-14 17:51 UTC**.
+Opening state: crossvenue trigger, 10,000 equity, three feeds (hyperliquid, bybit, okx),
+40 interval reconciliations in the first 40 minutes with zero differences, zero
+reconnects, zero watchdog events, heartbeat 0.4s old. Per the 05b definition the clock
+counts coverage, so a clean deploy restart during the week does not reset it.
+
+**It is qualified, and the qualification has to be read before the result is.** The run is
+on a loop that does not yet have the entry policy, so `execution.entry_ttl_s` and
+`execution.max_reprices` are honoured by `backtest/engine.py` and by nothing in the live
+path. The Phase 5 DoD asks whether paper lands in a plausible band of the backtest over
+the same days, and until the entry policy is shared the two are running different order
+policies by construction. Days recorded before that lands measure the plumbing, not the
+comparison: reconciliation, feeds, alerts, the kill path and the watchdog. That is worth
+seven days of evidence on its own, and it is not the DoD.
+
+The alternative was to leave the loop stopped until the entry policy exists, which buys
+nothing: the plumbing evidence is only available by running, and the comparison days can
+start whenever the policy lands. Recorded so the week is not later read as more than it is.
