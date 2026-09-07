@@ -200,6 +200,9 @@ class PaperBackend:
             return InjectResult(injected=False, reason=str(exc))
         if intent is None:
             return InjectResult(injected=False, coin=coin, reason="no price for that coin yet")
+        # An injected order is placed outside a tick, and the fill model can take it before
+        # the next one. Sync now, or a drill's entry never reaches the registry at all.
+        await self.loop.session.sync_orders(now_ms())
         await self.loop.post(
             f"[{self.loop.settings.env}] INTENT INJECTED {coin} {side} "
             f"entry {intent.entry_px:g} target {intent.target_px:g} stop {intent.stop_px:g}",

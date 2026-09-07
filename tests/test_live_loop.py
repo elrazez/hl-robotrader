@@ -534,3 +534,47 @@ async def test_inject_intent_is_refused_when_live_trading_is_armed(
 
     assert result.injected is False
     assert "LIQFADE_LIVE_TRADING" in (result.reason or "")
+
+
+async def test_a_paper_fill_is_written_to_the_fills_table(loop: PaperLoop) -> None:
+    """Paper writes the registry a testnet run writes, or it is drilling something else.
+
+    The bare `OrderStore.upsert` wrote the orders table and nothing else, so `data/
+    orders.sqlite` had no fills in it at all and the panel's fills history, which is one of
+    the things Phase 5 is supposed to be exercising, had nothing to show.
+    """
+    from liqfade.control.protocol import now_ms
+
+    assert loop.store is not None
+    from liqfade.live.loop import PaperBackend
+
+    at = now_ms()
+    a_market(loop, 3000.0, at=at)
+    await loop.session.tick(at + 1_000)
+    # Driven the way the owner drives it, because the backend is what syncs the registry
+    # after an order placed outside a tick.
+    assert (await PaperBackend(loop).inject_intent(coin=COIN, side="long")).injected
+    a_market(loop, 3000.0, at=at + 2_900)
+    await loop.session.tick(at + 3_000)
+
+    fills = await loop.store.fills()
+
+    assert fills, "a simulated fill left no row in the fills table"
+    assert fills[0]["size"] > 0
+    assert fills[0]["px"] > 0
+
+
+async def test_a_paper_order_walks_the_real_state_machine(loop: PaperLoop) -> None:
+    """SUBMITTED then ACKED, through `OrderManager`, not a status computed on the side."""
+    from liqfade.execution.orders import OrderStatus
+
+    assert loop.store is not None
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
+    await loop.session.tick(START + 1_250)
+
+    rows = await loop.store.all_orders()
+
+    assert [row.status for row in rows] == [OrderStatus.ACKED]
+    assert rows[0].oid is not None  # the manager records what the transport answered
