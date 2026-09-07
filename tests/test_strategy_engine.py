@@ -158,6 +158,28 @@ class TestIntent:
             intents.extend(engine.on_tick(ts, {"BTC": quiet_row(ts, 98.0)}))
         assert intents[0].urgency == "high"
 
+    def test_a_null_threshold_never_marks_an_intent_urgent(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """`intent.urgency_liq_z: null` is how a config says the z-scale means nothing here.
+
+        The threshold reads the same aad-scaled `liq_z` whose p99 on the real lake is
+        1.8e11, so under `features.z_robust` almost every cascade clears any finite number
+        and every intent is urgent. Urgency is not cosmetic: with
+        `allow_taker_entry_high_urgency` it decides whether the entry crosses the spread.
+        Null turns the comparison off rather than asking the owner to guess a number on a
+        scale that has none.
+        """
+        settings = settings_factory(**{"intent.urgency_liq_z": None})
+        engine = StrategyEngine(settings, META)
+        engine.on_tick(START_MS, {"BTC": falling_row(START_MS, 100.0, liq_z_long_w=1e12)})
+        intents: list[Intent] = []
+        for step in range(1, 600):
+            ts = START_MS + step * TICK_MS
+            intents.extend(engine.on_tick(ts, {"BTC": quiet_row(ts, 98.0)}))
+        assert intents, "the fixture produced no intent, so it proves nothing"
+        assert all(intent.urgency == "normal" for intent in intents)
+
     def test_explain_names_real_windows(self, settings_factory: SettingsFactory) -> None:
         """Telegram posts this mapping, so a reader needs to know which 60 seconds."""
         engine = StrategyEngine(settings_factory(), META)

@@ -244,7 +244,16 @@ class Intent(Base):
     k_target: Pos = Field(..., description="fraction of (anchor - extreme) used as the target")
     k_stop: Pos = Field(..., description="multiple of rv_5m * mid placed beyond the extreme")
     time_stop_s: Pos = Field(..., description="seconds before an unresolved position is flattened")
-    urgency_liq_z: float = Field(..., description="z-score at or above which urgency is high")
+    # Nullable because the scale it reads has no natural units. `liq_z` is the liquidation
+    # notional scaled by the median absolute deviation of a series that is zero 82% of the
+    # time, with a fallback to the mean absolute deviation where the MAD is zero; its p99 on
+    # the real lake is 1.8e11. Any finite threshold is therefore either never met or almost
+    # always met, and which one it is depends on `features.z_robust`. Null means the
+    # comparison is not made and no intent is ever urgent, which is the honest setting until
+    # the scale means something. docs/DECISIONS.md, 2026-09-07.
+    urgency_liq_z: float | None = Field(
+        ..., description="z-score at or above which urgency is high; null: never urgent"
+    )
     allow_taker_entry_high_urgency: bool = Field(..., description="allow taker entry when urgent")
 
 

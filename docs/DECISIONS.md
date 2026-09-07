@@ -1563,6 +1563,19 @@ than the resting price during a violent cascade, which puts the realised entry p
 that was ahead when the intent was built. That is `backtest/fills.py` and the no-book path,
 not the exit rule, and it is the next thing to look at rather than any threshold.
 
+**Corrected 2026-09-07: the stale book is half of it, and the order type is the other
+half.** Those entries were IOC, and nothing in the run config asked for an IOC entry.
+`execution.entry_tif` was `Alo`, but `_entry_order` also crosses when the intent is high
+urgency and `intent.allow_taker_entry_high_urgency` is set, and both were true on nearly
+every intent: urgency is `peak_liq_z >= intent.urgency_liq_z`, the threshold was the
+default 5.0, and under `features.z_robust` that z is scaled by the mean absolute deviation
+of a series that is zero 82% of the time, with a p99 of 1.8e11. So the run crossed the
+spread on essentially every entry, into the worst book of the cascade, and the stale-book
+path then priced the cross. A fix to `fills.py` alone would have left the crossing in
+place. `intent.urgency_liq_z` is nullable now, `v1_confluence.yaml` sets it null and turns
+the taker fallback off, and the entries that config produces are the maker entries the
+policy in `docs/STRATEGY_AND_RISK.md` section 3 describes.
+
 **`vwap_stretch` passes 92.7% of candidates and is barely a condition.** A cascade that has
 moved price by two volatilities is nearly always 30 bps from the session VWAP. Left at 30
 bps deliberately: the owner sets it after one clean run, and this is that run. `oi_flush` at

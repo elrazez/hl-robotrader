@@ -83,6 +83,16 @@ intent:
   # the fill. The stop stays beyond the extreme, below the wick that swept the level, so a
   # late entry has a nearer target and a wider stop and sizing follows the stop.
   target_from: entry
+  # The z-scale this threshold reads is meaningless on this data: `liq_z` is scaled by the
+  # mean absolute deviation of a series that is zero 82% of the time, and its p99 over the
+  # lake is 1.8e11. At the default 5.0 with `features.z_robust` on, nearly every cascade
+  # clears it, every intent is high urgency, and the entry crosses the spread as a taker.
+  # That is the mechanism behind the 863 to 1,152 bps entries in the 2026-09-06 year rerun,
+  # not only the stale-book path in fills.py. Null means no intent is urgent; the taker
+  # fallback is off as well, so neither half can turn the entry into an IOC on its own.
+  # docs/DECISIONS.md, 2026-09-07.
+  urgency_liq_z: null
+  allow_taker_entry_high_urgency: false
   # Exit: target 80% of the way back to the anchor from the entry, stop one 5 min vol beyond
   # the extreme, time stop 15 min. Change here to try other exits.
   k_target: 0.8
