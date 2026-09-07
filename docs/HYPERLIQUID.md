@@ -90,18 +90,71 @@ URL without "testnet" in it and reads no key itself; `execution/signer.py` does 
 
 | # | Probe | Subcommand | Answer |
 | --- | --- | --- | --- |
-| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | `gtc_cancel` | **not run** |
-| 2 | `Alo` that would cross, confirm the rejection string | `alo_cross` | **not run** |
-| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | `tpsl_group` | **not run** |
-| 4 | 50 submit-to-ack latencies at a quiet and a busy time | `latency` | **not run** |
-| 5 | `scheduleCancel` availability and its exact error when gated | `schedule_cancel` | **not run** |
-| 6 | `userFees` payload shape and current rates | `user_fees` | **not run** |
+| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | `gtc_cancel` | **run 2026-09-07, void: unfunded account** |
+| 2 | `Alo` that would cross, confirm the rejection string | `alo_cross` | **run 2026-09-07** |
+| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | `tpsl_group` | **not run: needs margin** |
+| 4 | 50 submit-to-ack latencies at a quiet and a busy time | `latency` | **not run: would measure void orders** |
+| 5 | `scheduleCancel` availability and its exact error when gated | `schedule_cancel` | **run 2026-09-07** |
+| 6 | `userFees` payload shape and current rates | `user_fees` | **run 2026-09-07** |
+| 7 | Reprice by cloid and by oid, and after a cancel | `modify` | **run 2026-09-07, void: unfunded account** |
+| 8 | Reduce-only with and without a position | `reduce_only` | **not run: needs margin** |
+| 9 | Raw `clearinghouseState`, `openOrders`, `frontendOpenOrders`, `userFills` | `state_shape` | **run 2026-09-07, empty account** |
 
-Every row says "not run" because `HL_TESTNET_AGENT_PRIVATE_KEY` is empty in the box's
-`.env`: Phase 0 item 4 is outstanding, and probe 6 waits with the rest because a fee tier
-is only meaningful for the account that will trade. Until a row is filled in, everything
-above in this file is what the docs claim, not what the venue did. The probe wins when
-they disagree; record the disagreement in `docs/DECISIONS.md` with the date.
+**Read the "void" rows as not run.** The testnet account had `accountValue: 0.0` on
+2026-09-07. On a zero-equity account Hyperliquid answers an order with
+`{"resting": {"oid": ...}}` and a real oid, and then books nothing: `openOrders`,
+`frontendOpenOrders` and `historicalOrders` all stay empty, `totalMarginUsed` stays 0.0,
+`orderUpdates` sends no frame, and `cancel_by_cloid` on the phantom returns
+`statuses: ["success"]`. Every probe whose answer depends on an order actually resting
+therefore measured nothing. Claim the faucet, then re-run 1, 3, 4, 7 and 8.
+
+### What the three trustworthy probes found
+
+**Probe 6, `userFees`.** `userCrossRate: "0.00045"` and `userAddRate: "0.00015"`: 0.045%
+taker and 0.015% maker, exactly the defaults CLAUDE.md rule 2 puts in every backtest. The
+cost model is confirmed against the venue rather than against a doc. No referral or
+staking discount is active (`activeReferralDiscount: "0.0"`), so there is no hidden edge
+in the fee line and none to lose.
+
+**Probe 2, `Alo` that crosses.** The exact string, verbatim:
+
+    Post only order would have immediately matched, bbo was 2491.3@2491.4. asset=4
+
+It arrives with HTTP 200 and a top-level `"status": "ok"`, inside
+`response.data.statuses[0].error`. **A rejected order is an `ok` response.** Anything that
+branches on the envelope's status treats a rejection as a fill; `classify_order_response`
+has to keep reading down to the per-status objects. The same holds for the modify refusal,
+`"Cannot modify canceled or filled order"`, which is also carried inside an `ok`.
+
+**Probe 5, `scheduleCancel`: gated, and this settles an open design question.**
+
+    Cannot set scheduled cancel time until enough volume traded. Required: $1000000. Traded: $0.
+
+Clearing it (`schedule_cancel(None)`) is refused by the same gate, so the dead man's
+switch is not available to this account and will not be until a million dollars of volume
+has gone through it. `execution/watchdog.py` says the venue half of the kill path is
+"owed" and that this probe would decide whether `scheduleCancel` or a signing watchdog
+closes it. It has decided: **the file-based watchdog is the only dead man's switch we
+have.** An order resting at Hyperliquid when the whole box dies stays there until someone
+cancels it by hand. Phase 6 must either accept that or fund a signing watchdog.
+
+**The WebSocket user channel, observed while the probes ran.** Both `orderUpdates` and
+`userFills` accept a subscription for the account and echo it back with the address
+lowercased, whichever case is sent. `userFills` immediately pushes a snapshot frame
+(`{"channel": "userFills", "data": {"isSnapshot": true, "fills": []}}`); `orderUpdates`
+sends nothing until an order changes state, and on the unfunded account nothing ever did.
+So the shape of a live `orderUpdates` frame is still unknown and the user-stream client
+cannot be written against a measured payload yet. That is probe 1's job once funded.
+
+### Provisional, from the void runs. Do not build on these.
+
+Recorded only so the re-run has something to disagree with. `modify` addressed by cloid
+answered with a **new oid** and the same cloid, which if real would mean a reprice is a
+cancel-and-replace at the venue and loses queue priority, making the "prefer modify"
+preference worth one round trip rather than any priority. The original oid then answered
+`"Cannot modify canceled or filled order"`. One modify round trip measured 789ms, which is
+a REST number from Tokyo to Tokyo and is implausibly slow for a booked order; it is more
+likely the cost of a rejected one. None of this is evidence until an order actually rests.
 
 Probe 4 writes the number `docs/STRATEGY_AND_RISK.md` uses for the latency model, and
 probe 5 decides whether `execution/watchdog.py` is a convenience or the only dead man's
