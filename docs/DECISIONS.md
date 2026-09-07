@@ -1787,3 +1787,62 @@ rows were that reconnect's snapshot rather than the overlap.
 Against about 18,000 ms of nothing recorded on every `Expired` close before, eight times a
 day. The raw-payload dedupe is enough once there is no spurious reconnect behind it, so the
 per-table key dedupe the overlap was going to need was not built.
+## 2026-09-06: the lab is a client of the CLI, and Textual is how it draws
+
+**`liqfade lab` spawns `liqfade backtest` rather than importing the engine.** The owner
+wants to run backtests for weeks before going live without asking for a code change, which
+means a tool that manages configs, launches runs and compares results. Making it a client
+of the CLI and of the files the CLI writes buys two properties that an in-process runner
+cannot have: a crash or a keystroke in the workbench cannot take a running replay down, and
+closing the workbench leaves the replay going. It also means the lab has no privileged view
+of a run: it sees the `--progress-file`, the stdout it captured and the report directory,
+which is exactly what `liqfade watch` and the owner see. Reverse if a future feature needs
+per-tick data the progress file does not carry, and even then prefer widening the progress
+file to importing the engine.
+
+**Textual, pinned to major 8, in a new optional `lab` extra.** It has to work on the laptop
+and over SSH on the VPS with the same keystrokes, which rules out a web page and rules out
+a curses hand-roll of tables, forms and modals. Optional because CLAUDE.md's rule that the
+trading process never imports the panel applies to a TUI for the same reason; `make setup`
+runs `uv sync --all-extras`, so the owner gets it anyway, and a box that installed the core
+only keeps every other subcommand. `tests/test_cli.py` pins that importing `liqfade.cli`
+does not import textual.
+
+**The edit form is walked out of the `Settings` model, never listed.** A form that
+enumerated knobs would go stale the first time a rule gained a threshold, and the owner
+would tune a config the lab could not show. Walking `model_fields` means a field added to
+`config/models.py` appears with its description and its validators, and saving goes through
+the same `Settings.model_validate` a YAML file meets, so what the lab accepts is exactly
+what the run will accept. `tests/test_lab_form.py` pins both the walk and the coverage of
+the sections a backtest reads.
+
+**One lake job at a time, enforced by pgrep as well as by the queue.** Two replays over the
+year do not fit in 8 GB, and the run the lab must not collide with is usually one started
+by hand in another terminal, which never took a lock the lab could see. `pgrep -f "liqfade
+backtest"` sees it. When pgrep cannot be run at all the answer is "busy", because refusing
+to start is the safe failure on a machine where a year run may already own the memory.
+Reverse if the lab ever runs somewhere without pgrep, and then take a lock file **and**
+keep the process check.
+
+**Latency is an env override, not a new CLI flag.** `liqfade backtest` has no `--latency`
+and adding one to serve the lab would put a second spelling of a config key into the CLI.
+`LIQFADE_BACKTEST__LATENCY_MS` already works, goes through the same layering and the same
+validation, and the Run screen shows it in the command it is about to run. The lab derives
+the variable name from the loader's own prefix rather than spelling it, so it follows the
+loader if that ever changes.
+
+**`lab.json` beside each report, because `summary.json` names a config by hash.** The hash
+is right for reproducing a run and useless for reading a list of thirty of them. The lab
+writes the config file's path, name, notes and overrides beside the report when the run
+ends, which is what the Results list shows and what the config diff compares. A run started
+by hand has none, and Results says so rather than guessing. The lagged rerun's net is the
+same shape of problem solved the same way round: `liqfade backtest` prints it, so it is
+read back out of `run.log`. Reverse either of these by adding the fields to `summary.json`
+if the panel ever wants them too, which would be a change to `backtest/report.py` and to
+the golden report bytes.
+
+**Nothing in the lab can write a loader layer or start live trading.** A save aimed at
+`default`, `paper`, `testnet`, `mainnet` or `overrides` is refused by stem, so pointing the
+lab at `config/` instead of `config/backtest/` cannot reach `config/mainnet.yaml`. The
+Status tab reads `data/state.json` and never opens the control socket, so the workbench can
+watch the box and not touch it.

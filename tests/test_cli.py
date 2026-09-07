@@ -29,6 +29,7 @@ ALL_COMMANDS = {
     "sync",
     "config",
     "watch",
+    "lab",
 }
 
 
@@ -654,3 +655,41 @@ class TestBacktestCommand:
         from liqfade.cli import NOT_YET
 
         assert "backtest" not in NOT_YET
+
+
+def test_lab_is_a_subcommand_and_the_cli_does_not_import_a_tui_to_offer_it() -> None:
+    """CLAUDE.md: the trading process never imports the panel or the lab.
+
+    `textual` is an optional extra, so every other subcommand has to keep working on a box
+    that never installed it. The import lives inside the handler for that reason.
+    """
+    import subprocess
+    import sys
+
+    assert "lab" in _subcommands()
+    # In a subprocess, because by the time the lab's own tests have run in this process
+    # textual is imported and the question can no longer be asked here.
+    proc = subprocess.run(
+        [sys.executable, "-c", "import liqfade.cli, sys; print('textual' in sys.modules)"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == "False"
+
+
+def test_lab_without_textual_says_how_to_install_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def refuse(name: str, *args: object, **kwargs: object) -> object:
+        if name.startswith("liqfade.lab") or name == "textual":
+            raise ImportError("No module named 'textual'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", refuse)
+    assert main(["lab"]) == 1
+    assert "uv sync --extra lab" in capsys.readouterr().err
