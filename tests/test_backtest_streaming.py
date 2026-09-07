@@ -301,6 +301,23 @@ class TestACascadeThatStraddlesMidnight:
 # engine it replaced; what changed is that three trades nothing should ever have taken are
 # gone. A digest that had survived this change would have meant the fix did nothing.
 # docs/DECISIONS.md, 2026-09-06.
+#
+# **STALE as of 2026-09-07, and not re-pinned, because the lake was not mounted.** Three
+# changes on branch 04e-backtest-review are expected to move this digest, and none of them
+# could be measured against real data here:
+#
+#   1. The previous day's `bbo` is carried whole rather than as its last snapshot. `mid`
+#      feeds every rolling window, and the reference days have `bbo`, so days two and three
+#      of this run read a different `ret_60s` and `rv_300s` on the carry.
+#   2. The replay tells the risk engine when a round trip closes. `coin_cooldown`,
+#      `daily_loss` and `losing_streak` could not fire before, so this run could re-enter a
+#      coin the moment it exited it and now cannot.
+#   3. A window opening inside the first `backtest.window_warmup_s` of a day now reaches
+#      back across midnight for its warmup instead of being clamped to 00:00.
+#
+# Re-run the command in the test below on the box, check the funnel for a `kill_switch`
+# block first, and re-pin `sha256` and `trades` with the reason. Do not assume the value
+# below still holds.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",
