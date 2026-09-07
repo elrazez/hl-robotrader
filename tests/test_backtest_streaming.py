@@ -559,6 +559,9 @@ class TestTheGridCache:
             ("intent.time_stop_s", 600),
             ("sizing.risk_frac", 0.001),
             ("risk.max_dd_frac", 0.5),
+            # Read by active_mask and cascade_windows, both of which run in the engine on
+            # a grid that is already built. See the test below.
+            ("exhaustion.max_age_s", 600.0),
         ):
             same = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
             assert feature_hash(same) == feature_hash(base), f"{key} must not invalidate"
@@ -569,7 +572,6 @@ class TestTheGridCache:
             ("cascade.trigger", "proxy"),
             ("backtest.feature_grid_ms", 250),
             ("sizing.vol_window_s", 600),
-            ("exhaustion.max_age_s", 600.0),
         ):
             other = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
             assert feature_hash(other) != feature_hash(base), f"{key} must invalidate"
@@ -782,3 +784,40 @@ class TestTheWarmupReachesBackAcrossMidnight:
             (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
             for trade in whole.trades
         ]
+
+
+class TestTheCacheKeyCoversTheColumnsAndNoMore:
+    """A key in `HASHED_KEYS` that changes no cached column throws grids away for nothing.
+
+    `exhaustion.max_age_s` was in the list because `active_mask` reads it. `active_mask`
+    runs in the engine, on a grid that is already built and already cached, so the cached
+    day is the same under any value of it: what the key changes is how much of that day the
+    engine keeps, which is decided after the read. A year of four coins is 6.8 GB of cache
+    and a sweep over the exhaustion window was rebuilding all of it.
+    """
+
+    def test_the_built_grid_is_the_same_under_a_different_max_age(
+        self, day_lake: tuple[Path, int, int], settings_factory: SettingsFactory
+    ) -> None:
+        from liqfade.backtest.source import LakeSource
+
+        data_dir, start_ms, end_ms = day_lake
+        grids = []
+        for max_age in (settings_factory().exhaustion.max_age_s, 600.0):
+            tuned = settings_factory(
+                **{"features.z_lookback_h": 1.0, "exhaustion.max_age_s": max_age}
+            )
+            lake = LakeSource(
+                data_dir,
+                settings=tuned,
+                coins=[golden_lake.COIN],
+                start_ms=start_ms,
+                end_ms=end_ms,
+                cache=False,
+            )
+            second = lake.days()[1]
+            ((_, grid),) = lake.grids(second, tuned, first=False)
+            grids.append(grid)
+        assert grids[0].equals(grids[1]), (
+            "exhaustion.max_age_s changed a built grid, so it belongs in HASHED_KEYS"
+        )

@@ -33,13 +33,13 @@ whose z-scores came from a lookback that was not there.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import orjson
 import polars as pl
 import pyarrow.parquet as pq
 
@@ -82,7 +82,9 @@ HASHED_KEYS: tuple[str, ...] = (
     "backtest.feature_grid_ms",  # the grid step every window is counted in
     "sizing.vol_window_s",  # names and fills traded_usd_{w}s
     "exhaustion.mark_mid_pct_threshold",  # the percentile mark_mid_threshold is taken at
-    "exhaustion.max_age_s",  # how far past a candidate active_mask reaches
+    # `exhaustion.max_age_s` is deliberately absent. `active_mask` and `cascade_windows`
+    # read it, and both run in the engine on a grid that is already built, so it changes
+    # how much of a cached day the engine keeps and never the day itself.
     # Whether support_px and resistance_px are joined at all, one key per level rule so
     # toggling a rule that reads no levels does not throw a year of cached grids away.
     *(f"strategy.rules.{name}" for name in LEVEL_RULES),
@@ -114,7 +116,7 @@ class Day:
 def feature_hash(settings: Settings) -> str:
     """A short digest of every config key a feature column depends on."""
     payload = {key: _dotted(settings.model_dump(mode="json"), key) for key in HASHED_KEYS}
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode()
+    encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS, default=str)
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
@@ -452,7 +454,7 @@ class _CacheWriter:
             # The coin list rides in the schema metadata because it is the one thing the
             # rows cannot say: a coin that had no prints leaves no row, and a reader has to
             # tell "covered and empty" from "never asked about".
-            schema = table.schema.with_metadata({COINS_KEY: json.dumps(self.coins).encode()})
+            schema = table.schema.with_metadata({COINS_KEY: orjson.dumps(self.coins)})
             self._writer = pq.ParquetWriter(self.tmp, schema, compression="zstd")
             table = table.cast(schema)
         self._writer.write_table(table)
@@ -469,7 +471,7 @@ def _cached_coins(path: Path) -> set[str] | None:
     """The coins a cache file was built for, from its schema metadata."""
     metadata = pq.read_schema(path).metadata or {}
     raw = metadata.get(COINS_KEY)
-    return set(json.loads(raw)) if raw else None
+    return set(orjson.loads(raw)) if raw else None
 
 
 DAY_MS = 86_400_000

@@ -26,7 +26,6 @@ event stream breaks ties on a fixed key, so the same command twice writes byte-i
 
 from __future__ import annotations
 
-import random
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -262,11 +261,6 @@ def run_backtest(
         A `BacktestResult`. The trade list is the run's output; everything else exists so
         the report can say why there were not more of them.
     """
-    # Seeded even though nothing currently draws from it: the fill model has no
-    # stochastic component. It exists so that adding one later cannot silently break the
-    # determinism guarantee, and it is not a cryptographic use.
-    random.Random(source.seed)  # noqa: S311
-
     meta = _resolve_meta(source.meta, source.coins, settings)
     portfolio = Portfolio(settings, starting_equity=source.starting_equity)
     strategy = StrategyEngine(settings, meta)
@@ -323,7 +317,7 @@ def run_backtest(
         _load_funding(portfolio, source.funding(day))
 
         clock.day(rows, settings)
-        for start_ms, end_ms, closes in _segments(spans, day):
+        for start_ms, end_ms, closes in _segments(spans, day, spill):
             if progress is not None:
                 progress.set(stage="replaying", sim_ms=start_ms)
             result.replayed_ms += end_ms - start_ms
@@ -456,15 +450,25 @@ def _clip_to_day(
     return today, spill
 
 
-def _segments(spans: Mapping[str, list[tuple[int, int]]], day: Day) -> list[tuple[int, int, bool]]:
+def _segments(
+    spans: Mapping[str, list[tuple[int, int]]],
+    day: Day,
+    spill: Mapping[str, list[tuple[int, int]]],
+) -> list[tuple[int, int, bool]]:
     """The stretches of clock to replay today, merged across coins.
 
     Returns `(start_ms, end_ms, closes)`. `closes` is false when midnight cut the segment
     short, because the window continues tomorrow and a position it opened is meant to still
     be there. Only a segment that genuinely ends may be asserted flat.
+
+    Ending exactly at `day.end_ms` is not by itself being cut short. A window that closes on
+    the stroke of midnight has run its full length and nothing spills out of it, so it is
+    checked like any other; `spill` is what says whether anything is still open, and it is
+    read across coins because the segments are merged across coins.
     """
     flat = [span for coin_spans in spans.values() for span in coin_spans]
-    return [(start, end, end < day.end_ms) for start, end in merge_spans(flat)]
+    continues = any(coin_spans for coin_spans in spill.values())
+    return [(start, end, end < day.end_ms or not continues) for start, end in merge_spans(flat)]
 
 
 def _clip_spans(
@@ -580,10 +584,14 @@ def _assert_flat(end_ms: int, state: Mapping[str, _CoinState], portfolio: Portfo
     """
     open_positions = sorted(portfolio.positions)
     working = sorted(coin for coin, coin_state in state.items() if coin_state.entry is not None)
-    assert not open_positions and not working, (
-        f"window ending {end_ms} left {open_positions} open and {working} working; "
-        f"raise backtest.window_margin_s or check intent.time_stop_s"
-    )
+    # An explicit raise rather than `assert`, which `python -O` removes. This is the one
+    # check standing between the windowed replay and silently skipping tape a decision was
+    # live in, so it may not be a check that only runs in development.
+    if open_positions or working:
+        raise RuntimeError(
+            f"window ending {end_ms} left {open_positions} open and {working} working; "
+            f"raise backtest.window_margin_s or check intent.time_stop_s"
+        )
 
 
 def _sample_idle(
@@ -598,8 +606,12 @@ def _sample_idle(
 
     The portfolio is flat outside a window, so equity there is cash and does not move; the
     samples exist so the drawdown series is continuous rather than jumping from one cascade
-    to the next, and so the risk engine sees at least one mark per UTC day and rolls its
-    daily budget at midnight rather than at the first cascade of the day.
+    to the next, and so the risk engine sees marks through a quiet day at all.
+
+    An hourly mark that lands inside a replayed window is skipped, because the replay
+    already marked it. That includes the mark at `day.start_ms`, so on a day whose first
+    window is open at midnight the risk engine's day roll happens at the first tick of that
+    window rather than here. It is the same millisecond of simulated time either way.
     """
     covered = merge_spans([span for coin_spans in spans.values() for span in coin_spans])
     index = 0
