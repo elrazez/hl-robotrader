@@ -22,7 +22,9 @@ UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"
 # either can be deployed by naming it in LIQFADE_UNITS. Neither is in the default set.
 NEVER_ENABLE="liqfade-live"
 SERVICE_USER="liqfade"
-APP_ROOT="/srv/liqfade"
+# Overridable only so the unit plan below can be tested against temp directories; the box
+# never sets either of these.
+APP_ROOT="${LIQFADE_APP_ROOT:-/srv/liqfade}"
 # Where this deploy's checkout lives. The default is the one checkout everything has used
 # so far; LIQFADE_APP_DIR puts a branch somewhere else entirely, which is how two branches
 # run on one box without one quietly rolling back the other's code. When it is set, this
@@ -32,10 +34,68 @@ APP_DIR="${LIQFADE_APP_DIR:-$APP_ROOT/app}"
 DEFAULT_APP_DIR="$APP_ROOT/app"
 ISOLATED=0
 if [ "$APP_DIR" != "$DEFAULT_APP_DIR" ]; then ISOLATED=1; fi
-UNIT_DIR="/etc/systemd/system"
+UNIT_DIR="${LIQFADE_UNIT_DIR:-/etc/systemd/system}"
 UV="/home/$SERVICE_USER/.local/bin/uv"
 
 log() { printf '\n== %s\n' "$*"; }
+
+# runnable NAME: is this unit one this deploy may start?
+runnable() {
+  local name="${1%.service}" candidate
+  for candidate in $NEVER_ENABLE; do
+    if [ "$candidate" = "$name" ]; then return 1; fi
+  done
+  for candidate in $UNITS; do
+    if [ "$candidate" = "$name" ]; then return 0; fi
+  done
+  return 1
+}
+
+# owner_of DEST: the checkout the installed unit runs from, empty when it is not installed.
+owner_of() {
+  [ -f "$1" ] || return 0
+  sed -n 's|^WorkingDirectory=||p' "$1" | head -1
+}
+
+# plan_units: one line per unit this checkout ships, "install NAME" or "skip NAME REASON".
+# The whole ownership rule lives here and nowhere else.
+#
+# A unit belongs to the checkout its installed WorkingDirectory names. Writing one that
+# belongs to another checkout is how a deploy from /srv/liqfade/app silently repointed
+# liqfade-paper and liqfade-watchdog, which run from /srv/liqfade/paper, at app's
+# ExecStart. Nothing restarts them, so the paper soak kept running and would have come up
+# on the wrong code at the next reboot: a rollback nobody would have connected to a
+# deploy of a different branch days earlier.
+#
+# A unit named in LIQFADE_UNITS is always written, because naming it is how a checkout
+# claims it. A unit nobody owns yet is written by the default checkout and skipped by an
+# isolated one, which is what puts liqfade-live on a fresh box ready to be started by
+# hand without an isolated branch deploy dragging it in.
+plan_units() {
+  local src name owner
+  for src in "$APP_DIR"/scripts/systemd/*.service; do
+    [ -e "$src" ] || continue
+    name="$(basename "$src")"
+    owner="$(owner_of "$UNIT_DIR/$name")"
+    if runnable "$name"; then
+      echo "install $name"
+    elif [ -n "$owner" ] && [ "$owner" != "$APP_DIR" ]; then
+      echo "skip $name owned by $owner"
+    elif [ "$ISOLATED" -eq 1 ]; then
+      echo "skip $name not in LIQFADE_UNITS"
+    else
+      echo "install $name"
+    fi
+  done
+}
+
+# The plan needs no privileges and changes nothing, so it is answerable before the root
+# check: LIQFADE_PLAN_ONLY=1 prints what this deploy would write and exits, which is what
+# tests/test_deploy_units.py asserts against.
+if [ -n "${LIQFADE_PLAN_ONLY:-}" ]; then
+  plan_units
+  exit 0
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "run as root" >&2
@@ -74,20 +134,10 @@ log "dependencies"
 su -s /bin/bash -c "cd '$APP_DIR' && '$UV' sync --frozen --extra panel" "$SERVICE_USER"
 
 # --- units ----------------------------------------------------------------------
-# Compare before copying so we know which services actually need a restart. Every unit
-# file is installed; the enable and restart pass afterwards is the one that is selective.
-
-# runnable NAME: is this unit one this deploy may start?
-runnable() {
-  local name="${1%.service}" candidate
-  for candidate in $NEVER_ENABLE; do
-    if [ "$candidate" = "$name" ]; then return 1; fi
-  done
-  for candidate in $UNITS; do
-    if [ "$candidate" = "$name" ]; then return 0; fi
-  done
-  return 1
-}
+# `plan_units` decides what this checkout may write; this loop only carries it out, and
+# compares before copying so we know which services actually need a restart. Every unit
+# written has its paths rewritten to this checkout, which for the default one is a no-op,
+# so an installed unit always names the directory that installed it.
 
 log "units"
 if [ "$ISOLATED" -eq 1 ]; then
@@ -96,21 +146,16 @@ fi
 changed=()
 staged="$(mktemp -d)"
 trap 'rm -rf "$staged"' EXIT
-for src in "$APP_DIR"/scripts/systemd/*.service; do
-  name="$(basename "$src")"
-  dest="$UNIT_DIR/$name"
-  # An isolated deploy installs nothing it was not asked for. Installing every unit from
-  # this checkout would hand another checkout's services this branch's ExecStart, which
-  # nothing restarts today and everything picks up at the next reboot.
-  if [ "$ISOLATED" -eq 1 ] && ! runnable "$name"; then
-    echo "  skipped $name (not in LIQFADE_UNITS)"
+# `< <(...)` and not a pipe: a pipe puts the loop in a subshell and `changed` comes back
+# empty, so nothing would ever be restarted.
+while read -r verb name reason; do
+  if [ "$verb" != "install" ]; then
+    echo "  skipped $name ($reason)"
     continue
   fi
-  candidate="$src"
-  if [ "$ISOLATED" -eq 1 ]; then
-    candidate="$staged/$name"
-    sed "s|$DEFAULT_APP_DIR|$APP_DIR|g" "$src" > "$candidate"
-  fi
+  dest="$UNIT_DIR/$name"
+  candidate="$staged/$name"
+  sed "s|$DEFAULT_APP_DIR|$APP_DIR|g" "$APP_DIR/scripts/systemd/$name" > "$candidate"
   if ! cmp -s "$candidate" "$dest"; then
     install -m 0644 "$candidate" "$dest"
     changed+=("$name")
@@ -118,7 +163,7 @@ for src in "$APP_DIR"/scripts/systemd/*.service; do
   else
     echo "  unchanged $name"
   fi
-done
+done < <(plan_units)
 
 systemctl daemon-reload
 
