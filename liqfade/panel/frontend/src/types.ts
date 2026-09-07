@@ -12,6 +12,9 @@ export interface FeedState {
   parse_errors_1h: number;
   worst_coin: string | null;
   worst_lag_ms: number;
+  cadence_ms: number;
+  delivery_coin: string | null;
+  delivery_lag_ms: number;
 }
 
 export interface PositionState {

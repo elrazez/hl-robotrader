@@ -49,8 +49,10 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
           <th className="pb-1 text-right font-medium">lag</th>
           <th className="pb-1 text-right font-medium">msgs/min</th>
           <th className="pb-1 text-right font-medium">gaps 1h</th>
+          <th className="pb-1 text-right font-medium">cadence</th>
           <th className="pb-1 text-right font-medium">parse errors 1h</th>
           <th className="pb-1 text-right font-medium">worst coin</th>
+          <th className="pb-1 text-right font-medium">slowest coin</th>
         </tr>
       </thead>
       <tbody>
@@ -63,6 +65,11 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
             <td className="py-1 text-right tabular-nums">{feed.lag_ms} ms</td>
             <td className="py-1 text-right tabular-nums">{feed.msgs_1m}</td>
             <td className="py-1 text-right tabular-nums">{feed.gaps_1h}</td>
+            {/* The l2 gap threshold is a multiple of this, so a gap count that has moved
+                is read next to the cadence that moved it. */}
+            <td className="py-1 text-right tabular-nums">
+              {feed.cadence_ms ? `${feed.cadence_ms} ms` : "-"}
+            </td>
             <td
               className={`py-1 text-right tabular-nums ${
                 feed.parse_errors_1h > 0 ? "text-amber-300" : ""
@@ -72,6 +79,16 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
             </td>
             <td className="py-1 text-right tabular-nums">
               {feed.worst_coin ? `${feed.worst_coin} ${feed.worst_lag_ms} ms` : "-"}
+            </td>
+            {/* How far behind the slowest coin is delivering, which the stream's own lag
+                cannot show: it is never quiet while seventeen other coins are on time.
+                Amber past lag_alert_s, the threshold that posts to Telegram. */}
+            <td
+              className={`py-1 text-right tabular-nums ${
+                feed.delivery_lag_ms > 60_000 ? "text-amber-300" : ""
+              }`}
+            >
+              {feed.delivery_coin ? `${feed.delivery_coin} ${feed.delivery_lag_ms} ms` : "-"}
             </td>
           </tr>
         ))}

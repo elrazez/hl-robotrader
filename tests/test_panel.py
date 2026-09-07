@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -577,3 +578,58 @@ class TestReportPathTraversal:
 
         (tmp_path / "ok").mkdir()
         assert _run_dir(tmp_path, "ok").name == "ok"
+
+
+# --- the panel's TypeScript mirrors the control protocol ------------------------
+
+
+class TestTheFrontendTypesMirrorTheProtocol:
+    """types.ts says "Mirrors liqfade/control/protocol.py" and nothing checked it, so the
+    protocol grew cadence_ms, delivery_coin and delivery_lag_ms and the panel never saw
+    them. The panel reads state.json as JSON, so the field names are the contract."""
+
+    # The one deliberate divergence: `/api/state` strips the retained latency windows,
+    # which are the only large thing in the snapshot, and `/api/recorder/latency` serves
+    # them in a shape of their own because the page polls state every second and the
+    # chart every thirty. See liqfade/panel/app.py.
+    STRIPPED: ClassVar[dict[str, set[str]]] = {"LatencyState": {"ws_ping_samples", "rest_samples"}}
+    # And what the endpoint adds on top of the model: `/api/state` stamps how old the
+    # snapshot is, because the page greys itself out when nothing is writing state.json.
+    ADDED: ClassVar[dict[str, set[str]]] = {"StateSnapshot": {"age_s"}}
+
+    @staticmethod
+    def _interfaces() -> dict[str, set[str]]:
+        import re
+
+        source = (
+            Path(__file__).resolve().parents[1] / "liqfade/panel/frontend/src/types.ts"
+        ).read_text()
+        found = {}
+        for name, body in re.findall(r"export interface (\w+) \{(.*?)\n\}", source, re.S):
+            found[name] = set(re.findall(r"^  (\w+)\??:", body, re.M))
+        return found
+
+    def test_every_mirrored_interface_has_the_models_fields(self) -> None:
+        from liqfade.control import protocol
+
+        interfaces = self._interfaces()
+        assert "FeedState" in interfaces, "types.ts did not parse"
+        for name, fields in interfaces.items():
+            model = getattr(protocol, name, None)
+            if model is None or not hasattr(model, "model_fields"):
+                continue  # a type the panel invented for itself, not a mirror
+            expected = (set(model.model_fields) - self.STRIPPED.get(name, set())) | self.ADDED.get(
+                name, set()
+            )
+            assert fields == expected, f"{name} has drifted from protocol.py"
+
+    def test_the_schema_version_matches(self) -> None:
+        import re
+
+        from liqfade.control.protocol import SCHEMA_VERSION
+
+        source = (
+            Path(__file__).resolve().parents[1] / "liqfade/panel/frontend/src/types.ts"
+        ).read_text()
+        found = re.search(r"export const SCHEMA_VERSION = (\d+)", source)
+        assert found is not None and int(found.group(1)) == SCHEMA_VERSION
