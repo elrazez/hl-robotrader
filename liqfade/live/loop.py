@@ -265,7 +265,11 @@ class PaperLoop:
             started = time.monotonic()
             at = now_ms()
             try:
-                intents = [] if self.paused else await self.session.tick(at)
+                # Always tick, even paused. The tick is the only path to the exit checks,
+                # so a paused loop that skipped it would stop honouring the stop and the
+                # time stop of a position already open. Pause drops new entries, nothing
+                # else; `PaperSession.tick` is where that is applied.
+                intents = await self.session.tick(at, allow_entries=not self.paused)
             except Exception:
                 log.exception("tick_failed")
                 intents = []

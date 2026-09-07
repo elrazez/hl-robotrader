@@ -49,14 +49,14 @@ async def loop(tmp_path: Path) -> AsyncIterator[PaperLoop]:
         await paper.aclose()
 
 
-def a_market(loop: PaperLoop, px: float = 3000.0) -> None:
+def a_market(loop: PaperLoop, px: float = 3000.0, at: int = START) -> None:
     loop.sink(
         "bbo",
         "hyperliquid",
         {
             "coin": COIN,
-            "ts_ms": START,
-            "rx_ms": START,
+            "ts_ms": at,
+            "rx_ms": at,
             "bid_px": px - 0.5,
             "bid_sz": 50.0,
             "ask_px": px + 0.5,
@@ -68,8 +68,8 @@ def a_market(loop: PaperLoop, px: float = 3000.0) -> None:
         "hyperliquid",
         {
             "coin": COIN,
-            "ts_ms": START,
-            "rx_ms": START,
+            "ts_ms": at,
+            "rx_ms": at,
             "px": px,
             "sz": 5.0,
             "side": "sell",
@@ -89,11 +89,17 @@ async def test_status_reports_paper_and_never_live_trading(loop: PaperLoop) -> N
     assert state.risk.equity == pytest.approx(5_000.0)
 
 
-async def test_pause_stops_the_tick_from_deciding(loop: PaperLoop) -> None:
+async def test_pause_drops_new_intents_and_still_ticks(loop: PaperLoop) -> None:
+    """Pause is about new risk. The tick itself has to keep running: it is the only path
+    to the exit checks, so a loop that stops ticking stops honouring its own stops."""
+    from liqfade.control.protocol import now_ms
     from liqfade.live.loop import PaperBackend
 
     backend = PaperBackend(loop)
-    a_market(loop)
+    # Stamped on the wall clock, because `tick_loop` reads it. The feature engine buckets
+    # on rx_ms, so a fixture stamped years ago would have one tick walk every second in
+    # between.
+    a_market(loop, at=now_ms())
     await backend.pause(reason="test")
 
     stop = asyncio.Event()
@@ -104,6 +110,52 @@ async def test_pause_stops_the_tick_from_deciding(loop: PaperLoop) -> None:
 
     assert loop.ticks > 0
     assert loop.session.intents == []
+    # The tick reached the engine rather than being skipped, which is what keeps the
+    # exit checks alive. `_on_tick` samples equity, so a sample is the evidence.
+    assert loop.session.result.equity_curve
+
+
+async def test_pause_does_not_abandon_the_stop_on_a_position_already_open(
+    tmp_path: Path,
+) -> None:
+    """The defect this replaces: a paused loop with a position stopped checking its stop.
+
+    `_on_tick` is the only path to `_check_exits` and `_expire_entries`, so skipping the
+    tick while paused leaves an open position with no stop and no time stop, which is the
+    opposite of what a pause is for.
+    """
+    from liqfade.control.protocol import now_ms
+    from liqfade.live.loop import PaperBackend
+
+    paper = PaperLoop(
+        paper_settings(tmp_path, **{"execution.entry_tif": "Ioc"}), starting_equity=5_000.0
+    )
+    await paper.setup()
+    try:
+        at = now_ms()
+        a_market(paper, 3000.0, at=at)
+        await paper.session.tick(at + 1_000)
+        paper.session.inject_intent(coin=COIN, side="long", now_ms=at + 1_000, stop_bps=30.0)
+        # The entry is visible one latency later, and the book has to be fresh when it
+        # crosses: a stale book is a guess, and the fill model refuses to fill on one.
+        a_market(paper, 3000.0, at=at + 2_900)
+        await paper.session.tick(at + 3_000)
+        assert COIN in paper.session.portfolio.positions
+
+        await PaperBackend(paper).pause(reason="drill")
+        # Through the stop at 3000 * (1 - 0.003) = 2991.
+        a_market(paper, 2_900.0, at=at + 3_500)
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(paper.tick_loop(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+        assert COIN not in paper.session.portfolio.positions
+        assert [t.exit_reason for t in paper.session.portfolio.trades] == ["stop"]
+    finally:
+        await paper.aclose()
 
 
 async def test_inject_intent_over_the_control_socket(loop: PaperLoop, sock_dir: Path) -> None:

@@ -75,15 +75,32 @@ class _RecordingStrategy(StrategyEngine):
     `_on_tick` places intents itself and returns nothing, and Telegram has to see every
     one of them including those the risk gate then refuses. Recording them here is six
     lines against copying the tick function to add a hook.
+
+    It is also where a pause is applied. `allow_intents` False still runs the detectors
+    and then throws their intents away, so the pause costs nothing but the new entries:
+    skipping the tick instead would leave every cascade detector blind for the length of
+    the pause and make a resume a cold start.
     """
 
     def __init__(self, settings: Settings, meta: Mapping[str, AssetMeta]) -> None:
         super().__init__(settings, meta)
         self.last_intents: list[Intent] = []
+        self.allow_intents = True
+        self.dropped_intents = 0
 
     def on_tick(self, now_ms: int, features_by_coin: Mapping[str, FeatureRow]) -> list[Intent]:
-        self.last_intents = super().on_tick(now_ms, features_by_coin)
-        return self.last_intents
+        intents = super().on_tick(now_ms, features_by_coin)
+        if not self.allow_intents and intents:
+            self.dropped_intents += len(intents)
+            log.warning(
+                "intent_dropped_while_paused",
+                coins=sorted(intent.coin for intent in intents),
+                count=len(intents),
+                dropped_total=self.dropped_intents,
+            )
+            intents = []
+        self.last_intents = intents
+        return intents
 
 
 class PaperSession:
@@ -157,10 +174,19 @@ class PaperSession:
 
     # --- the clock -----------------------------------------------------------
 
-    async def tick(self, now_ms: int) -> list[Intent]:
-        """One decision tick. Returns the intents the strategy emitted, for Telegram."""
+    async def tick(self, now_ms: int, *, allow_entries: bool = True) -> list[Intent]:
+        """One decision tick. Returns the intents the strategy emitted, for Telegram.
+
+        Args:
+            now_ms: the decision timestamp.
+            allow_entries: False while the loop is paused. The tick still runs in full,
+                because `_on_tick` is the only path to the stop, the time stop and the
+                entry expiry; only the new intents are dropped. A pause stops new risk,
+                it does not abandon the risk already on the book.
+        """
         self.features.advance(now_ms)
         rows = {coin: self.features.row(coin, now_ms) for coin in self.features.coins}
+        self.strategy.allow_intents = allow_entries
         self.strategy.last_intents = []
         _on_tick(
             now_ms,
