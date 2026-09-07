@@ -302,28 +302,27 @@ class TestACascadeThatStraddlesMidnight:
 # gone. A digest that had survived this change would have meant the fix did nothing.
 # docs/DECISIONS.md, 2026-09-06.
 #
-# **STALE as of 2026-09-07, and not re-pinned, because the lake was not mounted.** Three
-# changes on branch 04e-backtest-review are expected to move this digest, and none of them
-# could be measured against real data here:
+# **Re-pinned on 2026-09-07, from four trades to three**, against the lake mounted
+# read-only (`--no-cache`, which cold-versus-warm runs have already proven byte-identical).
+# Three changes on branch 04e-backtest-review moved it, each measured on real data here:
 #
 #   1. The previous day's `bbo` is carried whole rather than as its last snapshot. `mid`
 #      feeds every rolling window, and the reference days have `bbo`, so days two and three
-#      of this run read a different `ret_60s` and `rv_300s` on the carry.
+#      read a different `ret_60s` and `rv_300s` on the carry.
 #   2. The replay tells the risk engine when a round trip closes. `coin_cooldown`,
-#      `daily_loss` and `losing_streak` could not fire before, so this run could re-enter a
-#      coin the moment it exited it and now cannot.
-#   3. A window opening inside the first `backtest.window_warmup_s` of a day now reaches
-#      back across midnight for its warmup instead of being clamped to 00:00.
+#      `daily_loss` and `losing_streak` could not fire before, so the old run could re-enter
+#      a coin the moment it exited it; that is the trade that is gone.
+#   3. A window opening inside the first `backtest.window_warmup_s` of a day reaches back
+#      across midnight for its warmup instead of being clamped to 00:00.
 #
-# Re-run the command in the test below on the box, check the funnel for a `kill_switch`
-# block first, and re-pin `sha256` and `trades` with the reason. Do not assume the value
-# below still holds.
+# The funnel of the re-pin run shows no `kill_switch` block (the backtest no longer reads
+# the flag at all since 76dbf36). Control chat, 2026-09-07.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",
     "coins": "BTC,ETH,SOL,HYPE",
-    "sha256": "ee18f6c2164c84e97e785439cecdd80f94d3099b98dcd5a01bd9979e93e10496",
-    "trades": 4,
+    "sha256": "1075f88b70f8daae756766f5fe99ca545520960f8aeed397cd6e4947a22e87de",
+    "trades": 3,
 }
 
 
