@@ -9,16 +9,26 @@ with the loop and reads only two things off the filesystem:
    signal. A missing or unparseable file is *not* a young heartbeat: absence reads as
    stale, because "I cannot tell" and "everything is fine" being the same answer is the
    exact failure this process exists to catch.
-2. **`data/KILL`**, which silences it. A killed box has a dead loop on purpose and paging
-   about it at 3am is noise that teaches the owner to ignore the channel.
+2. **`data/KILL`**, which silences it, unless the watchdog is the one that wrote it. A
+   killed box has a dead loop on purpose and paging about it at 3am is noise that teaches
+   the owner to ignore the channel. Its own flag is a different thing: reading that as
+   "deliberately dead, all is well" would have it answer that the loop is breathing one
+   poll after it declared that the loop is not.
 
-**What it does not do, in 05a: it does not cancel.** `docs/STRATEGY_AND_RISK.md` wants a
-watchdog that cancels every resting order when the heartbeat goes stale, and doing that
-needs the agent key, which means a second process able to sign. Phase 0 item 4 is still
-outstanding, so there is nothing to cancel and no key to cancel it with; this ships as the
-alerting half and `scripts/probe/hl_testnet.py schedule_cancel` decides whether the
-cancelling half is `scheduleCancel` at the venue or a signing watchdog here. Both halves
-are named in docs/DECISIONS.md so neither is mistaken for finished.
+**What it does when the heartbeat goes stale: it writes the flag.** It cannot cancel at
+the venue, which needs the agent key and a second process able to sign, and Phase 0 item 4
+is still outstanding. It does not need to. `data/KILL` is where the loop's own watcher and
+the unit's `ExecStartPre` both look, so writing it cancels, flattens and stops the restart,
+and it needs nothing but a filesystem. A loop wedged badly enough not to see the flag is
+one systemd will not restart either, once the flag is there.
+
+What remains owed is only the venue side: an order resting at Hyperliquid when the whole
+box is gone is cancelled by `scheduleCancel` or by a signing watchdog, and
+`scripts/probe/hl_testnet.py schedule_cancel` decides which. That half is named in
+docs/DECISIONS.md so it is not mistaken for finished.
+
+The flag is written on the edge only. Rewriting it every poll would move its timestamp and
+lose the moment the loop actually stopped, which is the first thing anybody reads.
 
 Restarting the loop is systemd's job, not this process's: `Restart=always` with
 `RestartSec=3` already does it, and two things racing to restart one unit is worse than
@@ -33,11 +43,13 @@ import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from liqfade.config.models import Settings
+from liqfade.control.backend import write_kill_file
 from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["Watchdog", "heartbeat_age_s", "read_heartbeat"]
+__all__ = ["Watchdog", "build_watchdog", "heartbeat_age_s", "read_heartbeat"]
 
 DEFAULT_STALE_S = 10.0  # docs/STRATEGY_AND_RISK.md: stale after ten seconds of silence
 DEFAULT_POLL_S = 2.0
@@ -86,6 +98,8 @@ class Watchdog:
         self.healthy = True
         self.checks = 0
         self.alerts = 0
+        self.kills = 0
+        self._killed_by_us = False
 
     async def check(self, now_ms: int | None = None) -> bool:
         """One look. Returns whether the loop is breathing, and posts only on a change."""
@@ -95,9 +109,14 @@ class Watchdog:
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
         if self.kill_file.exists():
-            # Deliberately dead. Reset the edge so a later restart alerts properly.
-            self.healthy = True
-            return True
+            if not self._killed_by_us:
+                # Somebody else's kill. Deliberately dead; reset the edge so a later
+                # restart alerts properly.
+                self.healthy = True
+                return True
+        else:
+            # The flag went away, so whoever cleared it owns what happens next.
+            self._killed_by_us = False
 
         age = heartbeat_age_s(self.heartbeat, now_ms=now_ms)
         if age is None:
@@ -115,7 +134,18 @@ class Watchdog:
             log.error(
                 "watchdog_stale", label=self.label, detail=detail, heartbeat=str(self.heartbeat)
             )
-            await self._post(f"WATCHDOG: {self.label} is not responding. {detail}")
+            written = write_kill_file(self.kill_file, f"watchdog: {self.label} is stale. {detail}")
+            self._killed_by_us = True
+            self.kills += 1
+            log.error("watchdog_killed", kill_file=str(self.kill_file), flag_written=written)
+            await self._post(
+                f"WATCHDOG: {self.label} is not responding. {detail}. "
+                + (
+                    f"KILL flag written to {self.kill_file}; remove it deliberately."
+                    if written
+                    else f"KILL FLAG NOT WRITTEN to {self.kill_file}. Act by hand."
+                )
+            )
         return False
 
     async def _healthy(self, age: float) -> bool:
@@ -142,31 +172,41 @@ class Watchdog:
                 await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
 
 
+def build_watchdog(settings: Settings) -> Watchdog:
+    """The watchdog the unit runs, from the same config the loop it watches reads.
+
+    The threshold is `risk.watchdog_stale_s` and nothing else. It used to come from
+    `LIQFADE_WATCH_STALE_S`, which meant the number the loop is judged by lived in a
+    systemd unit while a validated field of the same name sat in the config being ignored.
+    The path and the label stay environment overrides: which loop this watchdog watches is
+    a property of the unit, not of the config.
+    """
+    from liqfade.alerts.telegram import send_alert
+
+    heartbeat = Path(os.environ.get("LIQFADE_WATCH_HEARTBEAT") or settings.heartbeat_path)
+    return Watchdog(
+        heartbeat=heartbeat,
+        kill_file=settings.kill_file,
+        alert=send_alert,
+        stale_s=settings.risk.watchdog_stale_s,
+        label=os.environ.get("LIQFADE_WATCH_LABEL") or "trading loop",
+    )
+
+
 def main() -> int:
     """`python -m liqfade.execution.watchdog`, which is what the systemd unit runs."""
-    from liqfade.alerts.telegram import send_alert
     from liqfade.config import load_settings
     from liqfade.log import setup_logging
     from liqfade.runtime import run_main, shutdown_event
 
     settings = load_settings()
     setup_logging(proc="watchdog", env=settings.env, level=settings.logging.level)
-    # The unit watching the paper loop points here with LIQFADE_WATCH_HEARTBEAT; without
-    # it the watchdog reads the same path the live loop writes, which is the default the
-    # live unit uses.
-    heartbeat = Path(os.environ.get("LIQFADE_WATCH_HEARTBEAT") or settings.heartbeat_path)
-    dog = Watchdog(
-        heartbeat=heartbeat,
-        kill_file=settings.kill_file,
-        alert=send_alert,
-        stale_s=float(os.environ.get("LIQFADE_WATCH_STALE_S") or DEFAULT_STALE_S),
-        label=os.environ.get("LIQFADE_WATCH_LABEL") or "trading loop",
-    )
+    dog = build_watchdog(settings)
     log.info(
         "watchdog_started",
-        heartbeat=str(heartbeat),
+        heartbeat=str(dog.heartbeat),
         stale_s=dog.stale_s,
-        kill_file=str(settings.kill_file),
+        kill_file=str(dog.kill_file),
     )
     run_main(lambda: dog.run(shutdown_event()))
     return 0
