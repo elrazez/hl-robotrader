@@ -627,3 +627,38 @@ async def test_a_sizing_refusal_is_reported_like_a_risk_one(
     assert events[0]["coin"] == "BTC"
     assert events[0]["gate"] == "sizing"
     assert posted and "RISK BLOCK" in posted[0]
+
+
+async def test_the_heartbeat_keeps_beating_through_a_long_tick(tmp_path: Path) -> None:
+    """A tick that takes a fill, a report and a reconcile must not stop the heartbeat.
+
+    The heartbeat used to be one more coroutine on the loop's own event loop, so anything
+    that held that loop for longer than `risk.watchdog_stale_s` also stopped the file the
+    watchdog reads, and the watchdog would kill a process that was merely busy. It runs on
+    its own thread now, and the thread's interval is `risk.heartbeat_s` rather than a
+    constant beside a validated field of the same name that nothing read.
+    """
+    import time as wall
+
+    from liqfade.execution.watchdog import read_heartbeat
+
+    paper = PaperLoop(
+        paper_settings(tmp_path, **{"risk.heartbeat_s": 0.02, "risk.watchdog_stale_s": 0.5}),
+        starting_equity=5_000.0,
+    )
+    await paper.setup()
+    stop = asyncio.Event()
+    task = asyncio.create_task(paper.heartbeat_loop(stop))
+    try:
+        await asyncio.sleep(0.05)
+        before = read_heartbeat(paper.settings.heartbeat_path)
+        # Blocking the event loop is the whole point: this is what a long tick does.
+        wall.sleep(0.3)  # noqa: ASYNC251 - fifteen heartbeat intervals of a busy loop
+        after = read_heartbeat(paper.settings.heartbeat_path)
+    finally:
+        stop.set()
+        await task
+        await paper.aclose()
+
+    assert before is not None and after is not None
+    assert after - before >= 200, "the heartbeat stopped while the event loop was busy"

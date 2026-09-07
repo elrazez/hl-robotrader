@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from liqfade.execution.watchdog import Watchdog, heartbeat_age_s, read_heartbeat
+from liqfade.execution.watchdog import (
+    Watchdog,
+    heartbeat_age_s,
+    read_heartbeat,
+    write_heartbeat_atomic,
+)
 
 
 def write_heartbeat(path: Path, ms: int) -> None:
@@ -201,3 +206,52 @@ def test_the_stale_threshold_comes_from_the_config_not_an_env_var(
 
     assert dog.stale_s == settings.risk.watchdog_stale_s
     assert dog.stale_s != 999.0
+
+
+def test_a_reader_never_catches_the_heartbeat_half_written(tmp_path: Path) -> None:
+    """The watchdog reads this file while the loop writes it, with no lock between them.
+
+    `Path.write_text` truncates in place, so a read landing between the truncate and the
+    flush sees an empty file. `read_heartbeat` maps every failure to None and the watchdog
+    reads None as a dead loop, so a torn read kills a healthy process. This is not
+    hypothetical: it is what wrote data/KILL on 2026-09-07 at 15:07:10 UTC, four
+    milliseconds after the loop stamped the very heartbeat the watchdog could not read.
+    """
+    import threading
+    import time
+
+    path = tmp_path / "heartbeat"
+    write_heartbeat_atomic(path, 1)
+    stop = threading.Event()
+
+    def writer() -> None:
+        while not stop.is_set():
+            write_heartbeat_atomic(path, int(time.time() * 1000))
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        unreadable = sum(1 for _ in range(20_000) if read_heartbeat(path) is None)
+    finally:
+        stop.set()
+        thread.join()
+
+    assert unreadable == 0
+
+
+def test_the_stale_limit_must_be_several_heartbeats_not_one_and_a_bit() -> None:
+    """A limit one beat above the interval trips on the first missed write.
+
+    The validator only asked for `>`, so a config could set the heartbeat to 9.9s and the
+    stale limit to 10.0s and be accepted, leaving 0.1s of headroom for a poll interval, a
+    write, a page fault and a busy box.
+    """
+    from pydantic import ValidationError
+
+    from liqfade.config import load_settings
+    from liqfade.config.models import Risk
+
+    fields = load_settings("paper", environ={}).risk.model_dump()
+    with pytest.raises(ValidationError, match="heartbeat"):
+        Risk.model_validate({**fields, "heartbeat_s": 9.9, "watchdog_stale_s": 10.0})

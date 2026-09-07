@@ -409,6 +409,10 @@ class Sizing(Base):
     respect_venue_max_leverage: bool = Field(..., description="also clamp to maxLeverage * equity")
 
 
+MIN_STALE_HEARTBEATS = 5
+"""How many missed heartbeats the watchdog must tolerate before it calls the loop dead."""
+
+
 class Risk(Base):
     max_daily_loss_frac: Frac = Field(..., description="fraction of day start equity")
     max_dd_frac: Frac = Field(..., description="fraction below peak equity")
@@ -446,8 +450,14 @@ class Risk(Base):
             raise ValueError(
                 "risk stale thresholds must be coin <= global_cancel <= global_flatten"
             )
-        if self.watchdog_stale_s <= self.heartbeat_s:
-            raise ValueError("risk.watchdog_stale_s must be > heartbeat_s")
+        if self.watchdog_stale_s < MIN_STALE_HEARTBEATS * self.heartbeat_s:
+            # `>` alone accepted a 9.9s heartbeat against a 10.0s limit, which is one
+            # missed write from a kill and leaves no room for the watchdog's own poll
+            # interval. The limit has to survive several consecutive missed beats,
+            # because one missed beat is a busy box and not a dead loop.
+            raise ValueError(
+                f"risk.watchdog_stale_s must be at least {MIN_STALE_HEARTBEATS}x heartbeat_s"
+            )
         if self.kill_budget_s >= self.kill_deadline_s:
             # The budget bounds the venue calls; the deadline is the promise CLAUDE.md
             # rule 5 makes. The confirmation, the alert and the logging happen in between,

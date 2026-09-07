@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -57,6 +58,7 @@ from liqfade.execution.hl import AccountSnapshot, VenueOrder
 from liqfade.execution.kill import KillSwitch, KillWatcher
 from liqfade.execution.orders import OrderStore
 from liqfade.execution.reconcile import Reconciler
+from liqfade.execution.watchdog import write_heartbeat_atomic
 from liqfade.live.paper import PaperSession
 from liqfade.log import get_logger
 from liqfade.recorder.backend import LatencyTracker
@@ -68,7 +70,6 @@ log = get_logger(__name__)
 
 __all__ = ["PaperBackend", "PaperLoop"]
 
-HEARTBEAT_S = 1.0
 # Seconds before the same risk reason is posted again. Every refusal is logged; a gate
 # that refuses every 250ms tick is one thing to say, not two thousand.
 RISK_BLOCK_ALERT_S = 300.0
@@ -464,15 +465,39 @@ class PaperLoop:
             await self.post(f"[{self.settings.env}] halt cleared, entries allowed again")
 
     async def heartbeat_loop(self, stop: asyncio.Event) -> None:
-        """Touch the heartbeat file every second. The watchdog reads nothing else."""
+        """Beat on a thread of its own, every `risk.heartbeat_s`. The watchdog reads nothing else.
+
+        The thread is the point. A heartbeat that is one more coroutine says "this event
+        loop is still turning", and the event loop turns for as long as no tick blocks it,
+        so the file went silent exactly when a tick had the most work to do: a fill, a
+        Telegram post, a reconcile. The watchdog cannot tell that apart from a dead process
+        and kills a loop that is merely busy. What the owner wants to know is that the
+        process is alive, and a thread answers that question even while the loop is
+        wedged. A truly dead process cannot beat from any thread.
+
+        The interval is `risk.heartbeat_s`, which is the field `risk.watchdog_stale_s` is
+        validated against; it was a module constant, so the two numbers that have to agree
+        lived in different files and only one of them was read.
+        """
         path = self.settings.heartbeat_path
-        while not stop.is_set():
-            try:
-                await asyncio.to_thread(path.write_text, f"{now_ms()}\n")
-            except OSError as exc:
-                log.error("heartbeat_write_failed", path=str(path), error=str(exc))
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_S)
+        interval = float(self.settings.risk.heartbeat_s)
+        done = threading.Event()
+
+        def beat() -> None:
+            while not done.is_set():
+                try:
+                    write_heartbeat_atomic(path, now_ms())
+                except OSError as exc:
+                    log.error("heartbeat_write_failed", path=str(path), error=str(exc))
+                done.wait(interval)
+
+        worker = threading.Thread(target=beat, name="heartbeat", daemon=True)
+        worker.start()
+        try:
+            await stop.wait()
+        finally:
+            done.set()
+            worker.join(timeout=interval + 1.0)
 
     async def _supervise(
         self, name: str, factory: Callable[[], Awaitable[None]], stop: asyncio.Event

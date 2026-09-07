@@ -5,10 +5,13 @@ and is deliberately independent of `liqfade-live` and `liqfade-paper`. A watchdo
 dies with the process it watches is not a watchdog, which is why it shares no code path
 with the loop and reads only two things off the filesystem:
 
-1. **`data/heartbeat`**, which the loop rewrites every second. Its age is the whole
-   signal. A missing or unparseable file is *not* a young heartbeat: absence reads as
-   stale, because "I cannot tell" and "everything is fine" being the same answer is the
-   exact failure this process exists to catch.
+1. **`data/heartbeat`**, which the loop rewrites every `risk.heartbeat_s`. Its age is
+   the whole signal. A missing or unparseable file is *not* a young heartbeat: absence
+   reads as stale, because "I cannot tell" and "everything is fine" being the same answer
+   is the exact failure this process exists to catch. That reading only holds because the
+   loop writes through `write_heartbeat_atomic`: while the write was a plain truncate, a
+   read landing inside it was unreadable through no fault of the loop, and this process
+   killed a healthy one on 2026-09-07. Absence must mean absence for the rule to be safe.
 2. **`data/KILL`**, which silences it, unless the watchdog is the one that wrote it. A
    killed box has a dead loop on purpose and paging about it at 3am is noise that teaches
    the owner to ignore the channel. Its own flag is a different thing: reading that as
@@ -49,10 +52,32 @@ from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["Watchdog", "build_watchdog", "heartbeat_age_s", "read_heartbeat"]
+__all__ = [
+    "Watchdog",
+    "build_watchdog",
+    "heartbeat_age_s",
+    "read_heartbeat",
+    "write_heartbeat_atomic",
+]
 
 DEFAULT_STALE_S = 10.0  # docs/STRATEGY_AND_RISK.md: stale after ten seconds of silence
 DEFAULT_POLL_S = 2.0
+
+
+def write_heartbeat_atomic(path: Path, stamp_ms: int) -> None:
+    """Write the stamp so a concurrent reader sees the old value or the new one, never neither.
+
+    `Path.write_text` truncates in place, which leaves the file empty for as long as it
+    takes the writing thread to be scheduled again. There is no lock between the loop and
+    the watchdog and there should not be one, so the file itself has to be the atom: write
+    a sibling temp file and `os.replace` it, which is a single rename on the same
+    filesystem. `read_heartbeat` cannot tell a torn read from a corrupt one, so the only
+    place this can be fixed is here.
+    """
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(f"{stamp_ms}\n")
+    os.replace(tmp, path)
 
 
 def read_heartbeat(path: Path) -> int | None:

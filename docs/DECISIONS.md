@@ -2421,3 +2421,78 @@ falling back to running without a cache. Seen on 2026-09-07 against a read-only 
 A cache is an optimisation and its absence is not an error; a read-only lake is a normal
 way to mount someone else's data. Reported by the recorder chat; it belongs to whoever
 next touches `backtest/`, not to this branch.
+
+## 2026-09-07 (05c: the watchdog killed a healthy loop, and the journal says exactly how)
+
+The paper loop was stopped at 15:07 UTC by its own watchdog, which wrote `data/KILL` with
+"paper loop is stale", after which the unit failed to start 1,860 times behind the flag.
+The question the next prompt had to answer was whether that was a real stall or a
+threshold with no headroom. It was neither. It was a torn read.
+
+**The journal, in order, with the millisecond stamps that settle it.**
+
+    15:07:10.575  watchdog  watchdog_stale   "no heartbeat file at /srv/liqfade/data/heartbeat"
+    15:07:10.576  watchdog  kill_file_written
+    15:07:10.978  paper     kill_file_seen
+    15:07:10.979  paper     kill_fired       canceled=0 closed=0 elapsed_s=0.0
+    15:07:11.011  paper     paper_stopping   ticks=35633 reconcile_runs=149 differences=0 reconnects=0
+    15:07:13.801  watchdog  watchdog_recovered  age_s=3.23
+    15:07:16.863  paper     shutdown_done
+    15:07:20.638  watchdog  watchdog_stale   "heartbeat is 10.1s old, over the 10s limit"
+
+The first trip is the one that killed the loop, and its detail is **"no heartbeat file"**,
+not a stale one. The second trip, the one quoted in the KILL file and in the hand-over, is
+three seconds after `shutdown_done`: by then the loop really was gone, so that reading was
+correct and irrelevant.
+
+The `watchdog_recovered` line is the proof. Its `age_s=3.23` at 15:07:13.801 puts the last
+heartbeat stamp at **15:07:10.571**, four milliseconds *before* the watchdog read the file
+at 15:07:10.575 and found nothing it could parse. A stalled loop does not stamp a heartbeat
+four milliseconds before the process watching it declares it dead. The loop was healthy:
+35,633 ticks, 149 reconciliations, zero differences, zero reconnects, and an orderly kill
+that cancelled 0 orders and closed 0 positions in 0.0s.
+
+**The mechanism.** `heartbeat_loop` wrote with `Path.write_text`, which opens the file
+`w`, truncating it in place, and only then writes and flushes. The watchdog reads the same
+path with no lock between them, on purpose, and `read_heartbeat` maps every failure to
+`None` because a corrupt heartbeat must not read as a healthy one. So a read landing inside
+the truncate window gets an empty file, becomes `None`, and `None` means dead. Measured
+locally: with a writer looping on `write_text` and a reader hammering the same path,
+**0.57% of reads are unparseable**. The stamp was built in the event loop and the write
+handed to `asyncio.to_thread`, which widens the window further, by however long the worker
+thread waits for the GIL while the main thread runs a 250ms tick over twenty coins.
+
+Over a two-and-a-half hour run at one write a second and one poll every two seconds this
+was going to happen; it took 2.5 hours. The loop had just taken its first fill and trade,
+which is a coincidence of timing rather than a cause, but it is what made the tick busiest.
+
+**Three fixes, because the incident exposed three separate weaknesses.**
+
+1. `write_heartbeat_atomic` writes a sibling temp file and `os.replace`s it. A rename is
+   atomic on one filesystem, so a reader sees the old stamp or the new one and never
+   neither. This is the only place it can be fixed: the reader genuinely cannot tell a
+   torn read from a corrupt one, and should not try, because the day it guesses wrong is
+   the day a corrupt heartbeat reads as a healthy loop forever.
+2. The heartbeat now beats on its own `threading.Thread` rather than as one more coroutine.
+   A coroutine heartbeat answers "this event loop is still turning", which goes silent
+   exactly when a tick has the most work to do: a fill, a Telegram post, a reconcile. The
+   owner's question is whether the process is alive, and a thread answers that even while
+   the loop is wedged. `tests/test_live_loop.py` blocks the event loop for fifteen
+   heartbeat intervals and asserts the file still advances; it fails without the thread.
+3. The interval is `risk.heartbeat_s` now, not a module constant. It was 1.0 in
+   `live/loop.py` while a validated field of the same name sat in the config unread, which
+   is the same bug 05b fixed for `watchdog_stale_s` living in a systemd `Environment=`
+   line. And `Risk._stale_ordered` asked only for `watchdog_stale_s > heartbeat_s`, which
+   accepts a 9.9s heartbeat against a 10.0s limit: one missed write from a kill, with no
+   room for the watchdog's own 2s poll. It now requires `MIN_STALE_HEARTBEATS` (5) beats.
+   The shipped 1.0 and 10.0 are ten beats apart and are unchanged.
+
+**What was not wrong.** The threshold. Ten seconds against a one second beat was never the
+problem, and raising it would have hidden the torn read rather than fixed it, until the
+next poll landed in the next truncate window.
+
+**What is still true and deliberate.** The watchdog writing `data/KILL` means a restart is
+refused until a human removes it, which is why 1,860 failed starts followed. That is the
+design working: `ExecStartPre` refusing to start behind the flag is what stops a wedged
+loop from being restarted into the same wedge. The cost of a false positive is exactly
+this, which is the argument for the false positive being impossible rather than cheap.
