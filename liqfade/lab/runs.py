@@ -8,6 +8,13 @@ by `backtest/watch.py` so the lab and `liqfade watch` can never disagree about a
 One lake job at a time, twice enforced: the queue starts a job only when none of its own is
 running, and only when `pgrep -f "liqfade backtest"` finds nothing, so a year run started in
 another terminal holds the queue instead of sharing 8 GB with it.
+
+**The queue lives only as long as the lab.** Quitting takes the queue with it: a running job
+survives, because it was spawned into its own session and finishing it is the point, and a
+job still waiting to start simply never starts. Nothing is written down that would let a
+later lab pick the queue back up, and nothing needs to be: a queued job has no process and
+no report, only a form the owner can fill in again. What a dead lab does leave behind are
+the running job's sidecars, and `_file_orphans` files those on the next start.
 """
 
 from __future__ import annotations
@@ -391,10 +398,3 @@ class RunQueue:
             job.process.terminate()
         except OSError:
             job.state = "cancelled"
-
-    def cancel_all(self) -> None:
-        """Called when the lab exits with runs it started. Queued jobs die, running ones
-        do not: a replay outliving the window it was launched from is the point."""
-        for job in self.jobs:
-            if job.state == "queued":
-                self.cancel(job)

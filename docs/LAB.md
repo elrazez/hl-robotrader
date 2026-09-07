@@ -94,7 +94,12 @@ goes through the same layering and the same validation as a YAML key.
 | key | does |
 |---|---|
 | `ctrl+r` | launch, or queue if the lake is busy |
-| `ctrl+t` | SIGTERM the selected run, SIGKILL it if it ignores that for 10s |
+| `ctrl+t` | SIGTERM the selected run, SIGKILL it if it ignores that for 10s. Selected means wherever the cursor is in the job table, not the top row |
+
+**Quitting takes the queue with it.** A running job survives, because it is spawned into its
+own session and outliving the window it was launched from is the point; a job still waiting
+to start simply never starts, and there is nothing to resume, only a form to fill in again.
+The running job's `run.log` and `lab.json` are not lost: the next lab files them.
 
 The progress panel calls `liqfade/backtest/watch.py`'s `render`, so the lab and
 `liqfade watch` draw the same frame and cannot disagree about a run.
@@ -125,6 +130,10 @@ Read-only. `data/state.json`, redrawn once a second: which process is up, its fe
 their lag, positions, orders, risk and latency. On the laptop it is normally empty and says
 so. A snapshot older than 10s is shown anyway and marked stale, because the last thing a
 process said before it stopped is usually the interesting part.
+
+| key | does |
+|---|---|
+| `r` | reread `data/state.json` now, without waiting for the next second |
 
 ## Files the lab writes
 
