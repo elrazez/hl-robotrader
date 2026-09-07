@@ -224,13 +224,26 @@ class LakeSource:
                 writer.close()
 
     def events(self, day: Day, spans: Mapping[str, Sequence[tuple[int, int]]]) -> Iterator[Event]:
-        """Every event inside `spans` on this day, merged into one time-ordered stream."""
+        """Every event inside `spans`, merged into one time-ordered stream.
+
+        Normally one partition. A window that opens inside the first
+        `backtest.window_warmup_s` of the day reaches back across midnight for its warmup,
+        and the previous partition is read as well, under the same spans: the filter keeps
+        only the minutes the window actually asked for, so the extra read is the warmup and
+        not the day.
+        """
         if not spans:
             return iter(())
+        partitions = [day.date]
+        if min(start for coin_spans in spans.values() for start, _ in coin_spans) < day.midnight_ms:
+            partitions.insert(0, day.previous)
         # Trades are Hyperliquid only, matching what the grid was built on; liquidations
         # come from every venue and `cascade.trigger` picks among them inside the grid.
         read = {
-            table: load_day(self.data_dir, table, day.date, spans=spans, venue=venue)
+            table: _concat(
+                load_day(self.data_dir, table, partition, spans=spans, venue=venue)
+                for partition in partitions
+            )
             for table, venue in (
                 ("trades", "hyperliquid"),
                 ("liquidations", None),
@@ -470,6 +483,12 @@ def midnight_ms(day: str) -> int:
     """Midnight UTC of a `YYYY-MM-DD` partition, in integer milliseconds."""
     parsed = date.fromisoformat(day)
     return int(datetime(parsed.year, parsed.month, parsed.day, tzinfo=UTC).timestamp() * 1000)
+
+
+def _concat(frames: Iterator[pl.DataFrame]) -> pl.DataFrame:
+    """Stack what the partitions gave back, skipping the ones that had nothing."""
+    parts = [frame for frame in frames if not frame.is_empty()]
+    return pl.concat(parts) if parts else pl.DataFrame()
 
 
 def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:

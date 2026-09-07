@@ -686,3 +686,99 @@ class TestTheCarryIsAsWideAsTheFeatureThatReadsIt:
             "the carried previous day is narrower than the windows that read it: "
             f"{differing} differ between the streamed and the whole-window grid"
         )
+
+
+class TestTheWarmupReachesBackAcrossMidnight:
+    """A window is `[cascade_start - window_warmup_s, ...]`, on both sides of a boundary.
+
+    The day loop clamped every window's start to the day it belonged to, so a candidate
+    inside the first `window_warmup_s` of a day got whatever warmup was left after midnight
+    instead of the 300s the spec gives it. The book, the tape and `risk.stale_coin_s` are
+    all colder than a whole-lake run would have made them, and within `stale_coin_s` of
+    00:00 the entry is blocked for staleness the whole-window run never saw.
+
+    The floor is the end of what the previous day already replayed, not midnight. That is
+    what keeps the reach from feeding the same prints to the book twice: tape the previous
+    day covered is behind the floor, and a window still open at midnight leaves the floor
+    exactly at midnight, which is where a spill picks up.
+    """
+
+    def test_a_window_opening_before_midnight_keeps_its_reach(self) -> None:
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        # A candidate at 00:05 with the default 300s warmup: the window opens at 23:55.
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        today, spill = _clip_to_day(spans, day, floor_ms=midnight - DAY_MS)
+        assert today == {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        assert spill == {}
+
+    def test_the_reach_stops_where_the_previous_day_stopped_replaying(self) -> None:
+        """Tape the previous day already fed to the book is not fed to it again."""
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        # Yesterday replayed up to 23:58, so only the last two minutes are new.
+        today, _ = _clip_to_day(spans, day, floor_ms=midnight - 120_000)
+        assert today == {"GOLD": [(midnight - 120_000, midnight + 900_000)]}
+
+    def test_a_window_still_open_at_midnight_leaves_no_room_to_reach_back(self) -> None:
+        """The spill case. Yesterday replayed right up to 00:00, so the floor is 00:00."""
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        today, _ = _clip_to_day(spans, day, floor_ms=midnight)
+        assert today == {"GOLD": [(midnight, midnight + 900_000)]}
+
+    @pytest.fixture(scope="class")
+    def after_midnight_lake(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> tuple[Path, int, int]:
+        """A lake whose first cascade of each copy lands at 00:05, five minutes in.
+
+        23h05m puts the tape's own start at 23:05 and its three cascades at 00:05, 01:05
+        and 02:05 of the next morning, so the first one sits inside `window_warmup_s` of
+        midnight and its window has to open on the previous partition.
+        """
+        root = tmp_path_factory.mktemp("after_midnight_lake")
+        start_ms, end_ms = golden_lake.write_lake(root, LAKE_DAYS, offset_ms=83_100_000)
+        return root, start_ms, end_ms
+
+    def test_a_window_reaching_back_reads_the_previous_partition(
+        self, after_midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The tape before midnight is in a different file, and the source has to open it."""
+        lake = source(after_midnight_lake, settings, cache=False)
+        second = lake.days()[1]
+        spans = {golden_lake.COIN: [(second.start_ms - 300_000, second.start_ms + 900_000)]}
+        stamps = [event.ts_ms for event in lake.events(second, spans)]
+        assert stamps, "the window read nothing at all"
+        assert min(stamps) < second.start_ms, (
+            "every event came from the scored day; the warmup never crossed midnight"
+        )
+        assert min(stamps) >= second.start_ms - 300_000, (
+            "the previous partition was read wider than the window asked for"
+        )
+
+    def test_the_backward_reach_finds_the_same_trades_the_whole_window_would(
+        self, after_midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The day loop against the same tape held whole, straddling midnight forwards."""
+        streamed = run_backtest(source(after_midnight_lake, settings, cache=False), settings)
+        whole = run_backtest(_whole_window(after_midnight_lake), settings)
+        assert whole.trades, "the baseline found nothing, so it proves nothing"
+        assert [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in streamed.trades
+        ] == [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in whole.trades
+        ]

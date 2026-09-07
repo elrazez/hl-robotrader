@@ -305,6 +305,10 @@ def run_backtest(
     # rows and its window across midnight instead of being cut in half by the day loop.
     carry: pl.DataFrame | None = None
     spill: dict[str, list[tuple[int, int]]] = {}
+    # How far the replay has already got. A window opening before midnight reaches back
+    # into yesterday's tape for its warmup, and this is what stops it reaching into tape
+    # yesterday already replayed and applying the same prints to the book twice.
+    floor_ms = source.start_ms
 
     for index, day in enumerate(source.days()):
         if progress is not None:
@@ -315,7 +319,7 @@ def run_backtest(
         # report's coin list has always meant: the universe the run actually covered.
         seen.update(traded)
         spans = _with_spill(spans, spill)
-        spans, spill = _clip_to_day(spans, day)
+        spans, spill = _clip_to_day(spans, day, floor_ms=floor_ms)
         _load_funding(portfolio, source.funding(day))
 
         clock.day(rows, settings)
@@ -341,6 +345,7 @@ def run_backtest(
             )
             if closes:
                 _assert_flat(end_ms, state, portfolio)
+            floor_ms = max(floor_ms, end_ms)
         _sample_idle(day, spans, portfolio, risk, result, progress)
 
     _close_out(source.end_ms, state, portfolio, result, settings)
@@ -411,20 +416,36 @@ def _with_spill(
 
 
 def _clip_to_day(
-    spans: Mapping[str, list[tuple[int, int]]], day: Day
+    spans: Mapping[str, list[tuple[int, int]]], day: Day, floor_ms: int
 ) -> tuple[dict[str, list[tuple[int, int]]], dict[str, list[tuple[int, int]]]]:
     """Split each coin's windows into the part this day replays and the part that spills.
 
     A window that runs past midnight is not shortened, it is continued: tomorrow's pass
     picks up its remainder with tomorrow's grid and tomorrow's funding in hand, which is
     the only order in which a position open at midnight can be priced correctly.
+
+    A window that *opens* before midnight is not shortened either. A candidate in the first
+    `backtest.window_warmup_s` of a day belongs to this day's grid and could not have been
+    seen yesterday, so its warmup has to be taken now, out of yesterday's tape.
+
+    Args:
+        spans: this day's windows, per coin, in absolute milliseconds.
+        day: the partition being replayed.
+        floor_ms: the earliest millisecond this pass may reach back to, which is the end of
+            what yesterday's pass already replayed (the run's start, on the first day).
+            Tape behind it has been fed to the book once already and must not be fed again;
+            a window still open at midnight puts the floor exactly at midnight, which is
+            where the spill picks up.
+
+    Returns:
+        `(today, spill)`, the part to replay now and the part tomorrow continues.
     """
     today: dict[str, list[tuple[int, int]]] = {}
     spill: dict[str, list[tuple[int, int]]] = {}
     for coin, coin_spans in spans.items():
         for start, end in coin_spans:
-            start = max(start, day.start_ms)
-            if end <= day.start_ms:
+            start = max(start, floor_ms)
+            if end <= start:
                 continue
             if start >= day.end_ms:
                 spill.setdefault(coin, []).append((start, end))
