@@ -46,6 +46,7 @@ import pyarrow.parquet as pq
 from liqfade.backtest.data import Event, iter_events, load_day, utc_days
 from liqfade.backtest.features import build_feature_grid, row_columns
 from liqfade.config.models import Settings
+from liqfade.features.grid import effective_ts
 from liqfade.features.levels import range_levels, swing_levels
 from liqfade.log import get_logger
 from liqfade.strategy.rules import LEVEL_RULES, level_rules_enabled
@@ -257,7 +258,7 @@ class LakeSource:
         rows = load_day(self.data_dir, "asset_ctx", day.date, coins=self.coins)
         if rows.is_empty():
             return rows
-        return rows.filter(_known().is_between(self.start_ms, self.end_ms, closed="left"))
+        return rows.filter(effective_ts(None).is_between(self.start_ms, self.end_ms, closed="left"))
 
     # --- internals ------------------------------------------------------------
 
@@ -457,10 +458,6 @@ def midnight_ms(day: str) -> int:
     """Midnight UTC of a `YYYY-MM-DD` partition, in integer milliseconds."""
     parsed = date.fromisoformat(day)
     return int(datetime(parsed.year, parsed.month, parsed.day, tzinfo=UTC).timestamp() * 1000)
-
-
-def _known() -> pl.Expr:
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
 
 
 def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:

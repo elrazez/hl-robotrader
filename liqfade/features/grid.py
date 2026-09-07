@@ -23,11 +23,21 @@ import polars as pl
 __all__ = ["build_grid", "effective_ts"]
 
 
-def effective_ts() -> pl.Expr:
-    """The timestamp a row became knowable: `rx_ms` when recorded, `ts_ms` when backfilled."""
-    return (
-        pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms")).alias("known")
-    )
+def effective_ts(alias: str | None = "known") -> pl.Expr:
+    """The timestamp a row became knowable: `rx_ms` when recorded, `ts_ms` when backfilled.
+
+    **The only place this rule is written.** It decides, for every table in the lake, which
+    column a no-lookahead filter or an as-of join reads, so a copy of it drifting to `>= 0`
+    would silently put the backfilled year on a receive time it never had.
+    `tests/test_conventions.py` fails if the expression reappears anywhere else.
+
+    Args:
+        alias: the column name to give the result. None leaves it unnamed, which is what a
+            filter predicate wants; the default names it `known`, which is what the as-of
+            joins in this module and in `features/book.py` join on.
+    """
+    expr = pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
+    return expr if alias is None else expr.alias(alias)
 
 
 def build_grid(

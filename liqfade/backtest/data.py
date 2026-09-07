@@ -33,6 +33,8 @@ from pathlib import Path
 
 import polars as pl
 
+from liqfade.features.grid import effective_ts
+
 __all__ = [
     "L2",
     "AssetCtx",
@@ -43,6 +45,7 @@ __all__ = [
     "day_files",
     "iter_events",
     "load_day",
+    "span_filter",
     "utc_days",
 ]
 
@@ -166,6 +169,37 @@ def day_files(data_dir: Path, table: str, day: str) -> list[Path]:
     return sorted(path for path in directory.glob("*.parquet") if not path.name.startswith("."))
 
 
+def span_filter(spans: Mapping[str, Sequence[tuple[int, int]]]) -> pl.Expr:
+    """Keep the rows whose `effective_ts` falls in one of a coin's replay windows.
+
+    One expression for both callers: `load_day` pushes it into the scan so a day's
+    unreplayed tape is never materialised, and `engine._within` applies it to the frames a
+    `RunInputs` already holds. Two copies of this predicate would be two answers to "did
+    the engine see this print", which is the one thing the windowed replay may not get
+    wrong.
+
+    Args:
+        spans: per coin, the `[from_ms, to_ms)` windows to keep. A coin absent from the
+            mapping, and a coin with no windows, keeps nothing.
+
+    Returns:
+        A boolean expression over `coin`, `rx_ms` and `ts_ms`. Literal false when no coin
+        has a window, because `any_horizontal([])` is null rather than false.
+    """
+    known = effective_ts(None)
+    return pl.any_horizontal(
+        [
+            (pl.col("coin") == coin)
+            & pl.any_horizontal(
+                [known.is_between(start, end, closed="left") for start, end in coin_spans]
+            )
+            for coin, coin_spans in sorted(spans.items())
+            if coin_spans
+        ]
+        or [pl.lit(False)]
+    )
+
+
 def load_day(
     data_dir: Path,
     table: str,
@@ -218,22 +252,9 @@ def load_day(
     if spans is not None:
         if not spans:
             return pl.DataFrame()
-        known = _effective_ts()
-        frame = frame.filter(
-            pl.any_horizontal(
-                [
-                    (pl.col("coin") == coin)
-                    & pl.any_horizontal(
-                        [known.is_between(start, end, closed="left") for start, end in coin_spans]
-                    )
-                    for coin, coin_spans in sorted(spans.items())
-                    if coin_spans
-                ]
-                or [pl.lit(False)]
-            )
-        )
+        frame = frame.filter(span_filter(spans))
     if tail_only:
-        latest = _effective_ts().alias("_known")
+        latest = effective_ts("_known")
         frame = (
             frame.with_columns(latest)
             .filter(pl.col("_known") == pl.col("_known").max())
@@ -279,16 +300,11 @@ def iter_events(
 # --- internals ----------------------------------------------------------------
 
 
-def _effective_ts() -> pl.Expr:
-    """`rx_ms` when the row was recorded, `ts_ms` when it was backfilled."""
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
-
-
 def _known(frame: pl.DataFrame) -> pl.DataFrame:
     """Add the `known` column the merge sorts on. `candles_1m` has no `rx_ms`."""
     if "rx_ms" not in frame.columns:
         return frame.with_columns(pl.col("ts_ms").alias("known"))
-    return frame.with_columns(_effective_ts().alias("known"))
+    return frame.with_columns(effective_ts())
 
 
 def _trade_events(frame: pl.DataFrame | None) -> list[tuple[int, int, int, Event]]:

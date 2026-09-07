@@ -41,6 +41,7 @@ from liqfade.backtest.data import (
     Liq,
     Trade,
     iter_events,
+    span_filter,
     utc_days,
 )
 from liqfade.backtest.features import (
@@ -66,6 +67,7 @@ from liqfade.backtest.portfolio import Trade as PortfolioTrade
 from liqfade.backtest.progress import ProgressWriter
 from liqfade.backtest.source import DAY_MS, Day, LakeSource, feature_hash, midnight_ms
 from liqfade.config.models import Settings
+from liqfade.features.grid import effective_ts
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
 from liqfade.sizing import LiquidityStats, size_intent
@@ -194,7 +196,7 @@ class RunInputs:
         if self.asset_ctx is None:
             return pl.DataFrame()
         return self.asset_ctx.filter(
-            _known_expr().is_between(day.start_ms, day.end_ms, closed="left")
+            effective_ts(None).is_between(day.start_ms, day.end_ms, closed="left")
         )
 
 
@@ -1155,28 +1157,14 @@ def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:
     return None if frame.is_empty() else frame
 
 
-def _known_expr() -> pl.Expr:
-    """The timestamp a row became knowable. Mirrors `features/grid.py`'s `effective_ts`."""
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
-
-
 def _within(
     frame: pl.DataFrame | None, spans: Mapping[str, Sequence[tuple[int, int]]]
 ) -> pl.DataFrame:
-    """The rows of an in-memory table falling inside a coin's replay windows."""
+    """The rows of an in-memory table falling inside a coin's replay windows.
+
+    The same predicate `load_day` pushes into the scan, so a `RunInputs` built by a test
+    and a `LakeSource` reading the lake keep exactly the same rows.
+    """
     if frame is None or frame.is_empty() or not spans:
         return pl.DataFrame()
-    known = _known_expr()
-    return frame.filter(
-        pl.any_horizontal(
-            [
-                (pl.col("coin") == coin)
-                & pl.any_horizontal(
-                    [known.is_between(start, end, closed="left") for start, end in coin_spans]
-                )
-                for coin, coin_spans in sorted(spans.items())
-                if coin_spans
-            ]
-            or [pl.lit(False)]
-        )
-    )
+    return frame.filter(span_filter(spans))
