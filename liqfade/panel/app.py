@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from liqfade.config import flatten, resolve
+from liqfade.config import config_layers, flatten, resolve
 from liqfade.config.models import Settings
 from liqfade.control.protocol import LatencyState, now_ms
 from liqfade.control.state import read_state
@@ -541,7 +541,14 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/config", dependencies=[Depends(require_session)])
     def config() -> dict[str, Any]:
-        """Read only for now. Phase 5 adds validated writes to config/overrides.yaml."""
+        """Read only for now. Phase 5 adds validated writes to config/overrides.yaml.
+
+        Both views are returned. `values` is the resolved config with the label of the
+        layer that won each key, which is what the page displays. `layers` is what each
+        layer set, in merge order, which is what a settings page needs before it offers to
+        change a number: the flattened resolution alone cannot say what a value is being
+        changed from or what removing an override would go back to.
+        """
         merged, sources = resolve(settings.env)
         flat = flatten(merged)
         return {
@@ -550,6 +557,15 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
             "live_trading_block_reason": settings.live_trading_block_reason(),
             "values": [
                 {"key": k, "value": flat[k], "source": sources.get(k)} for k in sorted(flat)
+            ],
+            "layers": [
+                {
+                    "name": layer.name,
+                    "path": layer.path,
+                    "exists": layer.exists,
+                    "values": layer.values,
+                }
+                for layer in config_layers(settings.env)
             ],
             "writable": False,
         }

@@ -188,7 +188,7 @@ class Recorder:
         self.poller = CoinalyzePoller(settings.venues.coinalyze, self.sink)
         self.universe = UniverseManager(
             settings.universe,
-            settings.venues.hyperliquid.api_url,
+            settings.venues.hyperliquid.info_base,
             on_change=self._apply_universe,
             on_rtt_ms=self.latency.add_rest,
         )

@@ -176,11 +176,11 @@ def load_signer(settings: Settings) -> Signer:
         env=env,
         account_address=address,
         agent_address=str(account.address),
-        base_url=settings.venues.hyperliquid.api_url,
+        base_url=settings.venues.hyperliquid.exchange_base,
     )
     return Signer(
         env=env,
         account_address=address,
-        base_url=settings.venues.hyperliquid.api_url,
+        base_url=settings.venues.hyperliquid.exchange_base,
         account=account,
     )

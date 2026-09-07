@@ -321,9 +321,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     settings = load_settings()
-    if "testnet" not in settings.venues.hyperliquid.api_url:
+    # The URL that signs, not the one that reads. A probe pointed at a testnet /info and
+    # a mainnet /exchange is the exact mistake the split exists to make visible.
+    if "testnet" not in settings.venues.hyperliquid.exchange_base:
         print(
-            f"refusing: api_url is {settings.venues.hyperliquid.api_url}, which is not "
+            f"refusing: exchange_base is {settings.venues.hyperliquid.exchange_base}, which is not "
             f"testnet. Set LIQFADE_ENV=testnet.",
             file=sys.stderr,
         )

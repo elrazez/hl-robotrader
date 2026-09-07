@@ -577,3 +577,30 @@ class TestReportPathTraversal:
 
         (tmp_path / "ok").mkdir()
         assert _run_dir(tmp_path, "ok").name == "ok"
+
+
+def test_config_endpoint_reports_the_layers_not_only_the_winner(client: TestClient) -> None:
+    """A settings page has to say what it is changing a number from, and back to what.
+
+    `flatten(resolve(...))` gives the winning value and the label of the layer that set
+    it, which cannot answer either question. The layers answer both: what each one set,
+    in merge order, so removing an override has a visible consequence.
+    """
+    client.post("/api/login", json={"password": PASSWORD})
+
+    body = client.get("/api/config").json()
+
+    assert [layer["name"] for layer in body["layers"]] == [
+        "default.yaml",
+        "paper.yaml",
+        "overrides.yaml",
+        "envvar",
+    ]
+    default = next(layer for layer in body["layers"] if layer["name"] == "default.yaml")
+    assert default["values"]["sizing.risk_frac"] == 0.005
+    assert default["exists"] is True
+    overrides = next(layer for layer in body["layers"] if layer["name"] == "overrides.yaml")
+    assert overrides["values"] == {}
+    # The resolved view stays, because that is what the rest of the page reads.
+    keys = {row["key"]: row for row in body["values"]}
+    assert keys["sizing.risk_frac"]["source"] == "default.yaml"

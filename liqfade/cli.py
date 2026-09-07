@@ -357,7 +357,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 return hl_candles.run(
                     client,
                     data_dir,
-                    settings.venues.hyperliquid.api_url,
+                    settings.venues.hyperliquid.info_base,
                     start,
                     end,
                     coins=coins or None,

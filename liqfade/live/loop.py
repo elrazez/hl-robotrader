@@ -232,7 +232,7 @@ class PaperLoop:
         self.streams: list[WSStream] = []
         self.universe = UniverseManager(
             settings.universe,
-            settings.venues.hyperliquid.api_url,
+            settings.venues.hyperliquid.info_base,
             on_change=self._apply_universe,
             on_rtt_ms=self.latency.add_rest,
         )

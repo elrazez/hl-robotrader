@@ -280,3 +280,68 @@ def test_an_explicit_env_argument_still_beats_liqfade_env(
     monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
     settings = load_settings("paper", environ={"LIQFADE_ENV": "testnet"})
     assert settings.env == "paper"
+
+
+def test_the_info_and_exchange_urls_default_to_the_one_api_url() -> None:
+    """Splitting them costs nothing while they are the same host, and buys the guard."""
+    from liqfade.config import load_settings
+
+    hl = load_settings("paper").venues.hyperliquid
+
+    assert hl.info_base == hl.api_url
+    assert hl.exchange_base == hl.api_url
+
+
+def test_the_exchange_url_can_be_pointed_apart_from_the_info_url() -> None:
+    """Reading is public and can come from anywhere. Signing must go where we meant.
+
+    They are one host today. They are two fields because the decision about where an
+    order is sent is not the same decision as where a price is read, and one of them
+    costs money when it is wrong.
+    """
+    from liqfade.config import resolve
+    from liqfade.config.models import Settings
+
+    merged, _ = resolve("paper")
+    merged["venues"]["hyperliquid"]["info_url"] = "https://a-node.example"
+
+    hl = Settings.model_validate(merged).venues.hyperliquid
+
+    assert hl.info_base == "https://a-node.example"
+    assert hl.exchange_base == hl.api_url
+
+
+def test_the_layers_are_reported_in_merge_order_with_what_each_one_set() -> None:
+    """The panel has to show what a layer said, not only which layer won.
+
+    `flatten(resolve(...))` gives the winning value and its source label. A settings page
+    that offers to change a number has to say what it is changing it from and what the
+    layer underneath will go back to saying if the override is removed.
+    """
+    from liqfade.config import config_layers
+
+    found = config_layers("paper")
+
+    assert [layer.name for layer in found] == [
+        "default.yaml",
+        "paper.yaml",
+        "overrides.yaml",
+        "envvar",
+    ]
+    assert found[0].exists is True
+    assert "risk.kill_deadline_s" in found[0].values
+    # A layer reports only what it sets, not the merged result.
+    assert "risk.kill_deadline_s" not in found[1].values
+
+
+def test_a_layer_that_is_not_there_is_reported_as_empty_not_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """overrides.yaml legitimately does not exist until the panel writes one."""
+    from liqfade.config import config_layers
+
+    monkeypatch.setenv("LIQFADE_SIZING__RISK_FRAC", "0.004")
+    layers = {layer.name: layer for layer in config_layers("paper")}
+
+    assert layers["overrides.yaml"].values == {}
+    assert layers["envvar"].values["sizing.risk_frac"] == 0.004

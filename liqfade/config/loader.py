@@ -19,6 +19,7 @@ top level `env` key.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +128,72 @@ def _env_layer(environ: dict[str, str]) -> dict[str, Any]:
             value = raw
         _set_dotted(layer, dotted, value)
     return layer
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigLayer:
+    """One source of configuration, and only what that source itself sets.
+
+    `values` is dotted-key to value for this layer alone, not the merged result, which is
+    what lets a reader say what the layer underneath an override will go back to saying.
+    `exists` is False for a file that is not there; `overrides.yaml` legitimately is not
+    until the panel writes one, and an empty layer is a different thing from a missing one.
+    """
+
+    name: str
+    path: str | None
+    exists: bool
+    values: dict[str, Any] = field(default_factory=dict)
+
+
+def config_layers(
+    env: str | None = None,
+    *,
+    extra_files: list[Path] | None = None,
+    environ: dict[str, str] | None = None,
+) -> list[ConfigLayer]:
+    """Every layer in merge order, later winning, with what each one sets.
+
+    The same list `resolve` folds, so the view a reader gets cannot disagree with the
+    config the process runs on: there is one definition of the order.
+    """
+    return _layers(env, extra_files, dict(os.environ if environ is None else environ))[1]
+
+
+def _layers(
+    env: str | None, extra_files: list[Path] | None, environ: dict[str, str]
+) -> tuple[str, list[ConfigLayer]]:
+    """The chosen environment and the layers to merge, in order."""
+    directory = config_dir()
+    default_path = directory / "default.yaml"
+    if not default_path.exists():
+        raise ConfigError(f"missing {default_path}")
+
+    default_tree = _read_yaml(default_path)
+    layers = [ConfigLayer("default.yaml", str(default_path), True, flatten(default_tree))]
+
+    chosen = env or environ.get("LIQFADE_ENV") or str(default_tree.get("env", "paper"))
+    env_path = directory / f"{chosen}.yaml"
+    if not env_path.exists():
+        raise ConfigError(f"unknown environment {chosen!r}: no {env_path}")
+    layers.append(ConfigLayer(env_path.name, str(env_path), True, flatten(_read_yaml(env_path))))
+
+    for extra in extra_files or []:
+        if not extra.exists():
+            raise ConfigError(f"missing config file {extra}")
+        layers.append(ConfigLayer(extra.name, str(extra), True, flatten(_read_yaml(extra))))
+
+    overrides_path = directory / "overrides.yaml"
+    layers.append(
+        ConfigLayer(
+            "overrides.yaml",
+            str(overrides_path),
+            overrides_path.exists(),
+            flatten(_read_yaml(overrides_path)),
+        )
+    )
+    layers.append(ConfigLayer("envvar", None, True, flatten(_env_layer(environ))))
+    return chosen, layers
 
 
 def resolve(

@@ -42,7 +42,9 @@ class Universe(Base):
 
 class HyperliquidVenue(Base):
     enabled: bool
-    api_url: str = Field(..., description="url: POST /info and /exchange base")
+    api_url: str = Field(..., description="url: base for /info and /exchange unless split")
+    info_url: str = Field("", description="url: /info base; empty means api_url")
+    exchange_url: str = Field("", description="url: /exchange base; empty means api_url")
     ws_url: str = Field(..., description="url: websocket endpoint")
     ws_ping_s: Pos = Field(..., description="seconds between ping frames")
     ws_lifetime_s: Pos = Field(
@@ -53,6 +55,21 @@ class HyperliquidVenue(Base):
     )
     liq_weight: NonNeg = Field(..., description="weight in aggregated liquidation notional")
     complete: bool = Field(..., description="true when the venue publishes every liquidation")
+
+    @property
+    def info_base(self) -> str:
+        """Where `/info` is read from. Public, keyless, and safe to point elsewhere."""
+        return self.info_url or self.api_url
+
+    @property
+    def exchange_base(self) -> str:
+        """Where a signed `/exchange` action goes.
+
+        Separate from `info_base` because deciding where an order is sent is not the same
+        decision as deciding where a price is read, and only one of them costs money when
+        it is wrong. They are the same host today, which is why both default to `api_url`.
+        """
+        return self.exchange_url or self.api_url
 
     @property
     def ws_rotate_after_s(self) -> float:
