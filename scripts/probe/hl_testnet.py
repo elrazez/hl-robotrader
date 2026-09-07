@@ -313,6 +313,169 @@ def probe_user_fees(signer: Signer, args: argparse.Namespace) -> None:
     )
 
 
+# --- probe 7: modify against cancel-and-replace ----------------------------------
+
+
+def probe_modify(signer: Signer, args: argparse.Namespace) -> None:
+    """Reprice a resting order by cloid and find out what `modify` costs and returns.
+
+    The entry policy in docs/STRATEGY_AND_RISK.md prefers modify over cancel-and-replace,
+    and that preference is only worth honouring if modify is actually one action, keeps
+    the cloid addressable, and does not resurrect a filled order. So: place, modify twice,
+    read openOrders between each, then modify one that is already cancelled. What comes
+    back decides whether `OrderManager` reprices with one call or two.
+    """
+    exchange = signer.exchange()
+    mid = mid_price(signer.base_url, args.coin)
+    px = hl_price(signer.base_url, args.coin, mid * FAR_FROM_MARKET)
+    size = hl_size(signer.base_url, args.coin, QUIET_SIZE_USD, px)
+    cloid = new_cloid()
+
+    show("plan", {"coin": args.coin, "mid": mid, "px": px, "size": size, "cloid": cloid.to_raw()})
+    placed = exchange.order(args.coin, True, size, px, {"limit": {"tif": "Gtc"}}, cloid=cloid)
+    show("order", placed)
+    show("openOrders after place", _open_orders(signer))
+
+    # Modify addressed by cloid, with the same cloid on the replacement: the question is
+    # whether the venue keeps one identity across a reprice, which is what the registry
+    # assumes when it tracks an entry through its TTL.
+    better = hl_price(signer.base_url, args.coin, px * 1.01)
+    started = time.perf_counter()
+    show(
+        "modify by cloid, same cloid back",
+        exchange.modify_order(
+            cloid, args.coin, True, size, better, {"limit": {"tif": "Gtc"}}, cloid=cloid
+        ),
+    )
+    show("modify_ms", round((time.perf_counter() - started) * 1000.0, 1))
+    show("openOrders after modify", _open_orders(signer))
+
+    # And by oid, which is what the response to the original order carries.
+    oid = _resting_oid(placed)
+    if oid is not None:
+        better2 = hl_price(signer.base_url, args.coin, px * 1.02)
+        show(
+            "modify by oid",
+            exchange.modify_order(
+                oid, args.coin, True, size, better2, {"limit": {"tif": "Gtc"}}, cloid=cloid
+            ),
+        )
+        show("openOrders after modify by oid", _open_orders(signer))
+
+    show("cancel", exchange.cancel_by_cloid(args.coin, cloid))
+    show(
+        "modify after cancel (expect a refusal, and the exact words matter)",
+        _try(
+            lambda: exchange.modify_order(
+                cloid, args.coin, True, size, px, {"limit": {"tif": "Gtc"}}, cloid=cloid
+            )
+        ),
+    )
+
+
+def _resting_oid(response: Any) -> int | None:
+    """The oid out of an order response, or None when it did not rest."""
+    try:
+        statuses = response["response"]["data"]["statuses"]
+    except (KeyError, TypeError):
+        return None
+    for status in statuses:
+        if isinstance(status, dict) and "resting" in status:
+            return int(status["resting"]["oid"])
+    return None
+
+
+def _try(call: Callable[[], Any]) -> Any:
+    """Run it and return whatever came back, exception included. A refusal is the answer."""
+    try:
+        return call()
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _open_orders(signer: Signer) -> Any:
+    return info_post(signer.base_url, {"type": "openOrders", "user": signer.account_address})
+
+
+# --- probe 8: reduce-only ---------------------------------------------------------
+
+
+def probe_reduce_only(signer: Signer, args: argparse.Namespace) -> None:
+    """Reduce-only with no position, then with one. The refusal string is the answer.
+
+    Every exit the bot places is reduce-only, so the case that matters is the one where
+    the position is already gone: the venue's refusal has to be recognisable, because
+    treating it as a transport error would have the order manager retry an exit for a
+    position that no longer exists.
+    """
+    exchange = signer.exchange()
+    mid = mid_price(signer.base_url, args.coin)
+    size = hl_size(signer.base_url, args.coin, max(QUIET_SIZE_USD, args.notional), mid)
+    far = hl_price(signer.base_url, args.coin, mid * (2.0 - FAR_FROM_MARKET))
+
+    show("positions before", _positions(signer))
+    show(
+        "reduce_only sell with no position",
+        _try(
+            lambda: exchange.order(
+                args.coin, False, size, far, {"limit": {"tif": "Gtc"}}, True, new_cloid()
+            )
+        ),
+    )
+
+    show("open a long to reduce", exchange.market_open(args.coin, True, size, None, 0.01))
+    show("positions after entry", _positions(signer))
+    cloid = new_cloid()
+    show(
+        "reduce_only sell against the position",
+        exchange.order(args.coin, False, size, far, {"limit": {"tif": "Gtc"}}, True, cloid),
+    )
+    show("openOrders", _open_orders(signer))
+    show("cancel the resting exit", exchange.cancel_by_cloid(args.coin, cloid))
+    show("close the position", exchange.market_close(args.coin))
+    show("positions after close", _positions(signer))
+
+
+def _positions(signer: Signer) -> Any:
+    state = info_post(
+        signer.base_url, {"type": "clearinghouseState", "user": signer.account_address}
+    )
+    return [p["position"] for p in state.get("assetPositions", [])]
+
+
+# --- probe 9: the shapes reconciliation reads ------------------------------------
+
+
+def probe_state_shape(signer: Signer, args: argparse.Namespace) -> None:
+    """Raw clearinghouseState, openOrders, frontendOpenOrders and userFills.
+
+    `execution/reconcile.py` compares the registry against these four payloads every sixty
+    seconds and on every reconnect. Their exact keys are what `parse_clearinghouse_state`,
+    `parse_open_orders` and `parse_user_fills` are written against, and until this has run
+    those parsers are written against a doc rather than against the venue.
+    """
+    address = signer.account_address
+    for name in ("clearinghouseState", "openOrders", "frontendOpenOrders"):
+        show(name, info_post(signer.base_url, {"type": name, "user": address}))
+    show(
+        "userFills",
+        info_post(signer.base_url, {"type": "userFills", "user": address})[: args.count],
+    )
+    from liqfade.execution.hl import parse_clearinghouse_state, parse_open_orders
+
+    show(
+        "what our parsers make of it",
+        {
+            "account": parse_clearinghouse_state(
+                info_post(signer.base_url, {"type": "clearinghouseState", "user": address})
+            ),
+            "open_orders": parse_open_orders(
+                info_post(signer.base_url, {"type": "openOrders", "user": address})
+            ),
+        },
+    )
+
+
 PROBES: dict[str, Callable[[Signer, argparse.Namespace], None]] = {
     "gtc_cancel": probe_gtc_cancel,
     "alo_cross": probe_alo_cross,
@@ -320,6 +483,9 @@ PROBES: dict[str, Callable[[Signer, argparse.Namespace], None]] = {
     "latency": probe_latency,
     "schedule_cancel": probe_schedule_cancel,
     "user_fees": probe_user_fees,
+    "modify": probe_modify,
+    "reduce_only": probe_reduce_only,
+    "state_shape": probe_state_shape,
 }
 
 
