@@ -61,10 +61,16 @@ here: they configure processes the lab does not run.
 
 `ctrl+s` saves, `escape` leaves the file alone.
 
-**An empty box means the key is not in the file**, so it keeps the default. A null override
-is spelled `null`, which is what `cascade.liq_z_min: null` needs. The writer emits only the
-keys whose value differs from the resolved default, each with the model's description above
-it, plus the name and notes header, so a saved file reads like the two written by hand.
+**An empty box means the key is not in the file**, so it keeps the default, and clearing a
+box is how a key is removed. A null override is spelled `null` and is shown as `null`, which
+is what `cascade.liq_z_min: null` needs: null is a value the file states, not the absence of
+one.
+
+The writer emits every key the file already had, plus any whose value now differs from the
+resolved default, each with the model's description above it and the name and notes header
+on top, so a saved file reads like the two written by hand. A key that matches the default
+is kept when the file already carried it: the file records what the owner chose, and is not
+a diff against whatever `config/default.yaml` says next month.
 
 ## Run
 

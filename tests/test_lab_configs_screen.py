@@ -94,3 +94,36 @@ async def test_delete_asks_twice_and_the_first_no_keeps_the_file(lab_dir: Path) 
         await pilot.press("y")
         await pilot.pause()
         assert not (lab_dir / "tight.yaml").exists()
+
+
+async def test_opening_the_real_v1_config_and_saving_it_changes_nothing(tmp_path: Path) -> None:
+    """The round trip that has to hold for every config the owner actually runs.
+
+    `v1_confluence.yaml` carries two deliberate nulls: `cascade.liq_z_min`, which is how it
+    says the z trigger is not applied at all, and `strategy.rules.oi_flush.build_min_frac`,
+    which switches off the build half of the flush. The form showed a null as an empty box
+    and read an empty box back as "not in this layer", so opening the file and pressing save
+    without touching anything deleted both, turned the z trigger back on, and changed which
+    cascades the next run would take.
+
+    Sixteen keys were lost, not two. Everything whose value happened to equal the resolved
+    default went with them: `cascade.trigger: exact`, `intent.k_target: 0.8`,
+    `backtest.latency_ms: 1000` and the rest. Those merge to the same run today and say
+    nothing about what the owner chose, which is what a config file is for.
+    """
+    source = Path("config/backtest/v1_confluence.yaml")
+    before = read_config(source)
+    assert before.overrides["cascade.liq_z_min"] is None, "the fixture must carry a null"
+    assert before.overrides["strategy.rules.oi_flush.build_min_frac"] is None
+
+    target = tmp_path / "v1_confluence.yaml"
+    target.write_text(source.read_text())
+    app = LabApp(config_dir=tmp_path, reports_dir=tmp_path / "reports")
+    async with app.run_test() as pilot:
+        await pilot.press("e")
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+    after = read_config(target)
+    assert after.overrides == before.overrides
+    assert after.overrides["cascade.liq_z_min"] is None, "the z trigger came back on"
