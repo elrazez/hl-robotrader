@@ -693,3 +693,16 @@ def test_lab_without_textual_says_how_to_install_it(
     monkeypatch.setattr(builtins, "__import__", refuse)
     assert main(["lab"]) == 1
     assert "uv sync --extra lab" in capsys.readouterr().err
+
+
+def test_paper_refuses_a_trigger_no_live_feed_carries(capsys: pytest.CaptureFixture[str]) -> None:
+    """`exact` reads S3 liquidations that arrive a day late. Paper says so and stops."""
+    assert main(["paper", "--env", "paper"]) == 1
+    error = capsys.readouterr().err
+    assert "cascade.trigger 'exact'" in error
+    assert "LIQFADE_CASCADE__TRIGGER=crossvenue" in error
+
+
+def test_paper_refuses_mainnet(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["paper", "--env", "mainnet"]) == 1
+    assert "refuses --env mainnet" in capsys.readouterr().err

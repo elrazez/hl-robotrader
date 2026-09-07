@@ -1846,3 +1846,231 @@ the golden report bytes.
 lab at `config/` instead of `config/backtest/` cannot reach `config/mainnet.yaml`. The
 Status tab reads `data/state.json` and never opens the control socket, so the workbench can
 watch the box and not touch it.
+## 2026-09-06 (05a: Phase 5 plumbing gap audit)
+
+Phase 5 is blocked on a trigger the live bot can see, which blocks the seven day
+acceptance run and the paper-versus-backtest comparison in the DoD. It does not block the
+plumbing underneath: the order manager, reconciliation, the kill switch, the watchdog, the
+Telegram command bot and the paper loop are the same code whichever trigger eventually
+feeds them, exactly as the 2026-09-06 Phase 4 override argued for the engine. This branch
+builds and drills that plumbing. It does not start the seven day clock and it does not
+touch the mainnet gates: `live_trading_enabled` still needs `LIQFADE_ENV=mainnet`,
+`LIQFADE_LIVE_TRADING=1` and no `data/KILL`.
+
+**What already exists**, from Phase 0 and Phase 1:
+
+| Area | State | What is there |
+| --- | --- | --- |
+| `control/protocol.py` | done | Typed command set, `StateSnapshot`, `OrderState`, `RiskState`, `LatencyState`. No `inject_intent` command yet. |
+| `control/server.py` | done | Unix socket, created 0600 under a narrowed umask, one process per socket enforced by `flock`. |
+| `control/client.py`, `control/state.py` | done | Client and the atomic 0600 `state.json` writer on a 1s interval. |
+| `control/backend.py` | done as a seam | `ControlBackend` protocol, `NoopBackend`, `write_kill_file`, `kill_not_persisted`. No trading backend implements it. |
+| `recorder/backend.py` | done | The one real `ControlBackend`, and the model the paper backend follows. Refuses `pause`/`resume`/`flat`, honours `kill`. |
+| `alerts/telegram.py` | half | Outbound `send_alert` only: one POST, ten minute dedupe, never raises. |
+| `execution/rounding.py` | done | Price and size rounding, the only place it happens. |
+| `backtest/fills.py` | done | The maker, taker, stale book and gapped stop model paper mode reuses unchanged. |
+| `strategy/`, `sizing/`, `risk/` | done | Phase 4. `RiskEngine` already takes its kill check as an argument. |
+| `scripts/deploy.sh` | done | Already deploys any ref through `LIQFADE_BRANCH`, so no new variable is needed to put a branch on the box. `liqfade-live` and `liqfade-watchdog` are in `NEVER_ENABLE`. |
+| `scripts/systemd/` | 3 of 5 | Recorder, panel and live units are hardened and installed. The live unit's `ExecStartPre` refuses to start while `data/KILL` exists. |
+
+**What is a stub:**
+
+- `liqfade/live/__init__.py` and `liqfade/execution/__init__.py` are docstrings that say
+  "empty until Phase 5". Nothing else in either package.
+- `cli.py`'s `paper`, `testnet` and `live` subcommands are `cmd_not_yet`.
+- `scripts/systemd/liqfade-watchdog.service` runs `python -m liqfade.execution.watchdog`,
+  a module that does not exist. This is why `NEVER_ENABLE` lists it: enabling it today
+  would crash loop every three seconds.
+- `alerts/telegram.py`'s docstring points at a command bot in "its own module". There is
+  no such module.
+
+**What is missing outright:** `execution/signer.py` (the only module that may read the
+agent key), the Hyperliquid REST and user-stream client, the order manager state machine
+and its `data/orders.sqlite` persistence, the cloid registry, reconciliation against
+`clearinghouseState` and `openOrders`, the kill switch path with its own tests, the
+watchdog, the inbound Telegram command bot with the chat id allowlist, the paper loop
+itself, and a `liqfade-paper` unit.
+
+**The six testnet probes from `docs/HYPERLIQUID.md`, by status.** None of the six has been
+run. `scripts/probe/` holds two scripts and neither is one of them: `hl_meta.py` reads
+`metaAndAssetCtxs` over public REST, and `ws_payloads.py` captures public WebSocket
+payload shapes. Both are keyless and read only.
+
+| # | Probe | Status | Needs |
+| --- | --- | --- | --- |
+| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | not run | testnet agent key |
+| 2 | `Alo` that would cross, confirm the rejection string | not run | testnet agent key |
+| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | not run | testnet agent key, faucet USDC |
+| 4 | 50 submit-to-ack latencies at a quiet and a busy time | not run | testnet agent key |
+| 5 | `scheduleCancel` availability and its exact error when gated | not run | testnet agent key |
+| 6 | `userFees` payload shape and current rates | not run | testnet account address only, no signing |
+
+`/srv/liqfade/.env` on the box has `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALERT_CHAT_ID` and
+`TELEGRAM_ALLOWED_CHAT_IDS` filled, and both `HL_TESTNET_ACCOUNT_ADDRESS` and
+`HL_TESTNET_AGENT_PRIVATE_KEY` empty, checked by name and length without reading a value.
+So probes 1 to 5 are blocked on Phase 0 item 4, which only the owner can do, and probe 6
+is blocked with them because it wants a real account's fee tier rather than a stranger's.
+The probe scripts are written on this branch anyway and land unrun; their answers get
+encoded in `docs/HYPERLIQUID.md` the day the key exists, and until then that file's
+"researched against docs" caveat stands.
+
+**What this branch will therefore not deliver:** the testnet half of the kill drill (the
+file and Telegram paths are drilled in paper mode instead, which exercises the same
+`ControlBackend.kill`), any testnet order round trip, and the seven day acceptance run.
+Those stay open against Phase 5's DoD.
+
+Reverse this entry if the trigger question resolves before the plumbing lands, in which
+case Phase 5 proceeds as written rather than as two halves.
+
+## 2026-09-06 (05a: the paper loop, the drills and what is still owed)
+
+The plumbing Phase 5 needs is built and drilled. Phase 5 itself stays blocked: the seven
+day acceptance run needs a trigger the live bot can see, which is Q4 at sixty recorder
+days on 2026-11-04, and the testnet half of everything below needs Phase 0 item 4.
+
+**Paper mode is the backtest engine on a live clock, not a second implementation.**
+`live/paper.py` imports `backtest/engine.py`'s tick functions rather than reimplementing
+entries, exits and the fill model against a live feed. They are private to that module and
+are imported anyway: the DoD asks whether paper lands in a plausible band of the backtest
+for the same days, and that question is meaningless if the two are different code. A
+drifted twin is a worse thing to own than a private import. If those functions need to
+change shape they change once.
+
+**The live feature engine recomputes the same definitions incrementally**, because the
+z-score wants a 24h lookback and rebuilding an 86,400 row grid per coin per second costs
+more than the strategy it feeds. `tests/test_live_features.py` sends one synthetic tape
+through both pipelines and compares every field the enabled config path reads. That test
+is the contract, and it caught two things that reading the code did not:
+
+- A quote wins over a fresher print however stale it is, because `build_grid` coalesces
+  two backward asof joins in that order.
+- The first minute sample of a coin's life contributes **no** deviation. Its own rolling
+  median is undefined, polars carries a null, and the rolling mean behind the fallback
+  scale skips it rather than counting it. Appending a zero divided by one too many and
+  inflated every z-score by a third, which would have made the cross-venue trigger fire
+  about a third too easily on a fresh process.
+
+**What the live engine will not compute, it refuses.** Open interest deltas, VWAP
+displacement, the mark-to-mid percentile, the proxy and the levels are `None`; every rule
+that reads one ships disabled, and `LiveFeatureEngine.unsupported()` makes the constructor
+raise on a config that turns one on. A rule reading `None` either vetoes every intent or
+passes every one, and both look like the strategy working. `cascade.trigger: exact` is
+refused the same way: those liquidations arrive through a next-day S3 pull, so a live loop
+on that trigger runs with the intensity columns empty forever and looks healthy doing it.
+
+**The trigger is set by the unit, not by `config/paper.yaml`.** That file is also the base
+for `liqfade backtest`, whose ceiling runs are taken on `exact`; the first attempt pinned
+`crossvenue` there and moved every research number, which eight engine tests caught.
+`liqfade-paper.service` carries `LIQFADE_CASCADE__TRIGGER=crossvenue` and the CLI refuses
+an unsupported trigger up front, naming the fix.
+
+**Deploying a branch without rolling back another one.** The box runs the recorder from
+`/srv/liqfade/app` on `01c-recorder`, five commits ahead of main with the WebSocket
+rotation fixes it is currently exercising live. Deploying this branch there would have
+handed the recorder pre-fix code: nothing restarts it today, and everything picks it up at
+the next reboot. `LIQFADE_APP_DIR` puts a checkout elsewhere; an isolated deploy must name
+its units in `LIQFADE_UNITS`, installs only those, and rewrites their `/srv/liqfade/app`
+paths to its own directory. 05a-paper runs from `/srv/liqfade/paper`, and the deploy
+printed `skipped liqfade-recorder.service`.
+
+### The drills
+
+Local, against live Hyperliquid feeds, 2026-09-06:
+
+| Drill | Result |
+| --- | --- |
+| Inject, size, gate, rest, fill | SOL long filled as maker against a real print, reduce-only target rested at the target price |
+| `/kill` over the control socket | **1.8 ms**: 1 order cancelled, 1 position closed, flag written |
+| `data/KILL` file appears | **0.695 s** to `kill_fired`, one second of which is the watcher's poll interval; the work itself took 7 ms |
+| Watchdog, loop process killed | one alert 6.0 s later at a 5 s threshold and a 2 s poll, silent before it |
+
+On the VPS, 2026-09-06, paper running from `/srv/liqfade/paper`:
+
+| Drill | Result |
+| --- | --- |
+| Watchdog, `systemctl stop` for 22 s | alert at 11.6 s stale, Telegram accepted it, recovery posted 0.8 s after restart |
+| Watchdog, `SIGKILL` the loop | systemd restarted it inside 20 s (NRestarts 1) and the watchdog correctly stayed quiet: the heartbeat never went stale |
+| `/kill` over the control socket | **778.7 ms** including the Telegram confirmation from Tokyo: 1 order cancelled, 1 position closed |
+| The flag against `Restart=always` | the unit failed its `ExecStartPre` 9 times in a row and never started. A kill survives systemd |
+| `data/KILL` file appears | flag written 20:54:23, kill sequence at 20:54:24.6, confirmation posted by 20:54:25.3 |
+
+Every one of these is well inside CLAUDE.md rule 5's five seconds.
+
+**A real unit bug the box found.** `Environment=LIQFADE_WATCH_LABEL=paper loop` is
+rejected by systemd with "Invalid environment assignment, ignoring: loop", and the unit
+starts anyway, so the label silently fell back to its default and every alert would have
+named the wrong process. Quoted now, and a test walks every `Environment=` line in every
+unit and requires quotes around any value with a space.
+
+**A finding left as a recommendation, not a change.** After a kill the unit retries every
+three seconds forever; each attempt is one `/usr/bin/test`, so it is cheap, but the
+journal fills. `StartLimitBurst` with `StartLimitIntervalSec` would let it give up into
+`failed` instead. Restart policy on the trading loop is the owner's call, so it is written
+down rather than changed.
+
+### What 05a does not deliver
+
+- **The six testnet probes are written and unrun.** `scripts/probe/hl_testnet.py` holds
+  all six as subcommands and refuses any URL without "testnet" in it. Both
+  `HL_TESTNET_*` variables are empty in the box `.env`, checked by name and length, so
+  every row of the table in `docs/HYPERLIQUID.md` still says "not run". Phase 0 item 4.
+- **No testnet order has ever been placed**, so the TP/SL grouping, the reject strings,
+  the submit-to-ack distribution and the reconciliation of a real `clearinghouseState`
+  are all unmeasured. `execution/hl.py`'s parsers are tested against the shapes the docs
+  describe, which is not the same as against the venue.
+- **The position half of reconciliation is not exercised.** Paper has no venue account, so
+  `venue_positions` has no second source; the order half runs every 60 s and compares the
+  sqlite registry against the engine's working orders, which is what catches the mirror
+  drifting.
+- **The watchdog does not cancel.** `docs/STRATEGY_AND_RISK.md` wants a stale heartbeat to
+  cancel every resting order, which needs the agent key and a second process able to sign.
+  The `scheduleCancel` probe decides whether that half belongs at the venue or here.
+- **`reload_config` is refused by the paper backend.** Reloading mid-session would swap
+  the windows the feature engine's buffers were filled under, and a half-reloaded engine
+  is worse than one that says no.
+- **The seven day acceptance run has not started** and must not be read as started. What
+  runs now is a plumbing soak.
+
+Reverse the paper-imports-engine decision if `backtest/engine.py`'s tick functions ever
+need a live-only branch inside them, which is the moment CLAUDE.md's rule about live-only
+branches in shared code would start being broken rather than honoured.
+
+## 2026-09-06 (05a: what deploying it found, and the soak that is now running)
+
+Three defects surfaced only once the code was on the box, which is the argument for
+drilling rather than declaring done.
+
+**A kill flag we did not write is still a kill.** The file-path drill created
+`/srv/liqfade/data/KILL` as root over ssh; the service user could not overwrite it, so
+`write_kill_file` returned False and the kill reported "NOT written, a restart will not
+stay killed" about a file sitting right there. The owner would have been told the opposite
+of the truth in the one moment the message has to be trusted. Presence is what matters, not
+authorship, so a failed write now re-checks. Present means a regular file we can actually
+see: the bias is the opposite of `Settings.kill_switch_present` on purpose, because that
+gate asks whether the kill is on (unknown means yes) and this asks whether the flag
+survived (unknown means no).
+
+**An OKX liquidation with no notional raised on every one of them.** The feature engine had
+already been taught that such a row is not a liquidation of zero; the order book path had
+not, because the edit was written against a line ruff had already wrapped and nothing
+asserted the pattern matched. It passed every test and the box logged
+`paper_ingest_failed` every few minutes. Both paths drop the row now and both have a test.
+The lesson is narrower than it looks: an edit applied by pattern needs an assertion that
+the pattern was found, or it is a silent no-op.
+
+**systemd starts a unit whose `Environment=` line it could not parse.** Covered in the
+entry above; it is listed again here because all three share a shape. Each passed locally,
+each was caught by putting the thing on the machine it runs on, and none would have been
+found by another test at the same seam.
+
+**The soak.** `liqfade-paper` and `liqfade-watchdog` run from `/srv/liqfade/paper` on
+05a-paper at `2a71440`, started **2026-09-06 21:10 UTC**, so twenty four hours lands on
+**2026-09-07 21:10 UTC**. At the start: 20 coins, Hyperliquid trades, bbo, l2 and
+`asset_ctx` all flowing, Bybit and OKX liquidations arriving, Binance off by the box's own
+env override, reconciliation clean on its 60s interval, watchdog silent, 86 MB resident
+against 3 GB free. The recorder's own unit was untouched throughout and its process has run
+continuously since 20:34 UTC on its own branch.
+
+This is a plumbing soak and not the Phase 5 acceptance run. Read it for reconnects,
+reconciliation differences, memory and whether cross-venue cascades produce intents at all;
+do not read it as seven days of paper trading.

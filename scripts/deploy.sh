@@ -16,12 +16,22 @@ BRANCH="${LIQFADE_BRANCH:-main}"
 # phase would otherwise crash loop every RestartSec seconds from the first deploy on.
 UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"
 # Never enabled here whatever UNITS says. Starting the trading loop is a decision the owner
-# makes on the box, not a side effect of deploying a branch, and the watchdog has no module
-# behind it until Phase 5.
-NEVER_ENABLE="liqfade-live liqfade-watchdog"
+# makes on the box, not a side effect of deploying a branch. liqfade-paper and
+# liqfade-watchdog are absent from this list on purpose: paper places no real order,
+# the watchdog only reads two files and posts, and both are what Phase 5 drills, so
+# either can be deployed by naming it in LIQFADE_UNITS. Neither is in the default set.
+NEVER_ENABLE="liqfade-live"
 SERVICE_USER="liqfade"
 APP_ROOT="/srv/liqfade"
-APP_DIR="$APP_ROOT/app"
+# Where this deploy's checkout lives. The default is the one checkout everything has used
+# so far; LIQFADE_APP_DIR puts a branch somewhere else entirely, which is how two branches
+# run on one box without one quietly rolling back the other's code. When it is set, this
+# deploy installs ONLY the units named in LIQFADE_UNITS and rewrites their paths to point
+# at this directory, so it cannot touch a unit another checkout owns.
+APP_DIR="${LIQFADE_APP_DIR:-$APP_ROOT/app}"
+DEFAULT_APP_DIR="$APP_ROOT/app"
+ISOLATED=0
+if [ "$APP_DIR" != "$DEFAULT_APP_DIR" ]; then ISOLATED=1; fi
 UNIT_DIR="/etc/systemd/system"
 UV="/home/$SERVICE_USER/.local/bin/uv"
 
@@ -33,6 +43,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 if [ ! -x "$UV" ]; then
   echo "uv not found at $UV. Run scripts/vps_bootstrap.sh first." >&2
+  exit 1
+fi
+if [ "$ISOLATED" -eq 1 ] && [ -z "${LIQFADE_UNITS:-}" ]; then
+  echo "LIQFADE_APP_DIR needs LIQFADE_UNITS: name the units this checkout owns." >&2
   exit 1
 fi
 if [ ! -f "$APP_ROOT/.env" ]; then
@@ -76,12 +90,29 @@ runnable() {
 }
 
 log "units"
+if [ "$ISOLATED" -eq 1 ]; then
+  echo "  isolated deploy from $APP_DIR: only $UNITS, paths rewritten"
+fi
 changed=()
+staged="$(mktemp -d)"
+trap 'rm -rf "$staged"' EXIT
 for src in "$APP_DIR"/scripts/systemd/*.service; do
   name="$(basename "$src")"
   dest="$UNIT_DIR/$name"
-  if ! cmp -s "$src" "$dest"; then
-    install -m 0644 "$src" "$dest"
+  # An isolated deploy installs nothing it was not asked for. Installing every unit from
+  # this checkout would hand another checkout's services this branch's ExecStart, which
+  # nothing restarts today and everything picks up at the next reboot.
+  if [ "$ISOLATED" -eq 1 ] && ! runnable "$name"; then
+    echo "  skipped $name (not in LIQFADE_UNITS)"
+    continue
+  fi
+  candidate="$src"
+  if [ "$ISOLATED" -eq 1 ]; then
+    candidate="$staged/$name"
+    sed "s|$DEFAULT_APP_DIR|$APP_DIR|g" "$src" > "$candidate"
+  fi
+  if ! cmp -s "$candidate" "$dest"; then
+    install -m 0644 "$candidate" "$dest"
     changed+=("$name")
     echo "  updated $name"
   else
@@ -109,7 +140,8 @@ echo "  left disabled, by design: $NEVER_ENABLE"
 
 log "status"
 systemctl --no-pager --lines=0 status \
-  liqfade-recorder liqfade-live liqfade-watchdog liqfade-panel 2>&1 | grep -E 'liqfade|Active' || true
+  liqfade-recorder liqfade-paper liqfade-live liqfade-watchdog liqfade-panel 2>&1 \
+  | grep -E 'liqfade|Active' || true
 
 cat <<'NOTE'
 

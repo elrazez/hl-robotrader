@@ -1,6 +1,12 @@
 # Paper: real feeds, simulated fills, no keys required. This is the default environment.
 env: paper
 
+# cascade.trigger is deliberately NOT set here. This file is the base for `liqfade
+# backtest` too, and the backtest's ceiling runs are taken on `exact`; pinning the live
+# trigger here would silently change every research number. The paper loop refuses
+# `exact` and `proxy` outright and the unit sets LIQFADE_CASCADE__TRIGGER=crossvenue, so
+# the live trigger is a visible choice in one place rather than a default nobody reads.
+
 execution:
   # Paper never talks to /exchange, but the fill simulator uses the same latency and
   # cost model as the backtester so paper and backtest numbers are comparable.

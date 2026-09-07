@@ -34,7 +34,7 @@ from liqfade.recorder.backend import LatencyTracker, RecorderBackend
 from liqfade.recorder.buffer import Buffers
 from liqfade.recorder.health import Health
 from liqfade.recorder.streams import binance, bybit, hl, okx
-from liqfade.recorder.streams.base import WSStream, backoff_delay
+from liqfade.recorder.streams.base import RowSink, WSStream, backoff_delay
 from liqfade.recorder.streams.coinalyze import CoinalyzePoller
 from liqfade.recorder.universe import UniverseManager
 from liqfade.recorder.writer import compact_day, quarantine_rows, write_rows
@@ -51,6 +51,112 @@ def _seconds_until_utc_hour(hour: int, now: datetime | None = None) -> float:
     if target <= now:
         target += timedelta(days=1)
     return (target - now).total_seconds()
+
+
+def build_streams(
+    settings: Settings,
+    sink: RowSink,
+    *,
+    on_rtt_ms: Callable[[float], None] | None = None,
+) -> list[WSStream]:
+    """Every enabled venue stream, pointed at one sink.
+
+    Module level rather than a method, because the paper loop needs the same feeds with a
+    different sink: it turns rows into features and a book instead of into Parquet. One
+    definition of which venues, which frames and which parser, for both.
+    """
+    venues = settings.venues
+    cfg = settings.recorder
+    streams: list[WSStream] = []
+
+    if venues.hyperliquid.enabled:
+        streams.append(
+            WSStream(
+                hl.VENUE,
+                venues.hyperliquid.ws_url,
+                parse=hl.make_parser(),
+                sink=sink,
+                cfg=cfg,
+                tables=hl.TABLES,
+                on_connect=hl.on_connect,
+                on_universe_change=hl.on_universe_change,
+                ping_s=venues.hyperliquid.ws_ping_s,
+                ping_frame=hl.PING_FRAME,
+                pong_marker=hl.PONG_MARKER,
+                on_rtt_ms=on_rtt_ms,
+                # Only Hyperliquid expires a socket on a clock. The other three close
+                # on an error or not at all, and reconnect from the ladder in `run`.
+                rotate_after_s=venues.hyperliquid.ws_rotate_after_s,
+            )
+        )
+    if venues.binance.enabled:
+        streams.append(
+            WSStream(
+                binance.VENUE,
+                venues.binance.ws_url,
+                parse=binance.make_parser(venues.binance.complete),
+                sink=sink,
+                cfg=cfg,
+                tables=binance.TABLES,
+                on_connect=binance.on_connect,
+            )
+        )
+    if venues.bybit.enabled:
+        on_connect, on_change = bybit.make_frames(venues.bybit.subscribe_batch)
+        streams.append(
+            WSStream(
+                bybit.VENUE,
+                venues.bybit.ws_url,
+                parse=bybit.make_parser(venues.bybit.complete),
+                sink=sink,
+                cfg=cfg,
+                tables=bybit.TABLES,
+                on_connect=on_connect,
+                on_universe_change=on_change,
+                ping_s=bybit.PING_S,
+                ping_frame=bybit.PING_FRAME,
+            )
+        )
+    if venues.okx.enabled:
+        streams.append(
+            WSStream(
+                okx.VENUE,
+                venues.okx.ws_url,
+                parse=okx.make_parser(venues.okx.complete),
+                sink=sink,
+                cfg=cfg,
+                tables=okx.TABLES,
+                on_connect=okx.on_connect,
+                ping_s=okx.PING_S,
+                ping_frame=okx.PING_FRAME,
+            )
+        )
+    return streams
+
+
+async def apply_universe(streams: Sequence[WSStream], coins: Sequence[str]) -> bool:
+    """Point every stream at the new universe. True only when all of them took it.
+
+    Each stream is applied under its own try/except, so a `ConnectionClosed` in the middle
+    of one venue's subscribe frames no longer stops the venues after it. The caller keeps
+    the old universe on a False, which is what makes the next refresh retry rather than see
+    `coins == self.coins` and report no change; that is how a venue used to under-record a
+    coin permanently behind one warning line.
+
+    Module level, shared with the paper loop, because the two copies of this differed only
+    in an argument order that got `to_venue_symbol` backwards and cost a smoke run its
+    whole universe.
+    """
+    applied = True
+    for stream in streams:
+        try:
+            await stream.set_symbols([to_venue_symbol(coin, stream.venue) for coin in coins])
+        except Exception as exc:
+            applied = False
+            log.warning(
+                "universe_apply_failed", venue=stream.venue, error=f"{type(exc).__name__}: {exc}"
+            )
+    return applied
 
 
 class Recorder:
@@ -94,73 +200,7 @@ class Recorder:
     # --- construction --------------------------------------------------------
 
     def _build_streams(self) -> list[WSStream]:
-        venues = self.settings.venues
-        cfg = self.settings.recorder
-        streams: list[WSStream] = []
-
-        if venues.hyperliquid.enabled:
-            streams.append(
-                WSStream(
-                    hl.VENUE,
-                    venues.hyperliquid.ws_url,
-                    parse=hl.make_parser(),
-                    sink=self.sink,
-                    cfg=cfg,
-                    tables=hl.TABLES,
-                    on_connect=hl.on_connect,
-                    on_universe_change=hl.on_universe_change,
-                    ping_s=venues.hyperliquid.ws_ping_s,
-                    ping_frame=hl.PING_FRAME,
-                    pong_marker=hl.PONG_MARKER,
-                    on_rtt_ms=self.latency.add_ws_ping,
-                    # Only Hyperliquid expires a socket on a clock. The other three close
-                    # on an error or not at all, and reconnect from the ladder in `run`.
-                    rotate_after_s=venues.hyperliquid.ws_rotate_after_s,
-                )
-            )
-        if venues.binance.enabled:
-            streams.append(
-                WSStream(
-                    binance.VENUE,
-                    venues.binance.ws_url,
-                    parse=binance.make_parser(venues.binance.complete),
-                    sink=self.sink,
-                    cfg=cfg,
-                    tables=binance.TABLES,
-                    on_connect=binance.on_connect,
-                )
-            )
-        if venues.bybit.enabled:
-            on_connect, on_change = bybit.make_frames(venues.bybit.subscribe_batch)
-            streams.append(
-                WSStream(
-                    bybit.VENUE,
-                    venues.bybit.ws_url,
-                    parse=bybit.make_parser(venues.bybit.complete),
-                    sink=self.sink,
-                    cfg=cfg,
-                    tables=bybit.TABLES,
-                    on_connect=on_connect,
-                    on_universe_change=on_change,
-                    ping_s=bybit.PING_S,
-                    ping_frame=bybit.PING_FRAME,
-                )
-            )
-        if venues.okx.enabled:
-            streams.append(
-                WSStream(
-                    okx.VENUE,
-                    venues.okx.ws_url,
-                    parse=okx.make_parser(venues.okx.complete),
-                    sink=self.sink,
-                    cfg=cfg,
-                    tables=okx.TABLES,
-                    on_connect=okx.on_connect,
-                    ping_s=okx.PING_S,
-                    ping_frame=okx.PING_FRAME,
-                )
-            )
-        return streams
+        return build_streams(self.settings, self.sink, on_rtt_ms=self.latency.add_ws_ping)
 
     # --- the row sink every stream writes through ----------------------------
 
@@ -263,25 +303,7 @@ class Recorder:
     # --- universe ------------------------------------------------------------
 
     async def _apply_universe(self, coins: Sequence[str]) -> bool:
-        """Point every stream at the new universe. True only when all of them took it.
-
-        Each stream is applied under its own try/except, so a `ConnectionClosed` in the
-        middle of one venue's subscribe frames no longer stops the venues after it. The
-        caller keeps the old universe on a False, which is what makes the next refresh
-        retry rather than see `coins == self.coins` and report no change; that is how a
-        venue used to under-record a coin permanently behind one warning line.
-        """
-        applied = True
-        for stream in self.streams:
-            try:
-                await stream.set_symbols([to_venue_symbol(coin, stream.venue) for coin in coins])
-            except Exception as exc:
-                applied = False
-                log.warning(
-                    "universe_apply_failed",
-                    venue=stream.venue,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+        applied = await apply_universe(self.streams, coins)
         self.poller.set_universe(list(coins))  # no socket, so nothing here can fail
         return applied
 

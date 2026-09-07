@@ -1,0 +1,57 @@
+[Unit]
+Description=liqfade paper trading loop
+Documentation=file:/srv/liqfade/app/CLAUDE.md
+After=network-online.target chrony.service liqfade-recorder.service
+Wants=network-online.target
+Requires=liqfade-recorder.service
+
+[Service]
+Type=simple
+# The kill switch wins over systemd too: the unit refuses to start while the flag exists,
+# so a restart loop cannot walk past a kill the owner triggered. Paper places no real
+# orders, and the flag still stops it: a kill that some units ignore is not a kill switch,
+# and the drill has to exercise the same path the live unit will.
+ExecStartPre=/usr/bin/test ! -e /srv/liqfade/data/KILL
+ExecStart=/srv/liqfade/app/.venv/bin/liqfade paper
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+# Its own control socket and state file. The recorder runs 24/7 on the same box and the
+# server takes an exclusive flock on its socket, so without these the second unit to
+# start refuses outright rather than stealing the first one's socket and answering /kill
+# for a process with nothing at risk. Paper gets a third pair for the same reason.
+# The live trigger, set here rather than in config/paper.yaml, which is also the base for
+# every backtest: the ceiling runs are taken on `exact` and pinning the live trigger in
+# that file would move every research number. `exact` reads S3 liquidations that arrive a
+# day late, so the paper loop refuses it and this is where the tradeable feed is named.
+Environment=LIQFADE_CASCADE__TRIGGER=crossvenue
+Environment=LIQFADE_CONTROL__SOCKET_PATH=control-paper.sock
+Environment=LIQFADE_CONTROL__STATE_FILE=state-paper.json
+# Paper simulates every fill and never signs, so it needs no key. LIQFADE_ENV in
+# the env file decides which config it loads; the CLI refuses mainnet outright.
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening. The code directory stays read only; only data and logs are writable.
+# The unit runs the venv deploy.sh synced, not `uv run`: uv wants a writable cache under
+# /home at every start, and nothing under /home is writable here.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -40,9 +40,10 @@ def _parse(path: Path) -> configparser.ConfigParser:
     return parser
 
 
-def test_all_four_units_exist() -> None:
+def test_every_unit_exists() -> None:
     assert {p.name for p in UNITS} == {
         "liqfade-recorder.service",
+        "liqfade-paper.service",
         "liqfade-live.service",
         "liqfade-watchdog.service",
         "liqfade-panel.service",
@@ -64,9 +65,19 @@ def test_unit_starts_from_the_synced_venv_not_through_uv(unit: Path) -> None:
     assert "uv run" not in exec_start
 
 
-def test_live_unit_refuses_to_start_while_the_kill_flag_exists() -> None:
-    service = _parse(UNIT_DIR / "liqfade-live.service")["Service"]
+@pytest.mark.parametrize("name", ["liqfade-live.service", "liqfade-paper.service"])
+def test_a_trading_unit_refuses_to_start_while_the_kill_flag_exists(name: str) -> None:
+    """Paper places no real order and still gates on the flag: a kill some units ignore
+    is not a kill switch, and the drill has to exercise the live unit's own path."""
+    service = _parse(UNIT_DIR / name)["Service"]
     assert service["ExecStartPre"] == "/usr/bin/test ! -e /srv/liqfade/data/KILL"
+
+
+def test_the_paper_unit_has_its_own_socket_and_state_file() -> None:
+    """Three units on one box, and the control server takes an exclusive lock per socket."""
+    text = (UNIT_DIR / "liqfade-paper.service").read_text()
+    assert "LIQFADE_CONTROL__SOCKET_PATH=control-paper.sock" in text
+    assert "LIQFADE_CONTROL__STATE_FILE=state-paper.json" in text
 
 
 def test_watchdog_does_not_depend_on_the_process_it_watches() -> None:
@@ -118,7 +129,7 @@ def test_deploy_installs_every_unit_before_it_enables_any() -> None:
     """Install, then daemon-reload, then start. Restarting a unit systemd has not
     re-read gives you the old ExecStart with the new code."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
-    install = text.index('install -m 0644 "$src" "$dest"')
+    install = text.index('install -m 0644 "$candidate" "$dest"')
     reload_units = text.index("systemctl daemon-reload")
     enable = text.index('systemctl enable "$name"')
     assert install < reload_units < enable
@@ -128,17 +139,21 @@ def test_deploy_enables_only_the_units_this_phase_runs() -> None:
     """A unit whose code arrives in a later phase crash loops from the first deploy on."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
     assert 'UNITS="${LIQFADE_UNITS:-liqfade-recorder liqfade-panel}"' in text
-    assert 'NEVER_ENABLE="liqfade-live liqfade-watchdog"' in text
+    # Only the mainnet loop is denied outright now. paper and the watchdog have code
+    # behind them as of 05a, place no real order between them, and are what Phase 5
+    # drills, so LIQFADE_UNITS may name either. Neither is in the default set.
+    assert 'NEVER_ENABLE="liqfade-live"' in text
+    assert "liqfade-paper" not in text.split("UNITS=")[1].split("\n")[0]
     # The denylist is consulted first, so LIQFADE_UNITS cannot talk the script into
     # starting the trading loop.
     assert text.index("for candidate in $NEVER_ENABLE") < text.index("for candidate in $UNITS")
     assert text.index('if ! runnable "$name"') < text.index('systemctl enable "$name"')
 
 
-def test_deploy_never_starts_the_trading_loop_or_the_watchdog() -> None:
+def test_deploy_never_starts_the_mainnet_trading_loop() -> None:
     """It may print the command in the closing note, but must never run it."""
     text = (ROOT / "scripts" / "deploy.sh").read_text()
-    for unit in ("liqfade-live", "liqfade-watchdog"):
+    for unit in ("liqfade-live",):
         for command in ("systemctl enable", "systemctl enable --now", "systemctl start"):
             assert f"\n{command} {unit}" not in text
     assert "    systemctl enable --now liqfade-live" in text  # the note says how, by hand
@@ -163,3 +178,44 @@ def test_no_em_dashes_anywhere_in_the_repo_text() -> None:
             if EM_DASH in path.read_text(errors="ignore"):
                 offenders.append(str(path.relative_to(ROOT)))
     assert not offenders, f"em dash found in: {offenders}"
+
+
+def test_deploy_can_put_a_branch_in_its_own_directory() -> None:
+    """Two branches on one box, without either rolling back the other's code.
+
+    The recorder runs from its own checkout on its own branch. A deploy of this branch
+    into the same directory would hand it code from before its fixes, which nothing
+    restarts today and everything picks up at the next reboot.
+    """
+    text = (ROOT / "scripts" / "deploy.sh").read_text()
+    assert 'APP_DIR="${LIQFADE_APP_DIR:-$APP_ROOT/app}"' in text
+    # An isolated deploy has to name what it owns, install only that, and rewrite the
+    # unit paths to its own directory.
+    assert "LIQFADE_APP_DIR needs LIQFADE_UNITS" in text
+    assert 'if [ "$ISOLATED" -eq 1 ] && ! runnable "$name"; then' in text
+    assert 'sed "s|$DEFAULT_APP_DIR|$APP_DIR|g"' in text
+
+
+def test_deploy_is_valid_bash() -> None:
+    import subprocess
+
+    subprocess.run(
+        ["bash", "-n", str(ROOT / "scripts" / "deploy.sh")], check=True, capture_output=True
+    )
+
+
+@pytest.mark.parametrize("unit", UNITS, ids=lambda p: p.name)
+def test_environment_values_with_spaces_are_quoted(unit: Path) -> None:
+    """systemd drops `Environment=K=two words` with a parse warning and carries on.
+
+    The watchdog shipped with `Environment=LIQFADE_WATCH_LABEL=paper loop` and the box
+    logged "Invalid environment assignment, ignoring: loop" while starting anyway, so the
+    label silently fell back to the default. A unit that is half applied is worse than one
+    that refuses.
+    """
+    for line in unit.read_text().splitlines():
+        if not line.startswith("Environment="):
+            continue
+        value = line.removeprefix("Environment=")
+        if " " in value:
+            assert value.startswith('"') and value.endswith('"'), line

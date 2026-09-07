@@ -6,12 +6,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Deliberately independent of liqfade-live.service: a watchdog that dies with the process
-# it watches is not a watchdog. Built in Phase 5.
+# Deliberately independent of the loop units: a watchdog that dies with the process it
+# watches is not a watchdog, so there is no After= or Requires= on either of them. It
+# reads data/heartbeat and data/KILL and nothing else, which is why it needs no socket, no
+# key and no config beyond the env file.
+#
+# Restarting the loop is systemd's own Restart=always, not this process. What the watchdog
+# adds is that somebody is told. Cancelling on a stale heartbeat, which
+# docs/STRATEGY_AND_RISK.md also asks for, needs the agent key and is owed until Phase 0
+# item 4 lands: see docs/DECISIONS.md, 2026-09-06 (05a).
 ExecStart=/srv/liqfade/app/.venv/bin/python -m liqfade.execution.watchdog
 User=liqfade
 Group=liqfade
 EnvironmentFile=/srv/liqfade/.env
+# Seconds of silence before it pages. The loop writes the heartbeat every second, so ten
+# is nine missed writes and not a slow disk.
+Environment=LIQFADE_WATCH_STALE_S=10
+Environment="LIQFADE_WATCH_LABEL=paper loop"
 WorkingDirectory=/srv/liqfade/app
 Restart=always
 RestartSec=3

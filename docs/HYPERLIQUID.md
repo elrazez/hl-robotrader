@@ -82,9 +82,27 @@ WebSocket: max 100 connections, 1000 subscriptions, 10 unique users in user-spec
 
 ## Probes to run on testnet in Phase 5 (write results back here)
 
-1. Round-trip a `Gtc` limit far from market, cancel by cloid, confirm `orderUpdates` sequence.
-2. Place `Alo` that would cross; confirm rejection string.
-3. Place entry, then TP/SL with `positionTpsl` grouping; fill one, confirm the other cancels.
-4. Measure 50 submit-to-ack latencies at quiet and busy times.
-5. Confirm `scheduleCancel` availability and its exact error if gated.
-6. Confirm `userFees` payload shape and current rates.
+All six live in `scripts/probe/hl_testnet.py`, one subcommand each. The script refuses any
+URL without "testnet" in it and reads no key itself; `execution/signer.py` does that.
+
+    uv run python scripts/probe/hl_testnet.py --list
+    LIQFADE_ENV=testnet uv run python scripts/probe/hl_testnet.py gtc_cancel --coin ETH
+
+| # | Probe | Subcommand | Answer |
+| --- | --- | --- | --- |
+| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | `gtc_cancel` | **not run** |
+| 2 | `Alo` that would cross, confirm the rejection string | `alo_cross` | **not run** |
+| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | `tpsl_group` | **not run** |
+| 4 | 50 submit-to-ack latencies at a quiet and a busy time | `latency` | **not run** |
+| 5 | `scheduleCancel` availability and its exact error when gated | `schedule_cancel` | **not run** |
+| 6 | `userFees` payload shape and current rates | `user_fees` | **not run** |
+
+Every row says "not run" because `HL_TESTNET_AGENT_PRIVATE_KEY` is empty in the box's
+`.env`: Phase 0 item 4 is outstanding, and probe 6 waits with the rest because a fee tier
+is only meaningful for the account that will trade. Until a row is filled in, everything
+above in this file is what the docs claim, not what the venue did. The probe wins when
+they disagree; record the disagreement in `docs/DECISIONS.md` with the date.
+
+Probe 4 writes the number `docs/STRATEGY_AND_RISK.md` uses for the latency model, and
+probe 5 decides whether `execution/watchdog.py` is a convenience or the only dead man's
+switch we have.
