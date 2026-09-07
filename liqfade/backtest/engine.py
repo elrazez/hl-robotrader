@@ -213,11 +213,12 @@ class BacktestResult:
     strategy: StrategyEngine
     risk_blocks: dict[str, int]
     rejections: list[Rejection]
-    # The last few refusals with the coin attached, for a live process that has to say
-    # which coin was refused and why. The counter above is what a report reads; this is
-    # what Telegram reads, and it is bounded because a backtest produces millions of them
-    # and nobody drains it.
-    recent_risk_blocks: deque[tuple[int, str, str]] = field(
+    # The last few refusals with the coin and the gate attached, for a live process that
+    # has to say which coin was refused and why. The counters are what a report reads;
+    # this is what Telegram reads, and it is bounded because a backtest produces millions
+    # of them and nobody drains it. Sizing and risk both land here: they are two gates to
+    # us and one event to an owner watching an intent produce no order.
+    recent_blocks: deque[tuple[int, str, str, str]] = field(
         default_factory=lambda: deque(maxlen=RECENT_BLOCKS)
     )
     intents: int = 0
@@ -791,6 +792,7 @@ def _place_entry(
     )
     if decision.reason is not None:
         result.sizing_blocks[decision.reason] = result.sizing_blocks.get(decision.reason, 0) + 1
+        result.recent_blocks.append((now_ms, intent.coin, "sizing", decision.reason))
         return
     if decision.depth_cap_applied:
         result.depth_capped_entries += 1
@@ -818,7 +820,7 @@ def _place_entry(
     if not verdict.allowed:
         assert verdict.reason is not None
         result.risk_blocks[verdict.reason] = result.risk_blocks.get(verdict.reason, 0) + 1
-        result.recent_risk_blocks.append((now_ms, intent.coin, verdict.reason))
+        result.recent_blocks.append((now_ms, intent.coin, "risk", verdict.reason))
         return
 
     risk.on_entry(request)

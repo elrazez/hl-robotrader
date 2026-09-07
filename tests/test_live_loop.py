@@ -330,9 +330,9 @@ async def test_a_risk_block_records_the_coin_it_blocked(loop: PaperLoop) -> None
     loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000)
 
     assert loop.session.result.risk_blocks == {"stale_coin_data": 1}
-    assert [(coin, reason) for _ts, coin, reason in loop.session.result.recent_risk_blocks] == [
-        (COIN, "stale_coin_data")
-    ]
+    assert [
+        (coin, gate, reason) for _ts, coin, gate, reason in loop.session.result.recent_blocks
+    ] == [(COIN, "risk", "stale_coin_data")]
 
 
 async def test_a_risk_block_is_logged_and_posted_once_per_reason(
@@ -578,3 +578,52 @@ async def test_a_paper_order_walks_the_real_state_machine(loop: PaperLoop) -> No
 
     assert [row.status for row in rows] == [OrderStatus.ACKED]
     assert rows[0].oid is not None  # the manager records what the transport answered
+
+
+async def test_a_sizing_refusal_is_reported_like_a_risk_one(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by the box drill of 2026-09-07, not by reading the code.
+
+    An injected entry produced `intent_injected` and then nothing at all: no order, no
+    refusal, no line. Sizing returns before the risk gate is ever reached, so covering
+    only `risk_blocks` left half the refusals as silent as they were before. To an owner
+    watching Telegram the two are the same event, which is a drill that reported success
+    and rested no order.
+    """
+    import structlog
+
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    # A coin that is quoted and has never traded. Sizing caps on the traded volume in the
+    # window, so it refuses before the risk gate is consulted, which is the whole point.
+    loop.sink(
+        "bbo",
+        "hyperliquid",
+        {
+            "coin": "BTC",
+            "ts_ms": START,
+            "rx_ms": START,
+            "bid_px": 60_000.0,
+            "bid_sz": 5.0,
+            "ask_px": 60_001.0,
+            "ask_sz": 5.0,
+        },
+    )
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin="BTC", side="long", now_ms=START + 1_100)
+
+    assert loop.session.result.sizing_blocks, "expected sizing to refuse this one"
+    with structlog.testing.capture_logs() as logs:
+        await loop.report_risk_blocks()
+
+    events = [entry for entry in logs if entry["event"] == "risk_block"]
+    assert len(events) == 1
+    assert events[0]["coin"] == "BTC"
+    assert events[0]["gate"] == "sizing"
+    assert posted and "RISK BLOCK" in posted[0]

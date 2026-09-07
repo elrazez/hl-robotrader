@@ -412,30 +412,38 @@ class PaperLoop:
         return posted
 
     async def report_risk_blocks(self) -> None:
-        """Log every risk refusal since the last tick and post one per reason per window.
+        """Log every refusal since the last tick and post one per reason per window.
 
-        The engine counts refusals into `result.risk_blocks`, which is what the backtest
-        report reads. In the live process a counter nobody looks at is a silent refusal,
-        and a strategy that has quietly stopped trading looks exactly like one that has
-        found nothing to trade. Logging is unconditional; the Telegram post is rate
-        limited per reason, because a gate that refuses on every tick has one thing to say.
+        The engine counts refusals into `result.sizing_blocks` and `result.risk_blocks`,
+        which is what the backtest report reads. In the live process a counter nobody
+        looks at is a silent refusal, and a strategy that has quietly stopped trading
+        looks exactly like one that has found nothing to trade. Logging is unconditional;
+        the Telegram post is rate limited per reason, because a gate that refuses on every
+        tick has one thing to say.
+
+        Sizing and risk are both reported. They are two gates to us and one event to an
+        owner watching an intent produce no order, and sizing returns first, so covering
+        only the risk gate left half the refusals exactly as silent as before.
         """
-        blocks = self.session.result.recent_risk_blocks
+        blocks = self.session.result.recent_blocks
         now = time.monotonic()
-        newest: dict[str, str] = {}
+        newest: dict[str, tuple[str, str]] = {}
         while blocks:
-            ts_ms, coin, reason = blocks.popleft()
-            log.warning("risk_block", reason=reason, coin=coin, ts_ms=ts_ms)
-            newest[reason] = coin
-        for reason, coin in newest.items():
+            ts_ms, coin, gate, reason = blocks.popleft()
+            log.warning("risk_block", gate=gate, reason=reason, coin=coin, ts_ms=ts_ms)
+            newest[reason] = (coin, gate)
+        counters = self.session.result
+        for reason, (coin, gate) in newest.items():
             if now - self._risk_block_posted.get(reason, -RISK_BLOCK_ALERT_S * 2) < (
                 RISK_BLOCK_ALERT_S
             ):
                 continue
             self._risk_block_posted[reason] = now
+            seen = (counters.sizing_blocks if gate == "sizing" else counters.risk_blocks).get(
+                reason, 0
+            )
             await self.post(
-                f"[{self.settings.env}] RISK BLOCK {reason} on {coin} "
-                f"(x{self.session.result.risk_blocks.get(reason, 0)} so far)"
+                f"[{self.settings.env}] RISK BLOCK {gate}/{reason} on {coin} (x{seen} so far)"
             )
 
     async def report_halt(self) -> None:
