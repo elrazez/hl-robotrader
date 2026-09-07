@@ -228,13 +228,14 @@ def load_day(
             never read at all, so a busy day whose cascades cover 3% of the clock reads
             roughly 3% of its rows rather than fifty million and throwing them away. None
             reads the whole day.
-        tail_only: keep only the rows sharing the day's last `effective_ts`, which for
-            `bbo` and `l2` is its last snapshot. For a table that reaches its consumer
-            through a backward as-of join alone, that is the only row of the day a later
-            timestamp can select, and the filter is pushed into the scan so the rest of the
-            day is never materialised. `l2` is 3.1 million rows per coin per day, so this
-            is the difference between a year of four coins peaking over two gigabytes and
-            under.
+        tail_only: keep only the rows sharing each coin's last `effective_ts`, which for
+            `bbo` and `l2` is that coin's last snapshot of the day, all twenty levels of
+            it. For a table that reaches its consumer through a backward as-of join alone,
+            that is the only row of the day a later timestamp can select, and the filter is
+            pushed into the scan so the rest of the day is never materialised. `l2` is 3.1
+            million rows per coin per day, so this is the difference between a year of four
+            coins peaking over two gigabytes and under. **Per coin and not globally**: see
+            `mid` in `features/grid.py` for the kind of column this is not safe for.
 
     Returns:
         The rows, or an empty frame when the day is absent or nothing survives the filters.
@@ -254,10 +255,13 @@ def load_day(
             return pl.DataFrame()
         frame = frame.filter(span_filter(spans))
     if tail_only:
-        latest = effective_ts("_known")
         frame = (
-            frame.with_columns(latest)
-            .filter(pl.col("_known") == pl.col("_known").max())
+            frame.with_columns(effective_ts("_known"))
+            # Per coin, not globally. Two coins do not stop quoting at the same
+            # millisecond, so a global maximum keeps the latest coin's snapshot and hands
+            # every other coin an empty carry, which is a cold start wearing the shape of
+            # a warm one.
+            .filter(pl.col("_known") == pl.col("_known").max().over("coin"))
             .drop("_known")
         )
     return frame.collect()
