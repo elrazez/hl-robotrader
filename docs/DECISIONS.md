@@ -2496,3 +2496,61 @@ refused until a human removes it, which is why 1,860 failed starts followed. Tha
 design working: `ExecStartPre` refusing to start behind the flag is what stops a wedged
 loop from being restarted into the same wedge. The cost of a false positive is exactly
 this, which is the argument for the false positive being impossible rather than cheap.
+
+## 2026-09-07 (05c: the testnet key works and the testnet account is empty)
+
+`HL_TESTNET_AGENT_PRIVATE_KEY` is in the box `.env` and signs. Nine probes ran against
+`api.hyperliquid-testnet.xyz`. Five of them measured nothing, and finding out why is the
+result worth keeping.
+
+**A zero equity account is not a rejecting account. It is a lying one.** The account reads
+`accountValue: 0.0`, `withdrawable: 0.0`, no positions, no spot balance. An order placed
+against it comes back:
+
+    {"status": "ok", "response": {"type": "order", "data": {"statuses": [
+      {"resting": {"oid": 59571154142, "cloid": "0xaa8597..."}}]}}}
+
+A real oid, the word `resting`, and every sign of success. Then nothing is booked:
+`openOrders`, `frontendOpenOrders` and `historicalOrders` are all empty at +0s, +1s and
++3s, `totalMarginUsed` stays `0.0`, the `orderUpdates` socket never sends a frame, and
+`cancel_by_cloid` on the order that does not exist answers `statuses: ["success"]`.
+
+The consequence is the point: **an unfunded testnet account cannot be used to check the
+order path, and it does not fail loudly enough to stop you trying.** The gtc round trip,
+the modify semantics and the latency numbers all looked like results. Had they been
+written into `docs/HYPERLIQUID.md` as answers, the order manager would have been built
+against a venue that was agreeing with everything and doing nothing. This is the same
+lesson as 05b's twelve-minute equivalence test: a measurement taken where the mechanism
+cannot operate reports success rather than absence.
+
+**The three answers that do not need an order to rest.**
+
+- **Fees, from `userFees`.** `userCrossRate: "0.00045"`, `userAddRate: "0.00015"`. 0.045%
+  taker and 0.015% maker, which is what CLAUDE.md rule 2 has been putting in every
+  backtest. First time it has been confirmed against the venue rather than a doc.
+- **A rejection is an `ok`.** The post-only-that-crosses refusal arrives with HTTP 200 and
+  a top level `"status": "ok"`, with the words in `response.data.statuses[0].error`:
+  `Post only order would have immediately matched, bbo was 2491.3@2491.4. asset=4`. The
+  modify refusal, `Cannot modify canceled or filled order`, is carried the same way. Code
+  that branches on the envelope reads a rejection as a fill.
+- **`scheduleCancel` is gated behind $1,000,000 of traded volume**, and clearing it is
+  refused by the same gate:
+  `Cannot set scheduled cancel time until enough volume traded. Required: $1000000. Traded: $0.`
+  `execution/watchdog.py` said the venue half of the kill path was owed and that this
+  probe would decide between `scheduleCancel` and a signing watchdog. It has decided.
+  **The file-based watchdog is the only dead man's switch this account has**, and an order
+  resting at Hyperliquid when the box dies stays there until a human cancels it. Phase 6
+  either accepts that or funds the signing watchdog; it is no longer an open question.
+
+**The agent key is the master key.** `signer_loaded` reports `agent_address` equal to
+`account_address` (`0x0000a9e1...`). CLAUDE.md's Phase 0 item 3 asks for a separate API
+wallet whose `account_address` is the main wallet, and the code is written for that split:
+`Signer` carries both and `docs/HYPERLIQUID.md` explains why they differ. On testnet a
+master key is survivable. It does mean the two-address path has never actually been
+exercised, so the first time it is will be on mainnet, which is the wrong first time.
+
+**What this blocks, by name.** The TP/SL grouping drill, the reduce-only refusal string,
+the submit-to-ack latency distribution the cost model wants, the `orderUpdates` frame
+shape the user-stream client must parse, and the kill drill from a state with a resting
+order and an open testnet position. Every one of them needs margin. Work stopped here
+rather than building the order path against a venue that says yes to everything.
