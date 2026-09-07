@@ -2156,3 +2156,52 @@ against the tree at `142f2fb` rather than remembered.
 
 All six are the next prompt, and all six want the testnet agent key on the box first
 (Phase 0 item 4). None of them is started here.
+
+## 2026-09-07 (05b: what deploying and drilling it found)
+
+Four things, and three of them were found by running the code on the box rather than by
+reading it. That is the same lesson as 05a's deploy entry, arriving again.
+
+**A drill that reported success and rested no order.** The pause drill injects an intent
+over the control socket. The first run worked. The second logged `intent_injected`, posted
+"INTENT INJECTED" to Telegram, and then produced nothing at all: no order row, no refusal,
+no line anywhere. Sizing had capped it on the traded volume in the window, and sizing
+returns before the risk gate is ever consulted, so the commit that made risk refusals
+visible had covered only half of them, and the visible half was the rarer one. Both gates
+report now. They are two gates to us and one event to an owner watching an intent produce
+no order.
+
+`inject_intent` still answers `injected=True` when the gates then refuse the entry, which
+is literally true (the intent was injected and pushed through the real path, which is what
+the drill exercises) and reads as success. It is left alone because the refusal is now
+loud; if a later drill is confused by it again, the answer should carry the gate's verdict.
+
+**A recorder restart restarted the trading loop.** `liqfade-paper.service` carried
+`Requires=liqfade-recorder.service`. Every recorder restart therefore stopped and started
+the paper loop; it happened twice on 2026-09-07 and split one soak into three runs. The
+binding was never true: the loop opens its own feeds through `build_streams` and reads
+neither the recorder's process nor its Parquet. `After=` is kept for a predictable boot
+order. `liqfade-live.service` carried the same line and is fixed with it, before the first
+live run inherits a trading loop that restarts whenever an unrelated unit does.
+
+**What the seven day acceptance clock counts.** Continuous *coverage*, not one unbroken
+process. A clean restart, meaning the loop stopped with its positions closed out and came
+back reconciling clean, does not reset the clock; a gap in the feeds, an unclean stop, or a
+kill does. Recorded because the alternative reading makes every deploy restart the clock,
+which would mean never deploying during an acceptance run, which would mean not fixing
+anything found during one. The soak that was running before this branch is not the
+acceptance run in either reading.
+
+**A kill message nobody could read.** Against a venue hanging on every call, the
+confirmation named all sixty abandoned cloids: 1,555 characters of hex in the one message
+that has to be read at a glance. Five and a count now, with the full list in the log line.
+Found by running the drill and looking at what came out of it, which is the argument for
+drilling rather than asserting.
+
+### For the next backtest prompt, not fixed here
+
+The backtest engine raises when the feature cache directory cannot be created, instead of
+falling back to running without a cache. Seen on 2026-09-07 against a read-only lake mount.
+A cache is an optimisation and its absence is not an error; a read-only lake is a normal
+way to mount someone else's data. Reported by the recorder chat; it belongs to whoever
+next touches `backtest/`, not to this branch.
