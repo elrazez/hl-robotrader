@@ -1224,9 +1224,24 @@ got worse.
 counting a rolling window of rows. Same answer, and it is the form that can take the
 previous day's candidates as a carry, which a cascade starting at 23:59 needs.
 
-**Proof.** `trades.parquet` is byte-identical to the engine this replaces, on the golden
-fixture and on `2025-10-09` to `2025-10-11` of the real lake for `BTC,ETH,SOL,HYPE`; the
-digest and the command are pinned in `tests/test_backtest_streaming.py`.
+**Proof 1, and what it is not.** `trades.parquet` is byte-identical to the engine this
+replaces, on the golden fixture and on `2025-10-09` to `2025-10-11` of the real lake for
+`BTC,ETH,SOL,HYPE`; the digest and the command are pinned in
+`tests/test_backtest_streaming.py`.
+
+**That is three days, and the prompt asked for a month.** The reference has to be produced
+by the engine being replaced, and the engine being replaced is the one that cannot hold a
+month: `load_inputs` reads every trade in the window into one frame, which is what the OS
+killed twice on this 8 GB machine. A month-long reference was therefore not available to
+take, and three days that carry the busiest cascade day of the year for these four coins
+were taken instead. What the digest proves is the identity claim on real data, which does
+not need a month; what a month would have added is coverage, and the 42-coin and year runs
+below are where that comes from.
+
+**The digest has been re-pinned once, on purpose.** The 04c exit fix took it from seven
+trades to four, because three of the reference run's seven had a target already behind the
+entry. A digest that had survived that fix would have meant the fix did nothing. See the
+04c fill entry below; the reason is in the test comment beside the constant.
 
 Measured on the owner's machine, `/usr/bin/time -l`, nothing else running, with
 `features.z_robust: false` so that the runs have fills to be identical about.
@@ -1240,12 +1255,18 @@ The three reference days, `2025-10-09` to `2025-10-11`:
 | four coins, streaming, `--no-cache`, with `tail_only` | 37 s | **1.44 GB** |
 | the 42-coin research universe, `--no-cache`, with `tail_only` | 46 s | **1.31 GB** |
 
-The year, `2025-09-01` to `2026-08-30`, four coins:
+**Proof 2, the year**, `2025-09-01` to `2026-08-30`, four coins:
 
 | run | wall | peak RSS |
 | --- | --- | --- |
 | cold cache | 60.7 min | 2.64 GB |
 | warm cache | 32.0 min | 1.96 GB |
+
+**The warm number is the operating number.** A cold year happens once per feature-hash
+change; every run after it is warm, and warm is 1.96 GB and 32 minutes. The task asked for
+under 2 GB and the warm run meets it. The cold run does not, at 2.64 GB, and saying only
+"the year runs in 2 GB" would be reporting the number that is almost never the one you
+get. Both are above.
 
 **The universe costs almost nothing.** Ten times the coins is 23% more wall clock and
 *less* memory, 1.31 GB against 1.44 GB. Both halves of that are the per-coin day loop
@@ -1264,13 +1285,19 @@ is a second proof of the cache on top of the unit tests: a year of features read
 disk produces the same sixty-four trades as a year of features built from the tape. A year
 of four coins costs 6.8 GB of cache, about 1.7 GB per coin-year.
 
-**What is still over budget.** The year's cold run was 2.64 GB against the 2 GB the task
-asked for, and its warm run 1.96 GB. `tail_only` takes 0.15 GB off the per-day working set
-and the year has not been re-measured with it, so the honest statement is that the working
-set is comfortably under 2 GB and a cold year is not: the difference between the 1.59 GB
-three-day peak and the 2.64 GB year peak is allocator high-water mark accumulated over 364
-days of differently sized frames, not a bigger working set. Every run after the first is a
-warm one.
+**Why the cold year is the one over budget.** The difference between the 1.59 GB three-day
+peak and the 2.64 GB year peak is allocator high-water mark accumulated over 364 days of
+differently sized frames, not a bigger working set: the working set is one coin-day
+whatever the length of the run, which is what the 42-coin figure shows. So the honest
+statement is that the working set is comfortably under 2 GB and a cold year is not.
+
+**Every number above was taken with `tail_only` on both book tables, which was wrong for
+`bbo`.** `bbo` sets `mid`, and `mid` feeds every rolling window, so carrying one snapshot
+of it changed the scored day; the fix on 2026-09-07 reads the carry day's `bbo` whole and
+keeps `tail_only` for `l2` alone. `l2` is where the saving was (3.1 million rows per coin
+per day against a few hundred thousand), but the 0.15 GB `tail_only` took off the per-day
+working set was measured with both, so the memory figures here are a lower bound until the
+year is re-run. See the 2026-09-07 entry.
 
 **Two things found along the way that were not this change's to fix.**
 
