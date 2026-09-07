@@ -1603,3 +1603,187 @@ at all is the first of those three.
 **Reverse this entry** if 5 seconds turns out to be too tight on a thin coin whose book
 genuinely updates more slowly than that, which would show up as a jump in abandoned entries
 rather than as a wrong price.
+## 2026-09-06: 01c, three gap thresholds because the three HL streams arrive in three shapes
+
+The recorder's first 24 hours on the VPS logged 1,192 `hyperliquid.l2` gaps and 3,829
+`hyperliquid.bbo` gaps against `recorder.gap_alert_s: 5.0`. Neither number was an outage.
+Measured against the recorded Parquet on the box rather than against the logs
+(`data/parquet/{l2,bbo,trades}/date=2026-09-05`, 18 coins):
+
+| stream | how it arrives | measured |
+| --- | --- | --- |
+| `l2` | one snapshot per coin, every coin within a few ms of the rest | interval per coin p50 **5,390 ms**, p90 5,511 ms, p99 5,700 ms, max 19-20s, identical on all 18 coins |
+| `bbo` | only on a best-quote change | stream-wide p50 68 ms, **p99 316 ms**, 2 intervals over 5s in the day; per coin p99 up to 4.6s and max 33s |
+| `trades` | events | per coin p50 0.4 to 3.4s, p99 3.2s (PONS) to **54.5s** (DOGE), worst single interval on any coin all day **92.3s** |
+
+So each stream gets the threshold its own shape justifies, in
+`liqfade/recorder/streams/base.py`:
+
+- **`bbo` is judged stream-wide.** Any coin's message proves the connection is alive, and
+  the five silences over 5s in 18h were all reconnects. The quiet coin is still reported as
+  `worst_coin` in `liqfade status` and on the panel, because that is the evidence a dead
+  subscription leaves; it is information, not a gap.
+- **`l2`'s threshold is `recorder.l2_gap_multiple` (3) times its own measured cadence**, so
+  about 16s. The cadence is the median of the last 64 **per-coin** intervals, not per
+  message: with 18 coins landing in the same millisecond, seventeen of eighteen stream-level
+  intervals are 1 ms and the median of those is 1 ms, which would set the threshold to
+  nothing. `cadence_ms` is reported in status, so a threshold that has moved is visible.
+  Fixing the number instead would have to be re-measured every time Hyperliquid changes its
+  push rate, which it already has: `docs/DATA_SOURCES.md` recorded 4s on 2026-08-30 against
+  the 5.4s measured a week later.
+- **`trades` counts gaps per coin**, which is the one stream where that is the right
+  question (the stream as a whole is never quiet while any of eighteen coins prints, so one
+  dead subscription hides behind the others), against **`recorder.trades_gap_s: 180`**. That
+  is twice the worst natural silence measured. At 60s the day holds 32 intervals that would
+  have counted, at 120s none, so 180s has a factor of two of headroom on this universe. It is
+  a function of the thinnest coin the universe selects: a universe reaching further down the
+  volume ranking wants this raised, and `gaps_1h` on `hyperliquid.trades` climbing with no
+  reconnects behind it is what says so.
+
+One consequence worth stating: `recorder.silence_alert_s` (60s) can no longer be taken alone,
+because a thin coin's normal 92s quiet spell is longer than it. The outage alert now fires at
+`max(silence_alert_s, gap_threshold)`, so nothing pages that is not even a gap.
+
+**And one thing this gives up, deliberately.** A single dead `bbo` subscription no longer
+raises anything. It used to, and that is where 3,829 of the false gaps came from, so the
+trade was worth making; but the failure it used to catch is real, and what is left of it is
+`worst_coin` and `worst_lag_ms` in `liqfade status` and on the panel, which nobody is paged
+about. `trades` still catches a dead coin at 180s, so a coin that dies on both is caught.
+A coin dead on `bbo` alone is visible and not alerted. If that turns out to matter, the
+cheap version is an alert (not a gap count) on a `bbo` coin quiet far past any measured
+quiet spell: the worst on 2026-09-05 was 33s, so 60s would have fired zero times that day.
+Left out of 01c because the instruction for this change was that the worst-coin figure is
+information rather than a gap, and adding a second alert is a decision for the owner.
+
+## 2026-09-06: 01c, "DOGE arrives 356s late" is Hyperliquid replaying trades we already had
+
+The report was that DOGE trades reached the lake up to 356s behind their exchange time on
+2026-09-05, and again 26s behind on 2026-09-06, while every other coin on the same box sat
+under a second. Four measurements on the recorded Parquet, taken at the 22:42:14 UTC
+reconnect of 2026-09-05:
+
+1. **Every coin was replayed, about 30 rows each**, whatever its rate: 30 for DOGE, 30 for
+   CASHCAT, 29 for BTC, 16 for LIT. A fixed count, not a delay.
+2. **How far back those 30 rows reach is exactly 30 trades at that coin's rate.** DOGE
+   prints 3 times a minute, so 30 trades back is 356s. PONS prints 176 times a minute, so
+   30 trades back is 17.7s. BTC's were all under 5s. The ordering by age is the ordering by
+   rate, inverted, across all 18 coins.
+3. **All 458 replayed rows were already in the lake** under the same `(coin, tid)`. Not one
+   of them was new data.
+4. **They arrived at 22:42:15 and 22:42:16**, one and two seconds after the disconnect.
+
+So Hyperliquid answers a `trades` subscribe with a snapshot of each coin's last ~30 trades,
+`docs/DATA_SOURCES.md` said so from a probe on 2026-08-30 ("the first `trades` and `l2Book`
+messages after subscribing are snapshots ... do not read it as latency"), and the recorder
+wrote all of them again on every reconnect. It is ours, not Hyperliquid's.
+
+**The recorder does not shard subscriptions.** `Recorder._build_streams` makes one `WSStream`
+per venue and `hl.on_connect` puts one subscribe frame per coin per channel on it, so all 18
+coins and all 5 channels ride a single socket; `ss -tnp` on the box shows exactly one
+established connection to `api.hyperliquid.xyz`. DOGE is on the same connection as BTC,
+which on its own rules out the connection being behind.
+
+Four other explanations were ruled out by the same evidence: Hyperliquid genuinely
+delivering late (the rows are duplicates, and they arrive one second after a reconnect
+rather than at random), clock skew on the box (it would move every coin, and the p50 is
+220 ms on all of them), a backlog in our own receive loop (`rx_ms` is stamped in
+`WSStream._recv_loop` before anything is parsed, so a backlog would show on every coin at
+once), and per-coin subscription sharding (there is none).
+
+**The fix** is in `hl.make_parser()`: a trade whose `(coin, tid)` this process has already
+emitted is dropped, against a bounded per-coin memory of 512 ids. Not the whole snapshot,
+because the same replay is what fills the hole a reconnect leaves and those trades are
+exactly the ones we have not seen; across all of 2026-09-05, 69 of the 517 late rows were
+genuinely new. Per coin rather than one shared ring, because DOGE at 3 prints a minute
+needs six minutes of memory while PONS at 176 would drain a shared ring in seconds.
+
+**What it does not cover:** a process restart begins with an empty memory, so the first
+snapshot after one writes about 30 rows per coin that the previous run already recorded.
+That is roughly 540 rows per restart against 2,336 a day from the eight reconnects, and
+telling a restart's snapshot from a genuine first subscribe would mean reading the lake from
+inside a parser. Left, and stated here, so that anyone counting trades on a restart day
+knows the size of it. `select count(*) - count(distinct (coin, tid))` over a day is the
+measurement.
+
+**Consequences of the duplicates beyond the lag figure**, both now fixed: any research
+summing volume or counting prints over 2026-09-05 counted 2,336 trades twice, and the
+replayed rows are what put hour 23's file before hour 22's end and stopped the day
+compacting at all.
+
+## 2026-09-06: 01c, the recorder replaces a Hyperliquid socket before Hyperliquid expires it
+
+Hyperliquid closes every WebSocket with `1000 (OK) Expired` on a clock rather than on an
+error. Seven measured on the box between 2026-09-05 and 2026-09-06, from
+`stream_disconnected` to the next: **167, 167, 170, 174, 177, 180 and 181 minutes**. Each
+one cost about 18s with nothing recorded on `bbo` and `trades`, eight times a day.
+
+`venues.hyperliquid.ws_lifetime_s` is the shortest of those (167 min) and
+`ws_rotate_frac` is 0.9, so the replacement is opened at 150 minutes with 17 minutes of
+margin against the shortest lifetime ever seen. The two are separate on purpose: the
+lifetime is a measurement of Hyperliquid and should be corrected when Hyperliquid changes,
+the fraction is our safety margin.
+
+**Both sockets deliver during the changeover and the repeats are dropped**, rather than
+switching cleanly from one to the other. Two sockets subscribed to the same broadcast
+receive the same message a few milliseconds apart in no fixed order, so an instantaneous
+switch has a race that can lose a message as easily as duplicate one, and **a duplicate can
+be found in the lake afterwards while a missing row cannot**. The dedupe is keyed on the
+raw payload rather than on `(coin, ts_ms, tid)`, because the venue sends the same bytes to
+both sockets and one key then covers every table: `bbo` and `l2` carry no id of their own
+and a per-table key would have to invent one.
+
+Two boundaries are load-bearing and both were wrong first. A test against a fake server
+that expires connections the way Hyperliquid does caught them, at about one duplicate row
+per four rotations, and a traced harness said which socket delivered each copy and what the
+dedupe's state was at the time. Reasoning about it had twice pointed at the wrong end.
+
+- **On before the replacement is connected**, not after it. The venue starts broadcasting
+  to a socket the moment its handshake completes, which is *inside* the `connect` await
+  while the rotating task is still suspended there. So one message reached both sockets
+  with the dedupe still off: the old socket's copy was sinked without being recorded, and
+  the replacement's then looked like a first sight.
+- **Off only after the retired socket's receive loop has drained.** `close()` returns when
+  the closing handshake is done, but frames the socket had already received are still
+  queued in front of that loop, and turning the dedupe off at the close let one of them
+  through as a duplicate of a message the replacement had already delivered.
+
+The overlap is counted rather than flagged, so a drain that runs long cannot have one
+rotation's cleanup turn off the dedupe a later one is still using.
+
+**A rotation that cannot connect costs the hole it was meant to avoid and nothing else.**
+The old socket is untouched, Hyperliquid expires it on its own schedule, and the reconnect
+ladder in `run` takes over exactly as before.
+
+**One latent bug fell out of this.** `_close_on_stop` waited on the stop event alone, so a
+socket that closed on its own left that task pending forever and the `_pump` task group
+never emptied. On a venue with a ping loop the next ping raised on the dead socket and took
+the group down, which is what actually drove every reconnect; on a venue **without** one it
+did not, and `binance` is configured without a ping frame. A clean close there was a stream
+that silently stopped reconnecting for the life of the process. Every task belonging to a
+socket now ends when that socket closes, which the rotation needed anyway.
+
+### What the changeover actually does, measured against live Hyperliquid
+
+Waiting 167 minutes for an `Expired` close is a slow way to test a rotation, so it was
+measured instead with a 12 minute recorder against the real venue with
+`LIQFADE_VENUES__HYPERLIQUID__WS_LIFETIME_S=300`, writing to a scratch lake so the live
+recorder and its data were untouched. Same code, same venue, sooner.
+
+The first run found the bug the fake server could not: Hyperliquid does not answer our
+close frame, so closing the retired socket raised `ConnectionClosedError` out of its
+receive loop, that left the `_pump` task group, and the group took the replacement's tasks
+with it. Both rotations were followed by a full reconnect, so the changeover was still
+paying the hole and the resubscribe snapshot it exists to avoid, and the 20 duplicate `l2`
+rows were that reconnect's snapshot rather than the overlap.
+
+| over 12 minutes, 2 rotations | before the teardown fix | after |
+| --- | --- | --- |
+| reconnects following a rotation | 2 | **0** |
+| `trades` duplicates on `(coin, ts_ms, tid)` | 0 of 14,744 | 0 of 13,732 |
+| `bbo` duplicates on `(coin, ts_ms)` | 0 of 49,274 | 0 of 50,029 |
+| `l2` duplicates on `(coin, ts_ms, level)` | 20 of 52,780 | **0 of 52,060** |
+| longest gap between `bbo` messages | 767 ms | **619 ms**, p99 341 ms |
+
+Against about 18,000 ms of nothing recorded on every `Expired` close before, eight times a
+day. The raw-payload dedupe is enough once there is no spurious reconnect behind it, so the
+per-table key dedupe the overlap was going to need was not built.

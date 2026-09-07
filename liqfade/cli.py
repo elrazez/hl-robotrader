@@ -703,10 +703,20 @@ def _print_state(state: Any, origin: str, settings: Settings) -> None:
         for feed in state.feeds:
             mark = "ok" if feed.connected else "DOWN"
             worst = f"  worst={feed.worst_coin} {feed.worst_lag_ms}ms" if feed.worst_coin else ""
+            # The cadence is what the l2 gap threshold is measured against, so it belongs
+            # next to gaps_1h: a number that has moved is why the gap count has.
+            cadence = f"  cadence={feed.cadence_ms}ms" if feed.cadence_ms else ""
+            # How far behind the slowest coin is delivering, which `lag_ms` cannot show:
+            # the stream is never quiet while seventeen other coins are on time.
+            slow = (
+                f"  slowest={feed.delivery_coin} {feed.delivery_lag_ms}ms"
+                if feed.delivery_coin
+                else ""
+            )
             print(
                 f"  {feed.name:<28} {mark:<5} lag={feed.lag_ms:>7}ms  "
                 f"msgs_1m={feed.msgs_1m:<7} gaps_1h={feed.gaps_1h}  "
-                f"parse_errors_1h={feed.parse_errors_1h}{worst}"
+                f"parse_errors_1h={feed.parse_errors_1h}{cadence}{worst}{slow}"
             )
     if state.positions:
         print("\npositions:")

@@ -68,6 +68,15 @@ class FeedState(Base):
         None, description="the coin quiet longest on a per-coin stream, None when not tracked"
     )
     worst_lag_ms: int = Field(0, ge=0, description="ms since worst_coin's last message")
+    cadence_ms: int = Field(
+        0, ge=0, description="ms this stream typically leaves between messages, 0 if not measured"
+    )
+    delivery_coin: str | None = Field(
+        None, description="the coin whose rows arrive furthest behind their exchange time"
+    )
+    delivery_lag_ms: int = Field(
+        0, ge=0, description="median rx_ms minus ts_ms for delivery_coin, 0 if not measured"
+    )
 
 
 class PositionState(Base):

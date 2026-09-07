@@ -94,6 +94,18 @@ After the first time, just:
 ssh -p 2222 root@<server> 'bash -s' < scripts/deploy.sh
 ```
 
+To put a branch on the box instead of `main`, which is how a recorder or panel change is
+watched on live feeds before it is merged:
+
+```bash
+ssh -p 2222 root@<server> 'LIQFADE_BRANCH=01c-recorder bash -s' < scripts/deploy.sh
+```
+
+The branch has to be pushed first: the box resets to `origin/<branch>` and never builds
+from your working tree. Deploying `main` again is the same command with the variable left
+off. `LIQFADE_UNITS` narrows which services a deploy may restart, and
+`liqfade-live`/`liqfade-watchdog` are never enabled by the script whatever it says.
+
 It pulls the code, installs dependencies from the lockfile, installs the service files,
 and restarts only the services whose service file changed. If you changed code but not a
 service file, restart it yourself on purpose:

@@ -45,8 +45,19 @@ class HyperliquidVenue(Base):
     api_url: str = Field(..., description="url: POST /info and /exchange base")
     ws_url: str = Field(..., description="url: websocket endpoint")
     ws_ping_s: Pos = Field(..., description="seconds between ping frames")
+    ws_lifetime_s: Pos = Field(
+        ..., description="seconds the venue keeps a websocket before closing it as Expired"
+    )
+    ws_rotate_frac: Frac = Field(
+        ..., description="fraction of ws_lifetime_s at which the replacement is opened"
+    )
     liq_weight: NonNeg = Field(..., description="weight in aggregated liquidation notional")
     complete: bool = Field(..., description="true when the venue publishes every liquidation")
+
+    @property
+    def ws_rotate_after_s(self) -> float:
+        """Seconds into a connection at which its replacement is opened."""
+        return float(self.ws_lifetime_s) * float(self.ws_rotate_frac)
 
 
 class WsVenue(Base):
@@ -77,6 +88,15 @@ class Recorder(Base):
         ..., gt=0, description="rows buffered per output file before an early flush"
     )
     gap_alert_s: Pos = Field(..., description="seconds of stream silence counted as a gap")
+    l2_gap_multiple: Pos = Field(
+        ..., description="multiples of the measured l2 cadence that count as a gap"
+    )
+    trades_gap_s: Pos = Field(
+        ..., description="seconds without a trade on one coin, counted as a gap"
+    )
+    lag_alert_s: Pos = Field(
+        ..., description="seconds one coin may arrive behind its exchange time before alerting"
+    )
     silence_alert_s: Pos = Field(..., description="seconds of silence that alerts Telegram")
     parse_error_alert_1h: int = Field(
         ..., gt=0, description="count: refused rows plus unreadable messages per hour that alerts"

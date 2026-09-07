@@ -397,14 +397,14 @@ def test_the_derivation_drops_the_api_bars_of_a_day_it_writes(tmp_path: Path) ->
 
 
 def test_a_partition_holding_both_becomes_compactable(tmp_path: Path) -> None:
-    """`_hour_of("hyperliquid_day.parquet")` raises, so the mixed partition never folds."""
+    """A day file beside the `hl_api` bars it duplicates is refused, so it never folds."""
     from liqfade.recorder.writer import compact_day
 
     root = tmp_path / "parquet"
     write_trades(tmp_path, DAY, [trade(MINUTE, 100.0, 1.0, tid=1)])
     write_api_bars(tmp_path, DAY)
     write_api_bars(tmp_path, DAY, name=candles.OUTPUT_NAME)  # as the old run left it
-    with pytest.raises(RuntimeError, match="cannot read the hour"):
+    with pytest.raises(RuntimeError, match="compacted day file beside"):
         compact_day(root, DAY.isoformat(), tables=["candles_1m"])
 
     assert candles.run(tmp_path, DAY, DAY, force=True) == 0
