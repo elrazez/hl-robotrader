@@ -25,6 +25,10 @@ Screen { layout: vertical; }
 #configs-table { height: 1fr; min-height: 8; }
 .run-row { height: 3; }
 .run-key { width: 12; padding: 1 1 0 0; }
+/* Textual's Input is 100% wide by default, so three of them on one row are laid out one
+   screen apart and the last two cannot be seen. `.field-input` covers the edit form only,
+   which is why this went unnoticed until docs/lab/run.svg was looked at. */
+.run-row Input, .run-row Select { width: 1fr; }
 #run-command { padding: 1 1; color: $success; }
 #run-status { color: $text-muted; padding: 0 1; }
 #run-progress { padding: 1 1; height: auto; min-height: 4; }
