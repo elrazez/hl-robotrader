@@ -306,6 +306,7 @@ risk:
   heartbeat_s: 1.0  # seconds between touches of data/heartbeat by the live loop
   watchdog_stale_s: 10.0  # seconds of heartbeat staleness before the watchdog cancels all
   kill_deadline_s: 5.0  # seconds within which /kill must have cancelled and flattened
+  kill_budget_s: 4.0  # seconds the kill's venue calls get; the rest of the deadline is the report
 
 execution:
   entry_tif: Alo  # post only at the touch; taker entries are the exception, not the rule

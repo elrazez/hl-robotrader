@@ -226,6 +226,7 @@ class PaperLoop:
             close_position=self.session.close_position,
             alert=self.post,
             stop=stop,
+            budget_s=settings.risk.kill_budget_s,
         )
 
     def sink(self, table: str, venue: str, row: dict[str, Any]) -> None:

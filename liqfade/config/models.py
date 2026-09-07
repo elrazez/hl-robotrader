@@ -410,6 +410,9 @@ class Risk(Base):
         ..., description="seconds of heartbeat staleness before cancel all"
     )
     kill_deadline_s: Pos = Field(..., description="seconds within which /kill must have flattened")
+    kill_budget_s: Pos = Field(
+        4.0, description="seconds the kill sweep's venue calls get, inside kill_deadline_s"
+    )
 
     @model_validator(mode="after")
     def _stale_ordered(self) -> Risk:
@@ -419,6 +422,11 @@ class Risk(Base):
             )
         if self.watchdog_stale_s <= self.heartbeat_s:
             raise ValueError("risk.watchdog_stale_s must be > heartbeat_s")
+        if self.kill_budget_s >= self.kill_deadline_s:
+            # The budget bounds the venue calls; the deadline is the promise CLAUDE.md
+            # rule 5 makes. The confirmation, the alert and the logging happen in between,
+            # so a budget at the deadline is a promise already broken.
+            raise ValueError("risk.kill_budget_s must be < kill_deadline_s")
         return self
 
 
