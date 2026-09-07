@@ -69,6 +69,9 @@ log = get_logger(__name__)
 __all__ = ["PaperBackend", "PaperLoop"]
 
 HEARTBEAT_S = 1.0
+# Seconds before the same risk reason is posted again. Every refusal is logged; a gate
+# that refuses every 250ms tick is one thing to say, not two thousand.
+RISK_BLOCK_ALERT_S = 300.0
 DEFAULT_PAPER_EQUITY = 10_000.0  # USD, overridden by --equity. Never a hardcoded live number.
 
 
@@ -236,6 +239,7 @@ class PaperLoop:
         self.reconnected = asyncio.Event()
         self.ticks = 0
         self.reconnects = 0
+        self._risk_block_posted: dict[str, float] = {}
 
     # --- wiring ---------------------------------------------------------------
 
@@ -341,6 +345,7 @@ class PaperLoop:
             for intent in intents:
                 await self._post_intent(intent)
             posted_fills = await self._post_fills(posted_fills)
+            await self.report_risk_blocks()
             elapsed = time.monotonic() - started
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=max(0.0, cadence_s - elapsed))
@@ -378,6 +383,33 @@ class PaperLoop:
                 )
             )
         return posted
+
+    async def report_risk_blocks(self) -> None:
+        """Log every risk refusal since the last tick and post one per reason per window.
+
+        The engine counts refusals into `result.risk_blocks`, which is what the backtest
+        report reads. In the live process a counter nobody looks at is a silent refusal,
+        and a strategy that has quietly stopped trading looks exactly like one that has
+        found nothing to trade. Logging is unconditional; the Telegram post is rate
+        limited per reason, because a gate that refuses on every tick has one thing to say.
+        """
+        blocks = self.session.result.recent_risk_blocks
+        now = time.monotonic()
+        newest: dict[str, str] = {}
+        while blocks:
+            ts_ms, coin, reason = blocks.popleft()
+            log.warning("risk_block", reason=reason, coin=coin, ts_ms=ts_ms)
+            newest[reason] = coin
+        for reason, coin in newest.items():
+            if now - self._risk_block_posted.get(reason, -RISK_BLOCK_ALERT_S * 2) < (
+                RISK_BLOCK_ALERT_S
+            ):
+                continue
+            self._risk_block_posted[reason] = now
+            await self.post(
+                f"[{self.settings.env}] RISK BLOCK {reason} on {coin} "
+                f"(x{self.session.result.risk_blocks.get(reason, 0)} so far)"
+            )
 
     async def heartbeat_loop(self, stop: asyncio.Event) -> None:
         """Touch the heartbeat file every second. The watchdog reads nothing else."""

@@ -320,3 +320,70 @@ async def test_the_heartbeat_file_is_written(loop: PaperLoop) -> None:
 async def test_the_counters_are_what_the_daily_report_reads(loop: PaperLoop) -> None:
     counters = loop.counters()
     assert set(counters) >= {"ticks", "intents", "fills", "trades", "reconcile_differences"}
+
+
+async def test_a_risk_block_records_the_coin_it_blocked(loop: PaperLoop) -> None:
+    """A count keyed on the reason alone cannot say which coin was refused."""
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    # Six seconds after the last HL row, past risk.stale_coin_s of five.
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000)
+
+    assert loop.session.result.risk_blocks == {"stale_coin_data": 1}
+    assert [(coin, reason) for _ts, coin, reason in loop.session.result.recent_risk_blocks] == [
+        (COIN, "stale_coin_data")
+    ]
+
+
+async def test_a_risk_block_is_logged_and_posted_once_per_reason(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A silent refusal in the live process is a strategy that looks like it stopped."""
+    import structlog
+
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    for n in range(3):
+        loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000 + n)
+
+    with structlog.testing.capture_logs() as logs:
+        await loop.report_risk_blocks()
+
+    events = [entry for entry in logs if entry["event"] == "risk_block"]
+    assert len(events) == 3  # every one is logged
+    assert events[0]["reason"] == "stale_coin_data"
+    assert events[0]["coin"] == COIN
+    # And posted once, because three identical refusals in one second are one thing to say.
+    assert len(posted) == 1
+    assert "stale_coin_data" in posted[0]
+    assert COIN in posted[0]
+    # The counter the report reads is untouched.
+    assert loop.session.result.risk_blocks["stale_coin_data"] == 3
+
+
+async def test_the_same_risk_reason_is_not_posted_again_inside_its_window(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    posted: list[str] = []
+
+    async def fake_post(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    monkeypatch.setattr(loop, "post", fake_post)
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 7_000)
+    await loop.report_risk_blocks()
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 8_000)
+    await loop.report_risk_blocks()
+
+    assert len(posted) == 1
