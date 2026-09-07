@@ -346,3 +346,25 @@ def test_the_kill_budget_has_to_leave_room_inside_the_deadline() -> None:
     merged["risk"]["kill_budget_s"] = merged["risk"]["kill_deadline_s"]
     with pytest.raises(ValidationError, match="kill_budget_s"):
         Settings.model_validate(merged)
+
+
+async def test_the_confirmation_names_a_few_abandoned_targets_and_counts_the_rest(
+    tmp_path: Path,
+) -> None:
+    """The drill of 2026-09-07 found this one.
+
+    Sixty hanging calls put sixty 34 character cloids in the Telegram confirmation, which
+    is two thousand characters of hex in the one message that has to be read at a glance.
+    The count is the number that matters and a few examples are what makes it actionable;
+    the full list stays in the log line, where a machine reads it.
+    """
+    executor = Hanging(orders=[f"0x{i:032x}" for i in range(40)])
+    posted: list[str] = []
+    switch = a_switch(tmp_path, executor, posted, budget_s=0.2)
+
+    result = await switch.fire(reason="many")
+
+    assert "40" in (result.reason or "")
+    assert posted
+    assert len(posted[0]) < 400, f"confirmation is {len(posted[0])} characters"
+    assert "0x" + "0" * 32 in posted[0]  # still names some of them

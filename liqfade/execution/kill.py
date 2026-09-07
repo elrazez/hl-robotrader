@@ -55,6 +55,10 @@ DEFAULT_POLL_S = 1.0  # the flag is checked this often; the budget is 5s and thi
 # Seconds the whole sweep gets. Under `risk.kill_deadline_s`, which is the promise, so the
 # confirmation still lands inside it after the alert and the logging.
 DEFAULT_BUDGET_S = 4.0
+# Abandoned targets named in the confirmation before it says "and N more". The count is
+# the number that matters at a glance; a few cloids are what make it actionable. The full
+# list goes in the log line, where a machine reads it.
+NAMED_IN_CONFIRMATION = 5
 
 
 class KillSwitch:
@@ -132,11 +136,11 @@ class KillSwitch:
         if cancel_failures:
             parts.append(f"{cancel_failures} cancel(s) failed")
         if stuck_cancels:
-            parts.append(f"cancel abandoned on {', '.join(stuck_cancels)}")
+            parts.append(f"cancel abandoned on {_some(stuck_cancels)}")
         if close_failures:
             parts.append(f"{close_failures} close(s) failed")
         if stuck_closes:
-            parts.append(f"close abandoned on {', '.join(stuck_closes)}")
+            parts.append(f"close abandoned on {_some(stuck_closes)}")
         detail = "; ".join(parts) or None
         if not written:
             detail = kill_not_persisted(self.kill_file, detail)
@@ -212,6 +216,13 @@ class KillSwitch:
         with contextlib.suppress(Exception):
             # Telegram being down cannot be allowed to raise into a kill that worked.
             await self._alert(text)
+
+
+def _some(targets: Sequence[str]) -> str:
+    """A few of them by name, then how many more. See `NAMED_IN_CONFIRMATION`."""
+    named = ", ".join(targets[:NAMED_IN_CONFIRMATION])
+    extra = len(targets) - NAMED_IN_CONFIRMATION
+    return f"{named} and {extra} more" if extra > 0 else named
 
 
 async def _before(awaitable: Awaitable[Any], deadline: float) -> Any:
