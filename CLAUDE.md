@@ -9,6 +9,16 @@ Read this file fully before doing anything. Then read the reference doc for the 
 - `docs/STRATEGY_AND_RISK.md` before any signal, sizing, risk or backtest-logic work
 - `docs/ROADMAP.md` for the phase you are in and its definition of done
 
+Think before coding. State assumptions. Ask if ambiguous.
+Simplest code that works. No speculative abstractions.
+Surgical edits only. Do not “improve” adjacent code.
+Define done in a way a test or command can check.
+
+## Context7
+Before writing code that uses a third-party library or API, call Context7
+(resolve-library-id → query-docs) using the version in package.json.
+Do this without being asked. Skip for this repo’s own code.
+
 ## 1. Owner context and decisions already made
 
 - The project is driven through Claude Code. Explain non-obvious design choices in one or two sentences in commit messages or PR notes. Do not over-explain basics.
