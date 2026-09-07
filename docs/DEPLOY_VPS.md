@@ -57,6 +57,26 @@ exactly this reason.
 
 The script is safe to run twice.
 
+**Pin the box's key in `~/.ssh/config`, do not let the agent guess.** sshd allows 3 key
+attempts per connection and fail2ban bans the address for an hour after 4 failures in 10
+minutes. An SSH agent holding several keys offers them in its own order, so if the box's
+key is not among the first three the connection dies with "Too many authentication
+failures" and a few retries earn an hour long ban. That happened on 2026-09-07 and cost several
+hours. Give the box an alias that pins one key:
+
+```
+Host liqfade-vps
+    HostName <server>
+    Port 2222
+    User root
+    IdentityFile ~/.ssh/liqfade_vps.pub
+    IdentitiesOnly yes
+```
+
+Then every command below is `ssh liqfade-vps ...` rather than `ssh -p 2222 root@<server>`.
+`IdentitiesOnly yes` is the part that matters: without it the agent still offers
+everything it holds first. The `.pub` file is enough, the private half stays in the agent.
+
 ### 2. Turn on Tailscale
 
 ```bash
