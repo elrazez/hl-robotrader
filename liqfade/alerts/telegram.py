@@ -17,6 +17,12 @@ That puts a rule on the callers: an alert about an ongoing condition must read t
 every tick it is raised. A number that moves (seconds silent, percent full) makes every
 repeat a new string and defeats this entirely, so those alerts carry the threshold that
 was crossed rather than the current value. See `recorder/health.py`.
+
+**Events opt out with `dedupe=False`.** The dedupe is right for a condition and wrong for
+a thing that happened: two identical fills ten minutes apart are two fills, and the second
+one being swallowed loses a trade from the record the owner reads. An undeduped send also
+leaves the timer alone, so posting a fill cannot silence a health alert that happens to
+read the same. Intents and fills use it; everything else keeps the dedupe.
 """
 
 from __future__ import annotations
@@ -54,14 +60,22 @@ def _deduped(text: str, now: float) -> bool:
     return False
 
 
-async def send_alert(text: str, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> bool:
+async def send_alert(
+    text: str, *, timeout_s: float = DEFAULT_TIMEOUT_S, dedupe: bool = True
+) -> bool:
     """Post one alert. Returns True only when Telegram accepted it.
 
     Credentials are read from the environment at call time rather than cached, so adding
     them to .env and restarting nothing but the service is enough, and so a process that
     starts before .env is filled in starts logging alerts instead of crashing.
+
+    Args:
+        text: the message.
+        timeout_s: seconds before the send is abandoned.
+        dedupe: False for an event, which must always go out and must not start a timer
+            against its own words. True for a condition, which repeats.
     """
-    if _deduped(text, time.monotonic()):
+    if dedupe and _deduped(text, time.monotonic()):
         return False
 
     token = os.environ.get(TOKEN_ENV, "")

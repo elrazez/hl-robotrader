@@ -128,3 +128,30 @@ def test_a_send_leaves_no_bot_token_in_the_log(monkeypatch: pytest.MonkeyPatch) 
         setup_logging(proc="unit", env="paper", level="INFO")
         assert asyncio.run(send_alert("cascade on BTC")) is True
     assert token not in buf.getvalue()
+
+
+async def test_a_fill_is_never_suppressed_by_the_dedupe(fake: type[FakeClient]) -> None:
+    """Two identical fills ten minutes apart are two fills, and both have to be said.
+
+    The dedupe is keyed on the exact text for ten minutes, which is right for a health
+    alert about an ongoing condition and wrong for an event. `SIM FILL ETH entry 0.1 @
+    3000` is a different trade the second time it is true.
+    """
+    text = "[paper] SIM FILL ETH entry 0.1 @ 3000"
+
+    assert await send_alert(text, dedupe=False) is True
+    assert await send_alert(text, dedupe=False) is True
+
+    assert len(fake.posted) == 2
+
+
+async def test_an_undeduped_alert_does_not_silence_the_deduped_ones(
+    fake: type[FakeClient],
+) -> None:
+    """A fill going out must not start a ten minute timer against the same words."""
+    text = "[paper] SIM FILL ETH entry 0.1 @ 3000"
+
+    assert await send_alert(text, dedupe=False) is True
+    assert await send_alert(text) is True
+
+    assert len(fake.posted) == 2

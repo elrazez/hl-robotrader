@@ -202,7 +202,8 @@ class PaperBackend:
             return InjectResult(injected=False, coin=coin, reason="no price for that coin yet")
         await self.loop.post(
             f"[{self.loop.settings.env}] INTENT INJECTED {coin} {side} "
-            f"entry {intent.entry_px:g} target {intent.target_px:g} stop {intent.stop_px:g}"
+            f"entry {intent.entry_px:g} target {intent.target_px:g} stop {intent.stop_px:g}",
+            dedupe=False,
         )
         return InjectResult(injected=True, coin=coin, side=side, entry_px=intent.entry_px)
 
@@ -317,11 +318,17 @@ class PaperLoop:
             "reconnects": self.reconnects,
         }
 
-    async def post(self, text: str) -> bool:
-        """One Telegram line. Never raises, never blocks a decision."""
+    async def post(self, text: str, *, dedupe: bool = True) -> bool:
+        """One Telegram line. Never raises, never blocks a decision.
+
+        `dedupe=False` for an event. An intent and a fill are things that happened, and
+        two identical ones inside the dedupe window are two of them.
+        """
         if not self.settings.telegram.enabled:
             return False
-        return await send_alert(text, timeout_s=self.settings.telegram.send_timeout_s)
+        return await send_alert(
+            text, timeout_s=self.settings.telegram.send_timeout_s, dedupe=dedupe
+        )
 
     # --- the loops ------------------------------------------------------------
 
@@ -367,7 +374,8 @@ class PaperLoop:
         await self.post(
             f"[{self.settings.env}] INTENT {intent.coin} {intent.side} "
             f"entry {intent.entry_px:g} target {intent.target_px:g} stop {intent.stop_px:g} "
-            f"({intent.urgency})\n{explain}"
+            f"({intent.urgency})\n{explain}",
+            dedupe=False,
         )
 
     async def _post_fills(self, posted: int) -> int:
@@ -380,7 +388,8 @@ class PaperLoop:
                     f" pnl {self.session.portfolio.trades[-1].net_pnl:+.2f}"
                     if leg != "entry" and self.session.portfolio.trades
                     else ""
-                )
+                ),
+                dedupe=False,
             )
         return posted
 

@@ -387,3 +387,59 @@ async def test_the_same_risk_reason_is_not_posted_again_inside_its_window(
     await loop.report_risk_blocks()
 
     assert len(posted) == 1
+
+
+async def test_two_identical_simulated_fills_are_both_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`loop.post` used to send every line through the ten minute dedupe.
+
+    Two identical fills inside ten minutes are two trades, and the second one being
+    swallowed loses it from the only record the owner watches in real time.
+    """
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper.session.fills.append((START, COIN, "entry", 3000.0, 0.1))
+        paper.session.fills.append((START + 1, COIN, "entry", 3000.0, 0.1))
+
+        posted = await paper._post_fills(0)
+
+        assert posted == 2
+        assert len(sent) == 2
+        assert sent[0][0] == sent[1][0]  # identical text, both sent
+        assert all(dedupe is False for _text, dedupe in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_recorder_style_condition_alert_keeps_its_dedupe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything that is not an event still repeats the same words every tick it holds."""
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        await paper.post("[paper] RECONCILE interval: missing_order")
+
+        assert sent == [("[paper] RECONCILE interval: missing_order", True)]
+    finally:
+        await paper.aclose()
