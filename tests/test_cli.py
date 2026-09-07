@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -703,6 +704,30 @@ def test_paper_refuses_a_trigger_no_live_feed_carries(capsys: pytest.CaptureFixt
     assert "LIQFADE_CASCADE__TRIGGER=crossvenue" in error
 
 
-def test_paper_refuses_mainnet(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["paper", "--env", "mainnet"]) == 1
-    assert "refuses --env mainnet" in capsys.readouterr().err
+@pytest.mark.parametrize("asked", ["testnet", "mainnet"])
+def test_paper_forces_env_paper_whatever_was_asked_for(
+    asked: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The paper process runs under the paper config, and only that one.
+
+    Paper simulates every fill, so a run under the testnet or mainnet config would report
+    a simulated equity curve against the risk limits of a real account. The env is also
+    one of the three gates in CLAUDE.md rule 3, and the process that can never place an
+    order is the one that should never be able to claim it is on a venue.
+    """
+    seen: list[str] = []
+
+    class FakeLoop:
+        def __init__(self, settings: Any, **_kwargs: Any) -> None:
+            seen.append(settings.env)
+
+        async def run(self, _stop: Any) -> None:
+            return None
+
+    monkeypatch.setattr("liqfade.live.loop.PaperLoop", FakeLoop)
+    monkeypatch.setenv("LIQFADE_CASCADE__TRIGGER", "crossvenue")
+
+    assert main(["paper", "--env", asked, "--minutes", "0"]) == 0
+
+    assert seen == ["paper"]
+    assert f"ignores --env {asked}" in capsys.readouterr().err

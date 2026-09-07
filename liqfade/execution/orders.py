@@ -22,6 +22,11 @@ looping on it.
 back to PARTIAL, because a cancel that raced a fill did not stop the fill and pretending
 otherwise means the position book and the venue disagree in the direction that hurts.
 
+**The kill flag is re-checked at submit, not trusted from startup.** `load_signer`
+refuses to build a signer while the flag is there, and a kill can land in the seconds
+between that and an order. CLAUDE.md rule 5 says the flag wins, so `submit` asks again and
+records a refusal rather than placing.
+
 **Rounding happens here and nowhere else.** The strategy works in floats and does not
 know an asset's `szDecimals`; `submit` is the last thing to touch a price before the wire,
 so it is the only thing that rounds one, through `execution/rounding.py`. The rounded
@@ -40,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import random
 import secrets
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
@@ -376,6 +381,7 @@ class OrderManager:
         transport: OrderTransport,
         *,
         sz_decimals: Mapping[str, int],
+        killed: Callable[[], bool],
         retries: int = 3,
         backoff_s: float = 0.25,
     ) -> None:
@@ -386,6 +392,10 @@ class OrderManager:
             sz_decimals: coin to `meta.universe[i].szDecimals`, which is what both
                 rounding rules are computed from. A coin missing from it is refused: a
                 guessed grid is how a bug becomes an order.
+            killed: True when the kill flag is present. Asked on every submit, never
+                cached, because the flag can appear between one order and the next.
+                `Settings.kill_switch_present` is what the loop passes, and it fails
+                closed on an unreadable data dir.
             retries: retries after the first attempt, on transient errors only. From
                 `execution.transient_retries`.
             backoff_s: base delay; each retry waits `backoff_s * 2**attempt` times a
@@ -395,6 +405,7 @@ class OrderManager:
         self.store = store
         self.transport = transport
         self.sz_decimals = dict(sz_decimals)
+        self.killed = killed
         self.retries = retries
         self.backoff_s = backoff_s
         self._orders: dict[str, Order] = {}
@@ -422,7 +433,8 @@ class OrderManager:
         steps and the second task passes the check while the first is still in flight.
 
         Returns:
-            The order, ACKED on success or REJECTED when the venue refused it.
+            The order, ACKED on success or REJECTED when the venue refused it, when the
+            kill flag is on, or when it could not be rounded onto the venue's grid.
 
         Raises:
             TransientTransportError: every retry failed. The order may still be resting;
@@ -440,6 +452,13 @@ class OrderManager:
                     status=str(existing.status),
                 )
                 return existing
+
+            if self.killed():
+                reason = "kill switch is on; refusing to place"
+                order = Order(intent=intent, status=OrderStatus.REJECTED, reject_reason=reason)
+                self._orders[intent.cloid] = order
+                await self._persist(order, "order_rejected", reason=reason, source="kill_switch")
+                return order
 
             try:
                 intent = self._rounded(intent)

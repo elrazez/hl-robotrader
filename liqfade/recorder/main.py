@@ -58,7 +58,7 @@ def build_streams(
     sink: RowSink,
     *,
     on_rtt_ms: Callable[[float], None] | None = None,
-    on_reconnect: Callable[[], None] | None = None,
+    on_reconnect: Callable[[str], None] | None = None,
 ) -> list[WSStream]:
     """Every enabled venue stream, pointed at one sink.
 

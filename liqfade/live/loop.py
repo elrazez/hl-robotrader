@@ -241,6 +241,8 @@ class PaperLoop:
         self.ticks = 0
         self.reconnects = 0
         self._risk_block_posted: dict[str, float] = {}
+        self._halt_posted: str | None = None
+        self._tasks: set[asyncio.Task[Any]] = set()
 
     # --- wiring ---------------------------------------------------------------
 
@@ -287,14 +289,25 @@ class PaperLoop:
             budget_s=settings.risk.kill_budget_s,
         )
 
-    def _on_reconnect(self) -> None:
-        """A stream came back, or a supervised task was restarted. Reconcile now.
+    def _on_reconnect(self, venue: str) -> None:
+        """A stream came back, or a supervised task was restarted. Reconcile, and say so.
 
         CLAUDE.md rule 4: a socket that was away missed whatever happened while it was,
-        so the two books are compared without waiting out the interval.
+        so the two books are compared without waiting out the interval. CLAUDE.md section
+        5 lists the reconnect itself among the things Telegram hears about. Sync, because
+        the stream's own loop calls it, so the post goes on a task and the dedupe keeps a
+        flapping venue to one line every ten minutes.
         """
         self.reconnects += 1
         self.reconnected.set()
+        log.warning("stream_reconnected", venue=venue, reconnects=self.reconnects)
+        self._background(self.post(f"[{self.settings.env}] RECONNECT {venue}"))
+
+    def _background(self, coro: Any) -> None:
+        """Run a post from a sync caller. Kept referenced so it is not collected early."""
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     def sink(self, table: str, venue: str, row: dict[str, Any]) -> None:
         """Every stream's rows land here. Called from the receive loop, so it never raises."""
@@ -345,14 +358,16 @@ class PaperLoop:
                 # time stop of a position already open. Pause drops new entries, nothing
                 # else; `PaperSession.tick` is where that is applied.
                 intents = await self.session.tick(at, allow_entries=not self.paused)
-            except Exception:
+            except Exception as exc:
                 log.exception("tick_failed")
                 intents = []
+                await self.post(f"[{self.settings.env}] ERROR tick failed: {exc}")
             self.ticks += 1
             for intent in intents:
                 await self._post_intent(intent)
             posted_fills = await self._post_fills(posted_fills)
             await self.report_risk_blocks()
+            await self.report_halt()
             elapsed = time.monotonic() - started
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=max(0.0, cadence_s - elapsed))
@@ -420,6 +435,23 @@ class PaperLoop:
                 f"(x{self.session.result.risk_blocks.get(reason, 0)} so far)"
             )
 
+    async def report_halt(self) -> None:
+        """Post when the risk engine halts, and again when it clears. Once each.
+
+        The halt reason repeats every tick for as long as it holds, so the edge is what
+        is worth saying. CLAUDE.md section 5 lists halt among the things Telegram hears.
+        """
+        reason = self.session.risk.state.halt_reason
+        if reason == self._halt_posted:
+            return
+        self._halt_posted = reason
+        if reason:
+            log.error("risk_halted", reason=reason)
+            await self.post(f"[{self.settings.env}] HALT {reason}. No new entries.")
+        else:
+            log.warning("risk_halt_cleared")
+            await self.post(f"[{self.settings.env}] halt cleared, entries allowed again")
+
     async def heartbeat_loop(self, stop: asyncio.Event) -> None:
         """Touch the heartbeat file every second. The watchdog reads nothing else."""
         path = self.settings.heartbeat_path
@@ -441,11 +473,12 @@ class PaperLoop:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 log.exception("task_crashed", task=name)
-                # A restarted stream task is a reconnect like any other, and the books
-                # have to be compared before it is trusted again.
-                self._on_reconnect()
+                await self.post(f"[{self.settings.env}] ERROR task {name} crashed: {exc}")
+                # A restarted task is a reconnect like any other, and the books have to be
+                # compared before it is trusted again.
+                self._on_reconnect(name)
             delay = backoff_delay(attempt, self.settings.recorder)
             attempt += 1
             with contextlib.suppress(TimeoutError):

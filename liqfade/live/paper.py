@@ -21,11 +21,15 @@ the same rows they will see on testnet.
 `inject_intent` exists for drills, because a cross-venue cascade may not happen on the
 afternoon you want to test the plumbing. It builds an intent from the current book and
 pushes it through sizing, the risk gate and the order path exactly as the strategy's own
-intents go, and it is refused outright when the environment is mainnet.
+intents go, and it is refused outright when the environment is mainnet **or** when
+`LIQFADE_LIVE_TRADING` is set. The env is only one of the three gates in CLAUDE.md rule 3,
+and a box that has been armed is not a box to open a position on with no signal behind it,
+whatever its env file says.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -226,13 +230,19 @@ class PaperSession:
         invented entry price is an invented drill.
 
         Raises:
-            PermissionError: the environment is mainnet. A drill command that can open a
-                real position is not a drill command.
+            PermissionError: the environment is mainnet, or LIQFADE_LIVE_TRADING is set.
+                A drill command that can open a real position is not a drill command, and
+                the env is only one of the three gates that decide whether it can.
         """
         if self.settings.env == "mainnet":
             raise PermissionError(
                 "inject_intent is refused on mainnet: it opens a position with no signal "
                 "behind it. Run it in paper or on testnet."
+            )
+        if os.environ.get("LIQFADE_LIVE_TRADING"):
+            raise PermissionError(
+                "inject_intent is refused while LIQFADE_LIVE_TRADING is set: this process "
+                "has been armed for live trading, whatever its env says. Unset it first."
             )
         coin_state = self.state.get(coin)
         mid = coin_state.book.mid() if coin_state else None

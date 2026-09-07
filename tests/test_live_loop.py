@@ -297,7 +297,7 @@ async def test_a_stream_reconnect_reconciles_without_waiting_for_the_interval(
         await asyncio.sleep(0.02)
         assert loop.reconciler.runs == 1  # startup
 
-        loop.streams[0].on_reconnect()  # what WSStream.run calls when it comes back
+        loop.streams[0].on_reconnect("hyperliquid")  # what WSStream.run calls on the way back
         await asyncio.sleep(0.02)
 
         assert loop.reconciler.runs == 2
@@ -443,3 +443,94 @@ async def test_a_recorder_style_condition_alert_keeps_its_dedupe(
         assert sent == [("[paper] RECONCILE interval: missing_order", True)]
     finally:
         await paper.aclose()
+
+
+def _recorder(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    """Capture what the loop would have posted to Telegram."""
+    import liqfade.live.loop as loop_module
+
+    sent: list[tuple[str, bool]] = []
+
+    async def fake_send(text: str, *, timeout_s: float = 10.0, dedupe: bool = True) -> bool:
+        sent.append((text, dedupe))
+        return True
+
+    monkeypatch.setattr(loop_module, "send_alert", fake_send)
+    return sent
+
+
+async def test_a_stream_reconnect_is_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLAUDE.md section 5 lists reconnect among the things that go to Telegram."""
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper._on_reconnect("hyperliquid")
+        await asyncio.sleep(0.01)
+
+        assert any("RECONNECT" in text and "hyperliquid" in text for text, _ in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_tick_that_raises_is_posted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error the loop swallowed into a log line is an error nobody sees."""
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+
+        async def boom(*_args: object, **_kwargs: object) -> list[Any]:
+            raise RuntimeError("the book fell over")
+
+        monkeypatch.setattr(paper.session, "tick", boom)
+        stop = asyncio.Event()
+        task = asyncio.create_task(paper.tick_loop(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+
+        assert any("ERROR" in text and "the book fell over" in text for text, _ in sent)
+    finally:
+        await paper.aclose()
+
+
+async def test_a_halt_is_posted_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _recorder(monkeypatch)
+    paper = PaperLoop(paper_settings(tmp_path, **{"telegram.enabled": True}))
+    await paper.setup()
+    try:
+        paper.session.risk.state.halt_reason = "drawdown"
+        await paper.report_halt()
+        await paper.report_halt()
+
+        halts = [text for text, _ in sent if "HALT" in text]
+        assert len(halts) == 1
+        assert "drawdown" in halts[0]
+    finally:
+        await paper.aclose()
+
+
+async def test_inject_intent_is_refused_when_live_trading_is_armed(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`env != mainnet` is not the whole gate. An armed box is not a drill box.
+
+    The drill opens a position with no signal behind it. Doing that on a process that has
+    been told live trading is on is exactly the mistake the three gates exist to stop,
+    whatever the env file happens to say.
+    """
+    monkeypatch.setenv("LIQFADE_LIVE_TRADING", "1")
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+
+    from liqfade.live.loop import PaperBackend
+
+    result = await PaperBackend(loop).inject_intent(coin=COIN, side="long")
+
+    assert result.injected is False
+    assert "LIQFADE_LIVE_TRADING" in (result.reason or "")

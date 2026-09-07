@@ -418,7 +418,7 @@ class WSStream:
         ping_frame: Any = None,
         pong_marker: bytes | None = None,
         on_rtt_ms: Callable[[float], None] | None = None,
-        on_reconnect: Callable[[], None] | None = None,
+        on_reconnect: Callable[[str], None] | None = None,
         rotate_after_s: float | None = None,
         rotate_overlap_s: float = ROTATE_OVERLAP_S,
     ) -> None:
@@ -559,7 +559,7 @@ class WSStream:
                 # Never allowed to take the stream down: this is a notification, and the
                 # reconnect matters more than whoever wanted to hear about it.
                 with contextlib.suppress(Exception):
-                    self.on_reconnect()
+                    self.on_reconnect(self.venue)
             if time.monotonic() - opened > STABLE_CONNECTION_S:
                 attempt = 0
             delay = backoff_delay(attempt, self.cfg)

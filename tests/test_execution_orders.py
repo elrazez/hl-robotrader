@@ -54,7 +54,13 @@ SZ_DECIMALS = {"ETH": 4, "BTC": 5, "SOL": 2}
 
 
 def a_manager(store: OrderStore, transport: Any = None, **kwargs: Any) -> OrderManager:
-    return OrderManager(store, transport or FakeTransport(), sz_decimals=SZ_DECIMALS, **kwargs)
+    return OrderManager(
+        store,
+        transport or FakeTransport(),
+        sz_decimals=SZ_DECIMALS,
+        killed=lambda: False,
+        **kwargs,
+    )
 
 
 @pytest.fixture
@@ -325,4 +331,21 @@ async def test_a_size_that_rounds_away_is_refused(store: OrderStore) -> None:
     order = await manager.submit(an_intent(coin="SOL", px=150.0, size=0.001))
 
     assert order.status is OrderStatus.REJECTED
+    assert transport.placed == []
+
+
+async def test_submit_refuses_while_the_kill_flag_is_there(store: OrderStore) -> None:
+    """The check made once at `load_signer` is not the check that matters at submit time.
+
+    A kill can land in the seconds between loading a signer and placing an order, and
+    CLAUDE.md rule 5 says the flag wins. The order path asks again rather than trusting an
+    answer from before the flag existed.
+    """
+    transport = FakeTransport()
+    manager = OrderManager(store, transport, sz_decimals=SZ_DECIMALS, killed=lambda: True)
+
+    order = await manager.submit(an_intent(coin="ETH"))
+
+    assert order.status is OrderStatus.REJECTED
+    assert "kill" in (order.reject_reason or "").lower()
     assert transport.placed == []
