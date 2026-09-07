@@ -41,7 +41,7 @@ them and a hand-written file without them still lists.
 | `v` | view: every overridden key against the resolved default, with the model's description |
 | `e` | edit: the form |
 | `d` | duplicate under a new name |
-| `x` | delete, asked twice |
+| `x` | delete, asked twice; refuses the loader layers by name, as save does |
 | `r` | reread the directory |
 
 ### The form

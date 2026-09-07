@@ -319,7 +319,11 @@ class ConfigsPane(VerticalScroll):
             if not yes:
                 self._say("kept")
                 return
-            delete_config(config.path)
+            try:
+                delete_config(config.path)
+            except (LabConfigError, OSError) as exc:
+                self._say(f"[red]{exc}[/red]")
+                return
             self.action_refresh()
             self._say(f"deleted {config.path.name}")
 

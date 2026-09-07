@@ -127,3 +127,18 @@ async def test_opening_the_real_v1_config_and_saving_it_changes_nothing(tmp_path
     after = read_config(target)
     assert after.overrides == before.overrides
     assert after.overrides["cascade.liq_z_min"] is None, "the z trigger came back on"
+
+
+async def test_the_screen_refuses_to_delete_a_loader_layer(tmp_path: Path) -> None:
+    """`liqfade lab --config-dir config` puts mainnet.yaml one keystroke from the cursor."""
+    (tmp_path / "mainnet.yaml").write_text("risk:\n  max_dd_frac: 0.1\n")
+    app = LabApp(config_dir=tmp_path, reports_dir=tmp_path / "reports")
+    async with app.run_test() as pilot:
+        await pilot.press("x")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        assert (tmp_path / "mainnet.yaml").exists(), "the lab deleted a loader layer file"
+        assert "loader owns" in text_of(app.query_one("#configs-status"))
