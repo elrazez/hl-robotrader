@@ -354,3 +354,38 @@ class TestValidation:
 
     def test_metrics_on_an_empty_split_are_zeros_rather_than_a_crash(self) -> None:
         assert compute_metrics([]).trades == 0
+
+
+class TestTheReplayTellsRiskAboutItsExits:
+    """`RiskEngine.on_exit` is what moves the state three gates read.
+
+    `consecutive_losses`, `daily_realized_pnl` and `coin_cooldowns` are written by
+    `on_exit` and by nothing else, so a replay that never calls it leaves `losing_streak`,
+    `daily_loss` and `coin_cooldown` unable to fire however they are configured. Only
+    `drawdown` worked, because `on_equity` maintains the peak it reads.
+
+    The per-coin cooldown is the cheapest of the three to show: the consistency stream's
+    cascades are fifteen minutes apart on one coin, so a cooldown longer than that has to
+    block every cascade after the first.
+    """
+
+    def test_a_coin_that_just_exited_is_on_cooldown_for_the_next_cascade(
+        self, stream: tuple[pl.DataFrame, pl.DataFrame, int, int], settings_factory: SettingsFactory
+    ) -> None:
+        tuned = settings_factory(
+            **{"features.z_lookback_h": 1.0, "risk.coin_cooldown_after_exit_min": 30}
+        )
+        result = run(stream, tuned)
+        assert result.risk_blocks.get("coin_cooldown"), (  # type: ignore[attr-defined]
+            "six cascades fifteen minutes apart on one coin, under a thirty minute "
+            "cooldown, and nothing was blocked: the replay never told the risk engine"
+        )
+        assert len(result.trades) < 6  # type: ignore[attr-defined]
+
+    def test_a_cooldown_shorter_than_the_gap_blocks_nothing(
+        self, stream: tuple[pl.DataFrame, pl.DataFrame, int, int], settings: Settings
+    ) -> None:
+        """The other half, so the test above is about the cooldown and not about cascades."""
+        result = run(stream, settings)
+        assert not result.risk_blocks.get("coin_cooldown")  # type: ignore[attr-defined]
+        assert len(result.trades) == 6  # type: ignore[attr-defined]

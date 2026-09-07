@@ -1527,6 +1527,20 @@ a halted account. The per-coin cooldowns and the cluster cap stay, because they 
 trades a run takes rather than cutting the tape short. `config/default.yaml` keeps 0.10 and
 0.03 and a test pins both halves.
 
+**Corrected 2026-09-07: only one of those three keys was doing anything.**
+`consecutive_losses`, `daily_realized_pnl` and the per-coin cooldowns are all written by
+`RiskEngine.on_exit`, and the replay never called it, so `losing_streak`, `daily_loss` and
+`coin_cooldown` could not fire at any setting. `drawdown` was the halt that cut the year
+short, because `on_equity` maintains the peak it reads, and relaxing `max_dd_frac` is what
+actually bought the whole tape. Relaxing the other two changed nothing, and the sentence
+above saying the per-coin cooldowns "stay" described an intention rather than a run: they
+were not in force either, so **every number in this entry and in the rerun below was taken
+by a run that could re-enter a coin the moment it exited it**. The exits are wired now, in
+the backtest and in the paper loop, and the next run of this config will take fewer trades
+than the table below. The zero streak cooldown was and remains correct: the gate blocks for
+the length of the cooldown and then clears the count, so zero is off, which
+`tests/test_risk.py` now pins in both directions.
+
 **The rerun.** Same command, cache warm. The exit is a trade now rather than an accident:
 
 | | before the fix | after |

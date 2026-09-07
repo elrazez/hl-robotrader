@@ -123,6 +123,29 @@ class TestGates:
         assert engine.check_entry(request(now=after), account(after)).allowed
         assert engine.state.consecutive_losses == 0, "serving the cooldown clears the count"
 
+    def test_a_zero_cooldown_turns_the_streak_gate_off(
+        self, settings_factory: SettingsFactory, tmp_path: Path
+    ) -> None:
+        """`cooldown_after_streak_min: 0` is how a tuning run asks for the whole tape.
+
+        The gate blocks for the length of the cooldown and then clears the count, so a
+        cooldown of zero is served the instant it is imposed. It is the halt that blocks,
+        not the counter: `config/backtest/v1_confluence.yaml` sets 0 for exactly this and
+        would otherwise stop trading six losses into the year.
+        """
+        engine = RiskEngine(
+            settings_factory(**{"risk.cooldown_after_streak_min": 0}),
+            path=tmp_path / "risk_state.json",
+        )
+        prime(engine)
+        for step in range(engine.settings.risk.max_consecutive_losses):
+            engine.on_exit("ETH", -1.0, NOW + step)
+        assert engine.state.consecutive_losses == engine.settings.risk.max_consecutive_losses
+
+        after = NOW + engine.settings.risk.max_consecutive_losses
+        assert engine.check_entry(request(now=after), account(after)).allowed
+        assert engine.state.consecutive_losses == 0, "a zero cooldown still clears the count"
+
     def test_a_win_resets_the_streak(self, engine: RiskEngine) -> None:
         prime(engine)
         for step in range(engine.settings.risk.max_consecutive_losses - 1):

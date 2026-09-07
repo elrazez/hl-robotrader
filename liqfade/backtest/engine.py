@@ -571,7 +571,7 @@ def _replay(
                 cloid,
             )
         else:
-            _on_event(item, state, portfolio, result, settings)
+            _on_event(item, state, portfolio, risk, result, settings)
 
 
 def _assert_flat(end_ms: int, state: Mapping[str, _CoinState], portfolio: Portfolio) -> None:
@@ -634,6 +634,7 @@ def _on_event(
     event: Event,
     state: dict[str, _CoinState],
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
 ) -> None:
@@ -670,7 +671,7 @@ def _on_event(
             last_px=event.px,
             last_trade_ms=event.ts_ms,
         )
-        _fill_against_print(event, coin_state, portfolio, result, settings)
+        _fill_against_print(event, coin_state, portfolio, risk, result, settings)
     elif isinstance(event, AssetCtx):
         portfolio.funding.add_sample(coin, event.ts_ms, event.funding)
     elif isinstance(event, Liq):
@@ -683,6 +684,7 @@ def _fill_against_print(
     trade: Trade,
     coin_state: _CoinState,
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
 ) -> None:
@@ -714,7 +716,7 @@ def _fill_against_print(
             settings=settings,
         )
         if fill is not None:
-            _book_exit(fill, exit_order, coin_state, portfolio, result)
+            _book_exit(fill, exit_order, coin_state, portfolio, risk, result)
 
 
 # --- ticks --------------------------------------------------------------------
@@ -747,7 +749,7 @@ def _on_tick(
         equity = portfolio.equity(mids)
         _cross_taker_entries(now_ms, state, portfolio, settings)
         _expire_entries(now_ms, state, portfolio, result, settings)
-        _check_exits(now_ms, state, mids, portfolio, result, settings, cloid)
+        _check_exits(now_ms, state, mids, portfolio, risk, result, settings, cloid)
     else:
         mids = {}
         equity = portfolio.cash
@@ -971,6 +973,7 @@ def _check_exits(
     state: dict[str, _CoinState],
     mids: Mapping[str, float | None],
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
     cloid: _CloidCounter,
@@ -1000,6 +1003,7 @@ def _check_exits(
                 reason="stop",
                 now_ms=now_ms,
                 portfolio=portfolio,
+                risk=risk,
                 settings=settings,
                 cloid=cloid,
             )
@@ -1014,6 +1018,7 @@ def _check_exits(
                 reason="time_stop",
                 now_ms=now_ms,
                 portfolio=portfolio,
+                risk=risk,
                 settings=settings,
                 cloid=cloid,
             )
@@ -1042,6 +1047,7 @@ def _take_exit(
     reason: str,
     now_ms: int,
     portfolio: Portfolio,
+    risk: RiskEngine,
     settings: Settings,
     cloid: _CloidCounter,
 ) -> None:
@@ -1070,7 +1076,7 @@ def _take_exit(
     if fill is None:
         return
     coin_state.exit_order = None
-    portfolio.apply_exit(fill, reason)
+    _booked(portfolio.apply_exit(fill, reason), risk)
 
 
 def _book_exit(
@@ -1078,11 +1084,24 @@ def _book_exit(
     order: SimOrder,
     coin_state: _CoinState,
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
 ) -> None:
-    portfolio.apply_exit(fill, order.tag)
+    _booked(portfolio.apply_exit(fill, order.tag), risk)
     if order.remaining <= 0:
         coin_state.exit_order = None
+
+
+def _booked(trade: PortfolioTrade | None, risk: RiskEngine) -> None:
+    """Tell the risk engine a round trip closed, which is the only thing that moves
+    `consecutive_losses`, `daily_realized_pnl` and the per-coin cooldowns.
+
+    A partial exit returns None and is not a round trip yet. `_close_out` deliberately does
+    not come through here: it fires once at the end of the run, and there is no entry left
+    for a cooldown or a streak to gate.
+    """
+    if trade is not None:
+        risk.on_exit(trade.coin, trade.net_pnl, trade.exit_ms)
 
 
 def _close_out(
