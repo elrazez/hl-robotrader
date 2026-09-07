@@ -248,3 +248,50 @@ def test_a_job_id_is_stable_and_filesystem_safe(tmp_path: Path) -> None:
     assert job.progress_path.parent == tmp_path / ".lab"
     assert job.id in job.progress_path.name
     assert "/" not in job.id
+
+
+def test_the_lab_note_is_written_at_launch_not_at_the_reaper(tmp_path: Path) -> None:
+    """Closing the lab mid-run must not lose which config produced the report.
+
+    `lab.json` was built in `_reap`, so a run that outlived the lab, which is the whole
+    point of spawning it in its own session, finished with nobody left to write it. Results
+    then fell back to the config hash and the run showed as `abcdef12`. It is written when
+    the job starts instead, into the work directory beside the log, and moved next to the
+    report when the run is reaped.
+    """
+    import orjson
+
+    from liqfade.lab.configs import save_config
+
+    config = save_config(
+        tmp_path / "tight.yaml", "Tight stops", "k_stop halved", {"intent.k_stop": 0.5}
+    )
+    queue = RunQueue(tmp_path, spawn=lambda argv, log, env: FakeProcess(), lake_busy=lambda: False)
+    job = queue.submit(spec(tmp_path, config=config))
+    queue.poll()
+    assert job.sidecar_path.exists(), "nothing recorded the job before it finished"
+    note = orjson.loads(job.sidecar_path.read_bytes())
+    assert note["config_name"] == "Tight stops"
+    assert note["overrides"] == {"intent.k_stop": 0.5}
+
+
+def test_a_report_left_by_a_dead_lab_gets_its_sidecars_on_the_next_start(
+    tmp_path: Path,
+) -> None:
+    """The lab was closed while the run was going. The next one files what it left."""
+    import orjson
+
+    report = tmp_path / "20260906T101010Z_abcdef12"
+    report.mkdir()
+    queue = RunQueue(tmp_path, spawn=lambda argv, log, env: FakeProcess(), lake_busy=lambda: False)
+    job = queue.submit(spec(tmp_path))
+    queue.poll()
+    job.log_path.write_text("the run said things\n")
+    # The lab dies here: the run goes on and writes its own report and progress file.
+    job.progress_path.write_text(
+        orjson.dumps({"stage": "done", "report_dir": str(report)}).decode()
+    )
+
+    RunQueue(tmp_path, spawn=lambda argv, log, env: FakeProcess(), lake_busy=lambda: False)
+    assert (report / "run.log").read_text() == "the run said things\n"
+    assert orjson.loads((report / "lab.json").read_bytes())["job_id"] == job.id

@@ -133,7 +133,8 @@ Everything is under the reports directory, so nothing new appears in `data/`.
 | path | what |
 |---|---|
 | `reports/.lab/<job>.progress.json` | the run's `--progress-file`, while it runs |
-| `reports/.lab/<job>.log` | the run's stdout and stderr, while it runs |
+| `reports/.lab/<job>.log` | the run's stdout and stderr, streamed while it runs |
+| `reports/.lab/<job>.lab.json` | the lab's note, written when the job is launched |
 | `<report dir>/run.log` | the same log, moved beside the report when the run ends |
 | `<report dir>/lab.json` | which config file the lab launched, its name, notes and overrides |
 
@@ -141,6 +142,14 @@ Everything is under the reports directory, so nothing new appears in `data/`.
 config, which is right for reproducing it and useless for reading a list. A run started by
 hand has no `lab.json`; Results falls back to the config hash and says so when asked to
 promote or to diff a config it does not know.
+
+**Both sidecars are written into `reports/.lab/` from the moment a job starts, and moved
+beside the report when it ends.** A run is spawned into its own session so that it outlives
+the lab, so anything only written at the end is written by nobody when the lab is closed
+mid-run. The report directory is `<report dir>/<timestamp>_<config hash>` and both halves
+of that name are decided when the report is written, so the lab cannot write straight into
+it; what it can do is finish the move on its next start, which it does, off the progress
+file the dead lab left behind.
 
 The lagged rerun's net is not in `summary.json` either. `liqfade backtest` prints it, so
 the lab reads it back out of `run.log`, and a run without a log simply shows no number
