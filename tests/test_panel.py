@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
@@ -67,16 +66,30 @@ def test_malformed_hash_reads_as_wrong_password_rather_than_crashing() -> None:
     assert verify_password(PASSWORD, "not-a-bcrypt-hash") is False
 
 
-def test_session_token_expires() -> None:
-    # itsdangerous stamps whole seconds and compares age > max_age, so a 1s ttl needs
-    # just over 2s of wall clock to be certainly expired. This is the only sleep in the
-    # suite; expiry is worth two seconds because a session that never expires is a bug
-    # nothing else would catch.
+class _Clock:
+    """The clock itsdangerous stamps tokens with and compares them against.
+
+    One `time.time()` call in `itsdangerous.timed` is its whole surface, so standing in
+    for the module there is the fake clock. It used to be a real 2.05s sleep, and
+    itsdangerous stamps whole seconds and compares `age > max_age`, so no shorter wait
+    was certainly expired.
+    """
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+
+def test_session_token_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _Clock(1_788_000_000.0)
+    monkeypatch.setattr("itsdangerous.timed.time", clock)
     auth = SessionAuth(password_hash=hash_password(PASSWORD), secret="s", ttl_s=1)
     token = auth.login(PASSWORD)
     assert token is not None
     assert auth.valid(token) is True
-    time.sleep(2.05)
+    clock.now += 2.05
     assert auth.valid(token) is False
 
 

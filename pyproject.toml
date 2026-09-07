@@ -44,6 +44,9 @@ liqfade = "liqfade.cli:main"
 dev = [
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.25,<2",
+    # `make test` runs `-n auto`. CLAUDE.md wants the unit suite under 30s and it is 63s
+    # on one core, spread thin over 1,300 tests rather than sitting in any one of them.
+    "pytest-xdist>=3.6,<4",
     "ruff>=0.9,<1",
     "mypy>=1.14,<2",
     "pre-commit>=4.1,<5",

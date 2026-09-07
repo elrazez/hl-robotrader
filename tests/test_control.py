@@ -259,16 +259,23 @@ async def test_state_writer_survives_a_failing_source(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     calls = 0
 
+    survived = asyncio.Event()
+
     async def flaky() -> StateSnapshot:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("no state yet")
+        survived.set()
         return _snapshot(calls)
 
     stop = asyncio.Event()
     task = StateWriter(flaky, path, interval_s=0.01).start(stop)
-    await asyncio.sleep(0.05)
+    # Wait for the source's second call rather than for a fixed slice of wall clock: 0.05s
+    # was five intervals on an idle machine and not always two under `make test`, which
+    # runs one worker per core. The writer only leaves its loop between snapshots, so
+    # awaiting the task below is what guarantees that call's write landed.
+    await asyncio.wait_for(survived.wait(), timeout=5.0)
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
     assert calls > 1

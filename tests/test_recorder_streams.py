@@ -521,6 +521,11 @@ class ExpiringServer:
         self._live: set[Any] = set()
         self._server: Any = None
         self._broadcast: asyncio.Task[None] | None = None
+        # Set on the way out, so a handler still counting down to its expiry stops
+        # counting. `wait_closed` waits for every handler to return, so a test that
+        # expires sockets after 5s used to pay that 5s in its teardown having already
+        # asserted everything it came for.
+        self._closing = asyncio.Event()
 
     @property
     def url(self) -> str:
@@ -530,8 +535,10 @@ class ExpiringServer:
         self.connections += 1
         self._live.add(ws)
         try:
-            await asyncio.sleep(self.expire_after_s)
-            await ws.close(1000, "Expired")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._closing.wait(), timeout=self.expire_after_s)
+            if not self._closing.is_set():
+                await ws.close(1000, "Expired")
         finally:
             self._live.discard(ws)
 
@@ -551,6 +558,7 @@ class ExpiringServer:
 
     async def __aexit__(self, *exc: object) -> None:
         assert self._broadcast is not None
+        self._closing.set()
         self._broadcast.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self._broadcast

@@ -12,8 +12,11 @@ lint:
 	uv run ruff check .
 	uv run mypy
 
+# -n auto: one worker per core. The suite is 1,300 tests of a few ms each, so the
+# 30s CLAUDE.md asks for is only reachable in parallel. `uv run pytest` still works
+# serially when a failure needs reading in order.
 test:
-	uv run pytest
+	uv run pytest -n auto
 
 # Needs a .env with testnet keys. Never run against mainnet.
 test-int:

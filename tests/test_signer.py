@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from hyperliquid.info import Info
 
 from liqfade.config import resolve
 from liqfade.config.models import Settings
@@ -127,6 +128,11 @@ def test_exchange_is_built_against_the_configured_url(monkeypatch: pytest.Monkey
     """The URL comes from config, never from the SDK's default, so testnet stays testnet."""
     monkeypatch.setenv(ACCOUNT_ENV["testnet"], FAKE_ADDRESS)
     monkeypatch.setenv(AGENT_KEY_ENV["testnet"], FAKE_KEY)
+    # The SDK's Exchange builds an Info, which fetches meta and spotMeta over the network
+    # from whatever base_url it was given. Standing those two in keeps this a unit test:
+    # it ran against live testnet and cost 2.1s, and it would have failed offline.
+    monkeypatch.setattr(Info, "meta", lambda self, dex="": {"universe": []})
+    monkeypatch.setattr(Info, "spot_meta", lambda self: {"tokens": [], "universe": []})
     signer = load_signer(make_settings("testnet"))
     exchange = signer.exchange()
     assert exchange.base_url == "https://api.hyperliquid-testnet.xyz"

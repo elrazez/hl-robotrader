@@ -2074,3 +2074,40 @@ continuously since 20:34 UTC on its own branch.
 This is a plumbing soak and not the Phase 5 acceptance run. Read it for reconnects,
 reconciliation differences, memory and whether cross-venue cascades produce intents at all;
 do not read it as seven days of paper trading.
+
+## 2026-09-07 (01d: the unit suite runs in under 30s again)
+
+CLAUDE.md section 4 asks for unit tests offline in under 30s. They were at **86.8s** for
+1,299 tests on the owner's laptop (8 cores), and the 88s the review measured. Two things
+were wrong and the third is arithmetic.
+
+**Three real waits, worth 9.5s between them.** `ExpiringServer`, the fake venue in
+`tests/test_recorder_streams.py`, expires each socket on a timer, and `wait_closed()` waits
+for every handler to return: the test that set the expiry to 5s paid all 5s in teardown
+having already asserted everything it came for. The handler now races that timer against a
+`_closing` event the context manager sets. `test_session_token_expires` slept 2.05s of wall
+clock, because itsdangerous stamps whole seconds and compares `age > max_age`; it stands in
+for `itsdangerous.timed.time` instead, which is one `time.time()` call.
+`test_exchange_is_built_against_the_configured_url` cost 2.1s because the SDK's `Exchange`
+builds an `Info`, which fetches `meta` and `spotMeta` over the network: a unit test was
+calling live Hyperliquid testnet on every run and would have failed offline. That one was
+not a speed defect at all, it was found by looking for one.
+
+**The rest is 1,300 tests of a few ms each.** At **63.2s** after the three fixes, nothing
+was left to cut: the slowest test in the suite is 1.3s and the top twenty five sum to under
+half the total. So `make test` is `pytest -n auto` on `pytest-xdist`. On an idle 8-core
+laptop that is **24.7s, 26.3s, 23.2s** over three runs. With two other agent sessions
+building on the same laptop, load average 20, it is **28.4s to 36.0s** over four. The 30s
+is therefore a real number on a machine that is yours and not one on a machine that is
+busy, which is worth knowing before reading a slow run as a regression. `uv run pytest`
+still runs it serially, which is what you want when a failure needs reading in order.
+
+**Parallelism found one flaky test, and it was flaky before.**
+`test_state_writer_survives_a_failing_source` slept a fixed 0.05s and asserted the writer
+had ticked twice at 0.01s intervals. Five intervals on an idle machine, sometimes fewer
+than two under `-n auto`. It waits for the source's second call now, which is both
+deterministic and faster. A fixed sleep standing in for a condition is a flake
+whatever the worker count; parallelism only raised the odds.
+
+Reverse the parallelism if a test ever needs the machine to itself; the fix then is to mark
+it, not to go back to one worker.
