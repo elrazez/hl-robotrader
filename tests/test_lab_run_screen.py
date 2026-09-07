@@ -134,3 +134,46 @@ async def test_cancel_sends_a_term_to_the_selected_job(lab_dir: Path) -> None:
         await pilot.press("ctrl+t")
         await pilot.pause()
         assert process.terminated
+
+
+async def test_every_box_on_the_run_form_is_inside_the_screen(lab_dir: Path) -> None:
+    """Textual's Input is 100% wide by default, and three of them share a row.
+
+    `.field-input { width: 1fr }` only ever covered the edit form, so on the run form the
+    end date, the latency and the lagged-ms boxes were laid out past the right edge and
+    could not be seen or clicked. `docs/lab/run.svg` showed it and nothing failed.
+    """
+    from textual.widgets import Input
+
+    app = LabApp(config_dir=lab_dir, reports_dir=lab_dir / "reports", data_dir=LAKE)
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.press("2")
+        await pilot.pause()
+        boxes = list(app.query(".run-row Input").results(Input))
+        assert boxes, "the run form drew no boxes, so this proves nothing"
+        overflowing = {
+            widget.id: (widget.region.x, widget.region.right)
+            for widget in app.query(".run-row Input").results(Input)
+            if widget.region.right > app.size.width
+        }
+        assert overflowing == {}, f"boxes laid out past the right edge: {overflowing}"
+
+
+async def test_ctrl_t_cancels_the_selected_run_and_not_the_first_one(lab_dir: Path) -> None:
+    """Three jobs queued, the cursor on the third: that is the one that gets the SIGTERM."""
+    app = LabApp(config_dir=lab_dir, reports_dir=lab_dir / "reports", data_dir=LAKE)
+    app.queue.lake_busy = lambda: True  # nothing starts, so all three stay queued
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.press("2")
+        await pilot.pause()
+        for _ in range(3):
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+        pane = app.query_one("#run-pane")
+        app.query_one("#run-jobs").move_cursor(row=2)
+        await pilot.pause()
+        assert pane.selected is app.queue.jobs[2]
+
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        assert [job.state for job in app.queue.jobs] == ["queued", "queued", "cancelled"]

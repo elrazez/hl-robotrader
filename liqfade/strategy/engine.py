@@ -338,10 +338,16 @@ class StrategyEngine:
         if stop_px <= 0:
             return None
 
-        # The cascade's peak z, not this tick's: see `CascadeState.peak_liq_z`.
+        # The cascade's peak z, not this tick's: see `CascadeState.peak_liq_z`. A null
+        # threshold means the z-scale is not trusted to say anything here, so nothing is
+        # urgent; see `intent.urgency_liq_z` in `config/models.py` for why that is an
+        # option at all.
         peak_z = state.peak_liq_z
+        threshold = intent_cfg.urgency_liq_z
         urgency: Urgency = (
-            "high" if peak_z is not None and peak_z >= intent_cfg.urgency_liq_z else "normal"
+            "high"
+            if threshold is not None and peak_z is not None and peak_z >= threshold
+            else "normal"
         )
 
         return Intent(

@@ -33,6 +33,8 @@ from pathlib import Path
 
 import polars as pl
 
+from liqfade.features.grid import effective_ts
+
 __all__ = [
     "L2",
     "AssetCtx",
@@ -43,6 +45,7 @@ __all__ = [
     "day_files",
     "iter_events",
     "load_day",
+    "span_filter",
     "utc_days",
 ]
 
@@ -166,6 +169,37 @@ def day_files(data_dir: Path, table: str, day: str) -> list[Path]:
     return sorted(path for path in directory.glob("*.parquet") if not path.name.startswith("."))
 
 
+def span_filter(spans: Mapping[str, Sequence[tuple[int, int]]]) -> pl.Expr:
+    """Keep the rows whose `effective_ts` falls in one of a coin's replay windows.
+
+    One expression for both callers: `load_day` pushes it into the scan so a day's
+    unreplayed tape is never materialised, and `engine._within` applies it to the frames a
+    `RunInputs` already holds. Two copies of this predicate would be two answers to "did
+    the engine see this print", which is the one thing the windowed replay may not get
+    wrong.
+
+    Args:
+        spans: per coin, the `[from_ms, to_ms)` windows to keep. A coin absent from the
+            mapping, and a coin with no windows, keeps nothing.
+
+    Returns:
+        A boolean expression over `coin`, `rx_ms` and `ts_ms`. Literal false when no coin
+        has a window, because `any_horizontal([])` is null rather than false.
+    """
+    known = effective_ts(None)
+    return pl.any_horizontal(
+        [
+            (pl.col("coin") == coin)
+            & pl.any_horizontal(
+                [known.is_between(start, end, closed="left") for start, end in coin_spans]
+            )
+            for coin, coin_spans in sorted(spans.items())
+            if coin_spans
+        ]
+        or [pl.lit(False)]
+    )
+
+
 def load_day(
     data_dir: Path,
     table: str,
@@ -194,13 +228,14 @@ def load_day(
             never read at all, so a busy day whose cascades cover 3% of the clock reads
             roughly 3% of its rows rather than fifty million and throwing them away. None
             reads the whole day.
-        tail_only: keep only the rows sharing the day's last `effective_ts`, which for
-            `bbo` and `l2` is its last snapshot. For a table that reaches its consumer
-            through a backward as-of join alone, that is the only row of the day a later
-            timestamp can select, and the filter is pushed into the scan so the rest of the
-            day is never materialised. `l2` is 3.1 million rows per coin per day, so this
-            is the difference between a year of four coins peaking over two gigabytes and
-            under.
+        tail_only: keep only the rows sharing each coin's last `effective_ts`, which for
+            `bbo` and `l2` is that coin's last snapshot of the day, all twenty levels of
+            it. For a table that reaches its consumer through a backward as-of join alone,
+            that is the only row of the day a later timestamp can select, and the filter is
+            pushed into the scan so the rest of the day is never materialised. `l2` is 3.1
+            million rows per coin per day, so this is the difference between a year of four
+            coins peaking over two gigabytes and under. **Per coin and not globally**: see
+            `mid` in `features/grid.py` for the kind of column this is not safe for.
 
     Returns:
         The rows, or an empty frame when the day is absent or nothing survives the filters.
@@ -218,25 +253,15 @@ def load_day(
     if spans is not None:
         if not spans:
             return pl.DataFrame()
-        known = _effective_ts()
-        frame = frame.filter(
-            pl.any_horizontal(
-                [
-                    (pl.col("coin") == coin)
-                    & pl.any_horizontal(
-                        [known.is_between(start, end, closed="left") for start, end in coin_spans]
-                    )
-                    for coin, coin_spans in sorted(spans.items())
-                    if coin_spans
-                ]
-                or [pl.lit(False)]
-            )
-        )
+        frame = frame.filter(span_filter(spans))
     if tail_only:
-        latest = _effective_ts().alias("_known")
         frame = (
-            frame.with_columns(latest)
-            .filter(pl.col("_known") == pl.col("_known").max())
+            frame.with_columns(effective_ts("_known"))
+            # Per coin, not globally. Two coins do not stop quoting at the same
+            # millisecond, so a global maximum keeps the latest coin's snapshot and hands
+            # every other coin an empty carry, which is a cold start wearing the shape of
+            # a warm one.
+            .filter(pl.col("_known") == pl.col("_known").max().over("coin"))
             .drop("_known")
         )
     return frame.collect()
@@ -279,16 +304,11 @@ def iter_events(
 # --- internals ----------------------------------------------------------------
 
 
-def _effective_ts() -> pl.Expr:
-    """`rx_ms` when the row was recorded, `ts_ms` when it was backfilled."""
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
-
-
 def _known(frame: pl.DataFrame) -> pl.DataFrame:
     """Add the `known` column the merge sorts on. `candles_1m` has no `rx_ms`."""
     if "rx_ms" not in frame.columns:
         return frame.with_columns(pl.col("ts_ms").alias("known"))
-    return frame.with_columns(_effective_ts().alias("known"))
+    return frame.with_columns(effective_ts())
 
 
 def _trade_events(frame: pl.DataFrame | None) -> list[tuple[int, int, int, Event]]:

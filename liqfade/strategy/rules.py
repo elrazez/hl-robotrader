@@ -244,12 +244,16 @@ class LevelReclaim:
     liquidation mirrors it against `resistance_px`.
 
     The two conditions together require the level to sit **between the extreme and the
-    current mid**, which is what makes the nearest level below mid the right one to ask
-    about: it is the highest level that could be in that band, so if any level satisfies the
-    rule that one does. The corollary is that the rule sees one level and not all of them,
-    so where a shallower level sits between the swept one and mid, that shallower level is
-    the one judged. See `_with_levels` in `backtest/features.py` for how it is chosen and
-    for the deliberate restriction to levels knowable at the start of the day.
+    current mid**, and the nearest level below mid is the highest that can be in that band.
+    It is therefore the *shallowest* sweep available, not the deepest: the rule measures the
+    extreme against the level closest to price and never against a deeper one. Where a
+    shallow level sits between mid and a level the cascade genuinely tore through, the shallow
+    one is what gets judged, and the deeper level is invisible to the rule. At v1's
+    `sweep_min_bps` of 5 that matters, because a 5 bps sweep of the near level passes the
+    condition on a cascade whose real sweep was much deeper, and a shallow level too close to
+    mid to have been swept by 5 bps fails it while a deeper qualifying level goes unasked.
+    See `_with_levels` in `backtest/features.py` for how the level is chosen and for the
+    deliberate restriction to levels knowable at the start of the day.
 
     A null level fails. `support_px` is null when no level of that kind is within
     `features.levels.max_dist_bps`, and no level nearby means nothing was swept.

@@ -146,7 +146,7 @@ class PaperSession:
             self.features.ingest(table, venue, row)
             event = _as_event(table, venue, row)
             if event is not None:
-                _on_event(event, self.state, self.portfolio, self.result, self.settings)
+                _on_event(event, self.state, self.portfolio, self.risk, self.result, self.settings)
         except Exception as exc:
             log.warning(
                 "paper_ingest_failed",
@@ -318,6 +318,7 @@ class PaperSession:
                 reason="flat",
                 now_ms=now_ms,
                 portfolio=self.portfolio,
+                risk=self.risk,
                 settings=self.settings,
                 cloid=self.cloid,
             )

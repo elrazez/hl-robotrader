@@ -8,6 +8,13 @@ by `backtest/watch.py` so the lab and `liqfade watch` can never disagree about a
 One lake job at a time, twice enforced: the queue starts a job only when none of its own is
 running, and only when `pgrep -f "liqfade backtest"` finds nothing, so a year run started in
 another terminal holds the queue instead of sharing 8 GB with it.
+
+**The queue lives only as long as the lab.** Quitting takes the queue with it: a running job
+survives, because it was spawned into its own session and finishing it is the point, and a
+job still waiting to start simply never starts. Nothing is written down that would let a
+later lab pick the queue back up, and nothing needs to be: a queued job has no process and
+no report, only a form the owner can fill in again. What a dead lab does leave behind are
+the running job's sidecars, and `_file_orphans` files those on the next start.
 """
 
 from __future__ import annotations
@@ -133,6 +140,7 @@ class Job:
     spec: RunSpec
     progress_path: Path
     log_path: Path
+    sidecar_path: Path
     state: str = "queued"
     note: str = ""
     process: Process | None = None
@@ -190,6 +198,12 @@ def lake_busy(pattern: str = LAKE_PATTERN) -> bool:
     return found.returncode == 0
 
 
+def _move(source: Path, target: Path) -> None:
+    """Put a sidecar beside its report, if it is still where the lab left it."""
+    if source.exists() and source != target:
+        source.replace(target)
+
+
 def _spawn(argv: list[str], log: Path, env: dict[str, str]) -> Process:
     log.parent.mkdir(parents=True, exist_ok=True)
     handle = log.open("wb")
@@ -224,6 +238,8 @@ class RunQueue:
         self.lake_busy = lake_busy
         self.jobs: list[Job] = []
         self._next = 1
+        with suppress(OSError):
+            self._file_orphans()
 
     def submit(self, spec: RunSpec) -> Job:
         job_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{self._next:02d}"
@@ -233,6 +249,7 @@ class RunQueue:
             spec=spec,
             progress_path=self.work_dir / f"{job_id}.progress.json",
             log_path=self.work_dir / f"{job_id}.log",
+            sidecar_path=self.work_dir / f"{job_id}.lab.json",
         )
         self.jobs.append(job)
         return job
@@ -265,6 +282,14 @@ class RunQueue:
         job.state = "running"
         job.started_at = time.time()
         job.note = ""
+        # Written now rather than at the reaper. The run is spawned into its own session so
+        # that it outlives the lab, and a note only the reaper writes is a note nobody
+        # writes when the lab is closed mid-run. The config is read here too, so the note
+        # records the file as it was launched rather than as it was later edited.
+        with suppress(OSError):
+            job.sidecar_path.write_bytes(
+                orjson.dumps(self._sidecar(job), option=orjson.OPT_INDENT_2)
+            )
 
     def _reap(self, job: Job) -> None:
         process = job.process
@@ -295,19 +320,46 @@ class RunQueue:
         `summary.json` identifies a run by the hash of its resolved config, which is right
         for reproducibility and useless for reading a list. `lab.json` is the lab saying
         which file it launched and what that file overrode.
+
+        The report directory is `<--out>/<timestamp>_<config hash>`, and the timestamp and
+        the hash are both decided when the report is written, so the lab cannot know the
+        path at launch: it can only move the note there once the run says where it went.
+        Both files are therefore written into the work directory from the start and moved
+        here, and `_file_orphans` does the moving for a run the lab did not live to reap.
         """
         if job.report_dir is None:
             return
         try:
             job.report_dir.mkdir(parents=True, exist_ok=True)
-            if job.log_path.exists():
-                job.log_path.replace(job.report_dir / "run.log")
-                job.log_path = job.report_dir / "run.log"
-            (job.report_dir / "lab.json").write_bytes(
+            job.sidecar_path.write_bytes(
                 orjson.dumps(self._sidecar(job), option=orjson.OPT_INDENT_2)
             )
+            _move(job.log_path, job.report_dir / "run.log")
+            _move(job.sidecar_path, job.report_dir / "lab.json")
+            job.log_path = job.report_dir / "run.log"
+            job.sidecar_path = job.report_dir / "lab.json"
         except OSError:
             return
+
+    def _file_orphans(self) -> None:
+        """File what a lab that was closed mid-run left behind, on the next start.
+
+        A run outlives the lab on purpose. When it finishes it writes its report and stamps
+        the directory into its own progress file, and that file is still in the work
+        directory, so the next lab has everything it needs to finish the job the last one
+        started. Without this, Results falls back to showing the config hash.
+        """
+        for progress_path in sorted(self.work_dir.glob("*.progress.json")):
+            state = read_progress(progress_path)
+            if state is None or not state.report_dir:
+                continue
+            report_dir = Path(state.report_dir)
+            if not report_dir.is_dir():
+                continue
+            job_id = progress_path.name.removesuffix(".progress.json")
+            with suppress(OSError):
+                _move(self.work_dir / f"{job_id}.log", report_dir / "run.log")
+                _move(self.work_dir / f"{job_id}.lab.json", report_dir / "lab.json")
 
     def _sidecar(self, job: Job) -> dict[str, Any]:
         from liqfade.lab.configs import LabConfigError, read_config
@@ -346,10 +398,3 @@ class RunQueue:
             job.process.terminate()
         except OSError:
             job.state = "cancelled"
-
-    def cancel_all(self) -> None:
-        """Called when the lab exits with runs it started. Queued jobs die, running ones
-        do not: a replay outliving the window it was launched from is the point."""
-        for job in self.jobs:
-            if job.state == "queued":
-                self.cancel(job)

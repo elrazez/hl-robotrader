@@ -14,11 +14,12 @@ fraction done is `(sim_ms - window_start_ms) / (window_end_ms - window_start_ms)
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+import orjson
 
 # Wall-clock seconds between writes. A year is a few million ticks; the file is for eyes.
 WRITE_EVERY_S = 1.0
@@ -113,7 +114,7 @@ class ProgressWriter:
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(asdict(self.state)))
+            tmp.write_bytes(orjson.dumps(asdict(self.state)))
             os.replace(tmp, self.path)
         except OSError:
             # The bar is not worth the run. Stop trying rather than fail every second.
@@ -136,7 +137,7 @@ def process_alive(pid: int) -> bool | None:
 def read_progress(path: Path) -> ProgressState | None:
     """The state on disk, or None when there is no file or it is mid-write and unreadable."""
     try:
-        payload = json.loads(path.read_text())
+        payload = orjson.loads(path.read_bytes())
     except (OSError, ValueError):
         return None
     try:

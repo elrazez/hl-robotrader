@@ -154,10 +154,7 @@ def save_config(path: Path, name: str, notes: str, overrides: dict[str, Any]) ->
     path = Path(path).resolve()
     if path.suffix != ".yaml":
         raise LabConfigError(f"{path.name}: a strategy config must be a .yaml file")
-    if path.stem in RESERVED_STEMS:
-        raise LabConfigError(
-            f"{path.stem}.yaml is a config layer the loader owns; the lab does not write it"
-        )
+    _refuse_reserved(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_config(name, notes, overrides))
     return path
@@ -180,6 +177,23 @@ def duplicate_config(path: Path, new_name: str) -> Path:
     return save_config(target, new_name, notes, source.overrides)
 
 
+def _refuse_reserved(path: Path) -> None:
+    """Raise if this is one of the loader's own layer files, by name.
+
+    By name and not by directory, because `liqfade lab --config-dir config` is a legitimate
+    way to run the lab and it puts `mainnet.yaml` one keystroke from the cursor. CLAUDE.md's
+    rule about mainnet risk limits cannot depend on where the lab happens to be pointed.
+    """
+    if path.stem in RESERVED_STEMS:
+        raise LabConfigError(
+            f"{path.stem}.yaml is a config layer the loader owns; the lab does not touch it"
+        )
+
+
 def delete_config(path: Path) -> None:
-    """Remove a config. The screen asks twice before calling this."""
-    Path(path).unlink()
+    """Remove a config. The screen asks twice before calling this, and so does `save_config`
+    about the same list of names: a file the lab may not write is a file it may not
+    unlink."""
+    path = Path(path).resolve()
+    _refuse_reserved(path)
+    path.unlink()

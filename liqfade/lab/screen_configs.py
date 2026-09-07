@@ -154,15 +154,21 @@ class ConfigEditScreen(ModalScreen[bool]):
         for field in self.fields:
             raw = self.field(field.key).value.strip()
             if raw == "":
-                # An empty box means the key is not in this layer at all. A null override
-                # is spelled `null`, which is what `cascade.liq_z_min: null` needs.
+                # An empty box means the key is not in this layer at all, and clearing a
+                # box is how a key is removed from the file. A null override is spelled
+                # `null`, which is what `cascade.liq_z_min: null` needs.
                 continue
             try:
                 value = parse_value(field, raw)
             except LabValueError as exc:
                 errors[field.key] = str(exc)
                 continue
-            if value != field.default:
+            # A key the file already had stays in the file, even where it now matches the
+            # resolved default. Dropping those was silently rewriting a config to a
+            # fraction of itself: sixteen of v1_confluence.yaml's keys sit on a default
+            # today, and the file exists to record what the owner chose, not to be a diff
+            # against whatever `config/default.yaml` happens to say next month.
+            if value != field.default or field.key in self.config.overrides:
                 overrides[field.key] = value
         return overrides, errors
 
@@ -313,7 +319,11 @@ class ConfigsPane(VerticalScroll):
             if not yes:
                 self._say("kept")
                 return
-            delete_config(config.path)
+            try:
+                delete_config(config.path)
+            except (LabConfigError, OSError) as exc:
+                self._say(f"[red]{exc}[/red]")
+                return
             self.action_refresh()
             self._say(f"deleted {config.path.name}")
 
@@ -333,8 +343,15 @@ class ConfigsPane(VerticalScroll):
 
 
 def _as_text(value: Any) -> str:
+    """A value as the box shows it. None is the text `null`, never an empty box.
+
+    An empty box means "this key is not in the file", which is a different statement from
+    "this key is in the file and its value is null". `cascade.liq_z_min: null` is how v1
+    says the z trigger is not applied at all, and showing it as empty made saving the file
+    unchanged delete it and turn the trigger back on.
+    """
     if value is None:
-        return ""
+        return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, list | tuple):

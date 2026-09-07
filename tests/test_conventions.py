@@ -28,3 +28,23 @@ def test_no_module_decodes_json_with_the_stdlib() -> None:
         if "response.json()" in line or "resp.json()" in line
     ]
     assert offenders == [], f"use orjson.loads(response.content) instead: {offenders}"
+
+
+def test_the_effective_time_rule_is_written_once() -> None:
+    """CLAUDE.md rule 1: one place decides when a row became knowable.
+
+    `rx_ms` over `ts_ms` is the whole no-lookahead rule, and it had been spelled out four
+    times: `features/grid.py`, `backtest/data.py`, `backtest/engine.py` and
+    `backtest/source.py`. Four copies is four chances for one of them to drift to `>= 0`,
+    which would silently put the backfilled year on receive time it never had. The
+    expression lives in `features/grid.py:effective_ts` and everything else calls it.
+    """
+    home = PACKAGE / "features" / "grid.py"
+    offenders = [
+        f"{path.relative_to(PACKAGE.parent)}:{number}"
+        for path in _sources()
+        if path != home
+        for number, line in enumerate(path.read_text().splitlines(), start=1)
+        if 'pl.col("rx_ms") > 0' in line
+    ]
+    assert offenders == [], f"call features.grid.effective_ts() instead: {offenders}"

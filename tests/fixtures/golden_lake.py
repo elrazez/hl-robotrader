@@ -76,6 +76,7 @@ __all__ = [
     "N_CASCADES",
     "build",
     "expected_target_px",
+    "quotes",
     "write_lake",
 ]
 
@@ -105,6 +106,13 @@ BACKGROUND_STEP_MS = 70_000
 # constant background has none. Fixed values keep the fixture hand-checkable.
 BACKGROUND_PATTERN = (8_000.0, 12_000.0, 9_500.0, 11_000.0, 10_000.0, 13_000.0, 8_500.0)
 BACKGROUND_CLEARANCE_MS = 90_000
+
+# The quote tape, when `write_lake` is asked for one. 3s is not a multiple of the 1s trade
+# step in the sense that matters: a grid row lands between quotes as often as on one, so a
+# `mid` that had fallen back to the last trade price reads differently from one that came
+# off the book.
+BBO_STEP_MS = 3000
+BBO_HALF_SPREAD = 0.01
 
 CASCADE_STARTS: list[int] = [
     START_MS + WARMUP_MS + index * CASCADE_SPACING_MS for index in range(N_CASCADES)
@@ -169,7 +177,31 @@ def build() -> tuple[pl.DataFrame, pl.DataFrame, int, int]:
     return pl.DataFrame(trades), pl.DataFrame(liquidations), START_MS, END_MS
 
 
-def write_lake(root: Path, days: int, *, offset_ms: int = 0) -> tuple[int, int]:
+def quotes(start_ms: int, end_ms: int) -> pl.DataFrame:
+    """A bbo tape over the same price path, on its own cadence.
+
+    Every `BBO_STEP_MS`, which is deliberately not a multiple of `TRADE_STEP_MS`, so the
+    book midpoint and the last trade price are different numbers and a grid that silently
+    fell back to the trade price is visible. The spread is fixed and symmetric about the
+    scheduled price, so the midpoint is exactly `mid_at`.
+    """
+    return pl.DataFrame(
+        [
+            {
+                "coin": COIN,
+                "ts_ms": ts_ms,
+                "rx_ms": 0,
+                "bid_px": mid_at(ts_ms) - BBO_HALF_SPREAD,
+                "bid_sz": 50.0,
+                "ask_px": mid_at(ts_ms) + BBO_HALF_SPREAD,
+                "ask_sz": 50.0,
+            }
+            for ts_ms in range(start_ms, end_ms, BBO_STEP_MS)
+        ]
+    )
+
+
+def write_lake(root: Path, days: int, *, offset_ms: int = 0, bbo: bool = False) -> tuple[int, int]:
     """Write the same tape to a real Parquet lake, repeated over `days` UTC days.
 
     Returns `(start_ms, end_ms)`, the whole run window, midnight to midnight. Each day is
@@ -187,13 +219,22 @@ def write_lake(root: Path, days: int, *, offset_ms: int = 0) -> tuple[int, int]:
 
     Rows are partitioned by the UTC date they actually fall on rather than by the day they
     were copied from, so a shifted tape lands in the right files.
+
+    `bbo` adds the quote tape. Off by default because it changes `mid` from the last trade
+    price to the book midpoint and would move every number the golden derivation above
+    works out on paper. The streaming tests turn it on: a lake with a book is what the
+    recorder actually writes, and it is the case where carrying only yesterday's last
+    snapshot is wrong.
     """
     from liqfade.data.schemas import SOURCE_HL_S3
     from liqfade.recorder.writer import write_rows
 
-    trades, liquidations, start_ms, _ = build()
+    trades, liquidations, start_ms, end_ms = build()
     parquet = Path(root) / "parquet"
-    for table, frame in (("trades", trades), ("liquidations", liquidations)):
+    tables = [("trades", trades), ("liquidations", liquidations)]
+    if bbo:
+        tables.append(("bbo", quotes(start_ms, end_ms)))
+    for table, frame in tables:
         shifted = pl.concat(
             frame.with_columns(pl.col("ts_ms") + offset_ms + offset * DAY_MS)
             for offset in range(days)

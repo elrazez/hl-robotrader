@@ -301,6 +301,23 @@ class TestACascadeThatStraddlesMidnight:
 # engine it replaced; what changed is that three trades nothing should ever have taken are
 # gone. A digest that had survived this change would have meant the fix did nothing.
 # docs/DECISIONS.md, 2026-09-06.
+#
+# **STALE as of 2026-09-07, and not re-pinned, because the lake was not mounted.** Three
+# changes on branch 04e-backtest-review are expected to move this digest, and none of them
+# could be measured against real data here:
+#
+#   1. The previous day's `bbo` is carried whole rather than as its last snapshot. `mid`
+#      feeds every rolling window, and the reference days have `bbo`, so days two and three
+#      of this run read a different `ret_60s` and `rv_300s` on the carry.
+#   2. The replay tells the risk engine when a round trip closes. `coin_cooldown`,
+#      `daily_loss` and `losing_streak` could not fire before, so this run could re-enter a
+#      coin the moment it exited it and now cannot.
+#   3. A window opening inside the first `backtest.window_warmup_s` of a day now reaches
+#      back across midnight for its warmup instead of being clamped to 00:00.
+#
+# Re-run the command in the test below on the box, check the funnel for a `kill_switch`
+# block first, and re-pin `sha256` and `trades` with the reason. Do not assume the value
+# below still holds.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",
@@ -559,6 +576,9 @@ class TestTheGridCache:
             ("intent.time_stop_s", 600),
             ("sizing.risk_frac", 0.001),
             ("risk.max_dd_frac", 0.5),
+            # Read by active_mask and cascade_windows, both of which run in the engine on
+            # a grid that is already built. See the test below.
+            ("exhaustion.max_age_s", 600.0),
         ):
             same = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
             assert feature_hash(same) == feature_hash(base), f"{key} must not invalidate"
@@ -569,7 +589,6 @@ class TestTheGridCache:
             ("cascade.trigger", "proxy"),
             ("backtest.feature_grid_ms", 250),
             ("sizing.vol_window_s", 600),
-            ("exhaustion.max_age_s", 600.0),
         ):
             other = settings_factory(**{"features.z_lookback_h": 1.0, key: value})
             assert feature_hash(other) != feature_hash(base), f"{key} must invalidate"
@@ -594,3 +613,228 @@ class TestTheGridCache:
         )
         run_backtest(wider, settings)
         assert wider.grids_cached == 0, "a narrower cache must not answer for a wider run"
+
+
+class TestTheCarryIsAsWideAsTheFeatureThatReadsIt:
+    """A day's grid is a function of the date, on a lake that has a book.
+
+    `LakeSource._build` puts the previous day in front of the day being scored so that
+    every rolling window is full. For the tape and the liquidations it reads that day
+    whole; for the book tables it used to read only the last snapshot, on the argument that
+    a book reaches the grid through a backward as-of join and nothing else. That argument
+    holds for `l2`, whose four columns are joined onto the grid and never windowed, and it
+    is false for `bbo`: `_with_mid` makes `mid` the last book midpoint, and `mid` is what
+    `returns`, `realized_vol`, `cvd`, `displacement`, `session_vwap` and the 24h mark-mid
+    percentile are all computed from. With only the last snapshot carried, the previous
+    day's rows fall back to the last trade price, and every window on the scored day that
+    reaches back across midnight reads a different series.
+
+    The check is the definition: build day two through the streaming source, build it as
+    part of one two-day window, and require every column to agree.
+    """
+
+    @pytest.fixture(scope="class")
+    def book_lake(self, tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, int, int]:
+        """Two days of the golden tape **with a quote tape**, which is what a lake has."""
+        root = tmp_path_factory.mktemp("book_lake")
+        # The same 20h50m offset the straddle fixture uses, so each day's tape runs up to
+        # and across midnight. At the default offset the tape stops at 03:20 and every
+        # window on the second day reaches back only into its own quiet hours, where a
+        # carry of one snapshot and a carry of the whole day say the same thing.
+        start_ms, end_ms = golden_lake.write_lake(root, 2, offset_ms=75_000_000, bbo=True)
+        return root, start_ms, end_ms
+
+    def _whole_window_grid(self, lake: tuple[Path, int, int], settings: Settings) -> pl.DataFrame:
+        """The second day's grid, built from both days in one pass. The answer to match."""
+        from liqfade.backtest.features import build_feature_grid
+        from liqfade.backtest.source import DAY_MS, midnight_ms
+
+        data_dir, start_ms, end_ms = lake
+        days = utc_days(start_ms, end_ms)
+        read = {
+            table: pl.concat(
+                frames
+                if (
+                    frames := [
+                        f for day in days if not (f := load_day(data_dir, table, day)).is_empty()
+                    ]
+                )
+                else [pl.DataFrame()]
+            )
+            for table in ("trades", "liquidations", "bbo")
+        }
+        second = midnight_ms(days[1])
+        grid = build_feature_grid(
+            settings=settings,
+            trades=read["trades"],
+            liquidations=read["liquidations"],
+            start_ms=midnight_ms(days[0]),
+            end_ms=second + DAY_MS,
+            bbo=read["bbo"],
+        )
+        wanted = ("coin", "ts_ms", *row_columns(settings))
+        keep = [name for name in wanted if name in grid.columns]
+        return grid.filter(pl.col("ts_ms") >= second).select(keep)
+
+    def test_the_streamed_grid_equals_the_whole_window_grid_on_every_column(
+        self, book_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        from liqfade.backtest.source import LakeSource
+
+        data_dir, start_ms, end_ms = book_lake
+        source = LakeSource(
+            data_dir,
+            settings=settings,
+            coins=[golden_lake.COIN],
+            start_ms=start_ms,
+            end_ms=end_ms,
+            cache=False,
+        )
+        second = source.days()[1]
+        ((_, streamed),) = source.grids(second, settings, first=False)
+        expected = self._whole_window_grid(book_lake, settings)
+
+        assert streamed.columns == expected.columns
+        assert streamed.height == expected.height
+        differing = [
+            name
+            for name in streamed.columns
+            if not streamed.get_column(name).equals(expected.get_column(name))
+        ]
+        assert differing == [], (
+            "the carried previous day is narrower than the windows that read it: "
+            f"{differing} differ between the streamed and the whole-window grid"
+        )
+
+
+class TestTheWarmupReachesBackAcrossMidnight:
+    """A window is `[cascade_start - window_warmup_s, ...]`, on both sides of a boundary.
+
+    The day loop clamped every window's start to the day it belonged to, so a candidate
+    inside the first `window_warmup_s` of a day got whatever warmup was left after midnight
+    instead of the 300s the spec gives it. The book, the tape and `risk.stale_coin_s` are
+    all colder than a whole-lake run would have made them, and within `stale_coin_s` of
+    00:00 the entry is blocked for staleness the whole-window run never saw.
+
+    The floor is the end of what the previous day already replayed, not midnight. That is
+    what keeps the reach from feeding the same prints to the book twice: tape the previous
+    day covered is behind the floor, and a window still open at midnight leaves the floor
+    exactly at midnight, which is where a spill picks up.
+    """
+
+    def test_a_window_opening_before_midnight_keeps_its_reach(self) -> None:
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        # A candidate at 00:05 with the default 300s warmup: the window opens at 23:55.
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        today, spill = _clip_to_day(spans, day, floor_ms=midnight - DAY_MS)
+        assert today == {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        assert spill == {}
+
+    def test_the_reach_stops_where_the_previous_day_stopped_replaying(self) -> None:
+        """Tape the previous day already fed to the book is not fed to it again."""
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        # Yesterday replayed up to 23:58, so only the last two minutes are new.
+        today, _ = _clip_to_day(spans, day, floor_ms=midnight - 120_000)
+        assert today == {"GOLD": [(midnight - 120_000, midnight + 900_000)]}
+
+    def test_a_window_still_open_at_midnight_leaves_no_room_to_reach_back(self) -> None:
+        """The spill case. Yesterday replayed right up to 00:00, so the floor is 00:00."""
+        from liqfade.backtest.engine import _clip_to_day
+        from liqfade.backtest.source import DAY_MS, Day, midnight_ms
+
+        midnight = midnight_ms("2026-03-02")
+        day = Day(date="2026-03-02", start_ms=midnight, end_ms=midnight + DAY_MS)
+        spans = {"GOLD": [(midnight - 300_000, midnight + 900_000)]}
+        today, _ = _clip_to_day(spans, day, floor_ms=midnight)
+        assert today == {"GOLD": [(midnight, midnight + 900_000)]}
+
+    @pytest.fixture(scope="class")
+    def after_midnight_lake(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> tuple[Path, int, int]:
+        """A lake whose first cascade of each copy lands at 00:05, five minutes in.
+
+        23h05m puts the tape's own start at 23:05 and its three cascades at 00:05, 01:05
+        and 02:05 of the next morning, so the first one sits inside `window_warmup_s` of
+        midnight and its window has to open on the previous partition.
+        """
+        root = tmp_path_factory.mktemp("after_midnight_lake")
+        start_ms, end_ms = golden_lake.write_lake(root, LAKE_DAYS, offset_ms=83_100_000)
+        return root, start_ms, end_ms
+
+    def test_a_window_reaching_back_reads_the_previous_partition(
+        self, after_midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The tape before midnight is in a different file, and the source has to open it."""
+        lake = source(after_midnight_lake, settings, cache=False)
+        second = lake.days()[1]
+        spans = {golden_lake.COIN: [(second.start_ms - 300_000, second.start_ms + 900_000)]}
+        stamps = [event.ts_ms for event in lake.events(second, spans)]
+        assert stamps, "the window read nothing at all"
+        assert min(stamps) < second.start_ms, (
+            "every event came from the scored day; the warmup never crossed midnight"
+        )
+        assert min(stamps) >= second.start_ms - 300_000, (
+            "the previous partition was read wider than the window asked for"
+        )
+
+    def test_the_backward_reach_finds_the_same_trades_the_whole_window_would(
+        self, after_midnight_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        """The day loop against the same tape held whole, straddling midnight forwards."""
+        streamed = run_backtest(source(after_midnight_lake, settings, cache=False), settings)
+        whole = run_backtest(_whole_window(after_midnight_lake), settings)
+        assert whole.trades, "the baseline found nothing, so it proves nothing"
+        assert [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in streamed.trades
+        ] == [
+            (trade.coin, trade.entry_ms, trade.entry_px, trade.exit_px, trade.exit_reason)
+            for trade in whole.trades
+        ]
+
+
+class TestTheCacheKeyCoversTheColumnsAndNoMore:
+    """A key in `HASHED_KEYS` that changes no cached column throws grids away for nothing.
+
+    `exhaustion.max_age_s` was in the list because `active_mask` reads it. `active_mask`
+    runs in the engine, on a grid that is already built and already cached, so the cached
+    day is the same under any value of it: what the key changes is how much of that day the
+    engine keeps, which is decided after the read. A year of four coins is 6.8 GB of cache
+    and a sweep over the exhaustion window was rebuilding all of it.
+    """
+
+    def test_the_built_grid_is_the_same_under_a_different_max_age(
+        self, day_lake: tuple[Path, int, int], settings_factory: SettingsFactory
+    ) -> None:
+        from liqfade.backtest.source import LakeSource
+
+        data_dir, start_ms, end_ms = day_lake
+        grids = []
+        for max_age in (settings_factory().exhaustion.max_age_s, 600.0):
+            tuned = settings_factory(
+                **{"features.z_lookback_h": 1.0, "exhaustion.max_age_s": max_age}
+            )
+            lake = LakeSource(
+                data_dir,
+                settings=tuned,
+                coins=[golden_lake.COIN],
+                start_ms=start_ms,
+                end_ms=end_ms,
+                cache=False,
+            )
+            second = lake.days()[1]
+            ((_, grid),) = lake.grids(second, tuned, first=False)
+            grids.append(grid)
+        assert grids[0].equals(grids[1]), (
+            "exhaustion.max_age_s changed a built grid, so it belongs in HASHED_KEYS"
+        )

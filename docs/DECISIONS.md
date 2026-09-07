@@ -1224,9 +1224,24 @@ got worse.
 counting a rolling window of rows. Same answer, and it is the form that can take the
 previous day's candidates as a carry, which a cascade starting at 23:59 needs.
 
-**Proof.** `trades.parquet` is byte-identical to the engine this replaces, on the golden
-fixture and on `2025-10-09` to `2025-10-11` of the real lake for `BTC,ETH,SOL,HYPE`; the
-digest and the command are pinned in `tests/test_backtest_streaming.py`.
+**Proof 1, and what it is not.** `trades.parquet` is byte-identical to the engine this
+replaces, on the golden fixture and on `2025-10-09` to `2025-10-11` of the real lake for
+`BTC,ETH,SOL,HYPE`; the digest and the command are pinned in
+`tests/test_backtest_streaming.py`.
+
+**That is three days, and the prompt asked for a month.** The reference has to be produced
+by the engine being replaced, and the engine being replaced is the one that cannot hold a
+month: `load_inputs` reads every trade in the window into one frame, which is what the OS
+killed twice on this 8 GB machine. A month-long reference was therefore not available to
+take, and three days that carry the busiest cascade day of the year for these four coins
+were taken instead. What the digest proves is the identity claim on real data, which does
+not need a month; what a month would have added is coverage, and the 42-coin and year runs
+below are where that comes from.
+
+**The digest has been re-pinned once, on purpose.** The 04c exit fix took it from seven
+trades to four, because three of the reference run's seven had a target already behind the
+entry. A digest that had survived that fix would have meant the fix did nothing. See the
+04c fill entry below; the reason is in the test comment beside the constant.
 
 Measured on the owner's machine, `/usr/bin/time -l`, nothing else running, with
 `features.z_robust: false` so that the runs have fills to be identical about.
@@ -1240,12 +1255,18 @@ The three reference days, `2025-10-09` to `2025-10-11`:
 | four coins, streaming, `--no-cache`, with `tail_only` | 37 s | **1.44 GB** |
 | the 42-coin research universe, `--no-cache`, with `tail_only` | 46 s | **1.31 GB** |
 
-The year, `2025-09-01` to `2026-08-30`, four coins:
+**Proof 2, the year**, `2025-09-01` to `2026-08-30`, four coins:
 
 | run | wall | peak RSS |
 | --- | --- | --- |
 | cold cache | 60.7 min | 2.64 GB |
 | warm cache | 32.0 min | 1.96 GB |
+
+**The warm number is the operating number.** A cold year happens once per feature-hash
+change; every run after it is warm, and warm is 1.96 GB and 32 minutes. The task asked for
+under 2 GB and the warm run meets it. The cold run does not, at 2.64 GB, and saying only
+"the year runs in 2 GB" would be reporting the number that is almost never the one you
+get. Both are above.
 
 **The universe costs almost nothing.** Ten times the coins is 23% more wall clock and
 *less* memory, 1.31 GB against 1.44 GB. Both halves of that are the per-coin day loop
@@ -1264,13 +1285,19 @@ is a second proof of the cache on top of the unit tests: a year of features read
 disk produces the same sixty-four trades as a year of features built from the tape. A year
 of four coins costs 6.8 GB of cache, about 1.7 GB per coin-year.
 
-**What is still over budget.** The year's cold run was 2.64 GB against the 2 GB the task
-asked for, and its warm run 1.96 GB. `tail_only` takes 0.15 GB off the per-day working set
-and the year has not been re-measured with it, so the honest statement is that the working
-set is comfortably under 2 GB and a cold year is not: the difference between the 1.59 GB
-three-day peak and the 2.64 GB year peak is allocator high-water mark accumulated over 364
-days of differently sized frames, not a bigger working set. Every run after the first is a
-warm one.
+**Why the cold year is the one over budget.** The difference between the 1.59 GB three-day
+peak and the 2.64 GB year peak is allocator high-water mark accumulated over 364 days of
+differently sized frames, not a bigger working set: the working set is one coin-day
+whatever the length of the run, which is what the 42-coin figure shows. So the honest
+statement is that the working set is comfortably under 2 GB and a cold year is not.
+
+**Every number above was taken with `tail_only` on both book tables, which was wrong for
+`bbo`.** `bbo` sets `mid`, and `mid` feeds every rolling window, so carrying one snapshot
+of it changed the scored day; the fix on 2026-09-07 reads the carry day's `bbo` whole and
+keeps `tail_only` for `l2` alone. `l2` is where the saving was (3.1 million rows per coin
+per day against a few hundred thousand), but the 0.15 GB `tail_only` took off the per-day
+working set was measured with both, so the memory figures here are a lower bound until the
+year is re-run. See the 2026-09-07 entry.
 
 **Two things found along the way that were not this change's to fix.**
 
@@ -1500,6 +1527,20 @@ a halted account. The per-coin cooldowns and the cluster cap stay, because they 
 trades a run takes rather than cutting the tape short. `config/default.yaml` keeps 0.10 and
 0.03 and a test pins both halves.
 
+**Corrected 2026-09-07: only one of those three keys was doing anything.**
+`consecutive_losses`, `daily_realized_pnl` and the per-coin cooldowns are all written by
+`RiskEngine.on_exit`, and the replay never called it, so `losing_streak`, `daily_loss` and
+`coin_cooldown` could not fire at any setting. `drawdown` was the halt that cut the year
+short, because `on_equity` maintains the peak it reads, and relaxing `max_dd_frac` is what
+actually bought the whole tape. Relaxing the other two changed nothing, and the sentence
+above saying the per-coin cooldowns "stay" described an intention rather than a run: they
+were not in force either, so **every number in this entry and in the rerun below was taken
+by a run that could re-enter a coin the moment it exited it**. The exits are wired now, in
+the backtest and in the paper loop, and the next run of this config will take fewer trades
+than the table below. The zero streak cooldown was and remains correct: the gate blocks for
+the length of the cooldown and then clears the count, so zero is off, which
+`tests/test_risk.py` now pins in both directions.
+
 **The rerun.** Same command, cache warm. The exit is a trade now rather than an accident:
 
 | | before the fix | after |
@@ -1521,6 +1562,19 @@ behind-target exits are entry slippage of 863 to 1,152 bps: the fill model filli
 than the resting price during a violent cascade, which puts the realised entry past a target
 that was ahead when the intent was built. That is `backtest/fills.py` and the no-book path,
 not the exit rule, and it is the next thing to look at rather than any threshold.
+
+**Corrected 2026-09-07: the stale book is half of it, and the order type is the other
+half.** Those entries were IOC, and nothing in the run config asked for an IOC entry.
+`execution.entry_tif` was `Alo`, but `_entry_order` also crosses when the intent is high
+urgency and `intent.allow_taker_entry_high_urgency` is set, and both were true on nearly
+every intent: urgency is `peak_liq_z >= intent.urgency_liq_z`, the threshold was the
+default 5.0, and under `features.z_robust` that z is scaled by the mean absolute deviation
+of a series that is zero 82% of the time, with a p99 of 1.8e11. So the run crossed the
+spread on essentially every entry, into the worst book of the cascade, and the stale-book
+path then priced the cross. A fix to `fills.py` alone would have left the crossing in
+place. `intent.urgency_liq_z` is nullable now, `v1_confluence.yaml` sets it null and turns
+the taker fallback off, and the entries that config produces are the maker entries the
+policy in `docs/STRATEGY_AND_RISK.md` section 3 describes.
 
 **`vwap_stretch` passes 92.7% of candidates and is barely a condition.** A cascade that has
 moved price by two volatilities is nearly always 30 bps from the session VWAP. Left at 30
@@ -2111,3 +2165,129 @@ whatever the worker count; parallelism only raised the odds.
 
 Reverse the parallelism if a test ever needs the machine to itself; the fix then is to mark
 it, not to go back to one worker.
+## 2026-09-07: 04e, the code review's follow-ups, and three premises that were wrong
+
+Branch `04e-backtest-review`, against the 2026-09-07 review of `main` at `6d4626b`. One
+commit per finding. What follows is what changed, and where the review's reading of the
+code did not survive being run.
+
+**The previous day's `bbo` was being carried as one snapshot, and that was wrong.**
+`tail_carry` was set on both book tables on the argument that a book reaches the grid
+through a backward as-of join and nothing else. The argument holds for `l2`, whose four
+columns are aggregated per snapshot in `features/book.py` and joined; it is false for
+`bbo`, which sets `mid` in `features/grid.py`, and `mid` is the series `returns`,
+`realized_vol`, `cvd`, `displacement`, `session_vwap` and the 24h mark-mid percentile are
+all computed from. With one snapshot carried, the rest of the previous day fell back to the
+last trade price, so every window on the scored day reaching back across midnight read a
+different series. The rule is now written down where it is applied: set `tail_carry` only
+where every column the table feeds reaches the grid through a backward as-of join and is
+never read by a rolling window. The golden lake grew an opt-in quote tape to test it, off by
+default so the hand-checked numbers stand.
+
+`tail_only` also filtered on the global maximum of `effective_ts` rather than per coin, so
+on a multi-coin day only the coin that quoted latest kept a carry. The reference runs read
+one coin at a time so no committed number moves, but the 42-coin universe run did.
+
+**A warmup window opens before midnight now.** `_clip_to_day` clamped every window's start
+to the day it belonged to, so a candidate inside the first `backtest.window_warmup_s` of a
+day got whatever warmup was left after 00:00 instead of the 300s the spec gives it, and
+within `risk.stale_coin_s` of midnight the entry is blocked as stale where the whole-lake
+run traded. The clamp is a floor carried through the day loop: the end of what the previous
+day already replayed, which is the run's start on the first day and exactly midnight when a
+window was still open there. That is what stops the backward reach feeding the same prints
+to the book twice, and it makes the spill and the reach two halves of one rule.
+`LakeSource.events` opens the previous partition when a span asks for it, under the same
+span filter, so the extra read is the warmup and not the day.
+
+**The `rx_ms` over `ts_ms` rule is written once.** It existed in four places and a copy
+drifting to `>= 0` would silently put the backfilled year on a receive time it never had.
+`features.grid.effective_ts` is the only one, and `tests/test_conventions.py` fails if the
+expression reappears. `engine._within` folded into the same `span_filter` `load_day` pushes
+into its scan, so a `RunInputs` a test built and a `LakeSource` reading the lake keep the
+same rows by construction.
+
+**`exhaustion.max_age_s` left `HASHED_KEYS`.** `active_mask` and `cascade_windows` read it
+and both run in the engine on a grid that is already built, so it decides how much of a
+cached day the engine keeps and never the day itself. A sweep over the exhaustion window was
+rebuilding 6.8 GB of cache per year for nothing. That change and the move to `orjson` in
+`backtest/source.py` both change `feature_hash`, so the existing cache is invalid once and
+has to be rebuilt once.
+
+### Three of the review's findings did not hold, and one of them was hiding a bigger defect
+
+**"A zero streak cooldown means no streak block" is false, and the real defect is that the
+gate could never fire at all.** `cooldown_after_streak_min: 0` already means off:
+`_expire_halt` clears `consecutive_losses` when the cooldown is served, so a zero cooldown
+is served the instant it is imposed. The review missed that. What it was right to be
+suspicious of is worse. `consecutive_losses`, `daily_realized_pnl` and the per-coin
+cooldowns are written by `RiskEngine.on_exit` and by nothing else, and **neither the
+backtest nor the paper loop ever called it**. `losing_streak`, `daily_loss` and
+`coin_cooldown` were therefore unable to fire at any setting, in every backtest number this
+repo has produced. Only `drawdown` worked, because `on_equity` maintains the peak it reads,
+which is why relaxing `max_dd_frac` in `v1_confluence.yaml` was the only one of that file's
+three relaxations that did anything. `apply_exit` already returns the closed round trip, so
+the three exit sites that produce one now hand it to the risk engine; `_close_out` does not,
+because it fires once at the end of a run and there is no entry left to gate.
+
+**"The lab chooses `--out`, so write `lab.json` at launch into the report directory" is
+half right.** The lab chooses the parent. The report goes to `<--out>/<timestamp>_<config
+hash>` and both halves of that name are decided by `write_report` when the run ends, minutes
+to an hour after launch, so the lab cannot write into it at launch. What it can do is write
+both sidecars into `reports/.lab/` from the moment the job starts, move them when it reaps,
+and finish the move on its next start for a run it did not live to reap. That is what it
+does now, and it is why `_file_orphans` exists.
+
+**`LakeSource.meta` and `ctrl+t` were not defects.** `meta` is read by the engine on every
+run through `_resolve_meta(source.meta, ...)`, so it is empty rather than unused and
+deleting it breaks the `Source` union; `LakeSource.seed` is passed by `cli.py` from the
+documented `--seed` flag. Only the dead `random.Random(source.seed)` line went. `ctrl+t`
+already acted on the selected row through the table cursor; it has a test now rather than a
+change.
+
+### The lab was rewriting configs it was only asked to open
+
+Opening `config/backtest/v1_confluence.yaml` in the edit form and pressing save without
+touching a box deleted **sixteen of its thirty-seven keys**. The review found two of them.
+A null was shown as an empty box and an empty box read back as "not in this layer", so
+`cascade.liq_z_min: null` and `strategy.rules.oi_flush.build_min_frac: null` were dropped
+and the z trigger came back on. The other fourteen were keys whose value equals the resolved
+default: `cascade.trigger`, `intent.k_target`, `backtest.latency_ms` and the rest. They
+merge to the same run today and say nothing about what the owner chose, which is what the
+file is for, so a key the file already carried is written back whether or not it matches a
+default. Null is shown and read as the text `null`; an empty box still means unset, which is
+how a key is removed.
+
+`delete_config` also ignored `RESERVED_STEMS`, so `liqfade lab --config-dir config` put
+`mainnet.yaml` two keystrokes from deletion. Both paths go through one guard now.
+
+### The z-scale no longer decides the order type
+
+`intent.urgency_liq_z` is compared against the same aad-scaled `liq_z` whose p99 on the lake
+is 1.8e11, so under `features.z_robust` nearly every cascade cleared the default 5.0 and
+every intent came out high urgency. `_entry_order` crosses the spread when an intent is
+urgent and `intent.allow_taker_entry_high_urgency` is set, so a config whose
+`execution.entry_tif` said `Alo` was placing IOC entries into the worst book of the cascade.
+That is the mechanism behind the 863 to 1,152 bps entries the 2026-09-06 rerun attributed to
+`fills.py` and the no-book path alone. The key is nullable now, null meaning no intent is
+ever urgent, which is the honest setting while the scale has no units; `v1_confluence.yaml`
+sets it null and turns the taker fallback off. `config/default.yaml` is untouched.
+
+### What is owed
+
+**The reference digest was not re-taken and is expected to have moved.** The lake at
+`/Volumes/<drive>/liqfade-data` was not mounted for any of this work, so
+`tests/test_backtest_streaming.py`'s lake-marked test was deselected throughout and every
+change here was developed against `tests/fixtures`. Three of the changes above move real
+runs: the whole `bbo` carry, the wired exits, and the backward warmup reach. The comment
+beside `REFERENCE` says so and says what to do about it. Until that run happens the digest
+in the repo is a claim about the old engine, not about this one.
+
+**`v1_confluence.yaml`'s year has to be re-run before its table is quoted again.** Its
+numbers were taken by an engine that could re-enter a coin the moment it exited it, that
+crossed the spread on essentially every entry, and that read a truncated `bbo` carry. Three
+independent reasons for the same conclusion.
+
+**Reverse the wired exits** if the v1 rerun turns out to lose most of its trades to
+`coin_cooldown` and the owner would rather tune with the gates off. That is a config
+decision (`risk.coin_cooldown_after_exit_min: 0` in that file) and not a reason to leave
+three risk gates unable to fire.

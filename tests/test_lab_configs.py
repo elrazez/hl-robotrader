@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from liqfade.lab.configs import (
+    RESERVED_STEMS,
+    LabConfigError,
     delete_config,
     duplicate_config,
     list_configs,
@@ -117,3 +119,25 @@ def test_the_lab_refuses_to_write_outside_its_own_directory(tmp_path: Path) -> N
 
     with pytest.raises(LabConfigError):
         save_config(tmp_path / ".." / "mainnet.yaml", "Sneaky", "", {"intent.k_stop": 0.5})
+
+
+class TestDeleteIsGuardedLikeSave:
+    """`liqfade lab --config-dir config` points the lab at the loader's own layer files.
+
+    `save_config` refuses those by name, because CLAUDE.md's rule about mainnet risk limits
+    cannot depend on where the lab happens to be pointed. `delete_config` did not, so two
+    keystrokes on the configs screen could unlink `config/mainnet.yaml`.
+    """
+
+    @pytest.mark.parametrize("stem", sorted(RESERVED_STEMS))
+    def test_a_loader_layer_is_refused_by_name(self, tmp_path: Path, stem: str) -> None:
+        path = tmp_path / f"{stem}.yaml"
+        path.write_text("risk:\n  max_dd_frac: 0.1\n")
+        with pytest.raises(LabConfigError):
+            delete_config(path)
+        assert path.exists()
+
+    def test_a_strategy_config_still_deletes(self, tmp_path: Path) -> None:
+        path = save_config(tmp_path / "tight.yaml", "Tight", "", {"intent.k_stop": 0.5})
+        delete_config(path)
+        assert not path.exists()

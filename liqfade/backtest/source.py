@@ -33,19 +33,20 @@ whose z-scores came from a lookback that was not there.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import orjson
 import polars as pl
 import pyarrow.parquet as pq
 
 from liqfade.backtest.data import Event, iter_events, load_day, utc_days
 from liqfade.backtest.features import build_feature_grid, row_columns
 from liqfade.config.models import Settings
+from liqfade.features.grid import effective_ts
 from liqfade.features.levels import range_levels, swing_levels
 from liqfade.log import get_logger
 from liqfade.strategy.rules import LEVEL_RULES, level_rules_enabled
@@ -81,7 +82,9 @@ HASHED_KEYS: tuple[str, ...] = (
     "backtest.feature_grid_ms",  # the grid step every window is counted in
     "sizing.vol_window_s",  # names and fills traded_usd_{w}s
     "exhaustion.mark_mid_pct_threshold",  # the percentile mark_mid_threshold is taken at
-    "exhaustion.max_age_s",  # how far past a candidate active_mask reaches
+    # `exhaustion.max_age_s` is deliberately absent. `active_mask` and `cascade_windows`
+    # read it, and both run in the engine on a grid that is already built, so it changes
+    # how much of a cached day the engine keeps and never the day itself.
     # Whether support_px and resistance_px are joined at all, one key per level rule so
     # toggling a rule that reads no levels does not throw a year of cached grids away.
     *(f"strategy.rules.{name}" for name in LEVEL_RULES),
@@ -113,7 +116,7 @@ class Day:
 def feature_hash(settings: Settings) -> str:
     """A short digest of every config key a feature column depends on."""
     payload = {key: _dotted(settings.model_dump(mode="json"), key) for key in HASHED_KEYS}
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode()
+    encoded = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS, default=str)
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
@@ -223,13 +226,26 @@ class LakeSource:
                 writer.close()
 
     def events(self, day: Day, spans: Mapping[str, Sequence[tuple[int, int]]]) -> Iterator[Event]:
-        """Every event inside `spans` on this day, merged into one time-ordered stream."""
+        """Every event inside `spans`, merged into one time-ordered stream.
+
+        Normally one partition. A window that opens inside the first
+        `backtest.window_warmup_s` of the day reaches back across midnight for its warmup,
+        and the previous partition is read as well, under the same spans: the filter keeps
+        only the minutes the window actually asked for, so the extra read is the warmup and
+        not the day.
+        """
         if not spans:
             return iter(())
+        partitions = [day.date]
+        if min(start for coin_spans in spans.values() for start, _ in coin_spans) < day.midnight_ms:
+            partitions.insert(0, day.previous)
         # Trades are Hyperliquid only, matching what the grid was built on; liquidations
         # come from every venue and `cascade.trigger` picks among them inside the grid.
         read = {
-            table: load_day(self.data_dir, table, day.date, spans=spans, venue=venue)
+            table: _concat(
+                load_day(self.data_dir, table, partition, spans=spans, venue=venue)
+                for partition in partitions
+            )
             for table, venue in (
                 ("trades", "hyperliquid"),
                 ("liquidations", None),
@@ -257,7 +273,7 @@ class LakeSource:
         rows = load_day(self.data_dir, "asset_ctx", day.date, coins=self.coins)
         if rows.is_empty():
             return rows
-        return rows.filter(_known().is_between(self.start_ms, self.end_ms, closed="left"))
+        return rows.filter(effective_ts(None).is_between(self.start_ms, self.end_ms, closed="left"))
 
     # --- internals ------------------------------------------------------------
 
@@ -281,13 +297,24 @@ class LakeSource:
             liquidations=self._read(days, "liquidations", coin),
             start_ms=grid_start,
             end_ms=day.midnight_ms + DAY_MS,
-            # The book tables carry only their last snapshot from the previous day. Both
-            # reach the grid through a backward as-of join and nothing else, so the latest
-            # snapshot before midnight is the only row of that day any grid row can ever
-            # select; the rest cannot change an answer. It is worth the special case
-            # because `l2` is the largest table in the lake, 3.1 million rows per coin per
-            # day, and reading two days of it per day of the run was most of the memory.
-            bbo=_or_none(self._read(days, "bbo", coin, tail_carry=True)),
+            # `l2` carries only its last snapshot from the previous day, and `bbo` does
+            # not. The test is whether any column the table feeds is windowed, not whether
+            # the table itself is joined:
+            #
+            # - `l2` reaches the grid through `features/book.py`, which aggregates each
+            #   snapshot on its own and joins the four results backwards. No window reads
+            #   across snapshots, so the latest one before midnight is the only row of that
+            #   day a later timestamp can select and the rest cannot change an answer.
+            # - `bbo` sets `mid` in `features/grid.py`, and `mid` is the series `returns`,
+            #   `realized_vol`, `cvd`, `displacement`, `session_vwap` and the 24h mark-mid
+            #   percentile are all computed from. Carrying one snapshot leaves the rest of
+            #   the previous day falling back to the last trade price, so every window on
+            #   the scored day that reaches back across midnight reads a different series.
+            #   `tests/test_backtest_streaming.py` pins the two grids equal.
+            #
+            # The saving was `l2`'s anyway: it is the largest table in the lake at 3.1
+            # million rows per coin per day, against a few hundred thousand for `bbo`.
+            bbo=_or_none(self._read(days, "bbo", coin)),
             l2=_or_none(self._read(days, "l2", coin, tail_carry=True)),
             asset_ctx=_or_none(self._read(days, "asset_ctx", coin)),
             levels=self._level_set(settings),
@@ -361,8 +388,9 @@ class LakeSource:
     ) -> pl.DataFrame:
         """One coin's rows across `days`, the last of which is the day being built.
 
-        `tail_carry` keeps only the last snapshot of every day but the last, for the tables
-        that reach the grid through a backward as-of join alone.
+        `tail_carry` keeps only the last snapshot of every day but the last. Set it only
+        for a table whose every column reaches the grid through a backward as-of join and
+        is never read by a rolling window; see `_build` for which tables those are.
         """
         parts = []
         for index, partition in enumerate(days):
@@ -426,7 +454,7 @@ class _CacheWriter:
             # The coin list rides in the schema metadata because it is the one thing the
             # rows cannot say: a coin that had no prints leaves no row, and a reader has to
             # tell "covered and empty" from "never asked about".
-            schema = table.schema.with_metadata({COINS_KEY: json.dumps(self.coins).encode()})
+            schema = table.schema.with_metadata({COINS_KEY: orjson.dumps(self.coins)})
             self._writer = pq.ParquetWriter(self.tmp, schema, compression="zstd")
             table = table.cast(schema)
         self._writer.write_table(table)
@@ -443,7 +471,7 @@ def _cached_coins(path: Path) -> set[str] | None:
     """The coins a cache file was built for, from its schema metadata."""
     metadata = pq.read_schema(path).metadata or {}
     raw = metadata.get(COINS_KEY)
-    return set(json.loads(raw)) if raw else None
+    return set(orjson.loads(raw)) if raw else None
 
 
 DAY_MS = 86_400_000
@@ -459,8 +487,10 @@ def midnight_ms(day: str) -> int:
     return int(datetime(parsed.year, parsed.month, parsed.day, tzinfo=UTC).timestamp() * 1000)
 
 
-def _known() -> pl.Expr:
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
+def _concat(frames: Iterator[pl.DataFrame]) -> pl.DataFrame:
+    """Stack what the partitions gave back, skipping the ones that had nothing."""
+    parts = [frame for frame in frames if not frame.is_empty()]
+    return pl.concat(parts) if parts else pl.DataFrame()
 
 
 def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:

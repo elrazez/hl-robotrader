@@ -36,6 +36,7 @@ import websockets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from liqfade.config import load_settings
+from liqfade.execution.rounding import floor_size, round_price
 from liqfade.execution.signer import Signer, load_signer
 
 FAR_FROM_MARKET = 0.5  # a resting bid at half the mid never fills and never gets stale
@@ -77,6 +78,26 @@ def new_cloid() -> Any:
     return Cloid.from_str("0x" + uuid.uuid4().hex)
 
 
+def hl_price(base_url: str, coin: str, px: float) -> float:
+    """A price Hyperliquid will accept, through `execution/rounding.py` and nowhere else.
+
+    These probes used a bare `round(px)`, which is the integer for anything priced above a
+    dollar and zero for anything priced below one. CLAUDE.md keeps rounding in one module
+    for exactly that reason: a probe that rounds its own way is not probing the rules the
+    bot will actually place orders under.
+    """
+    return float(round_price(px, sz_decimals(base_url, coin)))
+
+
+def hl_size(base_url: str, coin: str, notional_usd: float, px: float) -> float:
+    """A size for `notional_usd` at `px`, floored to the asset's `szDecimals`.
+
+    Floored rather than rounded: rounding up can put the order over the notional the probe
+    meant to risk, and these run against a faucet-funded account.
+    """
+    return float(floor_size(notional_usd / px, sz_decimals(base_url, coin)))
+
+
 # --- probe 1: Gtc round trip and cancel by cloid ---------------------------------
 
 
@@ -84,8 +105,8 @@ def probe_gtc_cancel(signer: Signer, args: argparse.Namespace) -> None:
     """Place a Gtc far from market, watch orderUpdates, cancel by cloid, watch again."""
     exchange = signer.exchange()
     mid = mid_price(signer.base_url, args.coin)
-    px = round(mid * FAR_FROM_MARKET)
-    size = round(QUIET_SIZE_USD / px, sz_decimals(signer.base_url, args.coin))
+    px = hl_price(signer.base_url, args.coin, mid * FAR_FROM_MARKET)
+    size = hl_size(signer.base_url, args.coin, QUIET_SIZE_USD, px)
     cloid = new_cloid()
     show(
         "plan",
@@ -164,8 +185,8 @@ def probe_alo_cross(signer: Signer, args: argparse.Namespace) -> None:
     exchange = signer.exchange()
     book = info_post(signer.base_url, {"type": "l2Book", "coin": args.coin})
     best_ask = float(book["levels"][1][0]["px"])
-    px = round(best_ask * 1.01, 6)
-    size = round(QUIET_SIZE_USD / px, sz_decimals(signer.base_url, args.coin))
+    px = hl_price(signer.base_url, args.coin, best_ask * 1.01)
+    size = hl_size(signer.base_url, args.coin, QUIET_SIZE_USD, px)
     show("plan", {"coin": args.coin, "best_ask": best_ask, "buy_limit_px": px, "size": size})
     show(
         "alo_that_crosses",
@@ -187,12 +208,11 @@ def probe_tpsl_group(signer: Signer, args: argparse.Namespace) -> None:
 
     exchange = signer.exchange()
     mid = mid_price(signer.base_url, args.coin)
-    decimals = sz_decimals(signer.base_url, args.coin)
-    size = round(max(QUIET_SIZE_USD, args.notional) / mid, decimals)
+    size = hl_size(signer.base_url, args.coin, max(QUIET_SIZE_USD, args.notional), mid)
     show("entry", exchange.market_open(args.coin, True, size, None, 0.01, cloid=new_cloid()))
 
-    tp_px = round(mid * (1 + args.tp_bps / 1e4))
-    sl_px = round(mid * (1 - args.tp_bps / 1e4))
+    tp_px = hl_price(signer.base_url, args.coin, mid * (1 + args.tp_bps / 1e4))
+    sl_px = hl_price(signer.base_url, args.coin, mid * (1 - args.tp_bps / 1e4))
     requests: list[OrderRequest] = [
         {
             "coin": args.coin,
@@ -234,8 +254,8 @@ def probe_latency(signer: Signer, args: argparse.Namespace) -> None:
     """
     exchange = signer.exchange()
     mid = mid_price(signer.base_url, args.coin)
-    px = round(mid * FAR_FROM_MARKET)
-    size = round(QUIET_SIZE_USD / px, sz_decimals(signer.base_url, args.coin))
+    px = hl_price(signer.base_url, args.coin, mid * FAR_FROM_MARKET)
+    size = hl_size(signer.base_url, args.coin, QUIET_SIZE_USD, px)
     submits, cancels, statuses = [], [], []
     for _ in range(args.count):
         cloid = new_cloid()

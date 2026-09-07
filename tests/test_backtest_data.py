@@ -266,3 +266,75 @@ class TestClock:
         assert len(list(merge(events, [1000]))) == 2
         assert len(list(merge([], [1000, 2000]))) == 2
         assert len(list(merge(events, []))) == 1
+
+
+class TestTailOnly:
+    """The carry a book table leaves for the next day, which is per coin.
+
+    `tail_only` exists so a day's grid can be built with yesterday's last book state in
+    front of it without reading yesterday's 3.1 million `l2` rows. What "last" means is the
+    whole of it: the last snapshot **of each coin**, because two coins do not stop quoting
+    at the same millisecond and a global maximum would hand every coin but the latest an
+    empty carry.
+    """
+
+    @pytest.fixture
+    def two_coins(self, tmp_path: Path) -> Path:
+        """One day of bbo where BTC's last quote is a minute before ETH's."""
+        from liqfade.data.schemas import SOURCE_RECORDER
+        from liqfade.recorder.writer import write_rows
+
+        rows = [
+            {
+                "coin": coin,
+                "ts_ms": T0 + minute * 60_000,
+                "rx_ms": T0 + minute * 60_000,
+                "bid_px": 100.0 + minute,
+                "bid_sz": 1.0,
+                "ask_px": 101.0 + minute,
+                "ask_sz": 1.0,
+            }
+            for coin, last in (("BTC", 3), ("ETH", 4))
+            for minute in range(last + 1)
+        ]
+        write_rows(
+            tmp_path / "parquet",
+            ("bbo", "hyperliquid", "2026-03-01", 0),
+            rows,
+            source=SOURCE_RECORDER,
+        )
+        return tmp_path
+
+    def test_every_coin_keeps_its_own_last_snapshot(self, two_coins: Path) -> None:
+        kept = load_day(two_coins, "bbo", "2026-03-01", tail_only=True).sort("coin")
+        assert kept.get_column("coin").to_list() == ["BTC", "ETH"]
+        assert kept.get_column("ts_ms").to_list() == [T0 + 3 * 60_000, T0 + 4 * 60_000]
+
+    def test_a_snapshot_is_kept_whole(self, tmp_path: Path) -> None:
+        """`l2` is twenty rows per snapshot and the carry needs all twenty, not one."""
+        from liqfade.data.schemas import SOURCE_RECORDER
+        from liqfade.recorder.writer import write_rows
+
+        rows = [
+            {
+                "coin": "BTC",
+                "ts_ms": T0 + snapshot * 1000,
+                "rx_ms": T0 + snapshot * 1000,
+                "level": level,
+                "bid_px": 100.0 - level,
+                "bid_sz": 1.0,
+                "ask_px": 101.0 + level,
+                "ask_sz": 1.0,
+            }
+            for snapshot in range(2)
+            for level in range(20)
+        ]
+        write_rows(
+            tmp_path / "parquet",
+            ("l2", "hyperliquid", "2026-03-01", 0),
+            rows,
+            source=SOURCE_RECORDER,
+        )
+        kept = load_day(tmp_path, "l2", "2026-03-01", tail_only=True)
+        assert kept.height == 20
+        assert set(kept.get_column("ts_ms").to_list()) == {T0 + 1000}

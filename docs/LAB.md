@@ -41,7 +41,7 @@ them and a hand-written file without them still lists.
 | `v` | view: every overridden key against the resolved default, with the model's description |
 | `e` | edit: the form |
 | `d` | duplicate under a new name |
-| `x` | delete, asked twice |
+| `x` | delete, asked twice; refuses the loader layers by name, as save does |
 | `r` | reread the directory |
 
 ### The form
@@ -61,10 +61,16 @@ here: they configure processes the lab does not run.
 
 `ctrl+s` saves, `escape` leaves the file alone.
 
-**An empty box means the key is not in the file**, so it keeps the default. A null override
-is spelled `null`, which is what `cascade.liq_z_min: null` needs. The writer emits only the
-keys whose value differs from the resolved default, each with the model's description above
-it, plus the name and notes header, so a saved file reads like the two written by hand.
+**An empty box means the key is not in the file**, so it keeps the default, and clearing a
+box is how a key is removed. A null override is spelled `null` and is shown as `null`, which
+is what `cascade.liq_z_min: null` needs: null is a value the file states, not the absence of
+one.
+
+The writer emits every key the file already had, plus any whose value now differs from the
+resolved default, each with the model's description above it and the name and notes header
+on top, so a saved file reads like the two written by hand. A key that matches the default
+is kept when the file already carried it: the file records what the owner chose, and is not
+a diff against whatever `config/default.yaml` says next month.
 
 ## Run
 
@@ -88,7 +94,12 @@ goes through the same layering and the same validation as a YAML key.
 | key | does |
 |---|---|
 | `ctrl+r` | launch, or queue if the lake is busy |
-| `ctrl+t` | SIGTERM the selected run, SIGKILL it if it ignores that for 10s |
+| `ctrl+t` | SIGTERM the selected run, SIGKILL it if it ignores that for 10s. Selected means wherever the cursor is in the job table, not the top row |
+
+**Quitting takes the queue with it.** A running job survives, because it is spawned into its
+own session and outliving the window it was launched from is the point; a job still waiting
+to start simply never starts, and there is nothing to resume, only a form to fill in again.
+The running job's `run.log` and `lab.json` are not lost: the next lab files them.
 
 The progress panel calls `liqfade/backtest/watch.py`'s `render`, so the lab and
 `liqfade watch` draw the same frame and cannot disagree about a run.
@@ -120,6 +131,10 @@ their lag, positions, orders, risk and latency. On the laptop it is normally emp
 so. A snapshot older than 10s is shown anyway and marked stale, because the last thing a
 process said before it stopped is usually the interesting part.
 
+| key | does |
+|---|---|
+| `r` | reread `data/state.json` now, without waiting for the next second |
+
 ## Files the lab writes
 
 Everything is under the reports directory, so nothing new appears in `data/`.
@@ -127,7 +142,8 @@ Everything is under the reports directory, so nothing new appears in `data/`.
 | path | what |
 |---|---|
 | `reports/.lab/<job>.progress.json` | the run's `--progress-file`, while it runs |
-| `reports/.lab/<job>.log` | the run's stdout and stderr, while it runs |
+| `reports/.lab/<job>.log` | the run's stdout and stderr, streamed while it runs |
+| `reports/.lab/<job>.lab.json` | the lab's note, written when the job is launched |
 | `<report dir>/run.log` | the same log, moved beside the report when the run ends |
 | `<report dir>/lab.json` | which config file the lab launched, its name, notes and overrides |
 
@@ -135,6 +151,14 @@ Everything is under the reports directory, so nothing new appears in `data/`.
 config, which is right for reproducing it and useless for reading a list. A run started by
 hand has no `lab.json`; Results falls back to the config hash and says so when asked to
 promote or to diff a config it does not know.
+
+**Both sidecars are written into `reports/.lab/` from the moment a job starts, and moved
+beside the report when it ends.** A run is spawned into its own session so that it outlives
+the lab, so anything only written at the end is written by nobody when the lab is closed
+mid-run. The report directory is `<report dir>/<timestamp>_<config hash>` and both halves
+of that name are decided when the report is written, so the lab cannot write straight into
+it; what it can do is finish the move on its next start, which it does, off the progress
+file the dead lab left behind.
 
 The lagged rerun's net is not in `summary.json` either. `liqfade backtest` prints it, so
 the lab reads it back out of `run.log`, and a run without a log simply shows no number

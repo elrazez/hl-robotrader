@@ -26,7 +26,6 @@ event stream breaks ties on a fixed key, so the same command twice writes byte-i
 
 from __future__ import annotations
 
-import random
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -41,6 +40,7 @@ from liqfade.backtest.data import (
     Liq,
     Trade,
     iter_events,
+    span_filter,
     utc_days,
 )
 from liqfade.backtest.features import (
@@ -66,6 +66,7 @@ from liqfade.backtest.portfolio import Trade as PortfolioTrade
 from liqfade.backtest.progress import ProgressWriter
 from liqfade.backtest.source import DAY_MS, Day, LakeSource, feature_hash, midnight_ms
 from liqfade.config.models import Settings
+from liqfade.features.grid import effective_ts
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
 from liqfade.sizing import LiquidityStats, size_intent
@@ -194,7 +195,7 @@ class RunInputs:
         if self.asset_ctx is None:
             return pl.DataFrame()
         return self.asset_ctx.filter(
-            _known_expr().is_between(day.start_ms, day.end_ms, closed="left")
+            effective_ts(None).is_between(day.start_ms, day.end_ms, closed="left")
         )
 
 
@@ -260,11 +261,6 @@ def run_backtest(
         A `BacktestResult`. The trade list is the run's output; everything else exists so
         the report can say why there were not more of them.
     """
-    # Seeded even though nothing currently draws from it: the fill model has no
-    # stochastic component. It exists so that adding one later cannot silently break the
-    # determinism guarantee, and it is not a cryptographic use.
-    random.Random(source.seed)  # noqa: S311
-
     meta = _resolve_meta(source.meta, source.coins, settings)
     portfolio = Portfolio(settings, starting_equity=source.starting_equity)
     strategy = StrategyEngine(settings, meta)
@@ -303,6 +299,10 @@ def run_backtest(
     # rows and its window across midnight instead of being cut in half by the day loop.
     carry: pl.DataFrame | None = None
     spill: dict[str, list[tuple[int, int]]] = {}
+    # How far the replay has already got. A window opening before midnight reaches back
+    # into yesterday's tape for its warmup, and this is what stops it reaching into tape
+    # yesterday already replayed and applying the same prints to the book twice.
+    floor_ms = source.start_ms
 
     for index, day in enumerate(source.days()):
         if progress is not None:
@@ -313,11 +313,11 @@ def run_backtest(
         # report's coin list has always meant: the universe the run actually covered.
         seen.update(traded)
         spans = _with_spill(spans, spill)
-        spans, spill = _clip_to_day(spans, day)
+        spans, spill = _clip_to_day(spans, day, floor_ms=floor_ms)
         _load_funding(portfolio, source.funding(day))
 
         clock.day(rows, settings)
-        for start_ms, end_ms, closes in _segments(spans, day):
+        for start_ms, end_ms, closes in _segments(spans, day, spill):
             if progress is not None:
                 progress.set(stage="replaying", sim_ms=start_ms)
             result.replayed_ms += end_ms - start_ms
@@ -339,6 +339,7 @@ def run_backtest(
             )
             if closes:
                 _assert_flat(end_ms, state, portfolio)
+            floor_ms = max(floor_ms, end_ms)
         _sample_idle(day, spans, portfolio, risk, result, progress)
 
     _close_out(source.end_ms, state, portfolio, result, settings)
@@ -409,20 +410,36 @@ def _with_spill(
 
 
 def _clip_to_day(
-    spans: Mapping[str, list[tuple[int, int]]], day: Day
+    spans: Mapping[str, list[tuple[int, int]]], day: Day, floor_ms: int
 ) -> tuple[dict[str, list[tuple[int, int]]], dict[str, list[tuple[int, int]]]]:
     """Split each coin's windows into the part this day replays and the part that spills.
 
     A window that runs past midnight is not shortened, it is continued: tomorrow's pass
     picks up its remainder with tomorrow's grid and tomorrow's funding in hand, which is
     the only order in which a position open at midnight can be priced correctly.
+
+    A window that *opens* before midnight is not shortened either. A candidate in the first
+    `backtest.window_warmup_s` of a day belongs to this day's grid and could not have been
+    seen yesterday, so its warmup has to be taken now, out of yesterday's tape.
+
+    Args:
+        spans: this day's windows, per coin, in absolute milliseconds.
+        day: the partition being replayed.
+        floor_ms: the earliest millisecond this pass may reach back to, which is the end of
+            what yesterday's pass already replayed (the run's start, on the first day).
+            Tape behind it has been fed to the book once already and must not be fed again;
+            a window still open at midnight puts the floor exactly at midnight, which is
+            where the spill picks up.
+
+    Returns:
+        `(today, spill)`, the part to replay now and the part tomorrow continues.
     """
     today: dict[str, list[tuple[int, int]]] = {}
     spill: dict[str, list[tuple[int, int]]] = {}
     for coin, coin_spans in spans.items():
         for start, end in coin_spans:
-            start = max(start, day.start_ms)
-            if end <= day.start_ms:
+            start = max(start, floor_ms)
+            if end <= start:
                 continue
             if start >= day.end_ms:
                 spill.setdefault(coin, []).append((start, end))
@@ -433,15 +450,25 @@ def _clip_to_day(
     return today, spill
 
 
-def _segments(spans: Mapping[str, list[tuple[int, int]]], day: Day) -> list[tuple[int, int, bool]]:
+def _segments(
+    spans: Mapping[str, list[tuple[int, int]]],
+    day: Day,
+    spill: Mapping[str, list[tuple[int, int]]],
+) -> list[tuple[int, int, bool]]:
     """The stretches of clock to replay today, merged across coins.
 
     Returns `(start_ms, end_ms, closes)`. `closes` is false when midnight cut the segment
     short, because the window continues tomorrow and a position it opened is meant to still
     be there. Only a segment that genuinely ends may be asserted flat.
+
+    Ending exactly at `day.end_ms` is not by itself being cut short. A window that closes on
+    the stroke of midnight has run its full length and nothing spills out of it, so it is
+    checked like any other; `spill` is what says whether anything is still open, and it is
+    read across coins because the segments are merged across coins.
     """
     flat = [span for coin_spans in spans.values() for span in coin_spans]
-    return [(start, end, end < day.end_ms) for start, end in merge_spans(flat)]
+    continues = any(coin_spans for coin_spans in spill.values())
+    return [(start, end, end < day.end_ms or not continues) for start, end in merge_spans(flat)]
 
 
 def _clip_spans(
@@ -544,7 +571,7 @@ def _replay(
                 cloid,
             )
         else:
-            _on_event(item, state, portfolio, result, settings)
+            _on_event(item, state, portfolio, risk, result, settings)
 
 
 def _assert_flat(end_ms: int, state: Mapping[str, _CoinState], portfolio: Portfolio) -> None:
@@ -557,10 +584,14 @@ def _assert_flat(end_ms: int, state: Mapping[str, _CoinState], portfolio: Portfo
     """
     open_positions = sorted(portfolio.positions)
     working = sorted(coin for coin, coin_state in state.items() if coin_state.entry is not None)
-    assert not open_positions and not working, (
-        f"window ending {end_ms} left {open_positions} open and {working} working; "
-        f"raise backtest.window_margin_s or check intent.time_stop_s"
-    )
+    # An explicit raise rather than `assert`, which `python -O` removes. This is the one
+    # check standing between the windowed replay and silently skipping tape a decision was
+    # live in, so it may not be a check that only runs in development.
+    if open_positions or working:
+        raise RuntimeError(
+            f"window ending {end_ms} left {open_positions} open and {working} working; "
+            f"raise backtest.window_margin_s or check intent.time_stop_s"
+        )
 
 
 def _sample_idle(
@@ -575,8 +606,12 @@ def _sample_idle(
 
     The portfolio is flat outside a window, so equity there is cash and does not move; the
     samples exist so the drawdown series is continuous rather than jumping from one cascade
-    to the next, and so the risk engine sees at least one mark per UTC day and rolls its
-    daily budget at midnight rather than at the first cascade of the day.
+    to the next, and so the risk engine sees marks through a quiet day at all.
+
+    An hourly mark that lands inside a replayed window is skipped, because the replay
+    already marked it. That includes the mark at `day.start_ms`, so on a day whose first
+    window is open at midnight the risk engine's day roll happens at the first tick of that
+    window rather than here. It is the same millisecond of simulated time either way.
     """
     covered = merge_spans([span for coin_spans in spans.values() for span in coin_spans])
     index = 0
@@ -599,6 +634,7 @@ def _on_event(
     event: Event,
     state: dict[str, _CoinState],
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
 ) -> None:
@@ -635,7 +671,7 @@ def _on_event(
             last_px=event.px,
             last_trade_ms=event.ts_ms,
         )
-        _fill_against_print(event, coin_state, portfolio, result, settings)
+        _fill_against_print(event, coin_state, portfolio, risk, result, settings)
     elif isinstance(event, AssetCtx):
         portfolio.funding.add_sample(coin, event.ts_ms, event.funding)
     elif isinstance(event, Liq):
@@ -648,6 +684,7 @@ def _fill_against_print(
     trade: Trade,
     coin_state: _CoinState,
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
 ) -> None:
@@ -679,7 +716,7 @@ def _fill_against_print(
             settings=settings,
         )
         if fill is not None:
-            _book_exit(fill, exit_order, coin_state, portfolio, result)
+            _book_exit(fill, exit_order, coin_state, portfolio, risk, result)
 
 
 # --- ticks --------------------------------------------------------------------
@@ -712,7 +749,7 @@ def _on_tick(
         equity = portfolio.equity(mids)
         _cross_taker_entries(now_ms, state, portfolio, settings)
         _expire_entries(now_ms, state, portfolio, result, settings)
-        _check_exits(now_ms, state, mids, portfolio, result, settings, cloid)
+        _check_exits(now_ms, state, mids, portfolio, risk, result, settings, cloid)
     else:
         mids = {}
         equity = portfolio.cash
@@ -936,6 +973,7 @@ def _check_exits(
     state: dict[str, _CoinState],
     mids: Mapping[str, float | None],
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
     settings: Settings,
     cloid: _CloidCounter,
@@ -965,6 +1003,7 @@ def _check_exits(
                 reason="stop",
                 now_ms=now_ms,
                 portfolio=portfolio,
+                risk=risk,
                 settings=settings,
                 cloid=cloid,
             )
@@ -979,6 +1018,7 @@ def _check_exits(
                 reason="time_stop",
                 now_ms=now_ms,
                 portfolio=portfolio,
+                risk=risk,
                 settings=settings,
                 cloid=cloid,
             )
@@ -1007,6 +1047,7 @@ def _take_exit(
     reason: str,
     now_ms: int,
     portfolio: Portfolio,
+    risk: RiskEngine,
     settings: Settings,
     cloid: _CloidCounter,
 ) -> None:
@@ -1035,7 +1076,7 @@ def _take_exit(
     if fill is None:
         return
     coin_state.exit_order = None
-    portfolio.apply_exit(fill, reason)
+    _booked(portfolio.apply_exit(fill, reason), risk)
 
 
 def _book_exit(
@@ -1043,11 +1084,24 @@ def _book_exit(
     order: SimOrder,
     coin_state: _CoinState,
     portfolio: Portfolio,
+    risk: RiskEngine,
     result: BacktestResult,
 ) -> None:
-    portfolio.apply_exit(fill, order.tag)
+    _booked(portfolio.apply_exit(fill, order.tag), risk)
     if order.remaining <= 0:
         coin_state.exit_order = None
+
+
+def _booked(trade: PortfolioTrade | None, risk: RiskEngine) -> None:
+    """Tell the risk engine a round trip closed, which is the only thing that moves
+    `consecutive_losses`, `daily_realized_pnl` and the per-coin cooldowns.
+
+    A partial exit returns None and is not a round trip yet. `_close_out` deliberately does
+    not come through here: it fires once at the end of the run, and there is no entry left
+    for a cooldown or a streak to gate.
+    """
+    if trade is not None:
+        risk.on_exit(trade.coin, trade.net_pnl, trade.exit_ms)
 
 
 def _close_out(
@@ -1155,28 +1209,14 @@ def _or_none(frame: pl.DataFrame) -> pl.DataFrame | None:
     return None if frame.is_empty() else frame
 
 
-def _known_expr() -> pl.Expr:
-    """The timestamp a row became knowable. Mirrors `features/grid.py`'s `effective_ts`."""
-    return pl.when(pl.col("rx_ms") > 0).then(pl.col("rx_ms")).otherwise(pl.col("ts_ms"))
-
-
 def _within(
     frame: pl.DataFrame | None, spans: Mapping[str, Sequence[tuple[int, int]]]
 ) -> pl.DataFrame:
-    """The rows of an in-memory table falling inside a coin's replay windows."""
+    """The rows of an in-memory table falling inside a coin's replay windows.
+
+    The same predicate `load_day` pushes into the scan, so a `RunInputs` built by a test
+    and a `LakeSource` reading the lake keep exactly the same rows.
+    """
     if frame is None or frame.is_empty() or not spans:
         return pl.DataFrame()
-    known = _known_expr()
-    return frame.filter(
-        pl.any_horizontal(
-            [
-                (pl.col("coin") == coin)
-                & pl.any_horizontal(
-                    [known.is_between(start, end, closed="left") for start, end in coin_spans]
-                )
-                for coin, coin_spans in sorted(spans.items())
-                if coin_spans
-            ]
-            or [pl.lit(False)]
-        )
-    )
+    return frame.filter(span_filter(spans))
