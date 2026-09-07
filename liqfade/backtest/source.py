@@ -282,13 +282,24 @@ class LakeSource:
             liquidations=self._read(days, "liquidations", coin),
             start_ms=grid_start,
             end_ms=day.midnight_ms + DAY_MS,
-            # The book tables carry only their last snapshot from the previous day. Both
-            # reach the grid through a backward as-of join and nothing else, so the latest
-            # snapshot before midnight is the only row of that day any grid row can ever
-            # select; the rest cannot change an answer. It is worth the special case
-            # because `l2` is the largest table in the lake, 3.1 million rows per coin per
-            # day, and reading two days of it per day of the run was most of the memory.
-            bbo=_or_none(self._read(days, "bbo", coin, tail_carry=True)),
+            # `l2` carries only its last snapshot from the previous day, and `bbo` does
+            # not. The test is whether any column the table feeds is windowed, not whether
+            # the table itself is joined:
+            #
+            # - `l2` reaches the grid through `features/book.py`, which aggregates each
+            #   snapshot on its own and joins the four results backwards. No window reads
+            #   across snapshots, so the latest one before midnight is the only row of that
+            #   day a later timestamp can select and the rest cannot change an answer.
+            # - `bbo` sets `mid` in `features/grid.py`, and `mid` is the series `returns`,
+            #   `realized_vol`, `cvd`, `displacement`, `session_vwap` and the 24h mark-mid
+            #   percentile are all computed from. Carrying one snapshot leaves the rest of
+            #   the previous day falling back to the last trade price, so every window on
+            #   the scored day that reaches back across midnight reads a different series.
+            #   `tests/test_backtest_streaming.py` pins the two grids equal.
+            #
+            # The saving was `l2`'s anyway: it is the largest table in the lake at 3.1
+            # million rows per coin per day, against a few hundred thousand for `bbo`.
+            bbo=_or_none(self._read(days, "bbo", coin)),
             l2=_or_none(self._read(days, "l2", coin, tail_carry=True)),
             asset_ctx=_or_none(self._read(days, "asset_ctx", coin)),
             levels=self._level_set(settings),
@@ -362,8 +373,9 @@ class LakeSource:
     ) -> pl.DataFrame:
         """One coin's rows across `days`, the last of which is the day being built.
 
-        `tail_carry` keeps only the last snapshot of every day but the last, for the tables
-        that reach the grid through a backward as-of join alone.
+        `tail_carry` keeps only the last snapshot of every day but the last. Set it only
+        for a table whose every column reaches the grid through a backward as-of join and
+        is never read by a rolling window; see `_build` for which tables those are.
         """
         parts = []
         for index, partition in enumerate(days):

@@ -594,3 +594,95 @@ class TestTheGridCache:
         )
         run_backtest(wider, settings)
         assert wider.grids_cached == 0, "a narrower cache must not answer for a wider run"
+
+
+class TestTheCarryIsAsWideAsTheFeatureThatReadsIt:
+    """A day's grid is a function of the date, on a lake that has a book.
+
+    `LakeSource._build` puts the previous day in front of the day being scored so that
+    every rolling window is full. For the tape and the liquidations it reads that day
+    whole; for the book tables it used to read only the last snapshot, on the argument that
+    a book reaches the grid through a backward as-of join and nothing else. That argument
+    holds for `l2`, whose four columns are joined onto the grid and never windowed, and it
+    is false for `bbo`: `_with_mid` makes `mid` the last book midpoint, and `mid` is what
+    `returns`, `realized_vol`, `cvd`, `displacement`, `session_vwap` and the 24h mark-mid
+    percentile are all computed from. With only the last snapshot carried, the previous
+    day's rows fall back to the last trade price, and every window on the scored day that
+    reaches back across midnight reads a different series.
+
+    The check is the definition: build day two through the streaming source, build it as
+    part of one two-day window, and require every column to agree.
+    """
+
+    @pytest.fixture(scope="class")
+    def book_lake(self, tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, int, int]:
+        """Two days of the golden tape **with a quote tape**, which is what a lake has."""
+        root = tmp_path_factory.mktemp("book_lake")
+        # The same 20h50m offset the straddle fixture uses, so each day's tape runs up to
+        # and across midnight. At the default offset the tape stops at 03:20 and every
+        # window on the second day reaches back only into its own quiet hours, where a
+        # carry of one snapshot and a carry of the whole day say the same thing.
+        start_ms, end_ms = golden_lake.write_lake(root, 2, offset_ms=75_000_000, bbo=True)
+        return root, start_ms, end_ms
+
+    def _whole_window_grid(self, lake: tuple[Path, int, int], settings: Settings) -> pl.DataFrame:
+        """The second day's grid, built from both days in one pass. The answer to match."""
+        from liqfade.backtest.features import build_feature_grid
+        from liqfade.backtest.source import DAY_MS, midnight_ms
+
+        data_dir, start_ms, end_ms = lake
+        days = utc_days(start_ms, end_ms)
+        read = {
+            table: pl.concat(
+                frames
+                if (
+                    frames := [
+                        f for day in days if not (f := load_day(data_dir, table, day)).is_empty()
+                    ]
+                )
+                else [pl.DataFrame()]
+            )
+            for table in ("trades", "liquidations", "bbo")
+        }
+        second = midnight_ms(days[1])
+        grid = build_feature_grid(
+            settings=settings,
+            trades=read["trades"],
+            liquidations=read["liquidations"],
+            start_ms=midnight_ms(days[0]),
+            end_ms=second + DAY_MS,
+            bbo=read["bbo"],
+        )
+        wanted = ("coin", "ts_ms", *row_columns(settings))
+        keep = [name for name in wanted if name in grid.columns]
+        return grid.filter(pl.col("ts_ms") >= second).select(keep)
+
+    def test_the_streamed_grid_equals_the_whole_window_grid_on_every_column(
+        self, book_lake: tuple[Path, int, int], settings: Settings
+    ) -> None:
+        from liqfade.backtest.source import LakeSource
+
+        data_dir, start_ms, end_ms = book_lake
+        source = LakeSource(
+            data_dir,
+            settings=settings,
+            coins=[golden_lake.COIN],
+            start_ms=start_ms,
+            end_ms=end_ms,
+            cache=False,
+        )
+        second = source.days()[1]
+        ((_, streamed),) = source.grids(second, settings, first=False)
+        expected = self._whole_window_grid(book_lake, settings)
+
+        assert streamed.columns == expected.columns
+        assert streamed.height == expected.height
+        differing = [
+            name
+            for name in streamed.columns
+            if not streamed.get_column(name).equals(expected.get_column(name))
+        ]
+        assert differing == [], (
+            "the carried previous day is narrower than the windows that read it: "
+            f"{differing} differ between the streamed and the whole-window grid"
+        )
