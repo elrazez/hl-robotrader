@@ -418,6 +418,7 @@ class WSStream:
         ping_frame: Any = None,
         pong_marker: bytes | None = None,
         on_rtt_ms: Callable[[float], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
         rotate_after_s: float | None = None,
         rotate_overlap_s: float = ROTATE_OVERLAP_S,
     ) -> None:
@@ -433,6 +434,10 @@ class WSStream:
         self.ping_frame = ping_frame
         self.pong_marker = pong_marker
         self.on_rtt_ms = on_rtt_ms
+        # Called once per reconnect, after the connection is lost and before the next
+        # attempt. The trading loop reconciles on it: CLAUDE.md rule 4 wants the two books
+        # compared on every reconnect, because a socket that was away missed fills.
+        self.on_reconnect = on_reconnect
         self.rotate_after_s = rotate_after_s
         self.rotate_overlap_s = rotate_overlap_s
         self.stats: dict[str, StreamStats] = {}
@@ -550,6 +555,11 @@ class WSStream:
                 return
             for stat in self.stats.values():
                 stat.record_reconnect()
+            if self.on_reconnect is not None:
+                # Never allowed to take the stream down: this is a notification, and the
+                # reconnect matters more than whoever wanted to hear about it.
+                with contextlib.suppress(Exception):
+                    self.on_reconnect()
             if time.monotonic() - opened > STABLE_CONNECTION_S:
                 attempt = 0
             delay = backoff_delay(attempt, self.cfg)

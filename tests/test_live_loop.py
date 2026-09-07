@@ -234,7 +234,9 @@ async def test_reconcile_is_clean_when_the_registry_matches_the_engine(
     loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
     await loop.session.tick(START + 1_250)
 
-    assert await loop.reconcile_once("test") == 0
+    result = await loop.reconciler.check("test")
+
+    assert result is not None and result.clean
 
 
 async def test_reconcile_reports_a_registry_row_the_engine_does_not_have(
@@ -253,8 +255,55 @@ async def test_reconcile_reports_a_registry_row_the_engine_does_not_have(
         )
     )
 
-    assert await loop.reconcile_once("test") == 1
-    assert loop.reconcile_differences == 1
+    result = await loop.reconciler.check("test")
+
+    assert result is not None and [d.kind for d in result.differences] == ["missing_order"]
+    assert loop.counters()["reconcile_differences"] == 1
+
+
+async def test_paper_never_reports_its_own_position_as_one_the_venue_lost(
+    loop: PaperLoop,
+) -> None:
+    """Paper has no venue account, so the position half has no second source at all.
+
+    Comparing it against nothing would call every open position `missing_position`, which
+    is a HALT, every sixty seconds. Not checked is the honest answer.
+    """
+    a_market(loop)
+    await loop.session.tick(START + 1_000)
+    loop.session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
+    await loop.session.tick(START + 1_250)
+
+    result = await loop.reconciler.check("test")
+
+    assert result is not None
+    assert result.checked_positions == 0
+    assert not [d for d in result.differences if "position" in d.kind]
+
+
+async def test_a_stream_reconnect_reconciles_without_waiting_for_the_interval(
+    loop: PaperLoop,
+) -> None:
+    """CLAUDE.md rule 4: reconciliation runs on every WebSocket reconnect.
+
+    The loop counted reconnects and triggered nothing, while the class that implements
+    the trigger was used by nothing but its own tests.
+    """
+    assert loop.streams and all(stream.on_reconnect is not None for stream in loop.streams)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.reconciler.run(stop, reconnected=loop.reconnected))
+    try:
+        await asyncio.sleep(0.02)
+        assert loop.reconciler.runs == 1  # startup
+
+        loop.streams[0].on_reconnect()  # what WSStream.run calls when it comes back
+        await asyncio.sleep(0.02)
+
+        assert loop.reconciler.runs == 2
+    finally:
+        stop.set()
+        await task
 
 
 async def test_the_heartbeat_file_is_written(loop: PaperLoop) -> None:

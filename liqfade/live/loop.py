@@ -15,10 +15,12 @@ What runs here, and why each piece is where it is:
 - **The Telegram command bot**, polling in its own task, dispatching through the control
   backend so `/flat` means one thing everywhere.
 - **A heartbeat file touched every second**, which is what the watchdog reads.
-- **Registry reconciliation every `execution.reconcile_s`.** Paper has no venue account,
-  so the position half of reconciliation has no second source and only runs on testnet.
-  The order half does run: the sqlite registry is compared against the engine's working
-  orders, which is what catches the mirror drifting from the book it mirrors.
+- **Registry reconciliation on startup, on every stream reconnect and every
+  `execution.reconcile_s`**, run by `execution/reconcile.py`'s `Reconciler`, which is the
+  one implementation of it. Paper has no venue account, so the position half has no second
+  source and is switched off rather than compared against nothing. The order half does run:
+  the sqlite registry is compared against the engine's working orders, which is what
+  catches the mirror drifting from the book it mirrors.
 
 **Nothing here can place a real order.** The session simulates every fill, and the mainnet
 gates are untouched: `Settings.live_trading_enabled` still needs all three conditions, and
@@ -51,10 +53,10 @@ from liqfade.control.protocol import (
     StateSnapshot,
     now_ms,
 )
-from liqfade.execution.hl import VenueOrder
+from liqfade.execution.hl import AccountSnapshot, VenueOrder
 from liqfade.execution.kill import KillSwitch, KillWatcher
 from liqfade.execution.orders import OrderStore
-from liqfade.execution.reconcile import reconcile
+from liqfade.execution.reconcile import Reconciler
 from liqfade.live.paper import PaperSession
 from liqfade.log import get_logger
 from liqfade.recorder.backend import LatencyTracker
@@ -68,6 +70,41 @@ __all__ = ["PaperBackend", "PaperLoop"]
 
 HEARTBEAT_S = 1.0
 DEFAULT_PAPER_EQUITY = 10_000.0  # USD, overridden by --equity. Never a hardcoded live number.
+
+
+class PaperBooks:
+    """The `BookReader` the reconciler compares the registry against, in paper.
+
+    The engine's working orders are what the sqlite registry mirrors, so they are the
+    second opinion here in exactly the way `openOrders` is on testnet. There is no account
+    to read, which is why the reconciler runs with `compare_positions=False` and `account`
+    is never called.
+    """
+
+    def __init__(self, session: PaperSession) -> None:
+        self.session = session
+
+    async def account(self, address: str) -> AccountSnapshot:  # pragma: no cover - never called
+        raise NotImplementedError("paper has no venue account; compare_positions must be False")
+
+    async def open_orders(self, address: str) -> list[VenueOrder]:
+        orders = []
+        for coin, coin_state in self.session.state.items():
+            for order in (coin_state.entry, coin_state.exit_order):
+                if order is None or order.remaining <= 0:
+                    continue
+                orders.append(
+                    VenueOrder(
+                        oid=0,
+                        coin=coin,
+                        is_buy=order.is_buy,
+                        px=order.px,
+                        size=order.remaining,
+                        ts_ms=order.visible_ms,
+                        cloid=order.cloid,
+                    )
+                )
+        return orders
 
 
 class PaperBackend:
@@ -193,8 +230,11 @@ class PaperLoop:
             on_rtt_ms=self.latency.add_rest,
         )
         self.kill: KillSwitch
+        self.reconciler: Reconciler
+        # Set by every stream when its socket comes back, and by `_supervise` when a task
+        # it owns crashed and is being restarted. The reconciler waits on it.
+        self.reconnected = asyncio.Event()
         self.ticks = 0
-        self.reconcile_differences = 0
         self.reconnects = 0
 
     # --- wiring ---------------------------------------------------------------
@@ -217,7 +257,20 @@ class PaperLoop:
             starting_equity=self.starting_equity,
             risk_state_path=settings.risk_state_path,
         )
-        self.streams = build_streams(settings, self.sink, on_rtt_ms=self.latency.add_ws_ping)
+        self.streams = build_streams(
+            settings,
+            self.sink,
+            on_rtt_ms=self.latency.add_ws_ping,
+            on_reconnect=self._on_reconnect,
+        )
+        self.reconciler = Reconciler(
+            reader=PaperBooks(self.session),
+            address="",  # paper reads no account; PaperBooks ignores it
+            orders=self.store.open_orders,
+            interval_s=settings.execution.reconcile_s,
+            alert=self.post,
+            compare_positions=False,
+        )
         self.kill = KillSwitch(
             kill_file=settings.kill_file,
             open_orders=self.session.open_order_cloids,
@@ -228,6 +281,15 @@ class PaperLoop:
             stop=stop,
             budget_s=settings.risk.kill_budget_s,
         )
+
+    def _on_reconnect(self) -> None:
+        """A stream came back, or a supervised task was restarted. Reconcile now.
+
+        CLAUDE.md rule 4: a socket that was away missed whatever happened while it was,
+        so the two books are compared without waiting out the interval.
+        """
+        self.reconnects += 1
+        self.reconnected.set()
 
     def sink(self, table: str, venue: str, row: dict[str, Any]) -> None:
         """Every stream's rows land here. Called from the receive loop, so it never raises."""
@@ -246,7 +308,8 @@ class PaperLoop:
             "intents": len(self.session.intents),
             "fills": len(self.session.fills),
             "trades": len(self.session.portfolio.trades),
-            "reconcile_differences": self.reconcile_differences,
+            "reconcile_differences": self.reconciler.differences,
+            "reconcile_runs": self.reconciler.runs,
             "reconnects": self.reconnects,
         }
 
@@ -327,77 +390,6 @@ class PaperLoop:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_S)
 
-    async def reconcile_loop(self, stop: asyncio.Event) -> None:
-        """Compare the sqlite registry against the engine's working orders.
-
-        Paper has no venue account, so the position half of reconciliation has no second
-        source and is exercised on testnet instead. The order half is real: it is what
-        catches the registry mirror drifting away from the book it mirrors.
-        """
-        interval = self.settings.execution.reconcile_s
-        while not stop.is_set():
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-            if stop.is_set():
-                return
-            try:
-                await self.reconcile_once("interval")
-            except Exception:
-                log.exception("reconcile_loop_failed")
-
-    async def reconcile_once(self, trigger: str) -> int:
-        """One registry comparison. Returns the number of differences found."""
-        if self.store is None:
-            return 0
-        engine_orders = []
-        for coin, coin_state in self.session.state.items():
-            for order in (coin_state.entry, coin_state.exit_order):
-                if order is None or order.remaining <= 0:
-                    continue
-                engine_orders.append(
-                    VenueOrder(
-                        oid=0,
-                        coin=coin,
-                        is_buy=order.is_buy,
-                        px=order.px,
-                        size=order.remaining,
-                        ts_ms=order.visible_ms,
-                        cloid=order.cloid,
-                    )
-                )
-        positions = await self.session.open_positions()
-        result = reconcile(
-            our_orders=await self.store.open_orders(),
-            venue_orders=engine_orders,
-            our_positions=positions,
-            venue_positions={},
-        )
-        # The position half is not comparable in paper: `venue_positions` above is empty
-        # because there is no venue, so every open position would read as missing. Only
-        # the order findings are real here.
-        order_differences = [d for d in result.differences if "order" in d.kind]
-        if order_differences:
-            self.reconcile_differences += len(order_differences)
-            for difference in order_differences:
-                log.warning(
-                    "reconcile_difference",
-                    trigger=trigger,
-                    kind=difference.kind,
-                    detail=difference.detail,
-                )
-            await self.post(
-                f"[{self.settings.env}] RECONCILE {trigger}: "
-                + ", ".join(d.kind for d in order_differences)
-            )
-        else:
-            log.info(
-                "reconcile_clean",
-                trigger=trigger,
-                orders=len(engine_orders),
-                positions=len(positions),
-            )
-        return len(order_differences)
-
     async def _supervise(
         self, name: str, factory: Callable[[], Awaitable[None]], stop: asyncio.Event
     ) -> None:
@@ -410,7 +402,9 @@ class PaperLoop:
                 raise
             except Exception:
                 log.exception("task_crashed", task=name)
-                self.reconnects += 1
+                # A restarted stream task is a reconnect like any other, and the books
+                # have to be compared before it is trusted again.
+                self._on_reconnect()
             delay = backoff_delay(attempt, self.settings.recorder)
             attempt += 1
             with contextlib.suppress(TimeoutError):
@@ -446,14 +440,13 @@ class PaperLoop:
 
         await server.start()
         state_task = state_writer.start(stop)
-        await self.reconcile_once("startup")
 
         jobs: list[tuple[str, Callable[[], Awaitable[None]]]] = [
             *[(f"stream.{s.venue}", lambda s=s: s.run(stop)) for s in self.streams],
             ("universe", lambda: self.universe.run(stop)),
             ("tick", lambda: self.tick_loop(stop)),
             ("heartbeat", lambda: self.heartbeat_loop(stop)),
-            ("reconcile", lambda: self.reconcile_loop(stop)),
+            ("reconcile", lambda: self.reconciler.run(stop, reconnected=self.reconnected)),
             ("kill_watch", lambda: KillWatcher(self.kill).run(stop)),
             ("telegram", lambda: bot.run(stop)),
         ]
