@@ -1,9 +1,14 @@
 [Unit]
 Description=liqfade paper trading loop
 Documentation=file:/srv/liqfade/app/CLAUDE.md
+# After= only, and deliberately no Requires= or Wants= on the recorder. The paper loop
+# opens its own feeds through build_streams and never reads the recorder's process or its
+# Parquet, so it does not need it running. Requires= bound the two together the other way:
+# every recorder restart restarted the paper loop, which on 2026-09-07 split one soak into
+# three runs. The ordering is kept because starting them in a predictable order at boot is
+# still worth having.
 After=network-online.target chrony.service liqfade-recorder.service
 Wants=network-online.target
-Requires=liqfade-recorder.service
 
 [Service]
 Type=simple
