@@ -189,10 +189,10 @@ def test_deploy_can_put_a_branch_in_its_own_directory() -> None:
     """
     text = (ROOT / "scripts" / "deploy.sh").read_text()
     assert 'APP_DIR="${LIQFADE_APP_DIR:-$APP_ROOT/app}"' in text
-    # An isolated deploy has to name what it owns, install only that, and rewrite the
-    # unit paths to its own directory.
+    # An isolated deploy has to name what it owns and rewrite the unit paths to its own
+    # directory. Which units it then writes is asserted by running the script's own plan
+    # in tests/test_deploy_units.py, rather than by matching a line of it here.
     assert "LIQFADE_APP_DIR needs LIQFADE_UNITS" in text
-    assert 'if [ "$ISOLATED" -eq 1 ] && ! runnable "$name"; then' in text
     assert 'sed "s|$DEFAULT_APP_DIR|$APP_DIR|g"' in text
 
 
