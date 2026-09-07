@@ -73,6 +73,9 @@ strategy:
       # whether it agreed with the others often enough to matter.
       enabled: true
       required: false
+      # 30 and not the 15 Q7 measured: this width was set in the control chat, on
+      # how far from a level a trader would still call the tap a tap. Kept deliberately. The
+      # pass rate table is what would argue it back down.
       zone_width_bps: 30.0
 
 intent:
