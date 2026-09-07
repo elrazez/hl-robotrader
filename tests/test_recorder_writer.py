@@ -47,6 +47,19 @@ def bbo(ts_ms: int) -> dict[str, object]:
     }
 
 
+def trade(ts_ms: int, tid: int, px: float = 60000.0, coin: str = "BTC") -> dict[str, object]:
+    return {
+        "venue": "hyperliquid",
+        "coin": coin,
+        "ts_ms": ts_ms,
+        "rx_ms": ts_ms + 3,
+        "px": px,
+        "sz": 0.5,
+        "side": "buy",
+        "tid": tid,
+    }
+
+
 def test_a_written_file_matches_the_canonical_schema(tmp_path: Path) -> None:
     path = write_rows(tmp_path, ("liquidations", "bybit", DATE, 12), [liq(1), liq(2)])
     assert path is not None
@@ -384,3 +397,62 @@ def test_a_short_write_never_replaces_the_file_it_would_overwrite(
 
     assert read(path).num_rows == 2
     assert not list(path.parent.glob(".*.tmp"))
+
+
+# --- dedupe ---------------------------------------------------------------------
+
+
+def test_compaction_drops_a_trade_the_recorder_wrote_twice(tmp_path: Path) -> None:
+    """2026-09-05 on the box carries 2,336 duplicate (coin, tid) trades, written by the
+    parser bug that has since been fixed. Compaction is the only pass that sees a whole
+    day at once, so it is where they come out."""
+    write_rows(tmp_path, ("trades", "hyperliquid", DATE, 10), [trade(1, 100), trade(2, 101)])
+    write_rows(tmp_path, ("trades", "hyperliquid", DATE, 11), [trade(2, 101), trade(3, 102)])
+
+    assert compact_day(tmp_path, DATE) == {"trades": 3}
+    table = read(partition_dir(tmp_path, "trades", DATE) / "all_day.parquet")
+    assert table.column("tid").to_pylist() == [100, 101, 102]
+
+
+def test_the_first_of_the_duplicates_is_the_one_kept(tmp_path: Path) -> None:
+    """Deterministic: the merge is by ts_ms and ties go to the earlier file name, so two
+    runs over the same lake produce the same file."""
+    write_rows(tmp_path, ("trades", "hyperliquid", DATE, 10), [trade(5, 100, px=1.0)])
+    write_rows(tmp_path, ("trades", "hyperliquid", DATE, 11), [trade(5, 100, px=2.0)])
+
+    assert compact_day(tmp_path, DATE) == {"trades": 1}
+    table = read(partition_dir(tmp_path, "trades", DATE) / "all_day.parquet")
+    assert table.column("px").to_pylist() == [1.0]
+
+
+def test_the_same_tid_on_two_coins_is_two_trades(tmp_path: Path) -> None:
+    """The key is the coin with the tid, never the tid alone."""
+    write_rows(
+        tmp_path,
+        ("trades", "hyperliquid", DATE, 10),
+        [trade(1, 100, coin="BTC"), trade(1, 100, coin="ETH")],
+    )
+    assert compact_day(tmp_path, DATE) == {"trades": 2}
+
+
+def test_a_table_with_no_tid_is_never_deduped(tmp_path: Path) -> None:
+    """Two bbo rows of the same millisecond are two real quotes: nothing identifies them
+    apart, so dropping either would be inventing a fact about the book."""
+    write_rows(tmp_path, ("bbo", "hyperliquid", DATE, 10), [bbo(1), bbo(1)])
+    assert compact_day(tmp_path, DATE) == {"bbo": 2}
+
+
+def test_an_already_compacted_day_can_be_folded_again_to_dedupe_it(tmp_path: Path) -> None:
+    """The duplicates on the box are already inside day files, so there has to be a way to
+    run compaction over one. Without `force` a lone day file is a no-op, which is what
+    every nightly run wants."""
+    write_rows(tmp_path, ("trades", "hyperliquid", DATE, 10), [trade(1, 100), trade(1, 100)])
+    day = partition_dir(tmp_path, "trades", DATE) / "all_day.parquet"
+    write_atomic(rows_to_table("trades", [trade(1, 100), trade(2, 101)], "recorder"), day)
+    for path in partition_dir(tmp_path, "trades", DATE).glob("*.parquet"):
+        if path != day:
+            path.unlink()
+
+    assert compact_day(tmp_path, DATE) == {}, "a lone day file is left alone by default"
+    assert compact_day(tmp_path, DATE, force=True) == {"trades": 2}
+    assert read(day).column("tid").to_pylist() == [100, 101]

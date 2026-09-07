@@ -207,7 +207,9 @@ def cmd_compact(args: argparse.Namespace) -> int:
                 # Bytes from `stat`, not row counts from the footers: a dry run over an
                 # uncompacted year would otherwise pay for 50,000 file opens to answer a
                 # question that "how much am I about to rewrite" already answers.
-                if inputs > 1 or (inputs == 1 and not found[0].name.endswith(DAY_SUFFIX)):
+                if inputs > 1 or (
+                    inputs == 1 and (args.force or not found[0].name.endswith(DAY_SUFFIX))
+                ):
                     mib = sum(path.stat().st_size for path in found) / 1024**2
                     files_after += 1
                     print(f"{date}  {table:<26} {inputs:>4} files, {mib:>9,.1f} MiB -> 1")
@@ -215,7 +217,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
                     files_after += inputs
                 continue
             began = time.monotonic()
-            written = compact_day(root, date, tables=[table])
+            written = compact_day(root, date, tables=[table], force=args.force)
             if not written:  # already one file, or no data for that day
                 files_after += inputs
                 continue
@@ -1066,6 +1068,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compact.add_argument(
         "--dry-run", action="store_true", help="print what would be folded and change nothing"
+    )
+    compact.add_argument(
+        "--force",
+        action="store_true",
+        help="fold a day that is already one file, which is how duplicate trades already "
+        "inside a day file are removed",
     )
     compact.add_argument(
         "--yes",

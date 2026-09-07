@@ -210,6 +210,21 @@ def _merged_rows(paths: list[Path]) -> Iterator[dict[str, Any]]:
     return heapq.merge(*(rows_of(path) for path in paths), key=lambda row: row["ts_ms"])
 
 
+def _dedup_fields(table_name: str) -> tuple[str, ...]:
+    """The columns that identify one row of this table, or `()` when nothing does.
+
+    Only a venue's own trade id does. Two `bbo` or `l2` rows of the same millisecond are
+    two real quotes and nothing tells them apart, so dropping either would be inventing a
+    fact about the book; a repeated `tid` is the same trade written twice.
+    """
+    names = set(schema_for(table_name).names)
+    if "tid" not in names:
+        return ()
+    # `venue` where the table has it: `trades` folds several venues into one day file and
+    # two of them numbering their own trades from 1 is not a duplicate.
+    return tuple(name for name in ("venue", "coin", "tid") if name in names)
+
+
 def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> int:
     """Fold one partition into one file ordered by `ts_ms`, streaming. Returns the rows.
 
@@ -227,19 +242,44 @@ def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> 
     expected = sum(int(pq.read_metadata(path).num_rows) for path in inputs)
     schema = schema_for(table_name)
 
+    fields = _dedup_fields(table_name)
+    seen: set[tuple[Any, ...]] = set()
+    dropped = 0
+
+    def keep(row: dict[str, Any]) -> bool:
+        """False for a row this fold has already written, by the venue's own trade id.
+
+        ponytail: one key per row of the day held in memory, which is about 90 MB for the
+        867k trades of 2026-09-05. Sort the whole partition by the key and drop runs
+        instead if a day ever outgrows the box.
+        """
+        nonlocal dropped
+        if not fields:
+            return True
+        key = tuple(row[name] for name in fields)
+        if None in key:  # unidentifiable, so nothing here may drop it
+            return True
+        if key in seen:
+            dropped += 1
+            return False
+        seen.add(key)
+        return True
+
     tmp = output.with_name(f".{output.name}.{os.getpid()}.tmp")
     writer = pq.ParquetWriter(tmp, schema, compression=COMPRESSION)
     sorted_inputs: list[Path] = []
     try:
         sorted_inputs = [_sorted_copy(table_name, path, directory) for path in inputs]
-        for chunk in batched(_merged_rows(sorted_inputs), MERGE_WRITE_ROWS):
+        for chunk in batched(filter(keep, _merged_rows(sorted_inputs)), MERGE_WRITE_ROWS):
             writer.write_table(pa.Table.from_pylist(list(chunk), schema=schema))
         writer.close()
         # The row count is checked on the temp file first: a short output must never
-        # replace the inputs, not even for the moment before the check fails.
+        # replace the inputs, not even for the moment before the check fails. `dropped` is
+        # counted as the rows go past, so the check still knows exactly what to expect.
+        kept = expected - dropped
         rows = pq.read_metadata(tmp).num_rows
-        if rows != expected:
-            raise RuntimeError(f"compacted {output} has {rows} rows, expected {expected}")
+        if rows != kept:
+            raise RuntimeError(f"compacted {output} has {rows} rows, expected {kept}")
         os.replace(tmp, output)
     finally:
         writer.close()  # idempotent; the failure path needs it before the unlink
@@ -248,22 +288,33 @@ def _compact_partition(table_name: str, directory: Path, inputs: list[Path]) -> 
                 path.unlink()
 
     after = pq.read_metadata(output).num_rows
-    if after != expected:
-        raise RuntimeError(f"compacted {output} has {after} rows, expected {expected}")
+    if after != kept:
+        raise RuntimeError(f"compacted {output} has {after} rows, expected {kept}")
+    if dropped:
+        log.info("compaction_deduped", table=table_name, path=str(output), dropped=dropped)
     for path in inputs:
         if path != output:
             path.unlink()
-    return expected
+    return kept
 
 
-def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> dict[str, int]:
+def compact_day(
+    root: Path, date: str, *, tables: list[str] | None = None, force: bool = False
+) -> dict[str, int]:
     """Fold every hourly file of `date` into one file per table. Returns table -> rows.
 
     The hourly files are deleted only after the compacted file exists and its row count
-    matches the sum of the inputs. A table whose partition holds rows from several venues
-    compacts to `all_day.parquet`; a single venue table keeps its venue in the name.
-    `tables` restricts the work to those table names; None means every canonical table in
-    the lake.
+    matches the sum of the inputs, less the duplicates this fold dropped. A table whose
+    partition holds rows from several venues compacts to `all_day.parquet`; a single
+    venue table keeps its venue in the name. `tables` restricts the work to those table
+    names; None means every canonical table in the lake.
+
+    A table carrying `tid` is deduped on `(venue, coin, tid)`, first occurrence wins. The
+    parser bug fixed in 2a71440 wrote 2,336 trades of 2026-09-05 twice, and compaction is
+    the only pass that sees a whole day at once. `force` folds a day that is already one
+    file, which is the only way to take those rows back out of a day file that has
+    already been compacted; without it a lone day file is left alone, because that is
+    what every nightly run wants.
 
     A directory with no canonical schema is skipped, never attempted. That is the two
     Tardis side tables, which keep Tardis's own columns by design and so have no schema
@@ -290,19 +341,21 @@ def compact_day(root: Path, date: str, *, tables: list[str] | None = None) -> di
         inputs = sorted(lake_files(directory)) if directory.is_dir() else []
         if not inputs:
             continue
-        if len(inputs) == 1 and inputs[0].name.endswith(DAY_SUFFIX):
-            continue  # already compacted, and re-running must be a no-op
-        if any(path.name.endswith(DAY_SUFFIX) for path in inputs):
-            # A compacted file beside loose ones. Compaction does not dedupe, and the day
-            # file is already the fold of a day, so folding it again with files that may
-            # hold the same rows writes them twice. `liqfade derive candles` leaves
-            # exactly this: its `hyperliquid_day.parquet` next to the `hl_api` bars of the
-            # same minutes. This is what `_hour_of` used to refuse by accident, said out
-            # loud. Move the day file aside to fold genuinely new rows into it.
+        if len(inputs) == 1 and inputs[0].name.endswith(DAY_SUFFIX) and not force:
+            continue  # already compacted, and a nightly re-run must be a no-op
+        if len(inputs) > 1 and any(path.name.endswith(DAY_SUFFIX) for path in inputs):
+            # A compacted file beside loose ones. The day file is already the fold of a
+            # day, so folding it again with files that may hold the same rows writes them
+            # twice, and only a table carrying `tid` can take those back out again.
+            # `liqfade derive candles` leaves exactly this: its `hyperliquid_day.parquet`
+            # next to the `hl_api` bars of the same minutes, and candles have no `tid`.
+            # This is what `_hour_of` used to refuse by accident, said out loud. Move the
+            # day file aside to fold genuinely new rows into it.
             raise RuntimeError(
                 f"{directory}: a compacted day file beside "
                 f"{sorted(p.name for p in inputs if not p.name.endswith(DAY_SUFFIX))}; "
-                f"compaction does not dedupe, so move it aside before folding these in"
+                f"only a table carrying tid can be deduped, so move it aside before "
+                f"folding these in"
             )
 
         rows = _compact_partition(table_name, directory, inputs)
