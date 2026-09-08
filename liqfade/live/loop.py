@@ -198,6 +198,7 @@ class PaperBackend:
                 now_ms=now_ms(),
                 target_bps=float(args.get("target_bps", 30.0)),
                 stop_bps=float(args.get("stop_bps", 30.0)),
+                urgency=str(args.get("urgency", "normal")),
             )
         except PermissionError as exc:
             return InjectResult(injected=False, reason=str(exc))

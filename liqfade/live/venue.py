@@ -503,6 +503,7 @@ class VenueSession:
         target_bps: float = 30.0,
         stop_bps: float = 30.0,
         time_stop_s: float | None = None,
+        urgency: str = "normal",
     ) -> Intent | None:
         """Build an intent from the current book and push it through the real path.
 
@@ -539,7 +540,10 @@ class VenueSession:
             target_px=mid * (1.0 + direction * target_bps / 1e4),
             stop_px=mid * (1.0 - direction * stop_bps / 1e4),
             time_stop_s=time_stop_s or float(self.settings.intent.time_stop_s),
-            urgency="normal",
+            # A drill that has to open a position now asks for `high`, which crosses.
+            # `normal` rests at the touch and may wait all afternoon for a fill, which
+            # drills patience rather than the kill path.
+            urgency=urgency,  # type: ignore[arg-type]
             ts_ms=now_ms,
             explain={"injected": 1.0, "mid": mid},
         )
