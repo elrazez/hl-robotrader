@@ -413,7 +413,8 @@ class NonceGate:
         self._lock = asyncio.Lock()
         self._last_ms = 0
 
-    async def __aenter__(self) -> None:
+    async def __aenter__(self) -> int:
+        """Yields the millisecond it cleared, which is the nonce the next signature takes."""
         await self._lock.acquire()
         # The wait happens with the lock held, and the kill wraps every venue call in a
         # `wait_for`: a call abandoned at its deadline is cancelled inside this sleep and
@@ -428,6 +429,7 @@ class NonceGate:
         except BaseException:
             self._lock.release()
             raise
+        return now
 
     async def __aexit__(self, *exc: object) -> None:
         self._lock.release()

@@ -366,22 +366,29 @@ async def test_signed_actions_never_share_a_millisecond() -> None:
     it had cancelled, which is the exact disagreement the kill path cannot afford.
 
     The transport serialises signed calls and refuses to issue two inside one millisecond.
-    """
-    import time
 
+    What is asserted here is the millisecond the gate handed out, which the context yields.
+    Reading the clock again inside the body times the body instead: half the actions below
+    hold the gate for 3ms, the way a signed call over the network does, and a task that
+    stalls past the millisecond it was let through reads the same clock as the one that
+    follows it. That collision is in the bodies, not in the nonces, and the version of this
+    test that stamped `time.time()` under the lock failed on a gate that was correct.
+    """
     from liqfade.execution.hl import NonceGate
 
     gate = NonceGate()
-    stamps = []
+    issued: list[int] = []
 
-    async def one() -> None:
-        async with gate:
-            stamps.append(int(time.time() * 1000))
+    async def one(stall: bool) -> None:
+        async with gate as nonce:
+            if stall:
+                await asyncio.sleep(0.003)
+            issued.append(nonce)
 
-    await asyncio.gather(*(one() for _ in range(6)))
+    await asyncio.gather(*(one(i % 2 == 0) for i in range(6)))
 
-    assert len(set(stamps)) == len(stamps), f"two actions shared a millisecond: {stamps}"
-    assert stamps == sorted(stamps), "and they must be issued in order"
+    assert len(set(issued)) == len(issued), f"two actions shared a millisecond: {issued}"
+    assert issued == sorted(issued), "and they must be issued in order"
 
 
 def test_equity_in_all_three_account_layouts() -> None:
