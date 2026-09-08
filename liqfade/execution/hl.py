@@ -555,3 +555,19 @@ class HyperliquidTransport:
             # A cancel that failed because the order is already gone is not an error worth
             # raising on: reconciliation is what settles what is actually resting.
             log.warning("cancel_not_ok", coin=coin, cloid=cloid, response=response)
+
+    async def cancel_oid(self, coin: str, oid: int) -> None:
+        """Cancel by exchange order id, for an order this bot did not place.
+
+        Everything the bot sends carries a cloid and is cancelled by it. An order opened by
+        hand on app.hyperliquid.xyz has no cloid at all, and the kill switch has to be able
+        to take it off the book anyway: it is on the same account, it is the account the
+        kill is emptying, and there is no other handle on it.
+        """
+        try:
+            async with self._nonce:
+                response = await asyncio.to_thread(self._exchange.cancel, coin, oid)
+        except Exception as exc:
+            raise as_transport_error(exc) from exc
+        if isinstance(response, dict) and response.get("status") != "ok":
+            log.warning("cancel_not_ok", coin=coin, oid=oid, response=response)

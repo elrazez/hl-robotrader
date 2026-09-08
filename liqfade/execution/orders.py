@@ -224,6 +224,8 @@ class OrderTransport(Protocol):
 
     async def cancel(self, coin: str, cloid: str) -> None: ...
 
+    async def cancel_oid(self, coin: str, oid: int) -> None: ...
+
     async def modify(self, intent: OrderIntent) -> int: ...
 
     async def place_group(self, requests: list[dict[str, Any]]) -> list[str]: ...
@@ -718,6 +720,23 @@ class OrderManager:
             remaining=order.remaining,
         )
         return order
+
+    async def cancel_foreign(self, coin: str, *, oid: int) -> None:
+        """Cancel an order at the venue that the registry has never heard of.
+
+        The kill sweep works from what the venue says it is holding, not from the registry,
+        because the registry can be missing an order the account really has: one placed by
+        hand, or one left by a process that died before it persisted. `cancel` refuses
+        those outright with a `KeyError`, which the sweep counted as a failure and moved
+        on from, leaving the order resting through a kill.
+
+        Nothing is recorded here. There is no row to move to CANCELED, and inventing one
+        for an order we never placed is exactly what `record_fill` refuses to do for a fill
+        we did not expect: reconciliation is the thing that reasons about strangers.
+        """
+        self._spend(reducing=True)  # counted, never refused: see execution/ratelimit.py
+        await self.transport.cancel_oid(coin, oid)
+        log.warning("foreign_order_canceled", coin=coin, oid=oid)
 
     async def submit_bracket(
         self, *, coin: str, is_long: bool, size: float, tp_px: float, sl_px: float
