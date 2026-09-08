@@ -2576,3 +2576,34 @@ seven days of evidence on its own, and it is not the DoD.
 The alternative was to leave the loop stopped until the entry policy exists, which buys
 nothing: the plumbing evidence is only available by running, and the comparison days can
 start whenever the policy lands. Recorded so the week is not later read as more than it is.
+
+## 2026-09-08 (four public liquidation bots read, one idea kept)
+
+Four public Hyperliquid liquidation projects were read end to end at the owner's request and
+graded against the repo: moondev's HIP-3 bot, `braindeadpt/Trading-bot-hyperliquid_V1`,
+`wilsontiger2222/liquidation-hunter` and `syzz-xd/hyperliquid-liquidations`. The scan, every
+URL and the date each was read, and the full rejection list with reasons are in
+`docs/research/external_bots_scan.md`.
+
+**The one finding worth the phase's attention: a liquidation map built from public
+`clearinghouseState` positions.** Every position's `liquidationPx` is public and free
+(verified 2026-09-08 against the HL perpetuals info-endpoint docs), so the notional queued to
+liquidate at each price level is observable without a node. `docs/research/hl_realtime_liquidations.md`
+asked whether we can *observe* HL liquidations in real time and answered no, which is what
+dropped the trigger to cross-venue Bybit; it never asked what is *about to* liquidate, and
+that question has a free HL-native answer. It bears on the proxy that reached precision 0.01
+and on the exhaustion timing Q2 could only beat with a flat delay.
+
+Not built, and deliberately not: `clearinghouseState` answers for now and not for a past
+block, so the year in the lake cannot grade it and no backtest is possible. Any value has to
+be measured forward from snapshots that do not exist yet. The scan therefore proposes a
+recorder-only first step (snapshot on an interval, no feature, no strategy wiring) and a
+preregistered Phase 3-style question once weeks of snapshots exist, validated against the
+exact `node_fills` liquidations that arrive a day later. Nothing enters `strategy/` before
+that answers.
+
+Also noted there: we discard the `users` field the public `trades` payload carries, which is
+the free address harvest the map needs; `frontendOpenOrders` exposes other wallets' stop and
+take-profit trigger levels; and braindeadpt's live-vs-replay comparator is the Phase 5 DoD
+sentence from 2026-09-07 written as a command. None of the four projects contained a strategy
+idea worth taking.
