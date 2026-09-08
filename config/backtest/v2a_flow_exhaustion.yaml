@@ -1,0 +1,131 @@
+# name: v2a flow exhaustion, all regimes
+# notes: enter when the liquidation flow itself has stopped, on every cascade the tape has; the fastest confirmation
+#
+# Backtest run config v2a. Layered on config/default.yaml by
+#   liqfade backtest --config config/backtest/v2a_flow_exhaustion.yaml ...
+#
+# Why this file exists. Every backtest so far lost money (v0 year -11.6%, v1 year -6.0%),
+# and reports/research/realizable_entries.md says why: the +85 bps edge Phase 3 measured is
+# from an entry one second after the cascade extreme, which nobody can see live. Replaying
+# the same 2,722 cascades with entries a live loop can actually take, a fixed delay after
+# the cascade starts lands BEFORE the true extreme 26 to 60% of the time, and those entries
+# lose a third of their risk budget each (the cascade runs through the stop). Entries after
+# the extreme are fine. What separates the two is not price but the liquidation flow: an
+# entry 10 s after the episode's LAST liquidation is +133 bps per trade at maker costs, 73%
+# hit rate, 14% stop-outs, 95% of entries after the extreme, and the edge is gone 30 to 45 s
+# after the flow stops. The engine's exhaustion rule is the live approximation of that
+# signal (liq_15s down to a fraction of its peak, buying back, no new extreme), so this
+# config turns it on and makes it fast. What the simulation cannot measure is how often the
+# rule fires on a mid-cascade lull; the stop-out share in the report is that number (a clean
+# after-extreme entry runs 10 to 15%, the old configs ran 28 to 37%).
+#
+# Recommended run (the 20 majors are the research universe's liquid coins; the edge per
+# trade is 10x larger there than on the core four, which every earlier run was limited to):
+#   liqfade backtest --config config/backtest/v2a_flow_exhaustion.yaml \
+#     --start 2025-09-01 --end 2026-08-30 --equity 10000 --lagged-ms 3000 \
+#     --coins BTC,ETH,SOL,HYPE,XRP,DOGE,SUI,ENA,ZEC,PUMP,FARTCOIN,XPL,ASTER,NEAR,kPEPE,TON,TRUMP,WLD,LIT,LINK,UNI,AVAX,BNB,TAO
+env: paper
+
+cascade:
+  trigger: exact
+  liq_z_min: null
+  # USD liquidated inside the 60 s window, per tier. Same floors as v1: the dollar size is
+  # what the owner reads, and the z-score has no usable scale on this data.
+  liq_usd_min:
+    core: 500000.0
+    major: 250000.0
+    minor: 100000.0
+  # 1.0, not the default 2.0. The start condition is abs(ret_60s) / rv_300s, and rv_300s
+  # contains the cascade's own moves, so a fast flush scores about 1 and a slow slide
+  # scores high. At 2.0 only 24% of the research cascades ever start a cascade in the
+  # engine (core 27%, major 20%); at 1.0 it is 86%, and the cascades 2.0 misses still
+  # revert (+148 bps at the hindsight entry on the majors). The notional floor above and
+  # the imbalance condition are what keep noise out, not this ratio.
+  ret_over_rv_min: 1.0
+
+exhaustion:
+  # The rule, not the flat delay. Q2 said the delay carried more PnL than the rule, but both
+  # were negative in 10 of 12 months, and the reason is the same for both: neither knows
+  # whether the flow has stopped. The rule is the only entry the engine has that reads the
+  # liquidation stream, and reading it is what the simulation says pays.
+  mode: rule
+  # Fast confirmation. liq_15s must fall to a quarter of the cascade's peak 15 s burst; a
+  # stricter fraction fires later, and the edge halves between 10 and 20 s after the last
+  # liquidation. v2c tests the strict setting.
+  liq_decay_frac: 0.25
+  no_new_extreme_s: 10.0
+  require_flow_flip: true
+  consecutive_ticks: 3
+  mark_mid_pct_threshold: 80.0
+  min_age_s: 20.0
+  max_age_s: 900.0
+
+intent:
+  # From the entry, so a target is always ahead of the fill; 80% of the reversion left.
+  # Measured from the extreme it drops 12% of the trades as target_behind for the same
+  # equity return.
+  target_from: entry
+  k_target: 0.8
+  # One rv_300 beyond the extreme. 1.5 lowers the stop-out share from 14% to 9% but each
+  # stop then costs 190 bps instead of 130 and the position is a third smaller, so the
+  # simulated equity return falls from +38% to +29% a year and the per-trade Sharpe with it.
+  k_stop: 1.0
+  time_stop_s: 900
+  # The z-scale has no units on this data; nothing is urgent. Entries are Ioc below anyway.
+  urgency_liq_z: null
+  allow_taker_entry_high_urgency: false
+
+filters:
+  # Sweeps stay in. With flow-timed entries the market-wide bucket is the larger half of the
+  # simulated return (+224 bps per trade against +16 isolated) and the cluster cap already
+  # sizes a sweep as one bet. v2b is the same file with sweeps skipped.
+  skip_when_btc_cascading: false
+
+strategy:
+  # Votes are counted and reported, never blocking: the pass-rate table is the evidence for
+  # promoting one. The simulation could not price them, so this run measures them.
+  min_confluence: 0
+  rules:
+    min_cascade_notional:
+      enabled: true
+      required: true
+      min_notional_usd: 250000.0
+    oi_flush:
+      # The owner's "open interest deviation": 1% of OI closed over 300 s. 22.6% pass rate
+      # in the v1 year run, the only discriminating vote there.
+      enabled: true
+      required: false
+      drop_min_frac: 0.01
+      build_min_frac: null
+    vwap_stretch:
+      # 30 bps passed 92.7% of v1's candidates, so it was not a condition. 60 is the first
+      # width worth measuring.
+      enabled: true
+      required: false
+      reference: day
+      min_disp_bps: 60.0
+    level_reclaim:
+      # The swing failure / three tap from the price action primer. A vote here.
+      enabled: true
+      required: false
+      sweep_min_bps: 5.0
+      reclaim_min_bps: 0.0
+    zone_proximity:
+      enabled: false
+
+execution:
+  # Cross the spread. A resting Alo bid placed after the flow has stopped sits behind the
+  # bounce and is abandoned (backtest/engine.py, _entry_order); the simulation's costs
+  # already price a taker entry plus a maker exit.
+  entry_tif: Ioc
+
+# Tuning runs only, as in v1: the account halts would cut the tape after one bad month and
+# hide the strategy. The per-coin cooldowns and the cluster cap stay at their defaults.
+risk:
+  max_dd_frac: 1.0
+  max_daily_loss_frac: 1.0
+  cooldown_after_streak_min: 0
+
+backtest:
+  latency_ms: 1000
+  holdout_frac: 0.25

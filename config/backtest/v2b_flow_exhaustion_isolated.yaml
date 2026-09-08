@@ -1,0 +1,96 @@
+# name: v2b flow exhaustion, isolated + one confluence
+# notes: v2a with market-wide sweeps skipped and one of a discretionary confluences required; the lowest-drawdown variant
+#
+# Backtest run config v2b. Layered on config/default.yaml by
+#   liqfade backtest --config config/backtest/v2b_flow_exhaustion_isolated.yaml ...
+#
+# Identical to v2a except two switches, so the difference between the two reports is the
+# price of safety:
+#   filters.skip_when_btc_cascading: true   an alt is not faded while BTC is cascading the
+#                                            same way. In the simulation the isolated bucket
+#                                            has a 10% stop-out share against 17% in sweeps,
+#                                            a 2.2% worst drawdown against 4.4%, and about a
+#                                            third of the equity return (+13% against +38% a
+#                                            year at 0.5% risk per trade, one trade per
+#                                            cluster +12% against +16%).
+#   strategy.min_confluence: 1               at least one of OI flushed, price stretched past
+#                                            the session VWAP, or a swept-and-reclaimed level
+#                                            must agree. The setup as stated: the
+#                                            liquidation is the signal, the rest corroborates.
+# Everything the v2a header explains applies here; read it first.
+#
+# Recommended run:
+#   liqfade backtest --config config/backtest/v2b_flow_exhaustion_isolated.yaml \
+#     --start 2025-09-01 --end 2026-08-30 --equity 10000 --lagged-ms 3000 \
+#     --coins BTC,ETH,SOL,HYPE,XRP,DOGE,SUI,ENA,ZEC,PUMP,FARTCOIN,XPL,ASTER,NEAR,kPEPE,TON,TRUMP,WLD,LIT,LINK,UNI,AVAX,BNB,TAO
+env: paper
+
+cascade:
+  trigger: exact
+  liq_z_min: null
+  liq_usd_min:
+    core: 500000.0
+    major: 250000.0
+    minor: 100000.0
+  ret_over_rv_min: 1.0
+
+exhaustion:
+  mode: rule
+  liq_decay_frac: 0.25
+  no_new_extreme_s: 10.0
+  require_flow_flip: true
+  consecutive_ticks: 3
+  mark_mid_pct_threshold: 80.0
+  min_age_s: 20.0
+  max_age_s: 900.0
+
+intent:
+  target_from: entry
+  k_target: 0.8
+  k_stop: 1.0
+  time_stop_s: 900
+  urgency_liq_z: null
+  allow_taker_entry_high_urgency: false
+
+filters:
+  # The one regime switch. Q6 dropped this filter on the hindsight entry, where sweeps carry
+  # the edge; with a realizable entry the sweeps are where the mistimed entries lose most.
+  skip_when_btc_cascading: true
+
+strategy:
+  # One vote of the three optional rules below must pass. Required rules block alone.
+  min_confluence: 1
+  rules:
+    min_cascade_notional:
+      enabled: true
+      required: true
+      min_notional_usd: 250000.0
+    oi_flush:
+      enabled: true
+      required: false
+      drop_min_frac: 0.01
+      build_min_frac: null
+    vwap_stretch:
+      enabled: true
+      required: false
+      reference: day
+      min_disp_bps: 60.0
+    level_reclaim:
+      enabled: true
+      required: false
+      sweep_min_bps: 5.0
+      reclaim_min_bps: 0.0
+    zone_proximity:
+      enabled: false
+
+execution:
+  entry_tif: Ioc
+
+risk:
+  max_dd_frac: 1.0
+  max_daily_loss_frac: 1.0
+  cooldown_after_streak_min: 0
+
+backtest:
+  latency_ms: 1000
+  holdout_frac: 0.25

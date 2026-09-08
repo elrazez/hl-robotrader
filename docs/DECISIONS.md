@@ -3241,3 +3241,80 @@ Two edges recorded, neither a defect in the fix:
 - **Two alerts for one outage on the resume path.** SIGCONT let the loop write one heartbeat
   before it killed itself, which read as recovered, and the next silence read as stale again.
   The flag existed, nothing was rewritten, the first reason survived. Not worth code today.
+
+## 2026-09-08 (the v2 backtest configs: the entry has to read the liquidation flow)
+
+Three run configs, `config/backtest/v2a_flow_exhaustion.yaml`,
+`v2b_flow_exhaustion_isolated.yaml` and `v2c_flow_exhaustion_strict.yaml`, written from
+one simulation and not yet run. `scripts/research/realizable_entries.py` replays the 2,722
+Phase 3 cascades over the 1s research grid with entries a live loop can actually take, and
+`reports/research/realizable_entries.md` is its output. Decided from that output, on the
+owner's request for the configs with the best return per unit of risk the data supports.
+
+**The Phase 3 edge is real and the entry it was measured from does not exist.** Q1 and Q8
+enter one second after the cascade extreme. Every realizable rule the engine has (a fixed
+delay after the start, or the price half of the exhaustion rule) puts 26 to 60% of its
+entries **before** the true extreme, and those lose about a third of their risk budget each
+because the cascade runs through the stop; the entries after the extreme are roughly break
+even under the stress costs and mildly positive under maker costs. That is the whole of the
+v0 and v1 losses (-11.6% halted, -6.0%), and it is what Q2's table already showed: both the
+rule and every fixed delay were negative in 10 of 12 months, and the summary's "harvested by
+entering a fixed delay" was never supported by that table. The reversion after the extreme
+is front loaded: +30 bps per trade at maker costs inside 30 s of the extreme, +15 at 30 to
+60 s, negative past a minute.
+
+**What separates before from after is the liquidation stream, not price.** An entry 5 to 10
+seconds after the episode's last liquidation is +132 bps per trade at maker costs, 73 to
+77% hit rate, 13 to 14% stop-outs, 95% of entries after the extreme, +38% of equity a year
+at 0.5% risk per trade with the coin cap, worst drawdown 4.4%, 11 of 12 months positive;
+20 s after it is +103 bps and +16%, 30 s +91 and +2%, 45 s negative. The median cascade's
+extreme is at 81 s and its last liquidation at 85 s: the flow stops and the low is in. The
+engine's exhaustion rule is the only entry that reads that stream (`liq_15s` down to a
+fraction of the cascade's peak, flow flipped, no new extreme), so all three configs run
+`exhaustion.mode: rule`, fast: `liq_decay_frac` 0.25 and `no_new_extreme_s` 10 in v2a and
+v2b, 0.10 and 20 in v2c. The simulation cannot say how often the rule fires on a lull inside
+the cascade, which is an entry before the extreme; the stop-out share in the reports is
+that number (clean after-extreme entries run 10 to 15%, v0 and v1 ran 28 to 37%), and v2c
+against v2a is the test of paying edge for fewer false starts.
+
+**`cascade.ret_over_rv_min` 2.0 -> 1.0 in all three.** `rv_300s` holds the cascade's own
+squared returns, so a one-second flush scores about 1 and a slow slide scores high. At 2.0
+only 24% of the research cascades ever start a cascade in the engine (core 27%, major 20%);
+at 1.5 it is 51% and at 1.0 86%. The cascades 2.0 misses still revert (+148 bps at the
+hindsight entry on the majors). The notional floors and the imbalance condition keep noise
+out; the ratio was silently deciding whether the strategy had trades at all.
+
+**`execution.entry_tif: Ioc` in all three.** `_entry_order`'s own docstring: a resting Alo
+placed after the flow has stopped sits behind the bounce and is abandoned through every
+reprice. The simulation's maker-cost column already prices a taker entry.
+
+**Regime is the v2a/v2b switch.** Q6 dropped `skip_when_btc_cascading` on the hindsight
+entry, where sweeps carry the edge. With realizable entries the sweeps are where the
+mistimed entries lose most (fixed delays: -170 to -236 bps per trade in sweeps against -19
+to -27 isolated), and with flow-timed entries they are the larger half of the return (+224
+bps per trade against +16 isolated, 17% stop-outs against 10%, 4.4% drawdown against 2.2%).
+v2a keeps them, v2b skips them and asks one of the three confluences to agree.
+
+**Exits from the same grid.** `target_from: entry` keeps 12% more trades than `extreme` for
+the same equity return. `k_stop` 1.0 beats 1.5: the wider stop lowers the stop-out share
+from 14 to 9% but each stop costs 190 bps instead of 130 and the position is a third
+smaller, so equity return falls from +38% to +29% and Sharpe with it. `k_target` 0.8 over
+0.5: 0.5 has the higher hit rate (80%) and Sharpe and half the hold, +29% against +38%; it
+is the next knob for the lab, not a fourth file. Time stop 900 against 1800 and 3600 is
+flat.
+
+**The universe is the other half of the return.** Every earlier run was BTC, ETH, SOL and
+HYPE, the tier with the least edge (+27 bps at the hindsight entry, +20 flow-timed) against
++165 and +266 on the majors. The recommended run names the research universe's twenty
+liquid majors beside the core four; PAXG and the coins with median effective spreads over
+30 bps are left out.
+
+**What the simulation is not.** No book, fills at the last trade, stops at their price with
+no slippage, no cooldowns, the cluster cap only as a one-trade-per-cluster column (which
+halves the sweep return), and the detector's notional floor timed by uniform accrual. It
+ranks entries; the backtests price them.
+
+**Reverse this entry** if v2a's stop-out share comes in far above 15% and v2c does not bring
+it down, which would mean the exhaustion rule cannot see the end of the flow at the 250 ms
+cadence and the strategy needs the liquidation map (Q9) or a paid HL feed before the
+entry problem is solved.

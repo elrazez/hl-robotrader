@@ -1,0 +1,92 @@
+# name: v2c flow exhaustion, strict confirmation
+# notes: v2a with the exhaustion rule made strict; fewer mid-cascade false starts at the cost of a later entry
+#
+# Backtest run config v2c. Layered on config/default.yaml by
+#   liqfade backtest --config config/backtest/v2c_flow_exhaustion_strict.yaml ...
+#
+# Identical to v2a except the two knobs that decide how sure the rule must be that the
+# flow has stopped before it enters:
+#   exhaustion.liq_decay_frac: 0.10   liq_15s must fall to a tenth of the cascade's peak
+#                                      burst, not a quarter: the last 15 s are nearly empty
+#                                      of liquidations before the entry is allowed.
+#   exhaustion.no_new_extreme_s: 20   twice the wait for a new low or high to stop printing.
+# The simulation says the edge is +133 bps per trade 10 s after the last liquidation and
+# +103 at 20 s, so the strict rule gives up about a quarter of the per-trade edge. What it
+# buys is unknown until the report: a mid-cascade lull that trips the fast rule in v2a is an
+# entry before the extreme, and those lose a third of their risk budget each. If v2a's
+# stop-out share is well above 15%, this file is the fix; if v2a's is already 10 to 15%, the
+# strictness only costs edge and v2a wins. Everything the v2a header explains applies here.
+#
+# Recommended run:
+#   liqfade backtest --config config/backtest/v2c_flow_exhaustion_strict.yaml \
+#     --start 2025-09-01 --end 2026-08-30 --equity 10000 --lagged-ms 3000 \
+#     --coins BTC,ETH,SOL,HYPE,XRP,DOGE,SUI,ENA,ZEC,PUMP,FARTCOIN,XPL,ASTER,NEAR,kPEPE,TON,TRUMP,WLD,LIT,LINK,UNI,AVAX,BNB,TAO
+env: paper
+
+cascade:
+  trigger: exact
+  liq_z_min: null
+  liq_usd_min:
+    core: 500000.0
+    major: 250000.0
+    minor: 100000.0
+  ret_over_rv_min: 1.0
+
+exhaustion:
+  mode: rule
+  # The two strictness knobs. Everything else as v2a.
+  liq_decay_frac: 0.10
+  no_new_extreme_s: 20.0
+  require_flow_flip: true
+  consecutive_ticks: 3
+  mark_mid_pct_threshold: 80.0
+  min_age_s: 20.0
+  max_age_s: 900.0
+
+intent:
+  target_from: entry
+  k_target: 0.8
+  k_stop: 1.0
+  time_stop_s: 900
+  urgency_liq_z: null
+  allow_taker_entry_high_urgency: false
+
+filters:
+  skip_when_btc_cascading: false
+
+strategy:
+  # Votes measured, not blocking, exactly as v2a, so the funnel is comparable line by line.
+  # level_reclaim is off here because it is the one rule that needs the level build from
+  # candles, and this file's question is about timing, not levels.
+  min_confluence: 0
+  rules:
+    min_cascade_notional:
+      enabled: true
+      required: true
+      min_notional_usd: 250000.0
+    oi_flush:
+      enabled: true
+      required: false
+      drop_min_frac: 0.01
+      build_min_frac: null
+    vwap_stretch:
+      enabled: true
+      required: false
+      reference: day
+      min_disp_bps: 60.0
+    level_reclaim:
+      enabled: false
+    zone_proximity:
+      enabled: false
+
+execution:
+  entry_tif: Ioc
+
+risk:
+  max_dd_frac: 1.0
+  max_daily_loss_frac: 1.0
+  cooldown_after_streak_min: 0
+
+backtest:
+  latency_ms: 1000
+  holdout_frac: 0.25
