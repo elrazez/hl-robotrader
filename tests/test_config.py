@@ -265,12 +265,16 @@ def test_an_overrides_file_may_not_choose_the_environment(
     The environment file is picked before this layer merges, so `env: mainnet` here used
     to give env == "mainnet" (the gate open) while mainnet.yaml was never loaded and
     paper's looser sizing and risk limits stayed in place.
+
+    Written under data_dir, which is where this layer lives; see
+    TestTheOverridesLayerIsUnderDataDir below for why.
     """
     shutil.copytree(CONFIG_DIR, tmp_path / "config")
-    (tmp_path / "config" / "overrides.yaml").write_text("env: mainnet\n")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "overrides.yaml").write_text("env: mainnet\n")
     monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
     with pytest.raises(ConfigError, match="Only --env and LIQFADE_ENV"):
-        load_settings(environ={})
+        load_settings(environ={"LIQFADE_PATHS__DATA_DIR": str(tmp_path / "data")})
 
 
 def test_an_explicit_env_argument_still_beats_liqfade_env(
@@ -345,3 +349,79 @@ def test_a_layer_that_is_not_there_is_reported_as_empty_not_missing(
 
     assert layers["overrides.yaml"].values == {}
     assert layers["envvar"].values["sizing.risk_frac"] == 0.004
+
+
+# --- the overrides layer lives under data_dir --------------------------------------
+
+
+class TestTheOverridesLayerIsUnderDataDir:
+    """`overrides.yaml` is the one config layer written at runtime, so it lives with the
+    data rather than with the code.
+
+    Three processes share one data dir on the box and each runs from its own checkout:
+    the recorder and the panel from `/srv/liqfade/app`, the paper loop from
+    `/srv/liqfade/paper`. A file under `config/` would be unwritable by the panel, whose
+    unit is `ProtectSystem=strict` with only the data dir writable, and invisible to the
+    other checkout even if it were written. See docs/DECISIONS.md, 2026-09-08.
+    """
+
+    @pytest.fixture
+    def config_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        shutil.copytree(CONFIG_DIR, tmp_path / "config")
+        monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
+        return tmp_path / "config"
+
+    def test_it_is_read_from_data_dir(self, config_dir: Path, tmp_path: Path) -> None:
+        data = tmp_path / "data"
+        data.mkdir()
+        (data / "overrides.yaml").write_text("sizing:\n  risk_frac: 0.004\n")
+
+        settings = load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(data)})
+
+        assert settings.sizing.risk_frac == 0.004
+
+    def test_a_file_left_in_the_config_directory_is_not_read(
+        self, config_dir: Path, tmp_path: Path
+    ) -> None:
+        """There is one overrides file, not two, so nothing can quietly win from code."""
+        (config_dir / "overrides.yaml").write_text("sizing:\n  risk_frac: 0.004\n")
+        data = tmp_path / "data"
+        data.mkdir()
+
+        settings = load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(data)})
+
+        assert settings.sizing.risk_frac == 0.005  # default.yaml's, untouched
+
+    def test_an_env_var_moving_data_dir_moves_the_overrides_file(
+        self, config_dir: Path, tmp_path: Path
+    ) -> None:
+        """The env layer merges last and so wins, and it can name the data dir.
+
+        The file has to be found before it can be merged, so data_dir is resolved from
+        every other layer first. A box that sets LIQFADE_DATA_DIR in its env file, which
+        is how this one is configured, must not have its overrides looked for elsewhere.
+        """
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "overrides.yaml").write_text("sizing:\n  risk_frac: 0.003\n")
+
+        settings = load_settings("paper", environ={"LIQFADE_DATA_DIR": str(elsewhere)})
+
+        assert settings.sizing.risk_frac == 0.003
+
+    def test_config_layers_names_the_path_it_looked_at(
+        self, config_dir: Path, tmp_path: Path
+    ) -> None:
+        """The panel shows the owner where the file it writes actually lives."""
+        from liqfade.config import config_layers
+
+        data = tmp_path / "data"
+        data.mkdir()
+        layers = {
+            layer.name: layer
+            for layer in config_layers("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(data)})
+        }
+
+        assert layers["overrides.yaml"].path == str(data / "overrides.yaml")
+        assert layers["overrides.yaml"].exists is False
+        assert layers["overrides.yaml"].values == {}

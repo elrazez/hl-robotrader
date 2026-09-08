@@ -86,10 +86,14 @@ def test_an_unknown_rule_name_fails_validation_loudly(
 
     source = Path("config")
     shutil.copytree(source, tmp_path / "config")
-    (tmp_path / "config" / "overrides.yaml").write_text(
+    # overrides.yaml lives under data_dir, not with the code. tests/test_config.py's
+    # TestTheOverridesLayerIsUnderDataDir says why.
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "overrides.yaml").write_text(
         "strategy:\n  rules:\n    zone_proximty:\n      enabled: true\n"
     )
     monkeypatch.setenv("LIQFADE_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("LIQFADE_PATHS__DATA_DIR", str(tmp_path / "data"))
     with pytest.raises(ConfigError, match="zone_proximty"):
         load_settings("paper")
 
