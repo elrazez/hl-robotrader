@@ -146,7 +146,12 @@ async def apply_event(manager: OrderManager, event: UserEvent) -> None:
             await manager.record_cancel(event.cloid, reason="venue")
         elif event.kind == "rejected" and order.status in LIVE:
             await manager.record_reject(event.cloid, reason="venue")
-        elif event.kind == "open" and order.oid != event.oid:
+        elif event.kind == "open" and order.status in LIVE and order.oid != event.oid:
+            # LIVE only. Hyperliquid sends `open` before the fill, and on a fast Ioc the
+            # two can be applied out of order: acking a filled order puts it back in the
+            # live set, where reconciliation reads it as an order the venue has lost and
+            # the entry policy may try to reprice it. A fill is terminal and a late `open`
+            # is old news.
             await manager.record_ack(event.cloid, event.oid)
     except Exception:
         log.exception("user_event_failed", cloid=event.cloid, kind=event.kind)

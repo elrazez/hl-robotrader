@@ -361,6 +361,12 @@ class VenueSession:
             px = px * (1 + bound) if is_buy else px * (1 - bound)
 
         cloid = new_cloid()
+        # Recorded before the submit, not after. An Ioc fills at the venue in a few hundred
+        # milliseconds and the user stream pushes the fill back while `submit` is still
+        # waiting on its own response, so an intent registered afterwards arrives too late
+        # and the fill finds nothing to bracket. Drilled on testnet: two positions with no
+        # stop behind them. The faster the venue, the more likely.
+        self.entry_intents[cloid] = intent
         order = await self.orders.submit(
             OrderIntent(
                 cloid=cloid,
@@ -376,8 +382,8 @@ class VenueSession:
             )
         )
         if order.status is OrderStatus.REJECTED:
+            self.entry_intents.pop(cloid, None)
             return None
-        self.entry_intents[cloid] = intent
         return cloid
 
     def _notional(self, coin: str) -> float:

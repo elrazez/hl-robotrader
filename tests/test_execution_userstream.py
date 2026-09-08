@@ -286,3 +286,42 @@ async def test_a_frame_off_the_socket_reaches_the_registry(tmp_path: Path) -> No
         assert stream.applied == 1
     finally:
         await store.close()
+
+
+async def test_an_open_frame_never_resurrects_a_filled_order(tmp_path: Path) -> None:
+    """Drilled on testnet: an order went FILLED and then back to ACKED.
+
+    Hyperliquid sends `open` before the fill, and on a fast Ioc the two can be applied out
+    of order. `record_ack` on a terminal order puts a filled entry back in the live set,
+    where reconciliation reads it as an order the venue has lost and the entry policy may
+    try to reprice it. A fill is terminal; an `open` that arrives afterwards is old news.
+    """
+    from liqfade.execution.userstream import apply_event
+
+    class Transport:
+        async def place(self, intent: OrderIntent) -> int:
+            return 1
+
+        async def cancel(self, coin: str, cloid: str) -> None: ...
+        async def modify(self, intent: OrderIntent) -> int:
+            return 2
+
+    store = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = OrderManager(store, Transport(), sz_decimals={"ETH": 4}, killed=lambda: False)
+        cloid = new_cloid()
+        await manager.submit(
+            OrderIntent(cloid=cloid, coin="ETH", is_buy=True, px=2000.0, size=0.01, tif="Ioc")
+        )
+        await apply_event(
+            manager,
+            UserEvent(kind="fill", cloid=cloid, oid=1, coin="ETH", px=2000.0, size=0.01, ts_ms=1),
+        )
+        assert manager.get(cloid).status is OrderStatus.FILLED
+
+        await apply_event(manager, UserEvent(kind="open", cloid=cloid, oid=99, coin="ETH"))
+
+        assert manager.get(cloid).status is OrderStatus.FILLED, "a fill is terminal"
+        assert await manager.open_orders() == []
+    finally:
+        await store.close()

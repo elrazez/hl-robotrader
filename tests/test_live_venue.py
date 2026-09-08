@@ -511,3 +511,31 @@ async def test_an_urgent_short_crosses_down_through_the_bid(tmp_path: Path) -> N
         assert order.px == pytest.approx(2999.0 * bound, rel=1e-6)
     finally:
         await session._store.close()
+
+
+async def test_a_fill_that_beats_the_submit_return_still_brackets(tmp_path: Path) -> None:
+    """Drilled on testnet: two positions with no bracket at all.
+
+    An `Ioc` fills at the venue in a few hundred milliseconds and the user stream pushes
+    the fill straight back, while `submit` is still waiting on its own HTTP response. The
+    intent was recorded in `entry_intents` *after* submit returned, so the fill arrived
+    for a cloid the session did not yet recognise, `on_fill` returned silently, and the
+    position ended up with no stop behind it. The faster the venue, the more likely.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        intent = an_intent("long", urgency="high")
+
+        # The transport fills and pushes the fill back before it returns the oid.
+        async def place_and_fill(order_intent):
+            await session.on_fill(order_intent.cloid, px=3001.0, size=0.01, ts_ms=START)
+            venue.placed.append(order_intent)
+            return 4242
+
+        venue.place = place_and_fill
+        await session.place(intent, START, Row())
+
+        assert len(venue.groups) == 1, "the fill must find its intent, however early it lands"
+    finally:
+        await session._store.close()
