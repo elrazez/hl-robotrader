@@ -233,20 +233,22 @@ class VenueSession:
         """Coin to signed size, for the kill switch and `/flat`."""
         return {coin: position.size for coin, position in self.positions.items()}
 
-    async def venue_state(self) -> tuple[dict[str, float], int]:
-        """What Hyperliquid holds right now: positions and an open order count.
+    async def venue_state(self) -> tuple[dict[str, float], list[str]]:
+        """What Hyperliquid holds right now: positions, and the cloids of every open order.
 
-        The kill switch's pass criterion. Read fresh from the venue rather than from the
-        local mirror, because the whole failure this exists for was a kill trusting its
-        own bookkeeping over the account.
+        The kill switch's pass criterion and its work list. Read fresh from the venue
+        rather than from the local mirror, because every failure this exists for was the
+        loop trusting its own bookkeeping over the account: a kill that closed what it
+        remembered, and one that cancelled only the orders in its registry.
+
+        Trigger orders are included. They live in `frontendOpenOrders` alone, so a sweep
+        reading `openOrders` leaves a bracket resting behind a closed position.
         """
         account = await self.reader.account(self.address)
         orders = await self.reader.open_orders(self.address)
         triggers = await self.reader.trigger_orders(self.address)
-        return (
-            {coin: p.size for coin, p in account.positions.items()},
-            len(orders) + len(triggers),
-        )
+        cloids = [o.cloid for o in orders if o.cloid] + [t.cloid for t in triggers if t.cloid]
+        return {coin: p.size for coin, p in account.positions.items()}, cloids
 
     async def open_order_cloids(self) -> list[str]:
         return sorted(order.cloid for order in await self.orders.open_orders())
@@ -481,22 +483,25 @@ class VenueSession:
     async def close_position(self, coin: str, size: float = 0.0) -> None:
         """Flatten one coin with a reduce-only `Ioc`. What `/flat` and the kill call.
 
-        `size` is what the caller believes is open and is deliberately ignored: the venue's
-        own number is read here instead, because the kill switch's copy can be a fill old
-        by the time this runs and an order for the wrong size is not a close.
+        `size` is the caller's signed size and wins over the local book. The kill passes
+        the venue's own number, and the mirror can be a whole reconcile behind: reading it
+        here made this a no-op for a position opened since the last reconcile, so the kill
+        reported "closed 1" and submitted nothing at all.
 
         Reduce-only because the size we think we hold can be stale by a fill, and an order
         that could open the other way is not a close. The venue's refusal for a position
         that has already gone is "Reduce only order would increase position", measured.
         """
-        position = self.positions.get(coin)
-        if position is None or position.size == 0:
+        known = self.positions.get(coin)
+        signed = size if size else (known.size if known else 0.0)
+        if signed == 0.0:
+            log.info("close_skipped", coin=coin, reason="no position")
             return
         # Cross into the far side: closing a long sells into the bid, closing a short
         # buys from the ask. Taking our own side and shaving the slippage off leaves
         # the order inside the spread on anything but the tightest book, and an Ioc
         # that cannot match is cancelled rather than filled.
-        px = self.touch(coin, is_buy=position.size > 0)
+        px = self.touch(coin, is_buy=signed > 0)
         if px is None:
             book = self.books.get(coin)
             px = book.last_px if book else None
@@ -505,14 +510,14 @@ class VenueSession:
             return
         slippage = self.settings.execution.taker_slippage_bps / 1e4
         # Cross by the configured bound so an Ioc actually takes rather than expiring.
-        limit = px * (1 + slippage) if position.size < 0 else px * (1 - slippage)
+        limit = px * (1 + slippage) if signed < 0 else px * (1 - slippage)
         await self.orders.submit(
             OrderIntent(
                 cloid=new_cloid(),
                 coin=coin,
-                is_buy=position.size < 0,
+                is_buy=signed < 0,
                 px=limit,
-                size=abs(position.size),
+                size=abs(signed),
                 tif="Ioc",
                 reduce_only=True,
                 tag="flat",

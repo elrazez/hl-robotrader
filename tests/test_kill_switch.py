@@ -405,8 +405,8 @@ class VenueBook:
             return  # accepted and did nothing, which is what the refused Ioc did
         self.positions.pop(coin, None)
 
-    async def venue_state(self) -> tuple[dict[str, float], int]:
-        return dict(self.positions), len(self.orders)
+    async def venue_state(self) -> tuple[dict[str, float], list[str]]:
+        return dict(self.positions), list(self.orders)
 
 
 async def test_a_kill_confirms_against_the_venue_not_its_own_counters(tmp_path: Path) -> None:

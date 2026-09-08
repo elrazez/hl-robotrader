@@ -41,7 +41,6 @@ import contextlib
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 from liqfade.control.backend import kill_not_persisted, write_kill_file
 from liqfade.control.protocol import KillResult
@@ -73,7 +72,8 @@ class KillSwitch:
         cancel_all: Callable[[str], Awaitable[None]],
         open_positions: Callable[[], Awaitable[Mapping[str, float]]],
         close_position: Callable[[str, float], Awaitable[None]],
-        venue_state: Callable[[], Awaitable[tuple[Mapping[str, float], int]]] | None = None,
+        venue_state: Callable[[], Awaitable[tuple[Mapping[str, float], Sequence[str]]]]
+        | None = None,
         alert: Callable[[str], Awaitable[bool]] | None = None,
         stop: asyncio.Event | None = None,
         budget_s: float = DEFAULT_BUDGET_S,
@@ -85,7 +85,7 @@ class KillSwitch:
             cancel_all: cancel one cloid.
             open_positions: coin to signed size, positive long.
             close_position: close one coin's signed size with an IOC reduce-only order.
-            venue_state: reads the venue for (positions, open order count) and is what
+            venue_state: reads the venue for (positions, open order cloids) and is what
                 decides whether the kill worked. The counters only say what was attempted:
                 on 2026-09-08 a kill reported "cancelled 2, closed 1" while Hyperliquid
                 still held the position, one order and a bracket leg, because its own
@@ -208,7 +208,8 @@ class KillSwitch:
         verified = False
         while True:
             try:
-                venue_positions, orders = await _before(self._venue_state(), deadline)
+                venue_positions, cloids = await _before(self._venue_state(), deadline)
+                orders = len(cloids)
             except Exception as exc:
                 log.error("kill_verify_failed", error=f"{type(exc).__name__}: {exc}")
                 return positions, orders, verified
@@ -235,14 +236,14 @@ class KillSwitch:
                     await _before(self._close(coin, size), deadline)
             if orders and time.monotonic() < deadline:
                 with contextlib.suppress(Exception):
-                    for cloid in list(await _before(self._open_orders(), deadline)):
+                    for cloid in list(cloids):
                         if time.monotonic() >= deadline:
                             break
                         await _before(self._cancel(cloid), deadline)
 
     async def _cancel_everything(self, deadline: float) -> tuple[int, int, list[str]]:
         try:
-            cloids = list(await _before(self._open_orders(), deadline))
+            cloids = list(await self._orders_now(deadline))
         except TimeoutError:
             log.error(
                 "kill_open_orders_timed_out", deadline_in_s=round(deadline - time.monotonic(), 3)
@@ -259,6 +260,18 @@ class KillSwitch:
         )
         return _count(outcomes, "kill_cancel_failed", cloids)
 
+    async def _orders_now(self, deadline: float) -> Sequence[str]:
+        """The venue's open order cloids when it can be asked, the registry's when not.
+
+        The registry can miss an order the venue holds: an entry repriced during the
+        sweep, or one placed by something else on the same account. Drilled on
+        2026-09-08, where a resting order survived a kill that reported two cancels.
+        """
+        if self._venue_state is not None:
+            _positions, cloids = await _before(self._venue_state(), deadline)
+            return cloids
+        return await _before(self._open_orders(), deadline)
+
     async def _positions_now(self, deadline: float) -> Mapping[str, float]:
         """The venue's positions when it can be asked, ours when it cannot.
 
@@ -268,7 +281,7 @@ class KillSwitch:
         since the last reconcile. A kill asks the venue.
         """
         if self._venue_state is not None:
-            positions, _orders = await _before(self._venue_state(), deadline)
+            positions, _cloids = await _before(self._venue_state(), deadline)
             return positions
         return await _before(self._open_positions(), deadline)
 
@@ -325,7 +338,7 @@ def _some(targets: Sequence[str]) -> str:
     return f"{named} and {extra} more" if extra > 0 else named
 
 
-async def _before(awaitable: Awaitable[Any], deadline: float) -> Any:
+async def _before[T](awaitable: Awaitable[T], deadline: float) -> T:
     """Await `awaitable`, abandoning it at `deadline`. Raises TimeoutError on overrun.
 
     `wait_for` cancels what it abandons, which for an SDK call already running on a
