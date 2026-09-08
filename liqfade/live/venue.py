@@ -23,6 +23,7 @@ here weakens them, and nothing here asks for a signer.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections import deque
 from collections.abc import Mapping
@@ -132,6 +133,9 @@ class VenueSession:
         # cloid -> the intent that asked for it, so a fill can be bracketed with the
         # target and stop the strategy actually chose rather than a recomputed pair.
         self.entry_intents: dict[str, Intent] = {}
+        # cloid -> how much of that entry has filled, so a bracket covers the whole
+        # position rather than whichever partial arrived first.
+        self.filled: dict[str, float] = {}
         self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
@@ -383,22 +387,36 @@ class VenueSession:
     # --- what the venue tells us ---------------------------------------------
 
     async def on_fill(self, cloid: str, *, px: float, size: float, ts_ms: int) -> None:
-        """An entry filled: bracket the position it opened.
+        """An entry filled, in whole or in part: bracket everything it has opened so far.
 
         The bracket goes on immediately and at the venue, so the position is protected by
         something that outlives this process. A stop that only exists as a check inside a
         250ms tick is a stop that a crash removes.
+
+        **Every fill re-brackets.** An entry that fills in four parts used to get a bracket
+        for the first part and nothing for the rest, because the coin already had one:
+        drilled on testnet 2026-09-08, a 0.0076 position wearing a 0.0019 stop. A partial
+        bracket is the failure `execution/tpsl.py` warns about, since the position reads as
+        protected. The old legs are cancelled before the new ones go on, or the venue holds
+        two brackets for one position and the second to trigger closes a flat account.
         """
-        intent = self.entry_intents.pop(cloid, None)
+        intent = self.entry_intents.get(cloid)
         if intent is None:
             return  # an exit leg, or an order from before this process
         self.fills.append((ts_ms, intent.coin, "entry", px, size))
-        if intent.coin in self.brackets:
-            return
+        self.filled[cloid] = self.filled.get(cloid, 0.0) + size
+        total = self.filled[cloid]
+
+        previous = self.brackets.pop(intent.coin, None)
+        if previous is not None:
+            for leg in (previous.tp_cloid, previous.sl_cloid):
+                with contextlib.suppress(KeyError):
+                    await self.orders.cancel(leg)
+
         legs = await self.orders.submit_bracket(
             coin=intent.coin,
             is_long=intent.side == "long",
-            size=size,
+            size=total,
             tp_px=intent.target_px,
             sl_px=intent.stop_px,
         )
@@ -406,6 +424,8 @@ class VenueSession:
         log.info(
             "bracket_placed",
             coin=intent.coin,
+            size=total,
+            replaced=previous is not None,
             tp=intent.target_px,
             sl=intent.stop_px,
             tp_cloid=legs.tp_cloid,

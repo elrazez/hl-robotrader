@@ -443,3 +443,32 @@ async def test_a_coin_the_venue_has_no_rules_for_is_not_ordered(tmp_path: Path) 
         assert venue.placed == []
     finally:
         await session._store.close()
+
+
+async def test_a_partly_filled_entry_brackets_the_whole_position(tmp_path: Path) -> None:
+    """Found by drilling on testnet: a 0.0076 position wearing a 0.0019 bracket.
+
+    The entry filled in four parts. `on_fill` bracketed the first and then skipped the
+    rest because the coin already had a bracket, so three quarters of the position had no
+    stop behind it. That is the exact failure the tpsl module warns about: a position that
+    looks protected and is not is worse than one that plainly is not.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+
+        for i in range(4):
+            await session.on_fill(cloid, px=2999.0, size=0.0019, ts_ms=START + i)
+
+        assert len(venue.groups) >= 1
+        legs = venue.groups[-1]
+        assert all(leg["sz"] == pytest.approx(0.0076) for leg in legs), (
+            "the last bracket must cover every fill, not the first one"
+        )
+        # The superseded legs are cancelled, or the venue holds two brackets for one
+        # position and the second fill to trigger closes a position that is already flat.
+        assert len(venue.cancelled) == len(venue.groups) * 2 - 2
+    finally:
+        await session._store.close()
