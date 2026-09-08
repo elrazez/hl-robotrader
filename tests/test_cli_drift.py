@@ -265,32 +265,39 @@ def test_the_diff_matches_on_everything_the_registry_records_faithfully(
     assert verdicts["holes"] is Verdict.MATCH
 
 
-def test_entries_and_pnl_drift_because_paper_books_the_order_price_not_the_fill_price(
+def test_the_registry_records_the_price_the_fill_model_filled_at_not_the_order_price(
     lake: tuple[Path, int, int], live_side: Any
 ) -> None:
-    """A real finding, pinned here so that fixing it fails this test rather than passing quietly.
+    """The finding this fixture found, kept as the assertion that it stays fixed.
 
-    The two portfolios agree to the cent (the test above). What disagrees is the order
-    registry: `PaperSession._book_fill` records `px=order.px`, the price the order was
-    placed at, while the fill model fills a crossing entry at the touch and the portfolio
-    books that. On this fixture the difference is the half spread, ten basis points, and it
-    flows into the reconstructed PnL as an entry that looks cheaper than the one the
-    portfolio paid.
+    `PaperSession._book_fill` used to record `px=order.px`, the price the order was placed
+    at, while the fill model fills a crossing entry at the touch and the portfolio books
+    that. The gap was the trade's own entry slippage, ten basis points on this fixture, and
+    it reached the reconstructed PnL as an entry that looked cheaper than the one the
+    portfolio paid. The panel, `/status` and this command all read the registry, so all
+    three showed it.
 
-    It is a paper-mode fidelity gap rather than a drift between engines: on a real venue
-    `record_fill` is handed the venue's own price. The panel, `/status` and this command
-    all read the registry, so all three currently show a better entry than was booked.
-    Fixing it belongs in `live/paper.py`, not here.
+    The fixture has to charge slippage for this to prove anything, which the first
+    assertion is: an entry that filled where it was placed would pass either way.
+
+    The `pnl` dimension is deliberately not asserted here. It still drifts on this fixture,
+    by less than it did, for a reason that is not this one: the replay's trade row carries
+    the size of the exit fill that closed the position rather than the size of the whole
+    round trip, so a target filled in two prints is reconstructed at one size off the
+    registry and another off the trade log.
     """
     root, start_ms, end_ms = lake
     settings = settings_for(root)
     result = replay(settings, root, start_ms, end_ms)
     report = compare(live_side, read_replay(result, settings=settings), settings=settings)
 
+    assert result.trades[0].entry_slippage_bps > 0
     entries = next(d for d in report.dimensions if d.name == "entries")
-    assert entries.verdict is Verdict.DRIFT
-    # Exactly the slippage the fill model charged and the registry did not record.
-    assert entries.metrics[0].value == pytest.approx(result.trades[0].entry_slippage_bps, rel=0.02)
+    assert entries.verdict is Verdict.MATCH
+    assert entries.metrics[0].value == pytest.approx(0.0, abs=1e-6)
+    # The same thing said without the median: the price the registry gave the live side is
+    # the price the fill model charged the portfolio.
+    assert live_side.round_trips[0].entry_px == pytest.approx(result.trades[0].entry_px)
 
 
 def test_a_replay_under_different_config_stops_the_report_at_the_config_line(

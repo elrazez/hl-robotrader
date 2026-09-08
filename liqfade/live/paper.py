@@ -38,6 +38,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from liqfade.backtest.costs import fee_for
 from liqfade.backtest.data import L2, AssetCtx, Bbo, Liq, Trade
 from liqfade.backtest.engine import (
     BacktestResult,
@@ -49,7 +50,7 @@ from liqfade.backtest.engine import (
     _resolve_meta,
     _take_exit,
 )
-from liqfade.backtest.fills import OrderKind, SimOrder
+from liqfade.backtest.fills import Fill, OrderKind, SimOrder
 from liqfade.backtest.portfolio import Portfolio
 from liqfade.config.models import Settings
 from liqfade.control.protocol import OrderState, PositionState
@@ -142,6 +143,42 @@ class PaperTransport:
         raise RejectError("paper brackets through the engine's exits, not positionTpsl")
 
 
+class _BookingPortfolio(Portfolio):
+    """The real portfolio, keeping the fills it books so the registry can record them.
+
+    `SimOrder` carries the price the order was placed at and no fill price, and for a
+    crossing order those differ by the trade's own slippage: an `Ioc` entry is placed at
+    the mid and lifts the ask. Every `Fill` the fill model produces passes through here on
+    its way into a position, so this is where `_book_fill` can be handed the price the
+    portfolio actually booked. On a venue this problem does not exist, because `record_fill`
+    is handed the venue's own price.
+    """
+
+    def __init__(self, settings: Settings, *, starting_equity: float) -> None:
+        super().__init__(settings, starting_equity=starting_equity)
+        self._booked: dict[str, list[Fill]] = {}
+
+    def apply_entry(self, fill: Fill, intent: Intent) -> None:
+        super().apply_entry(fill, intent)
+        self._booked.setdefault(fill.cloid, []).append(fill)
+
+    def apply_exit(self, fill: Fill, reason: str) -> Any:
+        trade = super().apply_exit(fill, reason)
+        self._booked.setdefault(fill.cloid, []).append(fill)
+        return trade
+
+    def take_fills(self, cloid: str) -> list[Fill]:
+        """The fills booked for one order since the last call, and forget them.
+
+        Taken rather than read, so a week long session does not keep every fill it ever
+        booked for the sake of one price each. What it does keep is the crossing exits the
+        engine builds, fills and discards inside a tick: they never rest in the coin state,
+        so nothing ever asks for them. That is one small list per stop, time stop and flat,
+        and `_note_trades` writes those rows from the trade at the price it closed at.
+        """
+        return self._booked.pop(cloid, [])
+
+
 class _RecordingStrategy(StrategyEngine):
     """The real engine, remembering the intents of the last tick so they can be posted.
 
@@ -222,7 +259,7 @@ class PaperSession:
             else None
         )
         self.strategy = _RecordingStrategy(settings, self.meta)
-        self.portfolio = Portfolio(settings, starting_equity=starting_equity)
+        self.portfolio = _BookingPortfolio(settings, starting_equity=starting_equity)
         # The real gate, with the real kill switch: a paper loop that ignored the kill file
         # would be drilling something other than the thing that runs on the box.
         self.risk = RiskEngine(settings, path=risk_state_path)
@@ -640,11 +677,20 @@ class PaperSession:
     async def _book_fill(self, order: SimOrder, now_ms: int) -> None:
         """Record whatever filled since the last look, if anything did.
 
-        The fee is the same one the portfolio charged, computed from the same config
-        fractions, so the registry's fills add up to the trade log's costs. Maker or taker
-        is the order kind: an `Alo` rested and an `Ioc` crossed.
+        The price is the one the portfolio booked, not `order.px`: a resting `Alo` fills at
+        its own price but a crossing `Ioc` fills at the touch, and recording what was asked
+        for rather than what was paid puts an entry in the registry the account never got.
+        The panel, `/status` and `liqfade drift` all read it.
+
+        The fee follows from that price through the same `fee_for` the portfolio charged,
+        so the registry's fills add up to the trade log's costs. Maker or taker is the order
+        kind: an `Alo` rested and an `Ioc` crossed.
         """
         assert self.orders is not None
+        # Taken first, and taken even on the paths that record nothing: a fill nobody can
+        # record is a fill nobody should keep, and this dict would otherwise hold one row
+        # per terminal order for the life of the process.
+        booked = self.portfolio.take_fills(order.cloid)
         if self._known_orders.get(order.cloid) in {OrderStatus.FILLED, OrderStatus.CANCELED}:
             return
         delta = order.filled - self._recorded_fill.get(order.cloid, 0.0)
@@ -652,14 +698,22 @@ class PaperSession:
             return
         self._recorded_fill[order.cloid] = order.filled
         maker = order.kind is not OrderKind.IOC
-        costs = self.settings.backtest
-        fee_frac = costs.maker_fee_frac if maker else costs.taker_fee_frac
+        # Size weighted, because one call can be recording several prints. Nothing booked
+        # is not an error and not a zero: the fill model advances a `SimOrder` before
+        # offering its fill to the portfolio, and an entry whose intent went away is filled
+        # by the model and booked by nobody. The price it asked for is all that is known.
+        booked_size = sum(fill.size for fill in booked)
+        px = (
+            sum(fill.px * fill.size for fill in booked) / booked_size
+            if booked_size > 0
+            else order.px
+        )
         updated = await self.orders.record_fill(
             order.cloid,
             size=delta,
-            px=order.px,
+            px=px,
             ts_ms=now_ms,
-            fee=order.px * delta * fee_frac,
+            fee=fee_for(px * delta, maker=maker, settings=self.settings),
             maker=maker,
         )
         self._known_orders[order.cloid] = updated.status

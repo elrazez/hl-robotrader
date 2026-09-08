@@ -356,3 +356,43 @@ async def test_a_session_with_no_store_drains_and_discards(tmp_path: Path) -> No
     await session.tick(START + 2_000)
 
     assert not session.result.refused
+
+
+async def test_a_crossing_entry_is_recorded_at_the_touch_it_paid_not_at_its_own_price(
+    tmp_path: Path,
+) -> None:
+    """The registry has to carry the price the fill model charged, not the one asked for.
+
+    An `Ioc` entry is placed at the mid and lifts the ask, so the portfolio books the
+    touch and the order's own `px` is half a spread better than that. `_book_fill` used to
+    record `order.px`, which put an entry in the registry the account never got: the panel,
+    `/status` and `liqfade drift` all read it, and on a real venue `record_fill` is handed
+    the venue's own price.
+    """
+    session = await a_session(tmp_path)
+    quote(session, START, 3000.0)
+    print_trade(session, START, 3000.0)
+    await session.tick(START + 1_000)
+
+    intent = session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000, urgency="high")
+    assert intent is not None
+    # One tick inside the latency window, which is where the loop's 250ms cadence puts the
+    # order into the registry before the fill model can reach it.
+    await session.tick(START + 1_250)
+    entry = session.state[COIN].entry
+    assert entry is not None
+    cloid, asked_px = entry.cloid, entry.px
+
+    # Past the latency, so the Ioc crosses. The book is unchanged, so it lifts the ask.
+    later = START + 1_000 + session.settings.backtest.latency_ms + 500
+    quote(session, later, 3000.0)
+    await session.tick(later)
+
+    position = session.portfolio.positions[COIN]
+    assert position.entry_px == pytest.approx(3000.5), "the ask, which is what an Ioc lifts"
+    assert asked_px == pytest.approx(3000.0), "placed at the mid, so the two differ"
+    order = session.orders.get(cloid)
+    assert order.status is OrderStatus.FILLED
+    assert order.avg_px == pytest.approx(position.entry_px)
+    fills = await session.store.fills(cloid)
+    assert [row["px"] for row in fills] == [pytest.approx(position.entry_px)]
