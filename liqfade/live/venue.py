@@ -143,6 +143,10 @@ class VenueSession:
         # cloid -> how much of that entry has filled, so a bracket covers the whole
         # position rather than whichever partial arrived first.
         self.filled: dict[str, float] = {}
+        # coin -> (the wall clock the intent's time stop expires at, the signed size the
+        # entry filled). The size is kept because `positions` is a mirror that lags
+        # reconciliation, and a position opened since the last one is invisible in it.
+        self.time_stops: dict[str, tuple[int, float]] = {}
         self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
@@ -228,6 +232,7 @@ class VenueSession:
         for coin in list(self.brackets):
             if coin not in self.positions:
                 self.brackets.pop(coin, None)
+                self.time_stops.pop(coin, None)
                 log.info("bracket_released", coin=coin, reason="position closed")
 
     def equity(self) -> float:
@@ -281,7 +286,13 @@ class VenueSession:
         return intents
 
     async def age_entries(self, now_ms: int) -> None:
-        """Run the entry policy over every resting entry. The same table the backtest runs."""
+        """Age everything on the book: positions against their time stop, then the entries.
+
+        The time stop rides here because this is the one pass the loop makes on every tick,
+        and a time stop that only ran when the strategy had something to say would not be a
+        time stop. The entry policy below is the same decision table the backtest runs.
+        """
+        await self.exit_expired_positions(now_ms)
         for order in await self.orders.open_orders():
             if order.intent.tag != "entry":
                 continue
@@ -304,6 +315,37 @@ class VenueSession:
             if touch is None:
                 continue  # no book to reprice onto; hold rather than invent a price
             await self.orders.reprice(order.cloid, touch)
+
+    async def exit_expired_positions(self, now_ms: int) -> list[str]:
+        """Close every position past its intent's time stop with a reduce-only Ioc.
+
+        `intent.time_stop_s` is the strategy's own answer to a fade that has not reverted,
+        and the backtest has exited on it since Phase 4. On this path nothing read it, so a
+        position was held until its target, its stop, or forever.
+
+        The bracket goes with the position, after the closing order and never before it:
+        the venue removes both legs itself once the position is gone, but only once it is.
+
+        Returns:
+            The coins it closed, in the order it closed them.
+        """
+        expired = [
+            coin for coin, (deadline, _size) in self.time_stops.items() if now_ms >= deadline
+        ]
+        closed = []
+        for coin in expired:
+            _deadline, filled = self.time_stops.pop(coin)
+            position = self.positions.get(coin)
+            size = position.size if position is not None else filled
+            if size == 0.0:
+                continue
+            log.warning("time_stop", coin=coin, size=size, now_ms=now_ms)
+            await self.close_position(coin, size)
+            closed.append(coin)
+            legs = self.brackets.pop(coin, None)
+            if legs is not None:
+                await self._cancel_legs(legs)
+        return closed
 
     async def place(self, intent: Intent, now_ms: int, row: Any = None) -> str | None:
         """Size an intent, gate it, and rest an `Alo` at the touch if it survives both.
@@ -453,6 +495,12 @@ class VenueSession:
             await self._abandon_unbracketed(cloid, intent, total, ts_ms)
             return
         self.brackets[intent.coin] = legs
+        # From the first fill, not from the last: the clock the strategy set runs from
+        # when the position was opened, and a partial that trickles in cannot extend it.
+        self.time_stops.setdefault(
+            intent.coin,
+            (ts_ms + int(intent.time_stop_s * 1000), total if intent.side == "long" else -total),
+        )
         log.info(
             "bracket_placed",
             coin=intent.coin,
@@ -541,6 +589,7 @@ class VenueSession:
         self.portfolio.trades.append(
             VenueTrade(coin=order.coin, net_pnl=order.closed_pnl, ts_ms=ts_ms)
         )
+        self.time_stops.pop(order.coin, None)
         self.risk.on_exit(order.coin, order.closed_pnl, ts_ms)
         log.info(
             "round_trip_closed",

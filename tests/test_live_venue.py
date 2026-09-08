@@ -829,3 +829,70 @@ async def test_a_bracket_that_lost_its_response_is_placed_on_the_retry(tmp_path:
         assert session.result.risk_blocks == {}
     finally:
         await session._store.close()
+
+
+async def test_a_position_past_its_time_stop_is_closed(tmp_path: Path) -> None:
+    """`intent.time_stop_s` was on every intent and read nowhere on the venue path.
+
+    The backtest exits on it, so a run's holding times and a run's PnL were both about a
+    rule the live loop did not have: a fade that never reverted was held until the stop or
+    forever, whichever came first.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        intent = an_intent("long")  # time_stop_s of 600
+        cloid = await session.place(intent, START, Row())
+        assert cloid is not None
+        filled_at = START + 10
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=filled_at)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.placed.clear()
+        venue.cancelled.clear()
+
+        await session.age_entries(filled_at + 599_000)
+        assert venue.placed == [], "still inside its time stop"
+
+        await session.age_entries(filled_at + 600_001)
+
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.is_buy is False, "a long is closed by selling"
+        cancelled = [c for _coin, c in venue.cancelled]
+        assert legs.tp_cloid in cancelled and legs.sl_cloid in cancelled
+        assert COIN not in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_a_time_stop_closes_what_the_venue_has_not_confirmed_yet(tmp_path: Path) -> None:
+    """The mirror lags reconciliation by up to `execution.reconcile_s`, so it is not asked.
+
+    A position opened since the last reconcile is invisible in `positions`, which is how a
+    kill once reported closing something and submitted nothing at all.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("short"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=3001.0, size=0.01, ts_ms=START)
+        assert session.positions == {}, "no reconcile has run"
+        venue.placed.clear()
+
+        await session.age_entries(START + 600_001)
+
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.is_buy is True, "a short is closed by buying"
+        assert closing.size == 0.01
+    finally:
+        await session._store.close()
