@@ -384,6 +384,7 @@ panel:
   state_stale_s: 5.0  # seconds after which /api/state returns 503 rather than stale numbers
 
 telegram:
+  commands: true  # poll getUpdates for /status, /pause, /flat; one consumer per bot token
   enabled: true
   alert_on_intent: true  # every intent is posted with its explain() values
   parse_mode: HTML

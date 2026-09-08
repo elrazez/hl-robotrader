@@ -32,6 +32,7 @@ import time
 
 import httpx
 
+from liqfade.alerts.redact import redact
 from liqfade.log import get_logger
 
 log = get_logger(__name__)
@@ -94,7 +95,7 @@ async def send_alert(
             log.warning("alert_failed", status=response.status_code, body=response.text[:200])
             return False
     except Exception as exc:
-        log.warning("alert_failed", error=f"{type(exc).__name__}: {exc}")
+        log.warning("alert_failed", error=redact(f"{type(exc).__name__}: {exc}"))
         return False
 
     log.info("alert_sent", alert=text)

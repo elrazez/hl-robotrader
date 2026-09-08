@@ -569,7 +569,7 @@ class PaperLoop:
             ("heartbeat", lambda: self.heartbeat_loop(stop)),
             ("reconcile", lambda: self.reconciler.run(stop, reconnected=self.reconnected)),
             ("kill_watch", lambda: KillWatcher(self.kill).run(stop)),
-            ("telegram", lambda: bot.run(stop)),
+            *([("telegram", lambda: bot.run(stop))] if settings.telegram.commands else []),
             *self.extra_jobs(stop),
         ]
         tasks = [

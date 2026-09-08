@@ -404,3 +404,21 @@ def test_the_drill_command_is_refused_on_mainnet(tmp_path: Path) -> None:
             session.inject_intent(coin=COIN, side="long", now_ms=START)
     finally:
         asyncio.run(session._store.close())
+
+
+def test_only_one_loop_polls_telegram_for_commands() -> None:
+    """Two long polls on one bot token is a 409, and neither side gets the commands.
+
+    Telegram allows one `getUpdates` consumer per token. Paper soaks for a week and owns
+    the channel; the testnet loop sends alerts and takes commands over its own control
+    socket instead. The one command that must reach both is `/kill`, and it does: it
+    writes data/KILL, which both loops watch, which is the point of it being one flag.
+    """
+    unit = Path("scripts/systemd/liqfade-testnet.service").read_text()
+    assert "Environment=LIQFADE_TELEGRAM__COMMANDS=0" in unit
+
+    from liqfade.config import load_settings
+
+    settings = load_settings("testnet", environ={"LIQFADE_TELEGRAM__COMMANDS": "0"})
+    assert settings.telegram.commands is False
+    assert load_settings("paper", environ={}).telegram.commands is True

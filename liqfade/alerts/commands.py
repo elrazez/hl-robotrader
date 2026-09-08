@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 import orjson
 
+from liqfade.alerts.redact import redact
 from liqfade.control.backend import ControlBackend
 from liqfade.control.protocol import StateSnapshot
 from liqfade.log import get_logger
@@ -174,7 +175,9 @@ class CommandBot:
                 try:
                     updates = await self._poll(client, token, timeout_s)
                 except Exception as exc:
-                    log.warning("telegram_poll_failed", error=f"{type(exc).__name__}: {exc}")
+                    log.warning(
+                        "telegram_poll_failed", error=redact(f"{type(exc).__name__}: {exc}")
+                    )
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(stop.wait(), timeout=5.0)
                     continue

@@ -547,6 +547,11 @@ class Panel(Base):
 
 
 class Telegram(Base):
+    # Telegram allows one getUpdates consumer per bot token, so a second loop polling the
+    # same bot gets 409 Conflict and neither side reliably receives a command. The loop
+    # that soaks owns the channel; the other one still sends alerts and is driven over its
+    # own control socket. /kill reaches both regardless: it writes the shared flag file.
+    commands: bool = True
     enabled: bool
     alert_on_intent: bool = Field(..., description="post every intent with its explain values")
     parse_mode: Literal["HTML", "MarkdownV2", "None"] = Field(..., description="Bot API parse mode")

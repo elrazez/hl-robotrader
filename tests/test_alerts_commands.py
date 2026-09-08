@@ -140,3 +140,31 @@ async def test_updates_are_processed_once_and_the_offset_advances(bot: CommandBo
     assert bot.offset == 6
     assert await bot.handle_update(an_update("/pause", update_id=5)) is None
     assert bot.offset == 6
+
+
+def test_a_telegram_error_never_carries_the_bot_token() -> None:
+    """httpx puts the full request URL in its exception message, token and all.
+
+    That is how the token reached the journal on 2026-09-08, five times per unit, from a
+    409 the two loops caused between them. CLAUDE.md rule 6 is about the agent key by
+    name, but a bot token is a credential and a log line is forever: anyone who can read
+    the journal can drive the alert bot.
+    """
+    from liqfade.alerts.redact import redact
+
+    message = (
+        "HTTPStatusError: Client error '409 Conflict' for url "
+        "'https://api.telegram.org/bot1234567890:AAGsecretsecretsecret/getUpdates?timeout=25'"
+    )
+    cleaned = redact(message)
+
+    assert "AAGsecretsecretsecret" not in cleaned
+    assert "1234567890" not in cleaned
+    assert "409 Conflict" in cleaned, "the useful half must survive"
+    assert "bot***" in cleaned
+
+
+def test_redacting_leaves_an_ordinary_message_alone() -> None:
+    from liqfade.alerts.redact import redact
+
+    assert redact("ConnectTimeout: timed out") == "ConnectTimeout: timed out"

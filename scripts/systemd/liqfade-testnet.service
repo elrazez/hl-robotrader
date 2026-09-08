@@ -28,6 +28,12 @@ Environment=LIQFADE_CONTROL__STATE_FILE=state-testnet.json
 Environment=LIQFADE_CONTROL__HEARTBEAT_FILE=heartbeat-testnet
 Environment=LIQFADE_CONTROL__RISK_STATE_FILE=risk_state-testnet.json
 Environment=LIQFADE_EXECUTION__ORDER_DB=orders-testnet.sqlite
+# Telegram allows one getUpdates consumer per bot token. The paper loop soaks for a
+# week and owns the command channel; this one sends alerts and is driven over its own
+# control socket. /kill still reaches it, because /kill writes the shared flag file.
+Environment=LIQFADE_TELEGRAM__COMMANDS=0
+# info, not debug: the recorder's frame logging at debug fills the journal in minutes.
+Environment=LIQFADE_LOGGING__LEVEL=INFO
 # LIQFADE_LIVE_TRADING is deliberately absent and must stay absent here. It is one of the
 # three gates in execution/signer.py, and this unit signs with the testnet agent key only.
 WorkingDirectory=/srv/liqfade/app
