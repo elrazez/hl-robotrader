@@ -187,8 +187,14 @@ money anywhere. That is the security property the agent-wallet design exists for
 bot key is a trading risk, not a withdrawal risk. `docs/RUNBOOK.md` should say so, because
 it changes what a key compromise costs and therefore how it should be responded to.
 
-The practical consequence: **the master's spot-to-perps transfer cannot be done by the
-bot.** Only the master's own wallet can move its USDC between spot and perps, which is one
-click in the UI and no API call the bot is able to make. Fund the perps account before
-expecting the bot to trade, and remember that an agent address holding a balance is a
-balance no order will ever use.
+The practical consequence is only about *whose* balance the bot can move, not about
+needing a separate perps balance. **There is no spot-to-perps step.** The account's USDC
+is its collateral directly: `clearinghouseState` reports `accountValue: 0.0` while flat
+and rises the moment a position is on (measured: 0.0 flat, 1.48872 holding 0.006 ETH,
+0.0 again after closing). A resting order and a market open both work against USDC that
+never left the spot balance.
+
+What does matter: **an agent address holding a balance is a balance no order will ever
+use**, because orders execute on the master. Funds sent to the agent address by mistake
+are recoverable with the agent key through `spot_transfer`, which acts on the agent's own
+address, and that is the only reason the split above needs to be understood at all.

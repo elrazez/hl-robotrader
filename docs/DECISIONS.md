@@ -2627,3 +2627,27 @@ could not operate, and in both cases the failure presented as success rather tha
 error. Here it went one worse: a wrong reading was written into this file as a finding.
 The check that would have caught it costs one call, `userRole`, and it is now the first
 thing any probe run should do.
+
+## 2026-09-08 (05c: resolved, and the second wrong conclusion corrected)
+
+The address was the whole blocker. With `HL_TESTNET_ACCOUNT_ADDRESS` pointing at the
+master, the account trades: a Gtc rests and appears in `openOrders`, `orderStatus` returns
+it, `market_open` fills 0.006 ETH at 2479.7 and the position appears in `assetPositions`,
+`market_close` flattens it, and `userFills` shows both fills. Nothing else was wrong.
+
+**Correcting the entry above a second time.** It concluded that the master needed a
+spot-to-perps transfer that only the owner's wallet could make. That is wrong: there is no
+such step. The account's USDC is its collateral directly. `accountValue` reads `0.0` while
+flat, `1.48872` while holding 0.006 ETH, and `0.0` again after closing, which is what made
+a funded account look empty and produced the wrong conclusion twice from the same reading.
+**Do not read `accountValue: 0.0` as an unfunded account.** Read the spot USDC balance.
+
+Moving the 995 off the agent address was still necessary, for the one reason that survives:
+orders execute on the master, so a balance sitting at the agent address is collateral no
+order can use. The master now holds 997 USDC and the agent 1.0.
+
+**Two wrong diagnoses in a row from the same data, so the method is the finding.** Both
+came from reasoning about a symptom instead of asking the venue a direct question. One
+`userRole` call would have found the address error immediately; one `market_open` would
+have disproved the funding theory in seconds. The probe script now has `state_shape`, and
+it should be run and read before any theory is written down, not after.
