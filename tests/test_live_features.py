@@ -512,3 +512,50 @@ def test_the_engine_agrees_with_the_grid_after_the_z_lookback_has_rolled_over() 
     samples = engine.coins["ETH"].samples["long"]
     assert len(samples) <= settings.features.z_lookback_h * 60 + 1
     assert len(samples) < hours * 60
+
+
+def test_a_one_sided_level_still_counts_the_side_that_is_there() -> None:
+    """A thin book runs out on one side, and the parser sends None for the missing half.
+
+    `_l2` emits `max(len(bids), len(asks))` levels, so a book with twenty bids and three
+    asks produces seventeen rows whose ask fields are None. `_ingest_level` used to call
+    `float()` on all four unconditionally, so the whole level was dropped, taking the bid
+    that *was* there with it. Depth came out understated on exactly the illiquid coins
+    where the depth cap matters most, and on testnet, where it fired on every snapshot.
+    """
+    engine = LiveFeatureEngine(crossvenue_settings())
+    both = {
+        "coin": "ETH",
+        "ts_ms": START,
+        "rx_ms": START,
+        "level": 0,
+        "bid_px": 3000.0,
+        "bid_sz": 10.0,
+        "ask_px": 3001.0,
+        "ask_sz": 10.0,
+    }
+    engine.ingest("l2", "hyperliquid", both)
+    engine.ingest(
+        "l2",
+        "hyperliquid",
+        {
+            **both,
+            "level": 1,
+            "bid_px": 2999.5,
+            "bid_sz": 7.0,
+            "ask_px": None,
+            "ask_sz": None,
+        },
+    )
+    engine.advance(START + 2_000)
+    ragged = engine.row("ETH", START + 2_000)
+
+    engine2 = LiveFeatureEngine(crossvenue_settings())
+    engine2.ingest("l2", "hyperliquid", both)
+    engine2.advance(START + 2_000)
+    touch_only = engine2.row("ETH", START + 2_000)
+
+    # A long lifts the asks, so the ragged level adds nothing there and everything on the
+    # short side, where its bid sits.
+    assert ragged.depth("short") > touch_only.depth("short"), "the bid at level one is real"
+    assert ragged.depth("long") == touch_only.depth("long")

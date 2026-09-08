@@ -234,18 +234,27 @@ class LiveFeatureEngine:
         therefore always the first row of a snapshot.
         """
         bucket = state.pending[bucket_ts]
-        bid_px, bid_sz = float(row["bid_px"]), float(row["bid_sz"])
-        ask_px, ask_sz = float(row["ask_px"]), float(row["ask_sz"])
+        # A ragged book is normal, not an error. `_l2` emits max(len(bids), len(asks))
+        # levels, so a coin with twenty bids and three asks sends seventeen rows whose ask
+        # half is None. Reading all four unconditionally dropped the whole level, and with
+        # it the bid that was there, understating depth on exactly the illiquid coins
+        # where the depth cap matters. Each side is now counted on its own.
+        bid_px, bid_sz = _maybe_float(row.get("bid_px")), _maybe_float(row.get("bid_sz"))
+        ask_px, ask_sz = _maybe_float(row.get("ask_px")), _maybe_float(row.get("ask_sz"))
         if int(row.get("level", 0)) == 0:
+            if bid_px is None or ask_px is None:
+                # No two sided touch means no mid, and the depth band is measured from the
+                # mid. A one sided level zero is a book we cannot place against anyway.
+                return
             bucket.book = (bid_px, ask_px, 0.0, 0.0)
         if bucket.book is None:
             return
         best_bid, best_ask, depth_bid, depth_ask = bucket.book
         mid = (best_bid + best_ask) / 2.0
         band = self.depth_bps / 1e4
-        if bid_px >= mid * (1 - band):
+        if bid_px is not None and bid_sz is not None and bid_px >= mid * (1 - band):
             depth_bid += bid_px * bid_sz
-        if ask_px <= mid * (1 + band):
+        if ask_px is not None and ask_sz is not None and ask_px <= mid * (1 + band):
             depth_ask += ask_px * ask_sz
         bucket.book = (best_bid, best_ask, depth_bid, depth_ask)
 
