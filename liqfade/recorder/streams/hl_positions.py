@@ -97,7 +97,7 @@ class HlPositionsPoller:
         """
         addresses = self.book.top(self.cfg.max_addresses)
         wanted = set(self.coins)
-        rx_ms = int(time.time() * 1000)
+        started_ms = int(time.time() * 1000)
         rows = 0
         failed = 0
         for address in addresses:
@@ -112,9 +112,15 @@ class HlPositionsPoller:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 continue
-            rows += self._sink_positions(address, state, wanted, rx_ms)
+            # Stamped per address, after its response arrives, and not once for the poll.
+            # The addresses are walked sequentially, so a poll of 200 spans several
+            # seconds (6.5s measured on the box 2026-09-08): one rx_ms for the whole poll
+            # dated every row after the first up to that much *earlier* than it actually
+            # arrived, which is lookahead, and CLAUDE.md rule 1 has no tolerance for it.
+            rows += self._sink_positions(address, state, wanted, int(time.time() * 1000))
 
-        self._stat.record_message(rx_ms)  # one poll is one message, whatever it returned
+        # One poll is one message, whatever it returned, timed from when it began.
+        self._stat.record_message(started_ms)
         if addresses and failed == len(addresses):
             self._stat.connected = False
         if self.book_path is not None:
