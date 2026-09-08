@@ -260,11 +260,14 @@ class KillSwitch:
                 with contextlib.suppress(Exception):
                     await _before(self._close(coin, size), deadline)
             if orders and time.monotonic() < deadline:
-                with contextlib.suppress(Exception):
-                    for cloid in list(cloids):
-                        if time.monotonic() >= deadline:
-                            break
-                        await _before(self._cancel(cloid), deadline)
+                for ref in list(cloids):
+                    if time.monotonic() >= deadline:
+                        break
+                    # Suppressed per order, not around the loop: one order the venue
+                    # refuses to cancel must not end a pass that has budget left for the
+                    # ones behind it.
+                    with contextlib.suppress(Exception):
+                        await _before(self._cancel(ref), deadline)
 
     async def _last_known(self) -> dict[str, float]:
         """The local book, for the confirmation line only. Never a pass criterion.

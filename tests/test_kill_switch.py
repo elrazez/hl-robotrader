@@ -617,3 +617,35 @@ async def test_a_kill_with_no_account_to_read_still_says_so(tmp_path: Path) -> N
     assert result.venue_flat is None
     assert "no account to read" in posted[0]
     assert "UNVERIFIED" not in posted[0]
+
+
+async def test_one_failed_cancel_does_not_skip_the_orders_behind_it(tmp_path: Path) -> None:
+    """The retry loop suppressed exceptions around the whole loop, not around each cancel.
+
+    So the first order the venue refused to cancel ended the pass, and everything after it
+    was left resting by a kill that had budget left to try.
+    """
+    attempts: list[str] = []
+    orders = ["0xa", "0xb"]
+
+    async def venue_state() -> tuple[dict[str, float], list[str]]:
+        return {}, list(orders)
+
+    async def cancel(ref: str) -> None:
+        attempts.append(ref)
+        if ref == "0xa":
+            raise RuntimeError("Order was never placed, already canceled, or filled")
+
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=lambda: asyncio.sleep(0, result=list(orders)),
+        cancel_all=cancel,
+        open_positions=lambda: asyncio.sleep(0, result={}),
+        close_position=lambda coin, size: asyncio.sleep(0),
+        venue_state=venue_state,
+        budget_s=1.0,
+    )
+
+    await switch.fire(reason="drill")
+
+    assert attempts.count("0xb") >= 2, "the sweep, and then the retry the failure ate"

@@ -35,7 +35,13 @@ from liqfade.backtest.engine import _resolve_meta
 from liqfade.backtest.fills import BookState
 from liqfade.config.models import Settings
 from liqfade.control.protocol import OrderState, PositionState
-from liqfade.execution.hl import AccountSnapshot, InfoReader, VenuePosition
+from liqfade.execution.hl import (
+    AccountSnapshot,
+    InfoReader,
+    TriggerOrder,
+    VenueOrder,
+    VenuePosition,
+)
 from liqfade.execution.orders import (
     LIVE,
     OrderIntent,
@@ -153,6 +159,9 @@ class VenueSession:
         # entry filled). The size is kept because `positions` is a mirror that lags
         # reconciliation, and a position opened since the last one is invisible in it.
         self.time_stops: dict[str, tuple[int, float]] = {}
+        # What the last `venue_state` read saw: ref -> (coin, oid), so a cancel for an
+        # order the registry does not hold still has somewhere to send it.
+        self._venue_orders: dict[str, tuple[str, int]] = {}
         self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
@@ -252,7 +261,7 @@ class VenueSession:
         return {coin: position.size for coin, position in self.positions.items()}
 
     async def venue_state(self) -> tuple[dict[str, float], list[str]]:
-        """What Hyperliquid holds right now: positions, and the cloids of every open order.
+        """What Hyperliquid holds right now: positions, and a handle on every open order.
 
         The kill switch's pass criterion and its work list. Read fresh from the venue
         rather than from the local mirror, because every failure this exists for was the
@@ -271,8 +280,15 @@ class VenueSession:
             self.reader.open_orders(self.address),
             self.reader.trigger_orders(self.address),
         )
-        cloids = [o.cloid for o in orders if o.cloid] + [t.cloid for t in triggers if t.cloid]
-        return {coin: p.size for coin, p in account.positions.items()}, cloids
+        # Every order, including the ones with no cloid. Filtering those out dropped them
+        # from the work list and from the pass criterion at once, so a kill could report
+        # VENUE FLAT over an order placed by hand on the web UI. `cancel` takes either
+        # handle, and `_venue_orders` is how it turns one back into a coin and an oid.
+        resting: list[VenueOrder | TriggerOrder] = [*orders, *triggers]
+        self._venue_orders = {
+            (order.cloid or f"oid:{order.oid}"): (order.coin, order.oid) for order in resting
+        }
+        return {coin: p.size for coin, p in account.positions.items()}, list(self._venue_orders)
 
     async def open_order_cloids(self) -> list[str]:
         return sorted(order.cloid for order in await self.orders.open_orders())
@@ -633,8 +649,22 @@ class VenueSession:
 
     # --- what the kill switch and /flat call ---------------------------------
 
-    async def cancel(self, cloid: str) -> None:
-        await self.orders.cancel(cloid)
+    async def cancel(self, ref: str) -> None:
+        """Cancel one order, by cloid when we placed it and by oid when we did not.
+
+        `ref` is what `venue_state` handed out: a cloid for an order in the registry, and
+        `oid:<n>` for one that is not in it. An order the venue holds and the registry does
+        not used to raise KeyError here, which the kill counted as a failure and moved past,
+        leaving the order resting through a kill that reported cancelling everything.
+        """
+        with contextlib.suppress(KeyError):
+            await self.orders.cancel(ref)
+            return
+        coin, oid = self._venue_orders.get(ref, ("", 0))
+        if not coin or not oid:
+            log.error("cancel_unknown_ref", ref=ref)
+            raise KeyError(ref)
+        await self.orders.cancel_foreign(coin, oid=oid)
 
     async def cancel_all(self) -> int:
         """Cancel every resting order except the brackets holding open positions.

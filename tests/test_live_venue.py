@@ -973,3 +973,64 @@ async def test_a_paused_tick_still_drains_what_it_refused(tmp_path: Path) -> Non
         assert len(await session.orders.store.refusals(0, START + 10_000)) == 1
     finally:
         await session._store.close()
+
+
+async def test_the_kill_can_cancel_an_order_the_registry_never_heard_of(
+    tmp_path: Path,
+) -> None:
+    """Every order the venue holds is on the kill's list, whatever placed it.
+
+    Two of these were invisible to a kill. One with a cloid the registry lacks raised
+    KeyError, which the sweep counted as a failure and moved past. One with no cloid at all
+    was dropped from the work list and from the pass criterion, so a kill could report
+    VENUE FLAT over an order the account was still holding.
+    """
+    from liqfade.execution.hl import TriggerOrder, VenueOrder
+
+    session, venue = await a_session(tmp_path)
+
+    class Reader(FakeReader):
+        async def open_orders(self, address: str) -> list[VenueOrder]:
+            return [
+                VenueOrder(oid=11, coin=COIN, is_buy=True, px=2999.0, size=0.01, ts_ms=START),
+                VenueOrder(
+                    oid=12,
+                    coin=COIN,
+                    is_buy=True,
+                    px=2998.0,
+                    size=0.01,
+                    ts_ms=START,
+                    cloid="0xnotinourregistry",
+                ),
+            ]
+
+        async def trigger_orders(self, address: str) -> list[TriggerOrder]:
+            return [
+                TriggerOrder(
+                    cloid=None,
+                    coin=COIN,
+                    oid=13,
+                    trigger_px=2900.0,
+                    is_stop=True,
+                    size=0.01,
+                    reduce_only=True,
+                )
+            ]
+
+    try:
+        session.reader = Reader()
+        cancelled_by_oid: list[tuple[str, int]] = []
+
+        async def cancel_oid(coin: str, oid: int) -> None:
+            cancelled_by_oid.append((coin, oid))
+
+        venue.cancel_oid = cancel_oid  # type: ignore[attr-defined]
+
+        _positions, refs = await session.venue_state()
+        assert len(refs) == 3, "every order the venue holds, counted"
+        for ref in refs:
+            await session.cancel(ref)
+
+        assert sorted(cancelled_by_oid) == [(COIN, 11), (COIN, 12), (COIN, 13)]
+    finally:
+        await session._store.close()
