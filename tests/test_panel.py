@@ -11,9 +11,22 @@ from fastapi.testclient import TestClient
 
 from liqfade.config import load_settings
 from liqfade.config.models import Settings
-from liqfade.control.protocol import LatencyState, RiskState, StateSnapshot, now_ms
+from liqfade.control.protocol import (
+    LatencyState,
+    OrderState,
+    PositionState,
+    RiskState,
+    StateSnapshot,
+    now_ms,
+)
 from liqfade.control.state import write_state
-from liqfade.panel.app import create_app, is_loopback, liquidations_by_venue, serve
+from liqfade.panel.app import (
+    create_app,
+    is_loopback,
+    liquidations_by_venue,
+    live_state_path,
+    serve,
+)
 from liqfade.panel.auth import (
     AuthNotConfiguredError,
     LoginLimiter,
@@ -673,3 +686,114 @@ def test_config_endpoint_reports_the_layers_not_only_the_winner(client: TestClie
     # The resolved view stays, because that is what the rest of the page reads.
     keys = {row["key"]: row for row in body["values"]}
     assert keys["sizing.risk_frac"]["source"] == "default.yaml"
+
+
+# --- the live page reads the trading loop, not the recorder ---------------------
+
+
+class TestTheLiveStateEndpoint:
+    """`/api/live/state` is the paper or live loop's snapshot, `/api/state` the recorder's.
+
+    Two processes write state under one data dir on the box: the recorder writes
+    `state.json` and the paper loop writes `state-paper.json`, named in
+    `scripts/systemd/liqfade-paper.service`. The Live page needs the loop's positions,
+    orders and risk, and the recorder's snapshot carries none of them.
+    """
+
+    @staticmethod
+    def _paper(ts_ms: int | None = None) -> StateSnapshot:
+        return StateSnapshot(
+            proc="paper",
+            env="paper",
+            ts_ms=ts_ms if ts_ms is not None else now_ms(),
+            uptime_s=126.9,
+            positions=[
+                PositionState(
+                    coin="BTC",
+                    side="long",
+                    size=0.03,
+                    entry_px=79000.0,
+                    mark_px=79100.0,
+                    notional_usd=2373.0,
+                    unrealized_pnl=3.0,
+                    opened_ms=1_788_784_000_000,
+                )
+            ],
+            orders=[
+                OrderState(
+                    cloid="0xabc",
+                    oid=7,
+                    coin="ETH",
+                    side="sell",
+                    px=3100.0,
+                    size=0.5,
+                    tif="Alo",
+                    reduce_only=True,
+                    status="ACKED",
+                    submitted_ms=1_788_784_100_000,
+                )
+            ],
+            risk=RiskState(paused=False, equity=10_000.0, consecutive_losses=2),
+        )
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/state").status_code == 401
+
+    def test_it_reads_the_paper_state_file_not_the_recorders(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        write_state(settings.state_path, _snapshot())  # the recorder's
+        write_state(live_state_path(settings), self._paper())
+
+        body = client.get("/api/live/state").json()
+
+        assert body["proc"] == "paper"
+        assert body["positions"][0]["coin"] == "BTC"
+        assert body["orders"][0]["cloid"] == "0xabc"
+        assert body["risk"]["consecutive_losses"] == 2
+        assert body["uptime_s"] == 126.9
+        assert body["live_trading"] is False
+        # The recorder's own snapshot is untouched and still served where it was.
+        assert client.get("/api/state").json()["proc"] == "live"
+
+    def test_no_loop_running_is_a_503_naming_the_file(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        response = client.get("/api/live/state")
+        assert response.status_code == 503
+        assert "state-paper.json" in response.json()["detail"]
+
+    def test_a_stale_snapshot_is_a_503_that_still_carries_the_last_values(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """The page greys its controls out behind the banner rather than going blank.
+
+        A stale loop snapshot is the case the read-only banner exists for: the numbers
+        on screen are the last known ones and no control may be sent against them.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+        stale_ms = now_ms() - int((settings.panel.state_stale_s + 5) * 1000)
+        write_state(live_state_path(settings), self._paper(stale_ms))
+
+        response = client.get("/api/live/state")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert "over the" in body["detail"]
+        assert body["state"]["positions"][0]["coin"] == "BTC"
+
+    def test_the_poll_does_not_carry_the_sample_series(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """Same rule as `/api/state`: this is polled every second over an SSH tunnel."""
+        client.post("/api/login", json={"password": PASSWORD})
+        snapshot = self._paper()
+        snapshot.latency.ws_ping_samples = [(1, 2.0)] * 200
+        write_state(live_state_path(settings), snapshot)
+
+        body = client.get("/api/live/state").json()
+
+        assert "ws_ping_samples" not in body["latency"]
+        assert "submit_ack_p50" in body["latency"]

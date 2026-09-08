@@ -53,9 +53,73 @@ def is_loopback(host: str) -> bool:
 
 HOUR_MS = 3_600_000
 MINUTE_MS = 60_000
+# What the trading loop calls its snapshot and its control socket. Two processes write
+# state into one data dir on the box: the recorder keeps the defaults from
+# config/default.yaml, and the paper loop is given these by
+# scripts/systemd/liqfade-paper.service, because the control server takes an exclusive
+# lock on its socket and the second process to start would otherwise refuse outright.
+# Named here rather than read from config because the panel is a third process and does
+# not see the loop unit's Environment= lines. If the unit renames either, the panel says
+# so loudly: /api/live/state 503s naming the file it could not find.
+LIVE_STATE_FILE = "state-paper.json"
+LIVE_SOCKET_FILE = "control-paper.sock"
 # Trades returned in one page. The owner scrolls a table; a year of runs is not a dataset
 # to hand a browser in one response.
 MAX_TRADES_PAGE = 2000
+
+
+def live_state_path(settings: Settings) -> Path:
+    """The trading loop's snapshot, beside the recorder's in the shared data dir."""
+    return settings.paths.data_dir / LIVE_STATE_FILE
+
+
+def live_socket_path(settings: Settings) -> Path:
+    """The trading loop's control socket. The panel is a client of it, never a server."""
+    return settings.paths.data_dir / LIVE_SOCKET_FILE
+
+
+def state_payload(path: Path, stale_s: float, *, absent: str) -> JSONResponse:
+    """One process's snapshot, or a 503 that still carries the last one it wrote.
+
+    Stale is an error rather than a warning field because every number on the page is a
+    trading number: showing a five second old position quietly is worse than an obvious
+    outage. The body carries the snapshot anyway, so the page can grey its controls out
+    behind the banner rather than going blank.
+
+    Args:
+        path: the state file to read.
+        stale_s: seconds of age past which the snapshot is refused.
+        absent: what to say when the file is not there, naming the process that is down.
+    """
+    try:
+        snapshot = read_state(path)
+    except FileNotFoundError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, absent) from None
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"state file unreadable: {exc}"
+        ) from None
+
+    age_s = (now_ms() - snapshot.ts_ms) / 1000.0
+    payload = snapshot.model_dump(mode="json") | {"age_s": age_s}
+    # The latency sample series belongs to the latency endpoints, which the page polls
+    # every thirty seconds. This one is polled every second, and several hundred points
+    # would be the whole payload, over an SSH tunnel, for a chart that has not moved.
+    payload["latency"] = {
+        key: value for key, value in payload["latency"].items() if not key.endswith("_samples")
+    }
+    if age_s > stale_s:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": (
+                    f"state is {age_s:.1f}s old, over the {stale_s}s limit: "
+                    "the writing process is stalled or gone"
+                ),
+                "state": payload,
+            },
+        )
+    return JSONResponse(payload)
 
 
 def _run_dir(reports_dir: Path, run_id: str) -> Path:
@@ -404,45 +468,27 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/state", dependencies=[Depends(require_session)])
     def state() -> JSONResponse:
-        """The snapshot from data/state.json, or 503 when it is missing or stale.
+        """The recorder's snapshot, which is what the recorder page reads."""
+        return state_payload(
+            settings.state_path,
+            settings.panel.state_stale_s,
+            absent=f"no state file at {settings.state_path}: no liqfade process is running",
+        )
 
-        Stale is an error rather than a warning field because every number on the page is
-        a trading number: showing a five second old position quietly is worse than an
-        obvious outage.
+    @api.get("/live/state", dependencies=[Depends(require_session)])
+    def live_state() -> JSONResponse:
+        """The trading loop's snapshot: positions, orders, risk, uptime, live_trading.
+
+        A separate route rather than a query parameter on /api/state, because the two
+        pages poll different files at different times and a page that asked for the
+        wrong one would show the recorder's empty position list as if it were the loop's.
         """
-        try:
-            snapshot = read_state(settings.state_path)
-        except FileNotFoundError:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                f"no state file at {settings.state_path}: no liqfade process is running",
-            ) from None
-        except (ValueError, OSError) as exc:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, f"state file unreadable: {exc}"
-            ) from None
-
-        age_s = (now_ms() - snapshot.ts_ms) / 1000.0
-        payload = snapshot.model_dump(mode="json") | {"age_s": age_s}
-        # The latency sample series belongs to /api/recorder/latency, which the page polls
-        # every thirty seconds. This one is polled every second, and several hundred
-        # points would be the whole payload, over an SSH tunnel, for a chart that has not
-        # moved.
-        payload["latency"] = {
-            key: value for key, value in payload["latency"].items() if not key.endswith("_samples")
-        }
-        if age_s > settings.panel.state_stale_s:
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "detail": (
-                        f"state is {age_s:.1f}s old, over the {settings.panel.state_stale_s}s "
-                        "limit: the writing process is stalled or gone"
-                    ),
-                    "state": payload,
-                },
-            )
-        return JSONResponse(payload)
+        path = live_state_path(settings)
+        return state_payload(
+            path,
+            settings.panel.state_stale_s,
+            absent=f"no state file at {path}: the trading loop is not running",
+        )
 
     @api.get("/recorder/disk", dependencies=[Depends(require_session)])
     def recorder_disk() -> dict[str, Any]:

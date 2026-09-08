@@ -2,38 +2,16 @@ import { useCallback, useEffect, useState } from "react";
 import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, logout } from "./api";
 import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
+import Live from "./Live";
 import Login from "./Login";
 import Reports from "./Reports";
 import type { DiskStats, FeedState, Latency, Liquidations, StateSnapshot } from "./types";
+import { Banner, Row, Section, ms } from "./ui";
 
 const POLL_MS = 1000;
 // The lake does not move fast and duckdb has to read files for it, so poll it slowly.
 const RECORDER_POLL_MS = 30_000;
 const LIQ_HOURS = 24;
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-lg border border-neutral-800 bg-neutral-900/40 p-4">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-neutral-500">
-        {title}
-      </h2>
-      {children}
-    </section>
-  );
-}
-
-function Row({ label, value, tone }: { label: string; value: string; tone?: string }) {
-  return (
-    <div className="flex justify-between gap-4 py-1 text-sm">
-      <span className="text-neutral-400">{label}</span>
-      <span className={tone ?? "text-neutral-100"}>{value}</span>
-    </div>
-  );
-}
-
-function ms(value: number | null) {
-  return value === null ? "-" : `${value.toFixed(0)} ms`;
-}
 
 function gb(bytes: number) {
   return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -97,7 +75,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
   );
 }
 
-type Tab = "recorder" | "reports";
+type Tab = "live" | "recorder" | "reports";
 
 function TabButton({
   tab,
@@ -125,7 +103,7 @@ function TabButton({
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("recorder");
+  const [tab, setTab] = useState<Tab>("live");
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -186,6 +164,7 @@ export default function App() {
           </span>
         </h1>
         <div className="flex items-center gap-2">
+          <TabButton tab="live" current={tab} onPick={setTab} label="live" />
           <TabButton tab="recorder" current={tab} onPick={setTab} label="recorder" />
           <TabButton tab="reports" current={tab} onPick={setTab} label="reports" />
           <button
@@ -197,13 +176,10 @@ export default function App() {
         </div>
       </header>
 
+      {tab === "live" ? <Live onUnauthorized={() => setAuthed(false)} /> : null}
       {tab === "reports" ? <Reports /> : null}
 
-      {tab === "recorder" && problem && (
-        <div className="mb-4 rounded border border-amber-700/60 bg-amber-950/40 px-4 py-2 text-sm text-amber-300">
-          stale: {problem}
-        </div>
-      )}
+      {tab === "recorder" && problem && <Banner kind="warn">stale: {problem}</Banner>}
 
       <div className={`grid gap-4 md:grid-cols-3 ${tab === "recorder" ? "" : "hidden"}`}>
         <Section title="status">

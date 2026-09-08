@@ -21,7 +21,16 @@ export interface StateResult {
 }
 
 export async function fetchState(): Promise<StateResult> {
-  const res = await fetch("/api/state", { credentials: "same-origin" });
+  return fetchStateFrom("/api/state");
+}
+
+/** The trading loop's snapshot. Same shape and same staleness rule, a different file. */
+export async function fetchLiveState(): Promise<StateResult> {
+  return fetchStateFrom("/api/live/state");
+}
+
+async function fetchStateFrom(url: string): Promise<StateResult> {
+  const res = await fetch(url, { credentials: "same-origin" });
   if (res.status === 401) {
     return { state: null, error: null, stale: false, unauthorized: true };
   }
