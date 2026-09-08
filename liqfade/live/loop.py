@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -68,6 +69,18 @@ from liqfade.recorder.streams.base import WSStream, backoff_delay
 from liqfade.recorder.universe import UniverseManager
 
 log = get_logger(__name__)
+
+
+async def _maybe_await(result: Any) -> Any:
+    """Await it when it is a coroutine. Paper's close_out is sync and the venue's is not.
+
+    `RuntimeWarning: coroutine 'VenueSession.close_out' was never awaited` is what this
+    fixes, and the cost of that warning was that shutdown cancelled nothing at all.
+    """
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
 
 __all__ = ["PaperBackend", "PaperLoop"]
 
@@ -600,7 +613,7 @@ class PaperLoop:
             # Flatten before the tasks go: an open paper position left across a restart
             # would be marked against a book the new process has not seen yet.
             with contextlib.suppress(Exception):
-                self.session.close_out(now_ms())
+                await _maybe_await(self.session.close_out(now_ms()))
             await asyncio.wait(tasks, timeout=5.0)
             for task in [*tasks, state_task]:
                 task.cancel()

@@ -6,6 +6,7 @@ disagrees with one of these, the probe wins and this file changes with it.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -354,3 +355,30 @@ def test_a_zero_decimal_asset_survives_the_parse() -> None:
     """szDecimals 0 is a whole-unit asset, not a missing field."""
     meta = parse_asset_meta({"universe": [{"name": "kBONK", "szDecimals": 0, "maxLeverage": 5}]})
     assert meta["kBONK"].sz_decimals == 0
+
+
+async def test_signed_actions_never_share_a_millisecond() -> None:
+    """Hyperliquid nonces are millisecond timestamps, so two actions in one ms collide.
+
+    Drilled on testnet: the kill cancelled three orders back to back and the second came
+    back `{"status": "err", "response": "Invalid nonce: duplicate nonce 1788866428841"}`.
+    The registry marked it cancelled anyway, so the venue kept an order the bot believed
+    it had cancelled, which is the exact disagreement the kill path cannot afford.
+
+    The transport serialises signed calls and refuses to issue two inside one millisecond.
+    """
+    import time
+
+    from liqfade.execution.hl import NonceGate
+
+    gate = NonceGate()
+    stamps = []
+
+    async def one() -> None:
+        async with gate:
+            stamps.append(int(time.time() * 1000))
+
+    await asyncio.gather(*(one() for _ in range(6)))
+
+    assert len(set(stamps)) == len(stamps), f"two actions shared a millisecond: {stamps}"
+    assert stamps == sorted(stamps), "and they must be issued in order"

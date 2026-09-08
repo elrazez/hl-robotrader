@@ -54,13 +54,8 @@ SZ_DECIMALS = {"ETH": 4, "BTC": 5, "SOL": 2}
 
 
 def a_manager(store: OrderStore, transport: Any = None, **kwargs: Any) -> OrderManager:
-    return OrderManager(
-        store,
-        transport or FakeTransport(),
-        sz_decimals=SZ_DECIMALS,
-        killed=lambda: False,
-        **kwargs,
-    )
+    kwargs.setdefault("killed", lambda: False)
+    return OrderManager(store, transport or FakeTransport(), sz_decimals=SZ_DECIMALS, **kwargs)
 
 
 @pytest.fixture
@@ -517,3 +512,41 @@ async def test_without_a_budget_nothing_is_counted(store: OrderStore) -> None:
     await manager.submit(an_intent(px=2000.0))
 
     assert manager.actions_remaining() is None
+
+
+# --- the kill switch must be able to close what the kill switch stopped -----------
+
+
+async def test_the_kill_flag_never_blocks_a_reduce_only_order(store: OrderStore) -> None:
+    """Drilled on testnet: the kill fired, reported "closed 1", and closed nothing.
+
+    `submit` re-checks the kill flag on every order, which is right for an entry and fatal
+    for the kill's own flatten: the kill writes the flag, then sends a reduce-only Ioc to
+    close the position, and its own gate refuses it. The kill reported success because it
+    counted the coins it tried, and the venue still held the position.
+
+    A reduce-only order cannot open or increase anything. It is the same principle the
+    action budget already follows: risk going down is never refused. CLAUDE.md rule 5
+    promises five seconds and no excuses, and a kill that cannot close is not a kill.
+    """
+    transport = FakeTransport()
+    manager = a_manager(store, transport, killed=lambda: True)
+
+    entry = await manager.submit(an_intent(px=2000.0))
+    closing = await manager.submit(an_intent(px=1990.0, reduce_only=True, tag="flat"))
+
+    assert entry.status is OrderStatus.REJECTED, "an entry behind the flag is still refused"
+    assert closing.status is OrderStatus.ACKED, "the flatten must go through"
+    assert [i.reduce_only for i in transport.placed] == [True]
+
+
+async def test_an_entry_is_still_refused_behind_the_flag(store: OrderStore) -> None:
+    """The gate that matters: nothing that adds risk gets past a kill."""
+    transport = FakeTransport()
+    manager = a_manager(store, transport, killed=lambda: True)
+
+    order = await manager.submit(an_intent(px=2000.0))
+
+    assert order.status is OrderStatus.REJECTED
+    assert "kill" in (order.reject_reason or "").lower()
+    assert transport.placed == []

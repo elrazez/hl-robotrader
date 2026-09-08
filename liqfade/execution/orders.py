@@ -511,7 +511,13 @@ class OrderManager:
                 )
                 return existing
 
-            if self.killed():
+            # A reduce-only order cannot open or increase a position, so the flag has
+            # nothing to protect against. It must go through, because the kill switch
+            # writes the flag and *then* sends the reduce-only Ioc that flattens: drilled
+            # on testnet, the kill reported "closed 1" and its own gate had refused the
+            # order, leaving the position open. Same principle as the action budget: risk
+            # going down is never refused.
+            if self.killed() and not intent.reduce_only:
                 reason = "kill switch is on; refusing to place"
                 order = Order(intent=intent, status=OrderStatus.REJECTED, reject_reason=reason)
                 self._orders[intent.cloid] = order

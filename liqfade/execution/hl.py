@@ -23,6 +23,7 @@ so reconciliation reads positions and orders over plain httpx rather than throug
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,7 @@ __all__ = [
     "AccountSnapshot",
     "HyperliquidTransport",
     "InfoReader",
+    "NonceGate",
     "VenueFill",
     "VenueOrder",
     "VenuePosition",
@@ -387,6 +389,36 @@ class InfoReader:
         return parse_user_fills(await self.post({"type": "userFills", "user": address}))
 
 
+class NonceGate:
+    """Serialises signed actions so no two share a millisecond.
+
+    docs/HYPERLIQUID.md: nonces are millisecond timestamps that must increase per signer.
+    The SDK stamps one per call from the wall clock, so two calls inside the same
+    millisecond produce the same nonce and the venue refuses the second with
+    "Invalid nonce: duplicate nonce". Drilled on testnet during a kill, where three
+    cancels went out back to back and one was silently lost: the registry recorded the
+    cancel and the venue kept the order.
+
+    A lock alone is not enough, because a lock does not make the clock advance. This waits
+    until the millisecond after the last action before letting the next one sign.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._last_ms = 0
+
+    async def __aenter__(self) -> None:
+        await self._lock.acquire()
+        now = int(time.time() * 1000)
+        if now <= self._last_ms:
+            await asyncio.sleep((self._last_ms + 1 - now) / 1000.0)
+            now = int(time.time() * 1000)
+        self._last_ms = now
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
 class HyperliquidTransport:
     """`OrderTransport` against the real venue. The SDK is sync, so every call is a thread.
 
@@ -398,6 +430,8 @@ class HyperliquidTransport:
     def __init__(self, signer: Signer) -> None:
         self.signer = signer
         self._exchange = signer.exchange()
+        # One gate for the process: every signed action goes through it, in order.
+        self._nonce = NonceGate()
 
     async def place(self, intent: OrderIntent) -> int:
         """Send one already rounded intent. Nothing here rounds anything.
@@ -426,16 +460,17 @@ class HyperliquidTransport:
             order_type = {"limit": {"tif": intent.tif}}
 
         try:
-            response = await asyncio.to_thread(
-                self._exchange.order,
-                intent.coin,
-                intent.is_buy,
-                size,
-                px,
-                order_type,
-                intent.reduce_only,
-                Cloid.from_str(intent.cloid),
-            )
+            async with self._nonce:
+                response = await asyncio.to_thread(
+                    self._exchange.order,
+                    intent.coin,
+                    intent.is_buy,
+                    size,
+                    px,
+                    order_type,
+                    intent.reduce_only,
+                    Cloid.from_str(intent.cloid),
+                )
         except Exception as exc:
             raise as_transport_error(exc) from exc
         return classify_order_response(response)
@@ -452,9 +487,10 @@ class HyperliquidTransport:
 
         wire = [{**request, "cloid": Cloid.from_str(str(request["cloid"]))} for request in requests]
         try:
-            response = await asyncio.to_thread(
-                self._exchange.bulk_orders, wire, grouping="positionTpsl"
-            )
+            async with self._nonce:
+                response = await asyncio.to_thread(
+                    self._exchange.bulk_orders, wire, grouping="positionTpsl"
+                )
         except Exception as exc:
             raise as_transport_error(exc) from exc
         return classify_group_response(response)
@@ -475,17 +511,18 @@ class HyperliquidTransport:
         wire_px, wire_size = intent.wire
         cloid = Cloid.from_str(intent.cloid)
         try:
-            response = await asyncio.to_thread(
-                self._exchange.modify_order,
-                cloid,
-                intent.coin,
-                intent.is_buy,
-                float(wire_size),
-                float(wire_px),
-                {"limit": {"tif": intent.tif}},
-                intent.reduce_only,
-                cloid,
-            )
+            async with self._nonce:
+                response = await asyncio.to_thread(
+                    self._exchange.modify_order,
+                    cloid,
+                    intent.coin,
+                    intent.is_buy,
+                    float(wire_size),
+                    float(wire_px),
+                    {"limit": {"tif": intent.tif}},
+                    intent.reduce_only,
+                    cloid,
+                )
         except Exception as exc:
             raise as_transport_error(exc) from exc
         return classify_order_response(response)
@@ -494,9 +531,10 @@ class HyperliquidTransport:
         from hyperliquid.utils.types import Cloid
 
         try:
-            response = await asyncio.to_thread(
-                self._exchange.cancel_by_cloid, coin, Cloid.from_str(cloid)
-            )
+            async with self._nonce:
+                response = await asyncio.to_thread(
+                    self._exchange.cancel_by_cloid, coin, Cloid.from_str(cloid)
+                )
         except Exception as exc:
             raise as_transport_error(exc) from exc
         if isinstance(response, dict) and response.get("status") != "ok":
