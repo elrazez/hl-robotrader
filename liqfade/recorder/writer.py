@@ -213,10 +213,17 @@ def _merged_rows(paths: list[Path]) -> Iterator[dict[str, Any]]:
 def _dedup_fields(table_name: str) -> tuple[str, ...]:
     """The columns that identify one row of this table, or `()` when nothing does.
 
-    Only a venue's own trade id does. Two `bbo` or `l2` rows of the same millisecond are
-    two real quotes and nothing tells them apart, so dropping either would be inventing a
-    fact about the book; a repeated `tid` is the same trade written twice.
+    Two kinds of table have an identity. A venue's own trade id is one: a repeated `tid`
+    is the same trade written twice. A poll is the other: `hl_positions` carries the
+    response's own `time`, so one address cannot hold two different positions in the same
+    coin at the same venue millisecond, and a second such row is a re-flush.
+
+    Everything else has none. Two `bbo` or `l2` rows of the same millisecond are two real
+    quotes and nothing tells them apart, so dropping either would be inventing a fact
+    about the book.
     """
+    if table_name == "hl_positions":
+        return ("address", "coin", "ts_ms")
     names = set(schema_for(table_name).names)
     if "tid" not in names:
         return ()

@@ -20,7 +20,7 @@ Two things the schema doc does not say and the wire does:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import orjson
@@ -55,6 +55,9 @@ PONG_MARKER = b'"pong"'
 # unknown token has to drop the row, because guessing it writes the opposite side.
 TRADE_SIDES = {"B": "buy", "A": "sell"}
 
+# (coin, notional_usd, ts_ms, buyer, seller) for one trade the lake has just taken.
+OnUsers = Callable[[str, float, int, str, str], None]
+
 
 def _subscription(channel: str, coin: str) -> dict[str, Any]:
     sub: dict[str, Any] = {"type": channel, "coin": coin}
@@ -87,7 +90,7 @@ def _f(value: Any) -> float | None:
     return float(value)
 
 
-def make_parser() -> Parser:
+def make_parser(*, on_users: OnUsers | None = None) -> Parser:
     """A parser bound to one connection, holding the open 1m bar and seen trades per coin.
 
     **Trades.** Hyperliquid answers a `trades` subscribe with a snapshot of the last ~30
@@ -126,6 +129,15 @@ def make_parser() -> Parser:
     opens, and the bars from a restart's downtime are not written at all. `candles_1m` is
     derivable from `trades` (`liqfade derive candles`), and both a duplicated bar and an
     in-progress bar in the lake are worse than a missing one.
+
+    **Addresses.** Every public HL trade carries `users: [buyer, seller]` and the `trades`
+    table drops it: that table is in `MULTI_VENUE_TABLES`, shared with Bybit, OKX and
+    Binance rows that have no such field, so the addresses cannot become a column on it.
+    With `on_users` set they instead go to a callback, once per trade that passes
+    `_first_sight`, and the recorder feeds them to `AddressBook` in memory. A replayed
+    trade must not be counted twice, or a reconnect would inflate whoever happened to be
+    trading through it. With no callback this parser behaves exactly as it did before,
+    which is what `live/loop.py` gets: it wants the rows and not the addresses.
     """
     open_bars: dict[str, tuple[int, dict[str, Any]]] = {}
     # coin -> its recent trade ids, oldest first. A dict rather than a deque plus a set:
@@ -138,11 +150,15 @@ def make_parser() -> Parser:
         channel = obj.get("channel")
         data = obj.get("data")
         if channel == "trades":
-            return [
-                parsed
-                for parsed in (_trade(row, rx_ms) for row in data)
-                if _first_sight(parsed, seen_tids)
-            ]
+            rows: list[ParsedRow] = []
+            for raw in data:
+                parsed = _trade(raw, rx_ms)
+                if not _first_sight(parsed, seen_tids):
+                    continue
+                rows.append(parsed)
+                if on_users is not None:
+                    _note_users(raw, parsed[1], on_users)
+            return rows
         if channel == "bbo":
             return [_bbo(data, rx_ms)]
         if channel == "l2Book":
@@ -176,6 +192,22 @@ def _trade(row: dict[str, Any], rx_ms: int) -> ParsedRow:
             "tid": int(row["tid"]),
         },
     )
+
+
+def _note_users(raw: dict[str, Any], row: dict[str, Any] | None, on_users: OnUsers) -> None:
+    """Report a trade's two counterparties and what it was worth. Never raises.
+
+    A row the parser refused (`row is None`) reports nothing: it is not in the lake, so
+    it is not a trade. `users` is documented on every public trade, but a payload without
+    it, or with anything other than the two addresses, is skipped rather than guessed at.
+    """
+    users = raw.get("users")
+    px, sz = (row or {}).get("px"), (row or {}).get("sz")
+    if row is None or px is None or sz is None:
+        return
+    if not isinstance(users, list) or len(users) != 2:
+        return
+    on_users(str(row["coin"]), px * sz, int(row["ts_ms"]), str(users[0]), str(users[1]))
 
 
 def _first_sight(parsed: ParsedRow, seen_tids: dict[str, dict[int, None]]) -> bool:

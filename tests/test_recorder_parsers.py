@@ -493,3 +493,54 @@ def test_the_replay_memory_is_bounded_per_coin() -> None:
         parse(_hl_trade("PONS", tid, 1788648000000), RX)
 
     assert parse(_hl_trade("DOGE", 1, 1788648000000), RX + 60_000) == []
+
+
+# --- the address harvest -------------------------------------------------------
+
+
+def test_on_users_reports_both_addresses_and_the_notional_of_each_trade() -> None:
+    """`users` is on every public HL trade and the lake throws it away; this is the only
+    place it is read. The addresses go to an in-memory book, never to a `trades` column:
+    that table is shared with Bybit, OKX and Binance rows that carry no addresses."""
+    seen: list[tuple[str, float, int, str, str]] = []
+    parse = hl.make_parser(on_users=lambda *args: seen.append(args))
+    rows = rows_for(parse(HL_TRADES, RX), "trades")
+
+    assert len(rows) == 2
+    assert seen == [
+        (
+            "BTC",
+            78862.0 * 0.16711,
+            1788098879496,
+            "0x49dfb8ddbd3ba96c0699a3f120e71f2516c345d8",
+            "0x3a62fea9cd2832f639f13d6a5bc5584f62c470e4",
+        ),
+        ("BTC", 78863.0 * 0.00018, 1788098879500, "0x4c69", "0x3a62"),
+    ]
+
+
+def test_a_trade_hyperliquid_replays_is_not_counted_towards_a_second_notional() -> None:
+    """The resubscribe snapshot is the same ~30 trades again. Counting them would inflate
+    exactly the addresses that reconnect most, which is not a fact about anybody's size."""
+    seen: list[tuple[str, float, int, str, str]] = []
+    parse = hl.make_parser(on_users=lambda *args: seen.append(args))
+    parse(HL_TRADES, RX)
+    parse(HL_TRADES, RX + 18_000)  # the same frame, as a reconnect replays it
+    assert len(seen) == 2
+
+
+def test_a_trade_the_parser_refused_reports_no_addresses() -> None:
+    """An unknown side drops the row, and a row that is not in the lake is not a trade."""
+    seen: list[tuple[str, float, int, str, str]] = []
+    parse = hl.make_parser(on_users=lambda *args: seen.append(args))
+    payload = HL_TRADES.replace(b'"side":"A"', b'"side":"Ask"')
+    assert _drops(parse(payload, RX)) == ["trades"]
+    assert [entry[2] for entry in seen] == [1788098879500]  # only the trade that survived
+
+
+def test_a_trade_with_no_users_field_is_recorded_and_reports_nothing() -> None:
+    seen: list[tuple[str, float, int, str, str]] = []
+    parse = hl.make_parser(on_users=lambda *args: seen.append(args))
+    payload = _hl_trade("DOGE", 5, 1788648000000).replace(b',"users":["0x01","0x02"]', b"")
+    assert rows_for(parse(payload, RX), "trades")
+    assert seen == []

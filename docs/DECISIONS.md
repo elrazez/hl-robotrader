@@ -2880,3 +2880,118 @@ the one field that answers the question, and three existing tests failed because
 changed behaviour they correctly asserted. Reverted. Reading the flag before theorising
 would have cost one command; this is the third time in this branch that the answer was one
 direct question away.
+
+## 2026-09-08 (05d: the refusals the live loop threw away)
+
+**The leak.** `StrategyEngine.take_rejections()` was called by `run_backtest` at the end of
+a replay and by nothing in `live/`. In a paper session `_rejections` grew for the life of
+the process and was written nowhere, and `PaperSession.result.rejections` stayed `[]`. The
+module docstring said the drain existed so a live loop would not grow a list forever, and
+nothing drained it. Sizing and risk fared worse: `_place_entry` recorded
+`(ts_ms, coin, gate, reason)` into `recent_blocks` and dropped the intent, so the prices
+that were refused were gone before `report_risk_blocks` logged the reason. A week of paper
+therefore knew how often each gate fired and nothing about what it cost.
+
+**What was built.** `Rejection` gained the four prices, the time stop and the urgency of the
+intent it killed; rules and filters both run after `_price`, so they are never absent and
+are not optional. `BacktestResult.refused` and `VenueCounters.refused` hold the sizing and
+risk refusals with the same fields under the same name, which is what lets one drain in
+`live/refusals.py` serve both sessions. `recent_blocks` is untouched: `report_risk_blocks`
+unpacks that four-tuple and CLAUDE.md rule 5 tests the path it feeds. The refusals land in
+a new `refusals` table in `data/orders.sqlite`, created by the schema script an existing
+registry is reopened with, so the box's database gains it on the next start.
+
+**Why it is a bound and says so.** `liqfade refusals` fills each refused intent as a taker
+at the first recorded print after `backtest.latency_ms`, with no queue, no book walk and no
+partial. Two rules are taken from braindeadpt's `shadow_outcome_evaluator.py` because they
+bias the counterfactual the right way: a second that touches both the target and the stop
+resolves as **the stop**, and a window the lake cannot cover is `no_tape` rather than a
+zero. A counterfactual that flatters the trades you did not take is worse than not
+measuring, because it argues for removing filters that were earning their keep. The exact
+answer for one filter is still a second backtest with it switched off, which `liqfade lab`
+runs; the report's first paragraph says so. Notional is sizing's risk-budget rule at
+`--equity` before any cap, because neither the account's equity at that millisecond nor the
+coin's depth is persisted, and guessing either would be a worse number than a stated bound.
+
+Reverse if the refusal table ever grows fast enough to matter on disk (it is one row per
+refused intent, so a soak week is thousands, not millions), or if the panel wants the
+scoring live rather than as a weekly command.
+
+## 2026-09-08 (the liquidation map, step one: recorder only)
+
+**`hl_positions`, a new table of public Hyperliquid positions polled from
+`clearinghouseState`.** `docs/research/external_bots_scan.md` section 1 kept this idea out
+of a scan of four public liquidation bots: every HL position is readable by anyone, and
+each one carries `liquidationPx`, the venue's own computed liquidation level. Polling the
+addresses the tape names gives a forward-looking map of what is queued to be force-closed
+at each price, which is worth more to a fader than to the cascade-chasers those bots are.
+Recorder only: no feature, no strategy wiring, nothing under `strategy/` or `features/`.
+Reverse by deleting the poller if Q9 says the map measures nothing, which is the
+preregistered stop rule.
+
+**Why it had to start now and small.** `clearinghouseState` answers for now and never for
+a past block, so there is no way to backtest this over the year already in the lake. The
+only way to have data is to have been recording, which makes step one small and step two
+patient. Nothing grades it until 21 days exist.
+
+**The addresses come from the tape, not from a list.** The public `trades` payload carries
+`users: [buyer, seller]` and the lake was throwing it away, because `trades` is in
+`MULTI_VENUE_TABLES` and Bybit, OKX and Binance rows have no such field. So the parser
+gained an optional `on_users` callback and the addresses go to an in-memory `AddressBook`
+persisted as `data/hl_addresses.json`, ranked by cumulative traded notional, bounded at
+5,000. The two public bots that solve this differently both rot: one buys the positions
+from a keyed third-party API, the other hardcodes thirteen wallets in its config.
+
+**Cumulative and never decayed.** A whale who opened a position a week ago and has not
+traded since is exactly who the map is for, so the ranking must not forget them. The
+ceiling (a permanently dormant address holds its rank forever) is named in a `ponytail:`
+comment with its upgrade.
+
+**Rate budget: 400 of 1200 per minute.** `clearinghouseState` weighs 2 against the 1200
+weight/min per-IP limit, so the default 200 addresses at 60s is 400, one third, and the
+hourly universe refresh is the recorder's only other info traffic. The addresses are asked
+sequentially and never gathered, so a slow venue stretches a poll rather than bursting the
+whole minute's budget into one instant.
+
+**Dedup key `(address, coin, ts_ms)`.** The first table in the lake whose identity is not a
+venue trade id. `ts_ms` is the response's own `time`, so one address cannot hold two
+different positions in the same coin at the same venue millisecond; a second such row is a
+re-flush. `_dedup_fields` gained a case rather than a rule.
+
+**Disk, estimated and to be measured.** At 200 addresses, five universe coins each and
+1440 polls a day, about 1.4 million rows a day, of the order of the `trades` table. The
+estimate's weak term is coins-per-address: the first probed account held five open
+positions but only three were in a plausible universe. **Measure the compacted partition
+after the first full day on the VPS (`du -sh /srv/liqfade/data/parquet/hl_positions`) and
+write the real number here beside this estimate.** Above 200 MB a day the follow-up is a
+changed-only write plus an hourly full snapshot, named in a `ponytail:` comment and not
+built now.
+
+**Config reload does not reach the poller.** Coinalyze's does not either; a restart applies
+a change. Said in the config comment rather than fixed, because the recorder is restarted
+by every deploy anyway.
+
+**Not in `CONTINUOUS_STREAMS`.** A poll is sparse by nature, so only its connection is
+monitored, exactly like `coinalyze.xchg_ctx`. A declared-but-idle stream pages Telegram
+every ten minutes, which is why the poller declares no stream at all when it is disabled.
+
+## 2026-09-08 (05f: the settings write nobody announced)
+
+**A settings write the running loop did not take is posted to Telegram by the panel
+itself.** The `CONFIG RELOADED` message is a side effect of a reload that applied. When
+the control socket is down, when the loop refuses restart-only keys, or when the values
+were already live, the write existed only in `overrides.yaml` and `panel_audit.jsonl`,
+both of which need someone to go and look. CLAUDE.md's settings flow promises the owner
+hears about every change, and the change made while the loop is down is exactly the one
+that is easiest to forget was ever made.
+
+Two alternatives were rejected. The panel posting **every** write would put two messages
+on the phone for the write the loop did announce, for one event. The loop posting it on
+its **next** reload is minutes away at best and never if it is down, which is the case
+this exists for. So: the loop announces what it applied, the panel announces what the
+loop did not take, and there is exactly one message per write either way.
+
+The panel unit already loads the same `/srv/liqfade/.env` as the loops, so the token and
+the chat id are in its environment, and `send_alert` never raises into the request.
+Reverse if the panel is ever run somewhere that env is not available; the message would
+then have to come from a process that has it.

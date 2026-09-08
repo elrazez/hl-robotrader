@@ -415,11 +415,19 @@ class NonceGate:
 
     async def __aenter__(self) -> None:
         await self._lock.acquire()
-        now = int(time.time() * 1000)
-        if now <= self._last_ms:
-            await asyncio.sleep((self._last_ms + 1 - now) / 1000.0)
+        # The wait happens with the lock held, and the kill wraps every venue call in a
+        # `wait_for`: a call abandoned at its deadline is cancelled inside this sleep and
+        # never reaches `__aexit__`. Released here, or the lock leaks once and every later
+        # signed action in the process waits on it forever.
+        try:
             now = int(time.time() * 1000)
-        self._last_ms = now
+            if now <= self._last_ms:
+                await asyncio.sleep((self._last_ms + 1 - now) / 1000.0)
+                now = int(time.time() * 1000)
+            self._last_ms = now
+        except BaseException:
+            self._lock.release()
+            raise
 
     async def __aexit__(self, *exc: object) -> None:
         self._lock.release()

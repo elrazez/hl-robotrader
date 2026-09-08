@@ -30,12 +30,15 @@ from liqfade.control import ControlServer, StateWriter
 from liqfade.control.protocol import FeedState, ReloadResult, now_ms
 from liqfade.data.symbols import to_venue_symbol
 from liqfade.log import get_logger
+from liqfade.recorder.addresses import FILENAME as ADDRESS_FILE
+from liqfade.recorder.addresses import AddressBook
 from liqfade.recorder.backend import LatencyTracker, RecorderBackend
 from liqfade.recorder.buffer import Buffers
 from liqfade.recorder.health import Health
 from liqfade.recorder.streams import binance, bybit, hl, okx
 from liqfade.recorder.streams.base import RowSink, WSStream, backoff_delay
 from liqfade.recorder.streams.coinalyze import CoinalyzePoller
+from liqfade.recorder.streams.hl_positions import HlPositionsPoller
 from liqfade.recorder.universe import UniverseManager
 from liqfade.recorder.writer import compact_day, quarantine_rows, write_rows
 
@@ -59,12 +62,16 @@ def build_streams(
     *,
     on_rtt_ms: Callable[[float], None] | None = None,
     on_reconnect: Callable[[str], None] | None = None,
+    on_users: hl.OnUsers | None = None,
 ) -> list[WSStream]:
     """Every enabled venue stream, pointed at one sink.
 
     Module level rather than a method, because the paper loop needs the same feeds with a
     different sink: it turns rows into features and a book instead of into Parquet. One
     definition of which venues, which frames and which parser, for both.
+
+    `on_users` reaches the Hyperliquid parser alone: it is the only venue whose public
+    trades name their counterparties. The paper loop passes none and is unchanged.
     """
     venues = settings.venues
     cfg = settings.recorder
@@ -75,7 +82,7 @@ def build_streams(
             WSStream(
                 hl.VENUE,
                 venues.hyperliquid.ws_url,
-                parse=hl.make_parser(),
+                parse=hl.make_parser(on_users=on_users),
                 sink=sink,
                 cfg=cfg,
                 tables=hl.TABLES,
@@ -184,8 +191,20 @@ class Recorder:
             # the counter that says the lake is short and by how much.
             "lost_rows": 0,
         }
+        # Loaded before the streams are built: `_build_streams` hands the parser the
+        # book's `note`, and a restart that began from an empty book would throw away
+        # weeks of ranking and poll the wrong addresses until it warmed up again.
+        self.address_path = Path(settings.paths.data_dir) / ADDRESS_FILE
+        self.book = AddressBook.load(self.address_path)
         self.streams: list[WSStream] = self._build_streams()
         self.poller = CoinalyzePoller(settings.venues.coinalyze, self.sink)
+        self.positions = HlPositionsPoller(
+            settings.venues.hyperliquid.positions,
+            self.sink,
+            self.book,
+            settings.venues.hyperliquid.info_base,
+            book_path=self.address_path,
+        )
         self.universe = UniverseManager(
             settings.universe,
             settings.venues.hyperliquid.info_base,
@@ -195,7 +214,7 @@ class Recorder:
         self.health = Health(
             settings.recorder,
             settings.paths.data_dir,
-            [*self.streams, self.poller],
+            [*self.streams, self.poller, self.positions],
         )
         self._flat_config = flatten(resolve(settings.env)[0])
         # Alerts raised from the receive loop, which is sync and cannot await. Drained on
@@ -205,7 +224,23 @@ class Recorder:
     # --- construction --------------------------------------------------------
 
     def _build_streams(self) -> list[WSStream]:
-        return build_streams(self.settings, self.sink, on_rtt_ms=self.latency.add_ws_ping)
+        # The harvest is wired only when something will poll the addresses: with the
+        # positions poller off nothing reads the book and nothing prunes it either.
+        harvest = self._note_users if self.settings.venues.hyperliquid.positions.enabled else None
+        return build_streams(
+            self.settings, self.sink, on_rtt_ms=self.latency.add_ws_ping, on_users=harvest
+        )
+
+    def _note_users(
+        self, coin: str, notional_usd: float, ts_ms: int, buyer: str, seller: str
+    ) -> None:
+        """Both counterparties of one Hyperliquid trade into the address book.
+
+        Both sides, because either can be the one carrying a leveraged position; the
+        ranking is by traded notional and a trade is worth the same to both of them.
+        """
+        self.book.note(buyer, notional_usd, ts_ms)
+        self.book.note(seller, notional_usd, ts_ms)
 
     # --- the row sink every stream writes through ----------------------------
 
@@ -266,6 +301,7 @@ class Recorder:
     def feed_states(self, at_ms: int) -> list[FeedState]:
         states = [state for stream in self.streams for state in stream.feed_states(at_ms)]
         states.extend(self.poller.feed_states(at_ms))
+        states.extend(self.positions.feed_states(at_ms))
         return sorted(states, key=lambda state: state.name)
 
     async def reload(self) -> ReloadResult:
@@ -310,6 +346,7 @@ class Recorder:
     async def _apply_universe(self, coins: Sequence[str]) -> bool:
         applied = await apply_universe(self.streams, coins)
         self.poller.set_universe(list(coins))  # no socket, so nothing here can fail
+        self.positions.set_universe(list(coins))
         return applied
 
     async def _bootstrap_universe(self) -> None:
@@ -484,6 +521,7 @@ class Recorder:
             *[(f"stream.{s.venue}", lambda s=s: s.run(stop)) for s in self.streams],
             ("universe", lambda: self.universe.run(stop)),
             ("coinalyze", lambda: self.poller.run(stop)),
+            ("hl_positions", lambda: self.positions.run(stop)),
             ("health", lambda: self.health.run(stop)),
             ("flush", lambda: self._flush_loop(stop)),
             ("compaction", lambda: self._compaction_loop(stop)),

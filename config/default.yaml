@@ -34,6 +34,22 @@ venues:
     ws_rotate_frac: 0.9
     liq_weight: 1.0  # weight in aggregated liquidation notional; HL-exact is complete
     complete: false  # the free public feed does not flag liquidations, only the S3 pull does
+    # The public liquidation map: `clearinghouseState` is keyless for any address, and
+    # every position it returns carries the venue's own `liquidationPx`. Poll the
+    # addresses the tape names and you have a forward-looking map of what is queued to be
+    # force-closed at each price. Recorder only for now; nothing reads hl_positions until
+    # the Q9 research question grades it (docs/research/external_bots_scan.md section 1).
+    #
+    # Budget: clearinghouseState weighs 2 against 1200 weight/min per IP
+    # (docs/HYPERLIQUID.md), so 200 addresses a minute is 400, one third of it, and the
+    # hourly universe refresh is the recorder's only other info traffic.
+    #
+    # Config reload does not reach this poller (Coinalyze's does not either): a restart
+    # is what applies a change here.
+    positions:
+      enabled: true
+      poll_s: 60  # seconds between polls of the tracked addresses
+      max_addresses: 200  # addresses per poll, ranked by cumulative traded notional
   binance:
     enabled: true
     ws_url: wss://fstream.binance.com/ws/!forceOrder@arr

@@ -11,6 +11,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import orjson
 import pytest
 import structlog
 
@@ -550,3 +551,76 @@ async def test_an_entry_is_still_refused_behind_the_flag(store: OrderStore) -> N
     assert order.status is OrderStatus.REJECTED
     assert "kill" in (order.reject_reason or "").lower()
     assert transport.placed == []
+
+
+# --- refusals -------------------------------------------------------------------
+
+
+def a_refusal(**kwargs: Any) -> Any:
+    from liqfade.strategy.engine import Rejection
+
+    fields: dict[str, Any] = {
+        "coin": "ETH",
+        "side": "long",
+        "ts_ms": 1_700_000_000_000,
+        "reason": "spread_too_wide",
+        "stage": "filter",
+        "entry_px": 2000.0,
+        "target_px": 2020.0,
+        "stop_px": 1990.0,
+        "time_stop_s": 900.0,
+        "urgency": "normal",
+        "explain": {"liq_z_60s": 4.5},
+    }
+    fields.update(kwargs)
+    return Rejection(**fields)
+
+
+async def test_refusals_round_trip_through_the_registry(store: OrderStore) -> None:
+    """What the drain writes is what the scorer reads back, prices and explain included."""
+    await store.add_refusals([a_refusal(), a_refusal(ts_ms=1_700_000_060_000, coin="BTC")])
+
+    rows = await store.refusals(1_699_999_000_000, 1_700_000_100_000)
+
+    assert [row["coin"] for row in rows] == ["ETH", "BTC"]
+    assert rows[0]["entry_px"] == 2000.0
+    assert rows[0]["stage"] == "filter"
+    assert orjson.loads(rows[0]["explain_json"]) == {"liq_z_60s": 4.5}
+
+
+async def test_refusals_are_windowed_by_time(store: OrderStore) -> None:
+    """The scorer asks for a week, not for the life of the box."""
+    await store.add_refusals([a_refusal(ts_ms=1_000), a_refusal(ts_ms=9_000)])
+
+    assert [row["ts_ms"] for row in await store.refusals(2_000, 10_000)] == [9_000]
+
+
+async def test_an_existing_registry_without_the_table_gains_it(tmp_path: Path) -> None:
+    """The box has an `orders.sqlite` full of real orders. It must not need deleting.
+
+    `CREATE TABLE IF NOT EXISTS` covers a missing table, but only if the schema script is
+    rerun on an existing file, which is what the 05c migration path already does for a
+    missing column. This pins that a database written before `refusals` existed gains it
+    on the next start rather than raising on the first read.
+    """
+    import aiosqlite
+
+    path = tmp_path / "orders.sqlite"
+    legacy = await aiosqlite.connect(path)
+    await legacy.execute(
+        "CREATE TABLE orders (cloid TEXT PRIMARY KEY, coin TEXT NOT NULL, is_buy INTEGER "
+        "NOT NULL, px REAL NOT NULL, size REAL NOT NULL, tif TEXT NOT NULL, reduce_only "
+        "INTEGER NOT NULL, tag TEXT NOT NULL, trigger_px REAL, tpsl TEXT, status TEXT NOT "
+        "NULL, oid INTEGER, filled REAL NOT NULL DEFAULT 0, avg_px REAL NOT NULL DEFAULT 0, "
+        "fees REAL NOT NULL DEFAULT 0, reject_reason TEXT, submitted_ms INTEGER NOT NULL, "
+        "updated_ms INTEGER NOT NULL)"
+    )
+    await legacy.commit()
+    await legacy.close()
+
+    store = await OrderStore.open(path)
+    try:
+        await store.add_refusals([a_refusal()])
+        assert len(await store.refusals(0, 2_000_000_000_000)) == 1
+    finally:
+        await store.close()

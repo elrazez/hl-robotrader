@@ -23,6 +23,7 @@ ALL_COMMANDS = {
     "backfill",
     "derive",
     "backtest",
+    "refusals",
     "paper",
     "testnet",
     "live",

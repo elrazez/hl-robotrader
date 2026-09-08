@@ -312,23 +312,52 @@ async def test_a_hung_cancel_does_not_stop_the_close_from_being_tried(tmp_path: 
 
 
 async def test_a_second_kill_during_one_joins_it_rather_than_waiting_for_it(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A retried /kill during a slow kill must answer with the one in flight.
 
     The lock made the second caller wait for the first sweep and then run a second, which
     is two budgets for one question, from a caller who has already
     typed /kill twice.
+
+    Timed on a clock the test owns, the way `tests/test_backtest_progress.py` does it: the
+    venue calls charge fake seconds and the wall clock is never read. The wall clock read
+    0.4s for one sweep on an idle box and anything at all under `-n auto`, so the same
+    passing kill failed by the load on the machine it ran on.
+
+    The clock is swapped into `kill.py`'s own namespace rather than into `time` itself:
+    `asyncio` reads `time.monotonic` for every timer it holds, and a frozen one there
+    means `asyncio.sleep` never returns.
     """
-    executor = FakeExecutor(orders=["0xa"], positions={"ETH": 1.0}, slow_s=0.2)
+    clock = {"wall": 100.0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return clock["wall"]
+
+    monkeypatch.setattr("liqfade.execution.kill.time", FakeTime)
+
+    class Charged(FakeExecutor):
+        """Every venue call costs its `slow_s` in fake seconds as well as real ones."""
+
+        async def cancel(self, cloid: str) -> None:
+            clock["wall"] += self.slow_s
+            await super().cancel(cloid)
+
+        async def close_position(self, coin: str, size: float) -> None:
+            clock["wall"] += self.slow_s
+            await super().close_position(coin, size)
+
+    executor = Charged(orders=["0xa"], positions={"ETH": 1.0}, slow_s=0.2)
     switch = a_switch(tmp_path, executor, budget_s=2.0)
 
-    started = time.monotonic()
+    started = clock["wall"]
     first, second = await asyncio.gather(switch.fire(reason="one"), switch.fire(reason="two"))
-    elapsed = time.monotonic() - started
+    elapsed = clock["wall"] - started
 
     assert first == second
-    assert elapsed < 0.6  # one sweep, not two queued behind each other
+    assert 0.3 < elapsed < 0.6, elapsed  # one sweep of two calls, not two sweeps of two
     assert executor.cancelled == ["0xa"]
     assert executor.closed == [("ETH", 1.0)]
 

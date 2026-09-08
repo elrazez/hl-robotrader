@@ -35,6 +35,23 @@ def liq(ts_ms: int, venue: str = "bybit") -> dict[str, object]:
     }
 
 
+def position(ts_ms: int, address: str = "0xa", coin: str = "BTC") -> dict[str, object]:
+    return {
+        "coin": coin,
+        "ts_ms": ts_ms,
+        "rx_ms": ts_ms + 3,
+        "address": address,
+        "szi": 1.5,
+        "entry_px": 60000.0,
+        "liquidation_px": None,
+        "position_value_usd": 90000.0,
+        "margin_used_usd": 9000.0,
+        "leverage": 10.0,
+        "leverage_type": "cross",
+        "max_leverage": 40,
+    }
+
+
 def bbo(ts_ms: int) -> dict[str, object]:
     return {
         "coin": "BTC",
@@ -456,3 +473,31 @@ def test_an_already_compacted_day_can_be_folded_again_to_dedupe_it(tmp_path: Pat
     assert compact_day(tmp_path, DATE) == {}, "a lone day file is left alone by default"
     assert compact_day(tmp_path, DATE, force=True) == {"trades": 2}
     assert read(day).column("tid").to_pylist() == [100, 101]
+
+
+def test_compaction_drops_a_poll_that_was_flushed_twice(tmp_path: Path) -> None:
+    """Two hl_positions rows with the same (address, coin, ts_ms) are one poll written
+    twice, never two facts: `ts_ms` is the response's own `time`, so one address cannot
+    hold two different positions in the same coin at the same venue millisecond."""
+    write_rows(
+        tmp_path,
+        ("hl_positions", "hyperliquid", DATE, 10),
+        [position(1, coin="BTC"), position(1, coin="ETH")],
+    )
+    write_rows(
+        tmp_path,
+        ("hl_positions", "hyperliquid", DATE, 11),
+        [position(1, coin="ETH"), position(2, coin="ETH"), position(1, address="0xb")],
+    )
+
+    assert compact_day(tmp_path, DATE) == {"hl_positions": 4}
+    # Single venue, so the day folds under the venue name rather than to all_day.
+    table = read(partition_dir(tmp_path, "hl_positions", DATE) / "hyperliquid_day.parquet")
+    assert sorted(
+        zip(table.column("address").to_pylist(), table.column("coin").to_pylist(), strict=True)
+    ) == [
+        ("0xa", "BTC"),
+        ("0xa", "ETH"),
+        ("0xa", "ETH"),
+        ("0xb", "BTC"),
+    ]

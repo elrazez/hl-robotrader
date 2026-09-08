@@ -419,3 +419,33 @@ def test_equity_in_all_three_account_layouts() -> None:
     assert parse_clearinghouse_state(state("400.0"), spot=spot("600.0")).equity == pytest.approx(
         1000.0
     )
+
+
+async def test_a_signed_action_abandoned_inside_the_gate_does_not_deadlock_the_next_one() -> None:
+    """The kill wraps every venue call in `wait_for`, so a call is abandoned mid-gate.
+
+    `__aenter__` holds the lock while it waits out the millisecond, and a cancellation
+    there never reaches `__aexit__`. Leaked once, the lock is held for the life of the
+    process and every later signed action, the kill's own cancels included, waits on it
+    forever.
+    """
+    import time
+
+    from liqfade.execution.hl import NonceGate
+
+    gate = NonceGate()
+    # The next entry has a wait to be cancelled inside, on any box: the gate holds the
+    # lock while it sleeps to the next free millisecond.
+    gate._last_ms = int(time.time() * 1000) + 50
+
+    async def signed_action() -> str:
+        async with gate:
+            return "done"
+
+    abandoned = asyncio.create_task(signed_action())
+    await asyncio.sleep(0)  # it now holds the lock and is sleeping out the millisecond
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+
+    assert await asyncio.wait_for(signed_action(), timeout=2.0) == "done"

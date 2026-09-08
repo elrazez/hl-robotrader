@@ -202,6 +202,31 @@ XCHG_CTX = pa.schema(
     ]
 )
 
+# Public Hyperliquid positions, polled from `clearinghouseState` for the addresses the
+# tape names. One row per open position per poll, so the table is a time series of who is
+# holding what and where the venue would liquidate them. Single venue by construction:
+# no other exchange publishes its accounts, so this is not in MULTI_VENUE_TABLES.
+HL_POSITIONS = pa.schema(
+    [
+        ("coin", STR),
+        ("ts_ms", I64),  # the response's `time`
+        ("rx_ms", I64),
+        ("source", STR),
+        ("address", STR),
+        ("szi", F64),  # signed as HL sends it: negative is short
+        ("entry_px", F64),
+        # Nullable, and it stays null when the venue sends null. A position with no
+        # liquidation level is a fact about the account; a zero would put a cluster at
+        # price zero and every map built from this table would be wrong there.
+        ("liquidation_px", F64),
+        ("position_value_usd", F64),
+        ("margin_used_usd", F64),
+        ("leverage", F64),  # `leverage.value`; float because only the venue decides it
+        ("leverage_type", STR),  # cross | isolated, from `leverage.type`
+        ("max_leverage", I64),  # the asset's cap, an integer in `meta`
+    ]
+)
+
 SCHEMAS: dict[str, pa.Schema] = {
     "liquidations": LIQUIDATIONS,
     "trades": TRADES,
@@ -211,6 +236,7 @@ SCHEMAS: dict[str, pa.Schema] = {
     "candles_1m": CANDLES_1M,
     "xchg_ctx": XCHG_CTX,
     "fills_full": FILLS_FULL,
+    "hl_positions": HL_POSITIONS,
 }
 
 # Tables written by more than one venue. Used by compaction to decide whether a day

@@ -73,7 +73,7 @@ from liqfade.log import get_logger
 from liqfade.risk.engine import RiskEngine
 from liqfade.risk.entry import gate_entry
 from liqfade.sizing import LiquidityStats
-from liqfade.strategy.engine import Rejection, StrategyEngine
+from liqfade.strategy.engine import Rejection, StrategyEngine, rejection_of
 from liqfade.strategy.types import AssetMeta, FeatureRow, Intent
 
 log = get_logger(__name__)
@@ -224,6 +224,11 @@ class BacktestResult:
     recent_blocks: deque[tuple[int, str, str, str]] = field(
         default_factory=lambda: deque(maxlen=RECENT_BLOCKS)
     )
+    # The same refusals with the intent attached, for `liqfade refusals` to price. Beside
+    # `recent_blocks` rather than replacing it: that tuple is what `report_risk_blocks`
+    # unpacks and posts, and widening it would change a path CLAUDE.md rule 5 tests.
+    # Bounded for the same reason and drained by the same kind of reader.
+    refused: deque[Rejection] = field(default_factory=lambda: deque(maxlen=RECENT_BLOCKS))
     intents: int = 0
     entries_placed: int = 0
     sizing_blocks: dict[str, int] = field(default_factory=dict)
@@ -842,12 +847,16 @@ def _place_entry(
         assert gated.reason is not None
         result.sizing_blocks[gated.reason] = result.sizing_blocks.get(gated.reason, 0) + 1
         result.recent_blocks.append((now_ms, intent.coin, "sizing", gated.reason))
+        result.refused.append(
+            rejection_of(intent, ts_ms=now_ms, reason=gated.reason, stage="sizing")
+        )
         return
     if gated.depth_cap_applied:
         result.depth_capped_entries += 1
     if gated.reason is not None:
         result.risk_blocks[gated.reason] = result.risk_blocks.get(gated.reason, 0) + 1
         result.recent_blocks.append((now_ms, intent.coin, "risk", gated.reason))
+        result.refused.append(rejection_of(intent, ts_ms=now_ms, reason=gated.reason, stage="risk"))
         return
 
     coin_state.intent = intent

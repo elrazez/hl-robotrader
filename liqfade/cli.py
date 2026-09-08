@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 from liqfade.config import ConfigError, flatten, load_settings, resolve
 from liqfade.config.models import Settings
 
@@ -625,6 +627,100 @@ def _with_latency(settings: Settings, latency_ms: int) -> Settings:
 # --- lab ----------------------------------------------------------------------
 
 
+def cmd_refusals(args: argparse.Namespace) -> int:
+    """Price what the live loop refused, over the tape that followed each refusal.
+
+    The weekly review command. It answers "what did `spread_too_wide` cost me last week"
+    from the run that produced the refusals, which the backtest cannot do: a replay
+    answers the same question about a different week.
+    """
+    from datetime import UTC, datetime
+
+    from liqfade.backtest.shadow import (
+        group_outcomes,
+        outcomes_frame,
+        render_report,
+        score_all,
+    )
+    from liqfade.data.ingest.common import BackfillError, parse_day
+    from liqfade.execution.orders import OrderStore
+    from liqfade.log import setup_logging
+    from liqfade.strategy.engine import Rejection
+
+    settings = _settings(args)
+    setup_logging(proc="refusals", env=settings.env, level=settings.logging.level)
+
+    try:
+        if not args.start or not args.end:
+            raise BackfillError("refusals needs --start and --end (YYYY-MM-DD, inclusive, UTC)")
+        start_day, end_day = parse_day(args.start), parse_day(args.end)
+    except BackfillError as exc:
+        print(f"refusals error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    def midnight(day: Any) -> int:
+        return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
+
+    start_ms = midnight(start_day)
+    end_ms = midnight(end_day) + 86_400_000  # --end is inclusive of the whole day
+    if end_ms <= start_ms:
+        print("refusals error: --end is before --start", file=sys.stderr)
+        return EXIT_ERROR
+
+    db_path = Path(args.db) if args.db else settings.order_db_path
+    if not db_path.exists():
+        print(f"refusals error: no order registry at {db_path}", file=sys.stderr)
+        return EXIT_ERROR
+
+    async def read() -> list[Rejection]:
+        store = await OrderStore.open(db_path)
+        try:
+            rows = await store.refusals(start_ms, end_ms)
+        finally:
+            await store.close()
+        return [
+            Rejection(
+                coin=row["coin"],
+                side=row["side"],
+                ts_ms=row["ts_ms"],
+                reason=row["reason"],
+                stage=row["stage"],
+                entry_px=row["entry_px"],
+                target_px=row["target_px"],
+                stop_px=row["stop_px"],
+                time_stop_s=row["time_stop_s"],
+                urgency=row["urgency"],
+                explain=orjson.loads(row["explain_json"]),
+            )
+            for row in rows
+        ]
+
+    refusals = asyncio.run(read())
+    scored = score_all(refusals, settings.paths.data_dir, settings, equity=args.equity)
+    groups = group_outcomes(scored)
+
+    out_dir = Path(args.out) if args.out else settings.paths.reports_dir / "live"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"refusals_{args.start}_{args.end}"
+    report = render_report(
+        groups,
+        start=args.start,
+        end=args.end,
+        equity=args.equity,
+        settings=settings,
+        total=len(refusals),
+    )
+    (out_dir / f"{stem}.md").write_text(report)
+    outcomes_frame(scored).write_parquet(out_dir / f"{stem}.parquet")
+
+    print(f"{out_dir / f'{stem}.md'}")
+    for group in groups:
+        print(f"  {group.verdict()}")
+    if not refusals:
+        print("  no refusals recorded in that window")
+    return 0
+
+
 def cmd_lab(args: argparse.Namespace) -> int:
     """Open the terminal workbench.
 
@@ -1086,6 +1182,24 @@ def build_parser() -> argparse.ArgumentParser:
         "'-' disables it)",
     )
 
+    refusals = sub.add_parser(
+        "refusals", parents=[common], help="price what the live loop refused, over recorded tape"
+    )
+    refusals.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    refusals.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    refusals.add_argument(
+        "--equity",
+        type=float,
+        default=DEFAULT_PAPER_EQUITY,
+        help="equity to size the refused intents against; sizing's risk budget rule is "
+        "applied to it before any cap",
+    )
+    refusals.add_argument(
+        "--db", default=None, help="the order registry (default: <data-dir>/orders.sqlite)"
+    )
+    refusals.add_argument("--out", default=None, help="report directory (default: reports/live/)")
+    refusals.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+
     lab = sub.add_parser(
         "lab", parents=[common], help="the terminal workbench: configs, runs, results"
     )
@@ -1193,6 +1307,7 @@ HANDLERS = {
     "sync": cmd_sync,
     "panel": cmd_panel,
     "lab": cmd_lab,
+    "refusals": cmd_refusals,
     "paper": cmd_paper,
     "testnet": cmd_testnet,
 }

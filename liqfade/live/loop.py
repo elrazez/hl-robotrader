@@ -55,7 +55,7 @@ from liqfade.control.protocol import (
     StateSnapshot,
     now_ms,
 )
-from liqfade.execution.hl import AccountSnapshot, VenueOrder
+from liqfade.execution.hl import AccountSnapshot, TriggerOrder, VenueOrder
 from liqfade.execution.kill import KillSwitch, KillWatcher
 from liqfade.execution.orders import OrderStore
 from liqfade.execution.reconcile import Reconciler
@@ -67,8 +67,34 @@ from liqfade.recorder.backend import LatencyTracker
 from liqfade.recorder.main import apply_universe, build_streams
 from liqfade.recorder.streams.base import WSStream, backoff_delay
 from liqfade.recorder.universe import UniverseManager
+from liqfade.strategy.rules import build_enabled_rules
 
 log = get_logger(__name__)
+
+
+def apply_settings(session: PaperSession | VenueSession, fresh: Settings) -> None:
+    """Swap reloaded settings into everything under the session that holds a copy.
+
+    The session, the risk engine and the strategy each keep their own reference, and the
+    strategy's rules and per coin detectors were built from the object they were given.
+    A reload that misses any of them announces a change on Telegram and applies none of
+    it, which is worse than refusing: the page and the box disagree and only the box is
+    trading. `strategy` and `filters` are two of the panel's writable sections, so this
+    is most of what a settings write is for.
+
+    The feature engine is deliberately not swapped: `features.` and `cascade.` are
+    restart only, because the buffers were filled under them.
+    """
+    session.settings = fresh
+    session.risk.settings = fresh
+    strategy = session.strategy
+    strategy.settings = fresh
+    # Built once at construction, from the config sections of the settings object handed
+    # in then. Reached here rather than through the engine because a live rebuild is only
+    # ever a reload, and `StrategyEngine` is shared with the backtest.
+    strategy._rules = build_enabled_rules(fresh)
+    for detector in strategy._detectors.values():
+        detector.settings = fresh
 
 
 async def _maybe_await(result: Any) -> Any:
@@ -109,6 +135,15 @@ class PaperBooks:
 
     async def account(self, address: str) -> AccountSnapshot:  # pragma: no cover - never called
         raise NotImplementedError("paper has no venue account; compare_positions must be False")
+
+    async def trigger_orders(self, address: str) -> list[TriggerOrder]:
+        """None: the simulator has no separate trigger book.
+
+        A paper exit, stop or target included, is a working order and comes back from
+        `open_orders` with everything else. The venue keeps its triggers in a query of
+        their own, which is what the reconciler reads this for.
+        """
+        return []
 
     async def open_orders(self, address: str) -> list[VenueOrder]:
         orders = []
@@ -547,8 +582,7 @@ class PaperLoop:
         for key in changed:
             log.warning("config_changed", key=key, before=before.get(key), after=after.get(key))
         self.settings = fresh
-        self.session.settings = fresh
-        self.session.risk.settings = fresh
+        apply_settings(self.session, fresh)
         await self.post(
             f"[{fresh.env}] CONFIG RELOADED, {len(changed)} change(s):\n"
             + "\n".join(f"{k}: {before.get(k)} -> {after.get(k)}" for k in changed[:10]),

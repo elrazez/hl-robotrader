@@ -305,3 +305,54 @@ async def test_an_abandoned_entry_is_cancelled_in_the_registry_not_filled(tmp_pa
     order = session.orders.get(cloid)
     assert order.status is OrderStatus.CANCELED, f"abandoned, not filled (was {order.status})"
     assert order.filled == 0.0
+
+
+async def test_a_refused_intent_is_written_to_the_registry_and_the_engine_is_drained(
+    tmp_path: Path,
+) -> None:
+    """The leak this closes: `_rejections` grew for the life of the process and was
+    written nowhere, and a sizing refusal dropped the intent that carried the prices.
+
+    Driven through `inject_intent` because it is the real path: the drill intent goes
+    through sizing and the risk gate exactly as the strategy's own do.
+    """
+    session = await a_session(tmp_path)
+    quote(session, START, 2000.0)
+
+    assert session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000) is not None
+    assert session.result.refused, "sizing refused it but the intent was not kept"
+    await session.tick(START + 2_000)
+
+    assert not session.result.refused, "the tick did not drain what sizing refused"
+    assert session.strategy.take_rejections() == []
+    assert session.store is not None
+    rows = await session.store.refusals(0, START + 10_000)
+    # `vol_cap` on this fixture: nothing has traded, so the first cap to bind is the
+    # participation one. Which cap binds is sizing's business; what this pins is that the
+    # refusal reached the registry with the prices attached.
+    assert [(row["stage"], row["coin"]) for row in rows] == [("sizing", COIN)]
+    assert rows[0]["reason"]
+    assert rows[0]["entry_px"] > 0
+    assert rows[0]["stop_px"] > 0
+
+
+async def test_a_session_with_no_store_drains_and_discards(tmp_path: Path) -> None:
+    """Persisting is the second thing the drain does; bounding the list is the first."""
+    session = PaperSession(
+        paper_settings(),
+        store=None,
+        meta={
+            COIN: AssetMeta(
+                coin=COIN, sz_decimals=4, max_leverage=25.0, tier="core", listing_days=400.0
+            )
+        },
+        starting_equity=10_000.0,
+    )
+    _OPENED.append(session)
+    quote(session, START, 2000.0)
+    session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000)
+    assert session.result.refused
+
+    await session.tick(START + 2_000)
+
+    assert not session.result.refused
