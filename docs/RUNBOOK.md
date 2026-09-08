@@ -161,6 +161,23 @@ deletes these files. A non-empty quarantine directory means a parser or the disk
 looking at; read a few lines, fix the cause, and the rows can be replayed by hand into
 the lake or written off deliberately.
 
+## Weekly review
+
+From the laptop, after `liqfade sync`. Every intent the live loop refused is scored against
+the tape that followed it, so "what did `spread_too_wide` cost me last week" is answerable
+from the run that happened rather than only from a replay of a different week:
+
+    liqfade refusals --start 2026-09-01 --end 2026-09-07 --data-dir <lake> --equity 10000
+
+Writes `reports/live/refusals_<start>_<end>.md` and `.parquet`. The report's own first
+paragraph is the caveat: it is a **bound**, filled as a taker at the first print after the
+configured latency, with no queue and no book walk. The exact question for one filter or
+one rule is a second backtest with it switched off, which `liqfade lab` runs.
+
+Read the table bottom-up. A gate with a large negative net saved money and is earning its
+keep; a large positive net is a gate to argue about. `no tape` is its own column and is
+never counted as a break-even.
+
 ## Pull data to the laptop
 
 From the laptop, not the VPS:

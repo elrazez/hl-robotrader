@@ -375,7 +375,12 @@ outcome. 6. The CLI (seam 6). 7. Docs.
 
 ## Prompt C: live versus replay
 
-ROUTING: NEW chat. Start only after **both** of these are true: prompt B is merged to
+ROUTING: NEW chat. Worktree: `git worktree add ../hl-robotrader-drift -b 05e-drift-check main`,
+then `uv sync --all-extras`. Both gates below were met on 2026-09-08 (B merged at 256999b,
+the entry policy in the live path since 05c). Two review-fix chats are live at the same time:
+in `liqfade/live/loop.py` touch only the `paper_started` line (seam 5) and nothing else, and
+stay out of `liqfade/live/venue.py`, `execution/` and `panel/`. Start only after **both** of
+these are true: prompt B is merged to
 `main`, and the entry policy (`execution.entry_ttl_s`, `execution.max_reprices`) is honoured
 by the live path — the qualification in `docs/DECISIONS.md`, 2026-09-07 "05c: the seven day
 paper acceptance run", has been lifted by a later entry. If either is false, say so and

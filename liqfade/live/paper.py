@@ -65,6 +65,7 @@ from liqfade.execution.orders import (
 )
 from liqfade.execution.ratelimit import ActionBudget
 from liqfade.live.features import LiveFeatureEngine
+from liqfade.live.refusals import drain
 from liqfade.log import get_logger
 from liqfade.risk.engine import RiskEngine
 from liqfade.strategy.engine import StrategyEngine
@@ -322,6 +323,7 @@ class PaperSession:
         )
         intents = list(self.strategy.last_intents)
         self.intents.extend(intents)
+        await drain(self.strategy, self.result.refused, self.store)
         await self.sync_orders(now_ms)
         await self._note_trades(now_ms)
         return intents

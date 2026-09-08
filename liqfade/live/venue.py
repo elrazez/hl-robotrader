@@ -45,9 +45,11 @@ from liqfade.execution.orders import (
 from liqfade.execution.policy import EntryAction, entry_action, touch_price
 from liqfade.execution.tpsl import TpslLegs
 from liqfade.live.features import LiveFeatureEngine
+from liqfade.live.refusals import drain
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
 from liqfade.sizing import LiquidityStats, size_intent
+from liqfade.strategy.engine import Rejection, rejection_of
 from liqfade.strategy.types import Intent
 
 log = get_logger(__name__)
@@ -94,11 +96,14 @@ class VenueCounters:
         self.recent_blocks: deque[tuple[int, str, str, str]] = deque(maxlen=RECENT_BLOCKS)
         self.sizing_blocks: dict[str, int] = {}
         self.risk_blocks: dict[str, int] = {}
+        # Named as `BacktestResult` names it, so `live/refusals.py` drains either session.
+        self.refused: deque[Rejection] = deque(maxlen=RECENT_BLOCKS)
 
-    def blocked(self, *, now_ms: int, coin: str, gate: str, reason: str) -> None:
+    def blocked(self, *, now_ms: int, coin: str, gate: str, reason: str, intent: Intent) -> None:
         counts = self.sizing_blocks if gate == "sizing" else self.risk_blocks
         counts[reason] = counts.get(reason, 0) + 1
         self.recent_blocks.append((now_ms, coin, gate, reason))
+        self.refused.append(rejection_of(intent, ts_ms=now_ms, reason=reason, stage=gate))
 
 
 class VenueSession:
@@ -268,9 +273,11 @@ class VenueSession:
         intents = self.strategy.on_tick(now_ms, rows)
         self.intents.extend(intents)
         if not allow_entries:
+            await drain(self.strategy, self.result.refused, self.orders.store)
             return []
         for intent in intents:
             await self.place(intent, now_ms, rows.get(intent.coin))
+        await drain(self.strategy, self.result.refused, self.orders.store)
         return intents
 
     async def age_entries(self, now_ms: int) -> None:
@@ -341,7 +348,11 @@ class VenueSession:
         )
         if decision.reason is not None:
             self.result.blocked(
-                now_ms=now_ms, coin=intent.coin, gate="sizing", reason=decision.reason
+                now_ms=now_ms,
+                coin=intent.coin,
+                gate="sizing",
+                reason=decision.reason,
+                intent=intent,
             )
             return None
 
@@ -363,7 +374,11 @@ class VenueSession:
         )
         if not verdict.allowed:
             self.result.blocked(
-                now_ms=now_ms, coin=intent.coin, gate="risk", reason=verdict.reason or "refused"
+                now_ms=now_ms,
+                coin=intent.coin,
+                gate="risk",
+                reason=verdict.reason or "refused",
+                intent=intent,
             )
             return None
 

@@ -35,9 +35,38 @@ from liqfade.strategy.types import (
     fade_side,
 )
 
-__all__ = ["EngineStats", "Rejection", "RuleStats", "StrategyEngine"]
+__all__ = ["EngineStats", "Rejection", "RuleStats", "StrategyEngine", "rejection_of"]
 
 BTC = "BTC"
+
+
+def rejection_of(
+    intent: Intent,
+    *,
+    ts_ms: int,
+    reason: str,
+    stage: str,
+    explain: Mapping[str, float] | None = None,
+) -> Rejection:
+    """The refusal of one priced intent, whichever layer refused it.
+
+    Here rather than in each caller because `sizing` and `risk` refuse intents this engine
+    already built and their rows have to be the same shape as its own; a second spelling
+    of the same six fields is how the scorer ends up with two kinds of refusal.
+    """
+    return Rejection(
+        coin=intent.coin,
+        side=intent.side,
+        ts_ms=ts_ms,
+        reason=reason,
+        stage=stage,
+        entry_px=intent.entry_px,
+        target_px=intent.target_px,
+        stop_px=intent.stop_px,
+        time_stop_s=intent.time_stop_s,
+        urgency=intent.urgency,
+        explain=dict(intent.explain if explain is None else explain),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,11 +78,22 @@ class Rejection:
         side: the position it would have taken.
         ts_ms: the decision tick.
         reason: the filter name or the rule name that killed it.
-        stage: `rule` or `filter`, so the report can separate the confluence layer's cost
-            from the pre-trade guards'.
+        stage: `rule` or `filter` from this engine, and `sizing` or `risk` from the layers
+            below it, so the report can separate the confluence layer's cost from the
+            pre-trade guards' and from the gates that never see this module.
+        entry_px: what the intent would have rested at.
+        target_px: its partial-reversion exit.
+        stop_px: its stop, which is also the risk denominator sizing would have used.
+        time_stop_s: seconds after which it would have been flattened regardless.
+        urgency: whether it would have taken liquidity.
         explain: the same mapping the intent would have carried, including the values of
             every rule that ran. A rejected trade is worth as much for research as a taken
             one, and it is worth nothing without its numbers.
+
+    The four prices are not optional. Rules and filters both run after `_price`, so every
+    rejection this engine records was a fully priced intent, and `liqfade refusals` scores
+    the counterfactual off them: a reason alone says how often a gate fired and never what
+    it cost.
     """
 
     coin: str
@@ -61,6 +101,11 @@ class Rejection:
     ts_ms: int
     reason: str
     stage: str
+    entry_px: float
+    target_px: float
+    stop_px: float
+    time_stop_s: float
+    urgency: Urgency
     explain: Mapping[str, float]
 
 
@@ -216,7 +261,7 @@ class StrategyEngine:
         killed_by = self._run_rules(row, state, explain)
         side = intent.side
         if killed_by is not None:
-            self._reject(state.coin, side, now_ms, killed_by, "rule", explain)
+            self._reject(intent, now_ms, killed_by, "rule", explain)
             return None
 
         reason = check_filters(
@@ -229,7 +274,7 @@ class StrategyEngine:
         )
         if reason is not None:
             self.stats.filters[reason] = self.stats.filters.get(reason, 0) + 1
-            self._reject(state.coin, side, now_ms, reason, "filter", explain)
+            self._reject(intent, now_ms, reason, "filter", explain)
             return None
 
         return replace(intent, explain=explain)
@@ -291,17 +336,14 @@ class StrategyEngine:
 
     def _reject(
         self,
-        coin: str,
-        side: Side,
+        intent: Intent,
         ts_ms: int,
         reason: str,
         stage: str,
         explain: Mapping[str, float],
     ) -> None:
         self._rejections.append(
-            Rejection(
-                coin=coin, side=side, ts_ms=ts_ms, reason=reason, stage=stage, explain=dict(explain)
-            )
+            rejection_of(intent, ts_ms=ts_ms, reason=reason, stage=stage, explain=explain)
         )
 
     def _price(self, now_ms: int, signal: CascadeSignal, row: FeatureRow) -> Intent | None:

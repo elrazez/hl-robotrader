@@ -72,7 +72,7 @@ from liqfade.features.grid import effective_ts
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
 from liqfade.sizing import LiquidityStats, size_intent
-from liqfade.strategy.engine import Rejection, StrategyEngine
+from liqfade.strategy.engine import Rejection, StrategyEngine, rejection_of
 from liqfade.strategy.types import AssetMeta, FeatureRow, Intent
 
 log = get_logger(__name__)
@@ -223,6 +223,11 @@ class BacktestResult:
     recent_blocks: deque[tuple[int, str, str, str]] = field(
         default_factory=lambda: deque(maxlen=RECENT_BLOCKS)
     )
+    # The same refusals with the intent attached, for `liqfade refusals` to price. Beside
+    # `recent_blocks` rather than replacing it: that tuple is what `report_risk_blocks`
+    # unpacks and posts, and widening it would change a path CLAUDE.md rule 5 tests.
+    # Bounded for the same reason and drained by the same kind of reader.
+    refused: deque[Rejection] = field(default_factory=lambda: deque(maxlen=RECENT_BLOCKS))
     intents: int = 0
     entries_placed: int = 0
     sizing_blocks: dict[str, int] = field(default_factory=dict)
@@ -831,6 +836,9 @@ def _place_entry(
     if decision.reason is not None:
         result.sizing_blocks[decision.reason] = result.sizing_blocks.get(decision.reason, 0) + 1
         result.recent_blocks.append((now_ms, intent.coin, "sizing", decision.reason))
+        result.refused.append(
+            rejection_of(intent, ts_ms=now_ms, reason=decision.reason, stage="sizing")
+        )
         return
     if decision.depth_cap_applied:
         result.depth_capped_entries += 1
@@ -859,6 +867,9 @@ def _place_entry(
         assert verdict.reason is not None
         result.risk_blocks[verdict.reason] = result.risk_blocks.get(verdict.reason, 0) + 1
         result.recent_blocks.append((now_ms, intent.coin, "risk", verdict.reason))
+        result.refused.append(
+            rejection_of(intent, ts_ms=now_ms, reason=verdict.reason, stage="risk")
+        )
         return
 
     risk.on_entry(request)

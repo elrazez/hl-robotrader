@@ -2881,6 +2881,42 @@ changed behaviour they correctly asserted. Reverted. Reading the flag before the
 would have cost one command; this is the third time in this branch that the answer was one
 direct question away.
 
+## 2026-09-08 (05d: the refusals the live loop threw away)
+
+**The leak.** `StrategyEngine.take_rejections()` was called by `run_backtest` at the end of
+a replay and by nothing in `live/`. In a paper session `_rejections` grew for the life of
+the process and was written nowhere, and `PaperSession.result.rejections` stayed `[]`. The
+module docstring said the drain existed so a live loop would not grow a list forever, and
+nothing drained it. Sizing and risk fared worse: `_place_entry` recorded
+`(ts_ms, coin, gate, reason)` into `recent_blocks` and dropped the intent, so the prices
+that were refused were gone before `report_risk_blocks` logged the reason. A week of paper
+therefore knew how often each gate fired and nothing about what it cost.
+
+**What was built.** `Rejection` gained the four prices, the time stop and the urgency of the
+intent it killed; rules and filters both run after `_price`, so they are never absent and
+are not optional. `BacktestResult.refused` and `VenueCounters.refused` hold the sizing and
+risk refusals with the same fields under the same name, which is what lets one drain in
+`live/refusals.py` serve both sessions. `recent_blocks` is untouched: `report_risk_blocks`
+unpacks that four-tuple and CLAUDE.md rule 5 tests the path it feeds. The refusals land in
+a new `refusals` table in `data/orders.sqlite`, created by the schema script an existing
+registry is reopened with, so the box's database gains it on the next start.
+
+**Why it is a bound and says so.** `liqfade refusals` fills each refused intent as a taker
+at the first recorded print after `backtest.latency_ms`, with no queue, no book walk and no
+partial. Two rules are taken from braindeadpt's `shadow_outcome_evaluator.py` because they
+bias the counterfactual the right way: a second that touches both the target and the stop
+resolves as **the stop**, and a window the lake cannot cover is `no_tape` rather than a
+zero. A counterfactual that flatters the trades you did not take is worse than not
+measuring, because it argues for removing filters that were earning their keep. The exact
+answer for one filter is still a second backtest with it switched off, which `liqfade lab`
+runs; the report's first paragraph says so. Notional is sizing's risk-budget rule at
+`--equity` before any cap, because neither the account's equity at that millisecond nor the
+coin's depth is persisted, and guessing either would be a worse number than a stated bound.
+
+Reverse if the refusal table ever grows fast enough to matter on disk (it is one row per
+refused intent, so a soak week is thousands, not millions), or if the panel wants the
+scoring live rather than as a weekly command.
+
 ## 2026-09-08 (the liquidation map, step one: recorder only)
 
 **`hl_positions`, a new table of public Hyperliquid positions polled from

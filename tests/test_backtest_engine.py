@@ -382,6 +382,38 @@ class TestTheReplayTellsRiskAboutItsExits:
         )
         assert len(result.trades) < 6  # type: ignore[attr-defined]
 
+    def test_a_risk_refusal_keeps_the_intent_it_refused(
+        self, stream: tuple[pl.DataFrame, pl.DataFrame, int, int], settings_factory: SettingsFactory
+    ) -> None:
+        """`recent_blocks` is four fields and drops the prices, so the refusal is unscorable.
+
+        `liqfade refusals` prices what a gate cost, and the gate refuses an intent that was
+        fully priced a microsecond earlier. Keeping it beside the counter is the difference
+        between "coin_cooldown fired 40 times" and "coin_cooldown saved $200".
+        """
+        tuned = settings_factory(
+            **{"features.z_lookback_h": 1.0, "risk.coin_cooldown_after_exit_min": 30}
+        )
+        result = run(stream, tuned)
+        refused = [r for r in result.refused if r.stage == "risk"]  # type: ignore[attr-defined]
+        assert refused, "the cooldown refused entries but kept none of them"
+        assert {r.reason for r in refused} == {"coin_cooldown"}
+        one = refused[0]
+        assert one.entry_px > 0 and one.stop_px > 0 and one.target_px > 0
+        assert one.time_stop_s == tuned.intent.time_stop_s
+
+    def test_a_sizing_refusal_keeps_the_intent_it_refused(
+        self, stream: tuple[pl.DataFrame, pl.DataFrame, int, int], settings_factory: SettingsFactory
+    ) -> None:
+        """The other gate. Sizing returns first, so covering only risk keeps half of them."""
+        tuned = settings_factory(**{"features.z_lookback_h": 1.0, "filters.min_notional_usd": 1e12})
+        result = run(stream, tuned)
+        refused = [r for r in result.refused if r.stage == "sizing"]  # type: ignore[attr-defined]
+        assert refused, "min_notional refused every entry but kept none of them"
+        assert {r.reason for r in refused} == {"min_notional"}
+        assert not result.trades  # type: ignore[attr-defined]
+        assert refused[0].entry_px > 0
+
     def test_a_cooldown_shorter_than_the_gap_blocks_nothing(
         self, stream: tuple[pl.DataFrame, pl.DataFrame, int, int], settings: Settings
     ) -> None:
