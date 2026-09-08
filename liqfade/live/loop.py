@@ -40,6 +40,7 @@ from typing import Any
 
 from liqfade.alerts.commands import CommandBot, allowed_chat_ids
 from liqfade.alerts.telegram import send_alert
+from liqfade.backtest.report import config_hash
 from liqfade.config.models import Settings
 from liqfade.control import ControlServer, StateWriter
 from liqfade.control.protocol import (
@@ -376,6 +377,27 @@ class PaperLoop:
     def feed_states(self, at_ms: int) -> list[FeedState]:
         return [state for stream in self.streams for state in stream.feed_states(at_ms)]
 
+    def started_fields(self) -> dict[str, Any]:
+        """What `paper_started` records about the run that is beginning.
+
+        `config_hash` is the whole point of the method existing rather than the fields
+        sitting inline in `run`: `liqfade drift` compares the settings a soak ran under
+        against the settings its replay resolved, and it reads the live half out of this
+        line. It is `backtest/report.py`'s own function rather than a second hash of the
+        same object, because two hashes that agree by construction cannot disagree by
+        accident, and a comparison between two differently-computed hashes would report
+        drift on every run.
+        """
+        settings = self.settings
+        return {
+            "env": settings.env,
+            "trigger": settings.cascade.trigger,
+            "equity": self.starting_equity,
+            "streams": [s.venue for s in self.streams],
+            "data_dir": str(settings.paths.data_dir),
+            "config_hash": config_hash(settings),
+        }
+
     def counters(self) -> dict[str, int]:
         return {
             "ticks": self.ticks,
@@ -667,14 +689,7 @@ class PaperLoop:
         if self.minutes:
             tasks.append(asyncio.create_task(self._deadline(stop), name="deadline"))
 
-        log.info(
-            "paper_started",
-            env=settings.env,
-            trigger=settings.cascade.trigger,
-            equity=self.starting_equity,
-            streams=[s.venue for s in self.streams],
-            data_dir=str(settings.paths.data_dir),
-        )
+        log.info("paper_started", **self.started_fields())
         await self.post(
             f"[{settings.env}] paper loop started on {settings.cascade.trigger}, "
             f"equity {self.starting_equity:,.0f}, {len(self.streams)} feeds"
