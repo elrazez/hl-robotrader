@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from liqfade.backtest.report import config_hash
 from liqfade.config import resolve
 from liqfade.config.models import Settings
 from liqfade.control import ControlClient, ControlServer
@@ -743,6 +744,43 @@ async def test_reload_refuses_what_the_feature_buffers_were_built_around(
     assert "features.z_lookback_h" in result.error
     assert "restart" in result.error
     assert loop.settings.features.z_lookback_h == before
+
+
+async def test_paper_started_names_the_config_hash_the_run_is_using(tmp_path: Path) -> None:
+    """`liqfade drift` compares the soak's config against the replay's by this hash.
+
+    Without it the config dimension can only report NOT_COMPARABLE, and every number
+    below it would be a diff between two runs nobody has shown were the same strategy.
+    """
+    paper = PaperLoop(paper_settings(tmp_path), starting_equity=5_000.0)
+    await paper.setup()
+    try:
+        fields = paper.started_fields()
+    finally:
+        await paper.aclose()
+
+    assert fields["config_hash"] == config_hash(paper.settings)
+    # The fields the line already carried are still on it.
+    assert fields["env"] == paper.settings.env
+    assert fields["trigger"] == "crossvenue"
+    assert fields["equity"] == 5_000.0
+
+
+async def test_the_config_hash_moves_when_a_setting_the_replay_reads_moves(
+    tmp_path: Path,
+) -> None:
+    """A hash that ignored an override would report MATCH across two different runs."""
+    one = PaperLoop(paper_settings(tmp_path), starting_equity=5_000.0)
+    other = PaperLoop(
+        paper_settings(tmp_path, **{"execution.max_reprices": 99}), starting_equity=5_000.0
+    )
+    await one.setup()
+    await other.setup()
+    try:
+        assert one.started_fields()["config_hash"] != other.started_fields()["config_hash"]
+    finally:
+        await one.aclose()
+        await other.aclose()
 
 
 async def test_reload_reaches_the_strategy_that_decides_the_next_tick(

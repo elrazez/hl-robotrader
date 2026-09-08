@@ -178,6 +178,11 @@ field the backtest computes, braindeadpt reports that dimension as `NOT_COMPARAB
 than defaulting it to zero and diffing against the default. A comparator that quietly invents
 the missing half is worse than no comparator.
 
+**Built 2026-09-08 on `05e-drift-check`: `liqfade drift`.** Seven dimensions, each
+answering `MATCH`, `DRIFT` or `NOT_COMPARABLE` with its threshold beside its number. The
+first run over the soak's own window is still to come; it is gated on the soak restarting
+on code that carries both the refusals table and the config hash.
+
 ---
 
 ## 4. Scoring the intents we refused

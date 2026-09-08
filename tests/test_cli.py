@@ -24,6 +24,7 @@ ALL_COMMANDS = {
     "derive",
     "backtest",
     "refusals",
+    "drift",
     "paper",
     "testnet",
     "live",

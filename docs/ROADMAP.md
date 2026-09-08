@@ -95,7 +95,7 @@ Owner acceptance runs, once the lake is synced locally:
 
 Build: `live/` loop in paper mode (real feeds, simulated fills using the backtest fill model), `alerts/` Telegram bot with all commands, `execution/` against testnet, order manager state machine with SQLite persistence, reconciliation, watchdog unit, kill switch path with its own tests, the six testnet probes listed in `docs/HYPERLIQUID.md`. **Panel v3**: live positions and orders, fills history, PnL and equity, submit-to-ack latency percentiles, pause/resume/flat buttons (kill stays Telegram and file only, on purpose), and the settings page: sizing fractions, risk limits, trigger thresholds, universe overrides, with diff preview, typed confirmation for risk fields, audit log, and Telegram notification on every change.
 
-DoD: 7 days of paper trading with every intent and simulated fill posted to Telegram and logged; paper results within a plausible band of backtest expectations for the same days (document the comparison); testnet orders round-trip correctly including TP/SL grouping, reconnects and reconciliation; `/kill` verified to flatten within 5s from a state with resting orders and an open testnet position; watchdog verified by killing the loop process.
+DoD: 7 days of paper trading with every intent and simulated fill posted to Telegram and logged; paper results within a plausible band of backtest expectations for the same days (document the comparison) (`liqfade drift`, see reports/live/); testnet orders round-trip correctly including TP/SL grouping, reconnects and reconciliation; `/kill` verified to flatten within 5s from a state with resting orders and an open testnet position; watchdog verified by killing the loop process.
 
 ## Phase 6: Mainnet, small (ongoing)
 
