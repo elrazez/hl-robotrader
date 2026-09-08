@@ -2648,3 +2648,11 @@ that would do it. `sizing` needs the same typed confirmation as `risk`: it decid
 size, which is a risk limit whatever the section is called. A key an env var already wins is
 refused outright, because the env layer merges last and the write would land while the
 process kept doing something else.
+
+**Panel v3 page load, measured on the box 2026-09-08.** 29 to 31 ms for `index.html` plus
+the JS and CSS bundles, served from loopback on the VPS, over three runs. CLAUDE.md asks for
+under a second on the VPS and this is two orders of magnitude inside it. The API calls behind
+the first paint are 1 to 2 ms each. Over an SSH tunnel from the laptop the same fetch takes
+about 1.1 s, which is the 470 KB bundle crossing the link and not the box: the bundle is one
+unsplit chunk, and code splitting is the lever if a slow link ever makes that annoying.
+Nothing here is worth optimising yet.
