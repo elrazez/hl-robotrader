@@ -79,6 +79,9 @@ class AccountSnapshot:
     margin_used: float
     withdrawable: float
     positions: dict[str, VenuePosition]
+    # The USDC sitting in the spot wallet, which is collateral the perps summary does not
+    # count. Included in `equity`; kept separately so the panel can show where it is.
+    spot_usdc: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,12 +182,23 @@ def as_transport_error(exc: BaseException) -> Exception:
     return RejectError(f"{type(exc).__name__}: {exc}")
 
 
-def parse_clearinghouse_state(state: Any) -> AccountSnapshot:
-    """Positions and equity from `clearinghouseState`.
+def parse_clearinghouse_state(state: Any, *, spot: Any = None) -> AccountSnapshot:
+    """Positions and equity from `clearinghouseState`, plus the spot USDC behind it.
 
     A coin the account is flat in stays in `assetPositions` with `szi` of "0.0". It is
     dropped here, because a zero position kept in the map is a difference the reconciler
     would report against a book that is correct.
+
+    **Equity is the perps account value plus the spot USDC.** Measured on testnet
+    2026-09-08: a flat account whose USDC sits in the spot wallet reports
+    `accountValue: 0.0`, `withdrawable: 0.0` and no margin used, and opens positions
+    perfectly well. Reading equity as `accountValue` alone made sizing refuse every entry
+    for `risk_budget`, which is indistinguishable from a strategy finding nothing to
+    trade. The same would happen on mainnet to an owner who leaves their USDC in spot.
+
+    Args:
+        spot: a `spotClearinghouseState` payload, or None to leave equity as the perps
+            account value alone, which is what callers that never ask for spot expect.
     """
     summary = state.get("marginSummary", {}) if isinstance(state, dict) else {}
     positions: dict[str, VenuePosition] = {}
@@ -200,11 +214,17 @@ def parse_clearinghouse_state(state: Any) -> AccountSnapshot:
             entry_px=_f(position.get("entryPx")),
             unrealized_pnl=_f(position.get("unrealizedPnl")),
         )
+    spot_usdc = 0.0
+    for balance in (spot or {}).get("balances", []):
+        if balance.get("coin") == "USDC":
+            spot_usdc = _f(balance.get("total"))
+            break
     return AccountSnapshot(
-        equity=_f(summary.get("accountValue")),
+        equity=_f(summary.get("accountValue")) + spot_usdc,
         margin_used=_f(summary.get("totalMarginUsed")),
         withdrawable=_f((state or {}).get("withdrawable")),
         positions=positions,
+        spot_usdc=spot_usdc,
     )
 
 
@@ -310,9 +330,17 @@ class InfoReader:
         return orjson.loads(response.content)
 
     async def account(self, address: str) -> AccountSnapshot:
-        return parse_clearinghouse_state(
-            await self.post({"type": "clearinghouseState", "user": address})
+        """The account, including the spot USDC that is collateral for the perps.
+
+        Two calls rather than one, because `clearinghouseState` alone reports zero equity
+        for an account that is flat with its USDC in spot, and sizing would refuse every
+        entry on it.
+        """
+        state, spot = await asyncio.gather(
+            self.post({"type": "clearinghouseState", "user": address}),
+            self.post({"type": "spotClearinghouseState", "user": address}),
         )
+        return parse_clearinghouse_state(state, spot=spot)
 
     async def open_orders(self, address: str) -> list[VenueOrder]:
         return parse_open_orders(await self.post({"type": "openOrders", "user": address}))

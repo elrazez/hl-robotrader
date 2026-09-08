@@ -261,3 +261,65 @@ async def test_a_rejected_order_records_no_fill_and_no_oid(tmp_path: Path) -> No
         assert await manager.open_orders() == []
     finally:
         await store.close()
+
+
+def test_equity_counts_the_spot_usdc_that_is_actually_the_collateral() -> None:
+    """`accountValue` is 0.0 on a flat account whose USDC sits in the spot wallet.
+
+    Measured on testnet 2026-09-08: perps `accountValue` 0.0, `withdrawable` 0.0,
+    `totalMarginUsed` 0.0, and 996.96 USDC in spot, on an account that opens positions
+    perfectly well. Reading equity as `accountValue` alone made sizing refuse every entry
+    for `risk_budget`, which looks exactly like a strategy finding nothing to trade. The
+    same would happen on mainnet to an owner who leaves their USDC in spot.
+    """
+    state = {
+        "marginSummary": {
+            "accountValue": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0",
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": "0.0",
+        "assetPositions": [],
+    }
+    spot = {"balances": [{"coin": "USDC", "token": 0, "total": "996.956248", "hold": "0.0"}]}
+
+    snapshot = parse_clearinghouse_state(state, spot=spot)
+
+    assert snapshot.equity == pytest.approx(996.956248)
+    assert snapshot.spot_usdc == pytest.approx(996.956248)
+
+
+def test_equity_adds_the_two_rather_than_choosing_one() -> None:
+    """With a position on, margin sits in perps and the rest is still in spot."""
+    state = {
+        "marginSummary": {
+            "accountValue": "1.48872",
+            "totalNtlPos": "14.87",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.74409",
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": "0.74463",
+        "assetPositions": [],
+    }
+    spot = {"balances": [{"coin": "USDC", "total": "995.0"}]}
+
+    assert parse_clearinghouse_state(state, spot=spot).equity == pytest.approx(996.48872)
+
+
+def test_no_spot_payload_leaves_equity_as_the_perps_account_value() -> None:
+    """Callers that never ask for spot keep the old meaning rather than getting a zero."""
+    state = {
+        "marginSummary": {
+            "accountValue": "500.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0",
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": "500.0",
+        "assetPositions": [],
+    }
+    assert parse_clearinghouse_state(state).equity == 500.0
