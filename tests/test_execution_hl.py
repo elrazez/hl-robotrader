@@ -6,6 +6,7 @@ disagrees with one of these, the probe wins and this file changes with it.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -183,3 +184,80 @@ def test_a_transport_exception_is_transient_not_a_reject() -> None:
 
     assert isinstance(as_transport_error(TimeoutError("read timeout")), TransientTransportError)
     assert isinstance(as_transport_error(ConnectionResetError()), TransientTransportError)
+
+
+def test_a_post_only_rejection_arrives_inside_an_ok_envelope() -> None:
+    """The exact body testnet returned on 2026-09-08, verbatim.
+
+    HTTP 200 and `"status": "ok"` at the top, with the refusal buried in
+    `response.data.statuses[0].error`. Code that branches on the envelope reads this as a
+    successful order. `classify_order_response` must keep reading down to the per-status
+    object, and it must raise `RejectError` rather than return an oid, because an oid is
+    what the caller records a live order against.
+    """
+    response = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {
+                "statuses": [
+                    {
+                        "error": "Post only order would have immediately matched, "
+                        "bbo was 2491.3@2491.4. asset=4"
+                    }
+                ]
+            },
+        },
+    }
+    with pytest.raises(RejectError, match="Post only order"):
+        classify_order_response(response)
+
+
+async def test_a_rejected_order_records_no_fill_and_no_oid(tmp_path: Path) -> None:
+    """The whole point of the envelope rule, asserted through the manager.
+
+    A transport that classifies the reject correctly must leave the registry with an
+    order that has no oid, no fill and a REJECTED status. If the envelope were trusted,
+    this order would be ACKED with a garbage oid and the loop would wait for a fill that
+    is never coming.
+    """
+    from liqfade.execution.orders import OrderIntent, OrderManager, OrderStatus, OrderStore
+
+    class RejectingTransport:
+        async def place(self, intent: OrderIntent) -> int:
+            return classify_order_response(
+                {
+                    "status": "ok",
+                    "response": {
+                        "type": "order",
+                        "data": {"statuses": [{"error": "Post only order would have matched"}]},
+                    },
+                }
+            )
+
+        async def cancel(self, coin: str, cloid: str) -> None: ...
+
+        async def modify(self, intent: OrderIntent) -> int:
+            raise AssertionError("not reached")
+
+    store = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = OrderManager(
+            store,
+            RejectingTransport(),
+            sz_decimals={"ETH": 4},
+            killed=lambda: False,
+        )
+        order = await manager.submit(
+            OrderIntent(
+                cloid="0x" + "ab" * 16, coin="ETH", is_buy=True, px=2000.0, size=0.01, tif="Alo"
+            )
+        )
+
+        assert order.status is OrderStatus.REJECTED
+        assert order.oid is None
+        assert order.filled == 0.0
+        assert "Post only" in (order.reject_reason or "")
+        assert await manager.open_orders() == []
+    finally:
+        await store.close()

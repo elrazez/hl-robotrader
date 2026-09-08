@@ -55,6 +55,7 @@ from liqfade.config.models import Settings
 from liqfade.control.protocol import OrderState, PositionState
 from liqfade.control.protocol import now_ms as wall_ms
 from liqfade.execution.orders import (
+    LIVE,
     OrderIntent,
     OrderManager,
     OrderStatus,
@@ -97,6 +98,7 @@ class PaperTransport:
         self.oid = 0
         self.placed: list[OrderIntent] = []
         self.cancelled: list[tuple[str, str]] = []
+        self.modified: list[OrderIntent] = []
 
     async def place(self, intent: OrderIntent) -> int:
         self.placed.append(intent)
@@ -105,6 +107,17 @@ class PaperTransport:
 
     async def cancel(self, coin: str, cloid: str) -> None:
         self.cancelled.append((coin, cloid))
+
+    async def modify(self, intent: OrderIntent) -> int:
+        """A new oid, which is what the venue answers a modify with (probe 7).
+
+        The engine has already moved its own `SimOrder`; this exists so the reprice is
+        recorded through the same manager call the live path makes, rather than the
+        registry quietly keeping a price the order no longer has.
+        """
+        self.modified.append(intent)
+        self.oid += 1
+        return self.oid
 
 
 class _RecordingStrategy(StrategyEngine):
@@ -515,9 +528,9 @@ class PaperSession:
         The engine owns the simulated orders and fills them; the manager owns the registry
         and the state machine. Each tick is a diff: an order the manager has never seen is
         submitted, an order whose filled size grew is a fill, and an order that left the
-        coin state without being cancelled filled the rest of the way, because the engine
-        drops an order the moment nothing is left of it. The `SimOrder` is kept for exactly
-        that last case, so the closing fill carries its real size.
+        coin state is closed out at whatever it actually filled, with the remainder
+        cancelled. The `SimOrder` is kept for exactly that last case, so the closing fill
+        carries its real size and the cancel carries the rest.
         """
         if self.orders is None:
             return
@@ -530,6 +543,13 @@ class PaperSession:
         for cloid, order in live.items():
             if cloid not in self._known_orders:
                 await self._submit(order)
+            elif self.orders is not None:
+                # The engine reprices an entry in place, keeping the cloid. Without this
+                # the registry keeps the price the order was first rested at, and the
+                # panel and every reconciliation read a price the order does not have.
+                known = self.orders.get(cloid)
+                if known.status in LIVE and known.intent.px != order.px:
+                    await self.orders.reprice(cloid, order.px)
             await self._book_fill(order, now_ms)
 
         self._seen_orders.update(live)
@@ -541,9 +561,18 @@ class PaperSession:
             }:
                 continue
             gone = self._seen_orders.pop(cloid, None)
-            if gone is not None:
-                gone.filled = gone.size
-                await self._book_fill(gone, now_ms)
+            if gone is None:
+                continue
+            # Book whatever actually filled, then close the rest as a cancel. This used
+            # to force `gone.filled = gone.size`, on the reasoning that the engine drops
+            # an order the moment nothing is left of it. That is true of a filled order
+            # and false of every other way one leaves the coin state: the entry policy
+            # abandoning it past `max_reprices`, and an `Ioc` cancelling its remainder.
+            # Both were recorded as full fills, with fees, for positions the portfolio
+            # never opened, which is a disagreement reconciliation would report forever.
+            await self._book_fill(gone, now_ms)
+            if gone.remaining > 0 and self.orders is not None:
+                await self.orders.record_cancel(cloid, reason="abandoned")
 
     async def _submit(self, order: SimOrder) -> None:
         """One simulated order into the registry, through the real submit path."""

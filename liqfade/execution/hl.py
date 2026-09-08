@@ -310,6 +310,37 @@ class HyperliquidTransport:
             raise as_transport_error(exc) from exc
         return classify_order_response(response)
 
+    async def modify(self, intent: OrderIntent) -> int:
+        """Move a resting order to a new price, addressed by its cloid.
+
+        Addressed by **cloid and not oid**, because a modify answers with a new oid
+        (docs/HYPERLIQUID.md probe 7): after one reprice the oid we were holding is dead,
+        and a second reprice by it answers "Cannot modify canceled or filled order" while
+        the live order sits untouched. The cloid is the identity that survives the move.
+
+        The replacement carries the same cloid on purpose, so the venue and the registry
+        agree on what this order is called for its whole life.
+        """
+        from hyperliquid.utils.types import Cloid
+
+        wire_px, wire_size = intent.wire
+        cloid = Cloid.from_str(intent.cloid)
+        try:
+            response = await asyncio.to_thread(
+                self._exchange.modify_order,
+                cloid,
+                intent.coin,
+                intent.is_buy,
+                float(wire_size),
+                float(wire_px),
+                {"limit": {"tif": intent.tif}},
+                intent.reduce_only,
+                cloid,
+            )
+        except Exception as exc:
+            raise as_transport_error(exc) from exc
+        return classify_order_response(response)
+
     async def cancel(self, coin: str, cloid: str) -> None:
         from hyperliquid.utils.types import Cloid
 

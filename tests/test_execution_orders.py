@@ -349,3 +349,107 @@ async def test_submit_refuses_while_the_kill_flag_is_there(store: OrderStore) ->
     assert order.status is OrderStatus.REJECTED
     assert "kill" in (order.reject_reason or "").lower()
     assert transport.placed == []
+
+
+# --- the entry policy: repricing by cloid ---------------------------------------
+
+
+class ModifyTransport(FakeTransport):
+    """A transport that can also modify, answering with whatever the test queued."""
+
+    def __init__(self, *, modifies: list[Any] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.modified: list[tuple[str, float]] = []
+        self.modifies = modifies or []
+
+    async def modify(self, intent: OrderIntent) -> int:
+        self.modified.append((intent.cloid, intent.px))
+        if self.modifies:
+            outcome = self.modifies.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return int(outcome)
+        self.next_oid += 1
+        return self.next_oid
+
+
+async def test_a_reprice_keeps_the_cloid_and_takes_the_new_oid(store: OrderStore) -> None:
+    """Measured on testnet 2026-09-08: modify answers with a new oid and the same cloid.
+
+    So the registry tracks the entry by cloid across its reprices, and records the oid the
+    venue moved it to, because the old one is dead the moment the modify lands.
+    """
+    transport = ModifyTransport(modifies=[7777])
+    manager = a_manager(store, transport)
+    order = await manager.submit(an_intent(px=2000.0))
+
+    repriced = await manager.reprice(order.cloid, 2010.0)
+
+    assert repriced.cloid == order.cloid
+    assert repriced.oid == 7777
+    assert repriced.intent.px == 2010.0
+    assert repriced.reprices == 1
+    assert repriced.status is OrderStatus.ACKED
+    assert transport.modified == [(order.cloid, 2010.0)]
+
+
+async def test_a_reprice_rounds_onto_the_venue_grid_like_a_submit(store: OrderStore) -> None:
+    """A reprice is an order too. An unrounded price is refused, not sent."""
+    manager = a_manager(store, ModifyTransport())
+    order = await manager.submit(an_intent(px=2000.0))
+
+    repriced = await manager.reprice(order.cloid, 2000.123456789)
+
+    assert repriced.intent.px == 2000.1  # 5 significant figures, docs/HYPERLIQUID.md
+    assert repriced.intent.wire_px == "2000.1"
+
+
+async def test_a_reprice_that_lost_the_race_is_left_for_reconciliation(store: OrderStore) -> None:
+    """ "Cannot modify canceled or filled order" means the venue already moved on.
+
+    Measured on testnet: modifying a stale oid answers with that error and leaves the live
+    order untouched, so the fill or the cancel that beat us is the truth. Recording it as a
+    rejection would mark an order REJECTED that may have filled, which is the one direction
+    the registry must never be wrong in. It stays live and the next reconciliation settles
+    it against the venue.
+    """
+    gone = RejectError("Cannot modify canceled or filled order")
+    manager = a_manager(store, ModifyTransport(modifies=[gone]))
+    order = await manager.submit(an_intent(px=2000.0))
+
+    repriced = await manager.reprice(order.cloid, 2010.0)
+
+    assert repriced.status is OrderStatus.ACKED, "not REJECTED: it may have filled"
+    assert repriced.intent.px == 2000.0, "the price the venue still has, not the one we wanted"
+    assert repriced.reprices == 0, "a move that did not happen is not a move"
+
+
+async def test_a_finished_order_is_not_repriced(store: OrderStore) -> None:
+    transport = ModifyTransport()
+    manager = a_manager(store, transport)
+    order = await manager.submit(an_intent(px=2000.0))
+    await manager.cancel(order.cloid)
+
+    repriced = await manager.reprice(order.cloid, 2010.0)
+
+    assert repriced.status is OrderStatus.CANCELED
+    assert transport.modified == []
+
+
+async def test_the_reprice_count_survives_a_restart(tmp_path: Path) -> None:
+    """The count bounds the reprices. Losing it across a restart unbounds them."""
+    first = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = a_manager(first, ModifyTransport())
+        order = await manager.submit(an_intent(px=2000.0))
+        await manager.reprice(order.cloid, 2010.0)
+    finally:
+        await first.close()
+
+    second = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager2 = a_manager(second, ModifyTransport())
+        await manager2.load()
+        assert manager2.get(order.cloid).reprices == 1
+    finally:
+        await second.close()

@@ -272,3 +272,36 @@ async def test_a_liquidation_with_no_notional_reaches_neither_the_book_nor_the_f
     session.ingest("liquidations", "okx", {**row, "notional_usd": 9_000.0, "px": 100.0})
     await session.tick(START + 1_000)
     assert session.features.row(COIN, START + 1_000).liq_long_usd_w == pytest.approx(9_000.0)
+
+
+async def test_an_abandoned_entry_is_cancelled_in_the_registry_not_filled(tmp_path: Path) -> None:
+    """The entry policy's terminal action must not look like a fill.
+
+    `_expire_entries` abandons an entry past `max_reprices` by dropping it from the coin
+    state. `sync_orders` reads "gone from the coin state and not cancelled" as "filled the
+    rest of the way", which is right for an order the fill model consumed and wrong for
+    one the policy gave up on. Recording a phantom fill puts a position in the registry
+    that the portfolio does not have, which is the exact disagreement reconciliation
+    exists to catch and would report forever.
+    """
+    settings = paper_settings(**{"execution.entry_ttl_s": 1.0, "execution.max_reprices": 0})
+    session = await a_session(tmp_path, settings)
+    quote(session, START, 3000.0)
+    print_trade(session, START, 3000.0)
+    await session.tick(START + 1_000)
+    assert session.inject_intent(coin=COIN, side="long", now_ms=START + 1_000) is not None
+    await session.tick(START + 1_250)
+
+    entry = session.state[COIN].entry
+    assert entry is not None, "the drill should have rested an entry"
+    cloid = entry.cloid
+
+    # Past the TTL with no reprices left: the policy abandons it.
+    later = START + 10_000
+    quote(session, later, 3000.0)
+    await session.tick(later)
+
+    assert session.state[COIN].entry is None, "the policy should have abandoned it"
+    order = session.orders.get(cloid)
+    assert order.status is OrderStatus.CANCELED, f"abandoned, not filled (was {order.status})"
+    assert order.filled == 0.0

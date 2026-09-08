@@ -67,6 +67,7 @@ from liqfade.backtest.portfolio import Trade as PortfolioTrade
 from liqfade.backtest.progress import ProgressWriter
 from liqfade.backtest.source import DAY_MS, Day, LakeSource, feature_hash, midnight_ms
 from liqfade.config.models import Settings
+from liqfade.execution.policy import EntryAction, entry_action
 from liqfade.features.grid import effective_ts
 from liqfade.log import get_logger
 from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
@@ -958,16 +959,23 @@ def _expire_entries(
     The same policy the live order manager will run. A backtest that let entries rest
     forever would report a maker fill rate nobody is going to achieve.
     """
-    ttl_ms = int(settings.execution.entry_ttl_s * 1000)
     for coin_state in state.values():
         entry = coin_state.entry
         # Only a resting Alo expires. An Ioc is crossed or cancelled the moment it becomes
         # visible, by _cross_taker_entries, and never reaches here.
         if entry is None or entry.kind is not OrderKind.ALO:
             continue
-        if now_ms < entry.visible_ms + ttl_ms:
+        # The decision itself lives in execution/policy.py, which the live order manager
+        # also calls. Two copies of this rule would differ in a way only a live run finds.
+        action = entry_action(
+            now_ms=now_ms,
+            visible_ms=entry.visible_ms,
+            reprices=coin_state.reprices,
+            settings=settings,
+        )
+        if action is EntryAction.HOLD:
             continue
-        if coin_state.reprices >= settings.execution.max_reprices:
+        if action is EntryAction.ABANDON:
             coin_state.entry = None
             coin_state.intent = None
             portfolio.abandoned_entries += 1

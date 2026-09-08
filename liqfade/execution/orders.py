@@ -60,6 +60,7 @@ from liqfade.log import get_logger
 log = get_logger(__name__)
 
 __all__ = [
+    "LIVE",
     "Order",
     "OrderIntent",
     "OrderManager",
@@ -167,6 +168,11 @@ class Order:
     reject_reason: str | None = None
     submitted_ms: int = field(default_factory=now_ms)
     updated_ms: int = field(default_factory=now_ms)
+    # How many times this entry has been moved, and when its current price became
+    # visible. `updated_ms` cannot serve as the clock: a partial fill touches it, which
+    # would hand a half filled order a fresh TTL it has not earned.
+    reprices: int = 0
+    priced_ms: int = field(default_factory=now_ms)
 
     @property
     def cloid(self) -> str:
@@ -208,6 +214,8 @@ class OrderTransport(Protocol):
 
     async def cancel(self, coin: str, cloid: str) -> None: ...
 
+    async def modify(self, intent: OrderIntent) -> int: ...
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
@@ -228,7 +236,9 @@ CREATE TABLE IF NOT EXISTS orders (
     fees        REAL NOT NULL DEFAULT 0,
     reject_reason TEXT,
     submitted_ms INTEGER NOT NULL,
-    updated_ms   INTEGER NOT NULL
+    updated_ms   INTEGER NOT NULL,
+    reprices     INTEGER NOT NULL DEFAULT 0,
+    priced_ms    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS orders_status ON orders(status);
 CREATE TABLE IF NOT EXISTS fills (
@@ -263,6 +273,18 @@ class OrderStore:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=FULL")
         await db.executescript(SCHEMA)
+        # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a
+        # registry written by an earlier version keeps its old columns and every read of
+        # a new one raises. The box has one of those, holding real orders.
+        async with db.execute("PRAGMA table_info(orders)") as cursor:
+            columns = {row["name"] for row in await cursor.fetchall()}
+        for name, ddl in (
+            ("reprices", "INTEGER NOT NULL DEFAULT 0"),
+            ("priced_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                await db.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
+                log.info("order_store_migrated", column=name)
         await db.commit()
         return cls(db)
 
@@ -276,12 +298,15 @@ class OrderStore:
             """
             INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only, tag,
                                 trigger_px, tpsl, status, oid, filled, avg_px, fees,
-                                reject_reason, submitted_ms, updated_ms)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                reject_reason, submitted_ms, updated_ms, reprices, priced_ms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(cloid) DO UPDATE SET
                 status=excluded.status, oid=excluded.oid, filled=excluded.filled,
                 avg_px=excluded.avg_px, fees=excluded.fees,
-                reject_reason=excluded.reject_reason, updated_ms=excluded.updated_ms
+                reject_reason=excluded.reject_reason, updated_ms=excluded.updated_ms,
+                -- px moves on a reprice, and the count and the clock move with it. Every
+                -- other column of the intent is still immutable.
+                px=excluded.px, reprices=excluded.reprices, priced_ms=excluded.priced_ms
             """,
             (
                 intent.cloid,
@@ -302,6 +327,8 @@ class OrderStore:
                 order.reject_reason,
                 order.submitted_ms,
                 order.updated_ms,
+                order.reprices,
+                order.priced_ms,
             ),
         )
         await self._db.commit()
@@ -369,7 +396,20 @@ def _order_from_row(row: aiosqlite.Row) -> Order:
         reject_reason=row["reject_reason"],
         submitted_ms=row["submitted_ms"],
         updated_ms=row["updated_ms"],
+        reprices=row["reprices"],
+        # A row written before this column existed reads 0, which would hand an old order
+        # an infinitely fresh price. Fall back to when it was submitted.
+        priced_ms=row["priced_ms"] or row["submitted_ms"],
     )
+
+
+# What the venue says when a modify lost its race. docs/HYPERLIQUID.md probe 7.
+ALREADY_GONE = "cannot modify canceled or filled order"
+
+
+def _already_gone(exc: BaseException) -> bool:
+    """Did this refusal mean the order is finished rather than that the request was bad?"""
+    return ALREADY_GONE in str(exc).lower()
 
 
 class OrderManager:
@@ -479,6 +519,7 @@ class OrderManager:
                 reduce_only=intent.reduce_only,
                 tag=intent.tag,
             )
+            order.priced_ms = now_ms()
             return await self._place_with_retries(order)
 
     def _rounded(self, intent: OrderIntent) -> OrderIntent:
@@ -574,6 +615,67 @@ class OrderManager:
             remaining=order.remaining,
         )
         return order
+
+    async def reprice(self, cloid: str, px: float) -> Order:
+        """Move a resting order to `px`, keeping its cloid. The entry policy's one action.
+
+        Measured on testnet 2026-09-08 (docs/HYPERLIQUID.md): `modify` answers with a
+        **new oid** and the same cloid, so the venue is doing a cancel-and-replace and
+        queue priority is not preserved. What it buys is one round trip instead of two and
+        an identity that survives the move, which is why the registry keys on the cloid
+        and merely records whichever oid the order is wearing now.
+
+        A price is rounded here exactly as `submit` rounds one: a reprice is an order, and
+        an unrounded price is refused rather than sent onto a grid the venue would reject.
+
+        Returns:
+            The order. Unchanged and still live when the venue said the order had already
+            been cancelled or filled, which is not a rejection to record but a race the
+            next reconciliation settles: marking it REJECTED would say "this did not
+            happen" about an order that may have filled, and that is the one direction the
+            registry must never be wrong in.
+
+        Raises:
+            TransientTransportError: every retry failed, same as `submit`.
+        """
+        order = self._orders[cloid]
+        async with self._locks.setdefault(cloid, asyncio.Lock()):
+            if order.status not in LIVE:
+                log.info("order_reprice_skipped", cloid=cloid, status=str(order.status))
+                return order
+            try:
+                intent = self._rounded(replace(order.intent, px=px))
+            except RoundingError as exc:
+                log.error("order_reprice_unroundable", cloid=cloid, px=px, error=str(exc))
+                return order
+
+            was_px = order.intent.px
+            try:
+                oid = await self.transport.modify(intent)
+            except RejectError as exc:
+                if _already_gone(exc):
+                    log.info("order_reprice_lost_race", cloid=cloid, px=px, reason=str(exc))
+                    return order
+                order.reject_reason = str(exc)
+                await self._transition(
+                    order, OrderStatus.REJECTED, "order_reprice_rejected", reason=str(exc)
+                )
+                return order
+
+            order.intent = intent
+            order.oid = oid
+            order.reprices += 1
+            order.priced_ms = now_ms()
+            await self._transition(
+                order,
+                order.status,
+                "order_repriced",
+                oid=oid,
+                was_px=was_px,
+                px=intent.px,
+                reprices=order.reprices,
+            )
+            return order
 
     async def record_fill(
         self,
