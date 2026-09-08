@@ -91,7 +91,12 @@ export interface DiskStats {
   used_pct: number;
 }
 
-/** GET /api/recorder/latency: the retained round trip samples as [ts_ms, ms] pairs. */
+/**
+ * GET /api/recorder/latency and /api/live/latency: the retained round trip samples as
+ * [ts_ms, ms] pairs, plus every percentile that process measured. submit_ack is null on
+ * the recorder, which places no orders, and there is no sample series behind it, so it
+ * renders as two numbers beside the two drawn series.
+ */
 export interface Latency {
   ws_ping: [number, number][];
   rest: [number, number][];
@@ -99,6 +104,8 @@ export interface Latency {
   ws_ping_p95: number | null;
   rest_p50: number | null;
   rest_p95: number | null;
+  submit_ack_p50: number | null;
+  submit_ack_p95: number | null;
 }
 
 /** GET /api/recorder/liquidations: hourly notional per venue, aligned on hour_ms. */
@@ -172,6 +179,87 @@ export interface EquityCurve {
   ts_ms: number[];
   equity: number[];
   drawdown: number[];
+}
+
+/** One resolved config key with the layer that won it. */
+export interface ConfigValue {
+  key: string;
+  value: unknown;
+  source: string | null;
+}
+
+/** One layer of the config, and only what that layer itself set. */
+export interface ConfigLayer {
+  name: string;
+  path: string | null;
+  exists: boolean;
+  values: Record<string, unknown>;
+}
+
+/** GET /api/config. `writable_sections` is served so the form cannot drift from the
+ * endpoint's allowlist, and `confirm_sections` says which fields need a typed name. */
+export interface ConfigView {
+  env: string;
+  live_trading_enabled: boolean;
+  live_trading_block_reason: string | null;
+  values: ConfigValue[];
+  layers: ConfigLayer[];
+  writable: boolean;
+  overrides_path: string;
+  writable_sections: string[];
+  confirm_sections: string[];
+}
+
+/** One row of the settings diff: what it is now, what it would become, who set it. */
+export interface DiffRow {
+  key: string;
+  before: unknown;
+  after: unknown;
+  source: string | null;
+}
+
+/** What POST /api/config came back with, in the shape the page shows. */
+export interface WriteResult {
+  ok: boolean;
+  diff: DiffRow[];
+  written: boolean;
+  reload: { changed: string[]; error: string | null } | null;
+  detail: string;
+}
+
+/** GET /api/audit: what the panel did, appended one JSON object per line. */
+export interface AuditEntry {
+  ts_ms: number;
+  action: string;
+  args: Record<string, unknown>;
+  ok: boolean;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  /** Settings writes only: why the owner made the change. */
+  reason?: string;
+}
+
+/** GET /api/live/fills: one fill joined to the order it belongs to. */
+export interface FillRow {
+  id: number;
+  cloid: string;
+  ts_ms: number;
+  coin: string;
+  side: "buy" | "sell";
+  px: number;
+  size: number;
+  notional_usd: number;
+  fee: number;
+  maker: boolean;
+  tag: string;
+  reduce_only: boolean;
+  status: string;
+}
+
+export interface FillsPage {
+  total: number;
+  offset: number;
+  fills: FillRow[];
 }
 
 export interface Candle {

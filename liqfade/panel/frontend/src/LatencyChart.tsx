@@ -7,7 +7,12 @@ import type { Latency } from "./types";
 // so it has far fewer points and lives on its own axis at the right.
 const WS_COLOR = "#34d399";
 const REST_COLOR = "#38bdf8";
+const ACK_COLOR = "#fbbf24";
 const HEIGHT = 160;
+
+function pair(p50: number | null, p95: number | null) {
+  return `p50 ${p50?.toFixed(1) ?? "-"} / p95 ${p95?.toFixed(1) ?? "-"} ms`;
+}
 
 /**
  * The two series are sampled at completely different rates (a ping every 20s, a REST
@@ -82,9 +87,7 @@ export default function LatencyChart({ data }: { data: Latency }) {
         <span className="flex items-center gap-2">
           <span className="inline-block h-2 w-2 rounded-sm" style={{ backgroundColor: WS_COLOR }} />
           <span className="text-neutral-400">ws ping</span>
-          <span className="tabular-nums">
-            p50 {data.ws_ping_p50 ?? "-"} / p95 {data.ws_ping_p95 ?? "-"} ms
-          </span>
+          <span className="tabular-nums">{pair(data.ws_ping_p50, data.ws_ping_p95)}</span>
         </span>
         <span className="flex items-center gap-2">
           <span
@@ -92,9 +95,18 @@ export default function LatencyChart({ data }: { data: Latency }) {
             style={{ backgroundColor: REST_COLOR }}
           />
           <span className="text-neutral-400">rest</span>
-          <span className="tabular-nums">
-            p50 {data.rest_p50 ?? "-"} / p95 {data.rest_p95 ?? "-"} ms
-          </span>
+          <span className="tabular-nums">{pair(data.rest_p50, data.rest_p95)}</span>
+        </span>
+        {/* No line: the protocol keeps percentiles for submit-to-ack but no sample
+            series behind them, so there is nothing to plot. Two numbers beside the two
+            series is the whole of what is measured, and a dash means not measured. */}
+        <span className="flex items-center gap-2">
+          <span
+            className="inline-block h-2 w-2 rounded-sm"
+            style={{ backgroundColor: ACK_COLOR }}
+          />
+          <span className="text-neutral-400">submit to ack</span>
+          <span className="tabular-nums">{pair(data.submit_ack_p50, data.submit_ack_p95)}</span>
         </span>
       </div>
     </div>

@@ -2607,3 +2607,52 @@ the free address harvest the map needs; `frontendOpenOrders` exposes other walle
 take-profit trigger levels; and braindeadpt's live-vs-replay comparator is the Phase 5 DoD
 sentence from 2026-09-07 written as a command. None of the four projects contained a strategy
 idea worth taking.
+
+## 2026-09-08
+
+**`overrides.yaml` lives under `data_dir`, not under `config/`.** Three processes share one
+data dir on the box and each runs from its own checkout: the recorder and the panel from
+`/srv/liqfade/app`, the paper loop from `/srv/liqfade/paper`, each with its own `config/`
+and its own venv. The panel is the only writer of this layer, and its unit runs
+`ProtectSystem=strict` with `ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs`, so a file
+under `config/` is unwritable by the writer; and even written, the paper loop would never
+see it, because it reads a different `config/` entirely. `/srv/liqfade/data` is the only
+path all three agree on and the only one the panel may write. The file has to be located
+before it can be merged, so `paths.data_dir` is resolved from every other layer first, the
+env layer included, because `LIQFADE_DATA_DIR` is how this box names its data dir. Reverse
+if the three processes are ever collapsed into one checkout, at which point `config/` is
+writable and shared again. No `overrides.yaml` existed anywhere on the box when this moved,
+so nothing was silently dropped.
+
+**The panel's fills curve is realized PnL on running average cost, not cumulative cash.**
+Cash is what a fill row literally is, and the first version plotted it: every entry dropped
+the line by the whole notional and every exit put it back, so a 2,400 dollar swing was drawn
+over a 30 dollar edge and the drawdown series measured position size rather than losses.
+Average cost per coin realizes only the part a fill closes and needs no guess about which
+entry an exit belongs to, so it is exact rather than an attribution that could be quietly
+wrong. The two agree wherever every book is flat, which is the check on the method and is
+asserted in `tests/test_panel.py`. Reverse if the order store ever persists per-trade PnL,
+which would make the attribution a lookup rather than a reconstruction.
+
+**No kill button in the panel, deliberately.** `/kill` stays Telegram and the `data/KILL`
+file. A kill is the one control that has to work when the panel is the thing that is broken,
+and a button in a browser tab is the easiest thing in this system to hit by accident. The
+test asserts the loop receives no kill command rather than that a route 404s, because the
+SPA catch-all answers unknown paths. Reverse never.
+
+**The panel writes settings behind an allowlist, not a blocklist.** `sizing`, `risk`,
+`cascade`, `exhaustion`, `intent`, `strategy`, `filters` and `universe` are writable;
+everything else is a deploy. CLAUDE.md says nothing in the panel may enable live trading,
+and an allowlist makes that true by construction rather than by having remembered every key
+that would do it. `sizing` needs the same typed confirmation as `risk`: it decides position
+size, which is a risk limit whatever the section is called. A key an env var already wins is
+refused outright, because the env layer merges last and the write would land while the
+process kept doing something else.
+
+**Panel v3 page load, measured on the box 2026-09-08.** 29 to 31 ms for `index.html` plus
+the JS and CSS bundles, served from loopback on the VPS, over three runs. CLAUDE.md asks for
+under a second on the VPS and this is two orders of magnitude inside it. The API calls behind
+the first paint are 1 to 2 ms each. Over an SSH tunnel from the laptop the same fetch takes
+about 1.1 s, which is the 470 KB bundle crossing the link and not the box: the bundle is one
+unsplit chunk, and code splitting is the lever if a slow link ever makes that annoying.
+Nothing here is worth optimising yet.

@@ -1,10 +1,14 @@
 import type {
+  AuditEntry,
+  ConfigView,
   DiskStats,
   EquityCurve,
+  FillsPage,
   Latency,
   Liquidations,
   ReportDetail,
   ReportRow,
+  WriteResult,
   StateSnapshot,
   TradeWindow,
   TradesPage,
@@ -21,7 +25,16 @@ export interface StateResult {
 }
 
 export async function fetchState(): Promise<StateResult> {
-  const res = await fetch("/api/state", { credentials: "same-origin" });
+  return fetchStateFrom("/api/state");
+}
+
+/** The trading loop's snapshot. Same shape and same staleness rule, a different file. */
+export async function fetchLiveState(): Promise<StateResult> {
+  return fetchStateFrom("/api/live/state");
+}
+
+async function fetchStateFrom(url: string): Promise<StateResult> {
+  const res = await fetch(url, { credentials: "same-origin" });
   if (res.status === 401) {
     return { state: null, error: null, stale: false, unauthorized: true };
   }
@@ -58,6 +71,12 @@ export async function logout(): Promise<void> {
   await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
 }
 
+/** Unauthenticated, so the header can name the environment before anyone logs in. */
+export async function fetchHealth(): Promise<{ ok: boolean; env: string } | null> {
+  const res = await fetch("/api/health", { credentials: "same-origin" });
+  return res.ok ? await res.json() : null;
+}
+
 export async function hasSession(): Promise<boolean> {
   const res = await fetch("/api/session", { credentials: "same-origin" });
   if (!res.ok) return false;
@@ -71,7 +90,16 @@ export async function fetchDisk(): Promise<DiskStats | null> {
 }
 
 export async function fetchLatency(): Promise<Latency | null> {
-  const res = await fetch("/api/recorder/latency", { credentials: "same-origin" });
+  return fetchLatencyFrom("/api/recorder/latency");
+}
+
+/** The trading loop's latency. The only place submit-to-ack is ever measured. */
+export async function fetchLiveLatency(): Promise<Latency | null> {
+  return fetchLatencyFrom("/api/live/latency");
+}
+
+async function fetchLatencyFrom(url: string): Promise<Latency | null> {
+  const res = await fetch(url, { credentials: "same-origin" });
   return res.ok ? ((await res.json()) as Latency) : null;
 }
 
@@ -80,6 +108,104 @@ export async function fetchLiquidations(hours = 24): Promise<Liquidations | null
     credentials: "same-origin",
   });
   return res.ok ? ((await res.json()) as Liquidations) : null;
+}
+
+/**
+ * The trading loop's fills, from `orders.sqlite`. `query` is the filter string built by
+ * Fills.tsx, shared with the curve below so the chart always plots the table's rows.
+ */
+export async function fetchFills(query: string, offset = 0, limit = 100): Promise<FillsPage> {
+  const res = await fetch(`/api/live/fills?${query}&limit=${limit}&offset=${offset}`, {
+    credentials: "same-origin",
+  });
+  if (!res.ok) return { total: 0, offset: 0, fills: [] };
+  return (await res.json()) as FillsPage;
+}
+
+export async function fetchLiveEquity(query: string): Promise<EquityCurve | null> {
+  const res = await fetch(`/api/live/equity?${query}`, { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as EquityCurve) : null;
+}
+
+/** What one control action came back with, in the shape the page shows. */
+export interface ControlOutcome {
+  action: string;
+  ok: boolean;
+  detail: string;
+  ts_ms: number;
+}
+
+/**
+ * Pause, resume or flat, through the loop's control socket. `confirm` is sent because
+ * the endpoint requires it: the second half of click-and-confirm is enforced server
+ * side, so a page reloaded mid-dialog cannot half submit an action.
+ */
+export async function sendControl(
+  action: "pause" | "resume" | "flat",
+  coin?: string,
+): Promise<ControlOutcome> {
+  const res = await fetch(`/api/live/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ confirm: true, coin: coin ?? null }),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    return {
+      action,
+      ok: false,
+      detail: body?.detail ?? res.statusText,
+      ts_ms: Date.now(),
+    };
+  }
+  return {
+    action,
+    ok: true,
+    detail: JSON.stringify(body.result),
+    ts_ms: body.entry?.ts_ms ?? Date.now(),
+  };
+}
+
+export async function fetchAudit(limit = 100): Promise<AuditEntry[]> {
+  const res = await fetch(`/api/audit?limit=${limit}`, { credentials: "same-origin" });
+  if (!res.ok) return [];
+  return ((await res.json()).entries ?? []) as AuditEntry[];
+}
+
+export async function fetchConfig(): Promise<ConfigView | null> {
+  const res = await fetch("/api/config", { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as ConfigView) : null;
+}
+
+/**
+ * Write settings, or preview them. `dry_run` runs every check the write runs and
+ * returns the same diff without touching the file, so the preview cannot promise
+ * something the write then refuses.
+ */
+export async function writeConfig(body: {
+  changes: Record<string, unknown>;
+  reason: string;
+  confirm: Record<string, string>;
+  dry_run: boolean;
+}): Promise<WriteResult> {
+  const res = await fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(body),
+  });
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    return {
+      ok: false,
+      diff: [],
+      written: false,
+      reload: null,
+      detail: payload?.detail ?? res.statusText,
+    };
+  }
+  return { ...payload, detail: "" } as WriteResult;
 }
 
 /** Backtest reports. All of these are session gated like everything else. */

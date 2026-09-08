@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
@@ -11,9 +13,25 @@ from fastapi.testclient import TestClient
 
 from liqfade.config import load_settings
 from liqfade.config.models import Settings
-from liqfade.control.protocol import LatencyState, RiskState, StateSnapshot, now_ms
+from liqfade.control.backend import NoopBackend
+from liqfade.control.protocol import (
+    LatencyState,
+    OrderState,
+    PositionState,
+    RiskState,
+    StateSnapshot,
+    now_ms,
+)
+from liqfade.control.server import ControlServer
 from liqfade.control.state import write_state
-from liqfade.panel.app import create_app, is_loopback, liquidations_by_venue, serve
+from liqfade.panel.app import (
+    create_app,
+    is_loopback,
+    liquidations_by_venue,
+    live_socket_path,
+    live_state_path,
+    serve,
+)
 from liqfade.panel.auth import (
     AuthNotConfiguredError,
     LoginLimiter,
@@ -194,10 +212,11 @@ def test_state_returns_503_on_a_corrupt_file(client: TestClient, settings: Setti
     assert "unreadable" in response.json()["detail"]
 
 
-def test_config_endpoint_is_read_only_and_reports_sources(client: TestClient) -> None:
+def test_config_endpoint_reports_sources_and_the_live_trading_gate(client: TestClient) -> None:
     client.post("/api/login", json={"password": PASSWORD})
     body = client.get("/api/config").json()
-    assert body["writable"] is False
+    # Writable since the settings page landed; TestSettingsWrites owns what that means.
+    assert body["writable"] is True
     assert body["live_trading_enabled"] is False
     keys = {row["key"]: row for row in body["values"]}
     assert keys["sizing.risk_frac"]["value"] == 0.005
@@ -409,6 +428,8 @@ def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
 ) -> None:
     client.post("/api/login", json={"password": PASSWORD})
     body = client.get("/api/recorder/latency").json()
+    # submit_ack is in the shape both latency endpoints share and is always None here:
+    # the recorder places no orders. One shape, so the two charts read the same fields.
     assert body == {
         "ws_ping": [],
         "rest": [],
@@ -416,6 +437,8 @@ def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
         "ws_ping_p95": None,
         "rest_p50": None,
         "rest_p95": None,
+        "submit_ack_p50": None,
+        "submit_ack_p95": None,
     }
 
 
@@ -673,3 +696,872 @@ def test_config_endpoint_reports_the_layers_not_only_the_winner(client: TestClie
     # The resolved view stays, because that is what the rest of the page reads.
     keys = {row["key"]: row for row in body["values"]}
     assert keys["sizing.risk_frac"]["source"] == "default.yaml"
+
+
+# --- the live page reads the trading loop, not the recorder ---------------------
+
+
+class TestTheLiveStateEndpoint:
+    """`/api/live/state` is the paper or live loop's snapshot, `/api/state` the recorder's.
+
+    Two processes write state under one data dir on the box: the recorder writes
+    `state.json` and the paper loop writes `state-paper.json`, named in
+    `scripts/systemd/liqfade-paper.service`. The Live page needs the loop's positions,
+    orders and risk, and the recorder's snapshot carries none of them.
+    """
+
+    @staticmethod
+    def _paper(ts_ms: int | None = None) -> StateSnapshot:
+        return StateSnapshot(
+            proc="paper",
+            env="paper",
+            ts_ms=ts_ms if ts_ms is not None else now_ms(),
+            uptime_s=126.9,
+            positions=[
+                PositionState(
+                    coin="BTC",
+                    side="long",
+                    size=0.03,
+                    entry_px=79000.0,
+                    mark_px=79100.0,
+                    notional_usd=2373.0,
+                    unrealized_pnl=3.0,
+                    opened_ms=1_788_784_000_000,
+                )
+            ],
+            orders=[
+                OrderState(
+                    cloid="0xabc",
+                    oid=7,
+                    coin="ETH",
+                    side="sell",
+                    px=3100.0,
+                    size=0.5,
+                    tif="Alo",
+                    reduce_only=True,
+                    status="ACKED",
+                    submitted_ms=1_788_784_100_000,
+                )
+            ],
+            risk=RiskState(paused=False, equity=10_000.0, consecutive_losses=2),
+        )
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/state").status_code == 401
+
+    def test_it_reads_the_paper_state_file_not_the_recorders(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        write_state(settings.state_path, _snapshot())  # the recorder's
+        write_state(live_state_path(settings), self._paper())
+
+        body = client.get("/api/live/state").json()
+
+        assert body["proc"] == "paper"
+        assert body["positions"][0]["coin"] == "BTC"
+        assert body["orders"][0]["cloid"] == "0xabc"
+        assert body["risk"]["consecutive_losses"] == 2
+        assert body["uptime_s"] == 126.9
+        assert body["live_trading"] is False
+        # The recorder's own snapshot is untouched and still served where it was.
+        assert client.get("/api/state").json()["proc"] == "live"
+
+    def test_no_loop_running_is_a_503_naming_the_file(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        response = client.get("/api/live/state")
+        assert response.status_code == 503
+        assert "state-paper.json" in response.json()["detail"]
+
+    def test_a_stale_snapshot_is_a_503_that_still_carries_the_last_values(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """The page greys its controls out behind the banner rather than going blank.
+
+        A stale loop snapshot is the case the read-only banner exists for: the numbers
+        on screen are the last known ones and no control may be sent against them.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+        stale_ms = now_ms() - int((settings.panel.state_stale_s + 5) * 1000)
+        write_state(live_state_path(settings), self._paper(stale_ms))
+
+        response = client.get("/api/live/state")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert "over the" in body["detail"]
+        assert body["state"]["positions"][0]["coin"] == "BTC"
+
+    def test_the_poll_does_not_carry_the_sample_series(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """Same rule as `/api/state`: this is polled every second over an SSH tunnel."""
+        client.post("/api/login", json={"password": PASSWORD})
+        snapshot = self._paper()
+        snapshot.latency.ws_ping_samples = [(1, 2.0)] * 200
+        write_state(live_state_path(settings), snapshot)
+
+        body = client.get("/api/live/state").json()
+
+        assert "ws_ping_samples" not in body["latency"]
+        assert "submit_ack_p50" in body["latency"]
+
+
+# --- fills history and realized PnL --------------------------------------------
+
+
+def _order_db(path: Path) -> None:
+    """A small orders.sqlite with the columns `execution/orders.py` writes.
+
+    Built with sqlite3 rather than by driving OrderManager: the panel reads this file
+    with duckdb and never through the manager, so the schema is the contract under test.
+    """
+    import sqlite3
+
+    from liqfade.execution.orders import SCHEMA
+
+    connection = sqlite3.connect(path)
+    connection.executescript(SCHEMA)
+    orders = [
+        ("0x01", "BTC", 1, 79000.0, 0.03, "Alo", 0, "entry", "FILLED", 1_788_784_000_000),
+        ("0x02", "BTC", 0, 79400.0, 0.03, "Ioc", 1, "target", "FILLED", 1_788_784_600_000),
+        ("0x03", "ETH", 0, 3100.0, 1.0, "Alo", 0, "entry", "FILLED", 1_788_870_000_000),
+        ("0x04", "ETH", 1, 3080.0, 1.0, "Ioc", 1, "target", "FILLED", 1_788_870_600_000),
+    ]
+    for cloid, coin, is_buy, px, size, tif, reduce_only, tag, status_, submitted in orders:
+        connection.execute(
+            """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only, tag,
+                                   status, submitted_ms, updated_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (cloid, coin, is_buy, px, size, tif, reduce_only, tag, status_, submitted, submitted),
+        )
+    fills = [
+        ("0x01", 1_788_784_000_000, 79000.0, 0.03, 1.06, 0),
+        ("0x02", 1_788_784_600_000, 79400.0, 0.03, 1.07, 0),
+        ("0x03", 1_788_870_000_000, 3100.0, 1.0, 0.46, 1),
+        ("0x04", 1_788_870_600_000, 3080.0, 1.0, 1.38, 0),
+    ]
+    connection.executemany(
+        "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,?,?)", fills
+    )
+    connection.commit()
+    connection.close()
+
+
+class TestFillsHistory:
+    """Every fill the loop has taken, from the registry the loop already writes.
+
+    Paper fills land in the same `orders.sqlite` as testnet and mainnet ones, so there is
+    one store and the panel reads it rather than keeping a second one that could disagree.
+    """
+
+    @pytest.fixture
+    def filled(self, client: TestClient, settings: Settings) -> TestClient:
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        _order_db(settings.order_db_path)
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/fills").status_code == 401
+
+    def test_no_registry_yet_is_an_empty_page_not_an_error(self, client: TestClient) -> None:
+        """The loop has never run on this box. That is an empty table, not a 500."""
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.get("/api/live/fills").json()
+        assert body == {"total": 0, "offset": 0, "fills": []}
+
+    def test_a_fill_carries_its_orders_coin_side_and_tag(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills").json()
+        assert body["total"] == 4
+        # The oldest row, which is the BTC entry: the page is newest first.
+        oldest = body["fills"][-1]
+        assert oldest["coin"] == "BTC"
+        assert oldest["side"] == "buy"
+        assert oldest["tag"] == "entry"
+        assert oldest["maker"] is False
+        assert oldest["ts_ms"] == 1_788_784_000_000
+        assert oldest["notional_usd"] == pytest.approx(2370.0)
+
+    def test_newest_first(self, filled: TestClient) -> None:
+        """The owner opens this page to see what just happened, not what happened first."""
+        stamps = [f["ts_ms"] for f in filled.get("/api/live/fills").json()["fills"]]
+        assert stamps == sorted(stamps, reverse=True)
+
+    def test_filters_by_coin_and_side(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills?coin=ETH").json()
+        assert body["total"] == 2
+        assert {f["coin"] for f in body["fills"]} == {"ETH"}
+
+        sells = filled.get("/api/live/fills?side=sell").json()
+        assert {f["side"] for f in sells["fills"]} == {"sell"}
+        assert sells["total"] == 2
+
+    def test_filters_by_date_range(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills?start_ms=1788870000000").json()
+        assert body["total"] == 2
+        assert {f["coin"] for f in body["fills"]} == {"ETH"}
+
+    def test_it_pages(self, filled: TestClient) -> None:
+        page = filled.get("/api/live/fills?limit=2&offset=1").json()
+        assert page["total"] == 4
+        assert page["offset"] == 1
+        assert len(page["fills"]) == 2
+
+    def test_an_unknown_coin_is_an_empty_page(self, filled: TestClient) -> None:
+        assert filled.get("/api/live/fills?coin=DOGE").json()["total"] == 0
+
+
+class TestTheRealizedEquityCurve:
+    """Realized PnL over the fills, on running average cost per coin.
+
+    The first version of this plotted cumulative cash, which is what a fill row literally
+    is. It made a useless chart: every entry dropped the line by the whole notional and
+    every exit put it back, so a 2,400 dollar swing drew over a 30 dollar edge. Average
+    cost realization needs no guess about which entry an exit belongs to and answers the
+    question the page exists for.
+    """
+
+    @pytest.fixture
+    def filled(self, client: TestClient, settings: Settings) -> TestClient:
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        _order_db(settings.order_db_path)
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_no_registry_yet_is_an_empty_curve(self, client: TestClient) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        assert client.get("/api/live/equity").json() == {
+            "ts_ms": [],
+            "equity": [],
+            "drawdown": [],
+        }
+
+    def test_an_entry_realizes_only_its_fee_and_an_exit_realizes_the_move(
+        self, filled: TestClient
+    ) -> None:
+        body = filled.get("/api/live/equity").json()
+
+        # BTC long: the entry costs its fee and nothing else, because nothing closed.
+        assert body["equity"][0] == pytest.approx(-1.06)
+        # Sold 0.03 at 79400 against a 79000 average: 12.00 realized, less the 1.07 fee.
+        assert body["equity"][1] == pytest.approx(9.87)
+        # ETH short: the entry is again its fee alone.
+        assert body["equity"][2] == pytest.approx(9.41)
+        # Bought 1.0 back at 3080 against a 3100 average short: 20.00 realized, less 1.38.
+        assert body["equity"][3] == pytest.approx(28.03)
+
+    def test_a_short_realizes_when_price_falls(self, filled: TestClient) -> None:
+        """A sell then a cheaper buy is a profit, which a signed cash total also says
+        but only after both legs. The point of the curve is that it says so at the exit."""
+        body = filled.get("/api/live/equity?coin=ETH").json()
+        assert body["equity"] == [pytest.approx(-0.46), pytest.approx(18.16)]
+
+    def test_a_partial_close_realizes_only_the_part_that_closed(
+        self, client: TestClient, settings: Settings, tmp_path: Path
+    ) -> None:
+        """Half an exit is half the PnL, and the rest stays open at the same average."""
+        import sqlite3
+
+        from liqfade.execution.orders import SCHEMA
+
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(settings.order_db_path)
+        connection.executescript(SCHEMA)
+        for cloid, is_buy, px, size, ts in [
+            ("0xa", 1, 100.0, 2.0, 1_000),
+            ("0xb", 0, 110.0, 1.0, 2_000),
+            ("0xc", 0, 120.0, 1.0, 3_000),
+        ]:
+            connection.execute(
+                """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only,
+                                       tag, status, submitted_ms, updated_ms)
+                   VALUES (?,'BTC',?,?,?,'Gtc',0,'entry','FILLED',?,?)""",
+                (cloid, is_buy, px, size, ts, ts),
+            )
+            connection.execute(
+                "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,0,0)",
+                (cloid, ts, px, size),
+            )
+        connection.commit()
+        connection.close()
+        client.post("/api/login", json={"password": PASSWORD})
+
+        equity = client.get("/api/live/equity").json()["equity"]
+
+        assert equity == [0.0, pytest.approx(10.0), pytest.approx(30.0)]
+
+    def test_a_position_that_flips_realizes_the_old_side_and_opens_the_new(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """One order can close a long and open a short. Only the closed part realizes;
+        treating the whole size as a close would book PnL on a position never held."""
+        import sqlite3
+
+        from liqfade.execution.orders import SCHEMA
+
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(settings.order_db_path)
+        connection.executescript(SCHEMA)
+        for cloid, is_buy, px, size, ts in [
+            ("0xa", 1, 100.0, 1.0, 1_000),  # long 1 at 100
+            ("0xb", 0, 110.0, 3.0, 2_000),  # closes the long, opens 2 short at 110
+            ("0xc", 1, 100.0, 2.0, 3_000),  # closes the short at 100
+        ]:
+            connection.execute(
+                """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only,
+                                       tag, status, submitted_ms, updated_ms)
+                   VALUES (?,'BTC',?,?,?,'Gtc',0,'entry','FILLED',?,?)""",
+                (cloid, is_buy, px, size, ts, ts),
+            )
+            connection.execute(
+                "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,0,0)",
+                (cloid, ts, px, size),
+            )
+        connection.commit()
+        connection.close()
+        client.post("/api/login", json={"password": PASSWORD})
+
+        equity = client.get("/api/live/equity").json()["equity"]
+
+        # 10 from the long, then 20 from the 2 short at 110 bought back at 100.
+        assert equity == [0.0, pytest.approx(10.0), pytest.approx(30.0)]
+
+    def test_it_agrees_with_the_cash_total_once_every_book_is_flat(
+        self, filled: TestClient
+    ) -> None:
+        """The check on the whole method: when nothing is open, realized PnL is exactly
+        the cash that came in less the cash that went out."""
+        body = filled.get("/api/live/equity").json()
+        cash = -2370.0 - 1.06 + 2382.0 - 1.07 + 3100.0 - 0.46 - 3080.0 - 1.38
+        assert body["equity"][-1] == pytest.approx(cash)
+
+    def test_the_curve_is_in_time_order_even_though_the_table_is_not(
+        self, filled: TestClient
+    ) -> None:
+        """The fills table is newest first for reading; a curve has to run forwards."""
+        stamps = filled.get("/api/live/equity").json()["ts_ms"]
+        assert stamps == sorted(stamps)
+
+    def test_drawdown_is_the_distance_below_the_running_peak(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/equity").json()
+        assert body["drawdown"][0] == pytest.approx(0.0)  # the first point is its own peak
+        assert body["drawdown"][1] == pytest.approx(0.0)  # a new high
+        assert all(value <= 0 for value in body["drawdown"])
+
+    def test_it_honours_the_same_filters_as_the_table(self, filled: TestClient) -> None:
+        """The chart under the table has to be the same rows the table is showing."""
+        body = filled.get("/api/live/equity?coin=ETH").json()
+        assert len(body["ts_ms"]) == 2
+        assert body["equity"][0] == pytest.approx(-0.46)
+
+
+# --- submit to ack latency ------------------------------------------------------
+
+
+class TestTheLiveLatencyEndpoint:
+    """Submit-to-ack is measured by the trading loop and by nothing else.
+
+    The recorder pings a websocket and calls REST; it never places an order, so its
+    snapshot's submit_ack percentiles are permanently None. The Live page therefore
+    reads the loop's own latency, which carries all three, rather than the recorder's.
+    """
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/latency").status_code == 401
+
+    def test_it_serves_the_loops_percentiles_and_its_rtt_series(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        snapshot = StateSnapshot(
+            proc="paper",
+            env="paper",
+            risk=RiskState(paused=False),
+            latency=LatencyState(
+                ws_ping_p50=3.7,
+                ws_ping_p95=14.2,
+                rest_p50=76.2,
+                rest_p95=88.0,
+                submit_ack_p50=41.5,
+                submit_ack_p95=190.0,
+                samples=7,
+                ws_ping_samples=[(1_788_784_000_000, 3.7), (1_788_784_020_000, 4.1)],
+                rest_samples=[(1_788_784_000_000, 76.2)],
+            ),
+        )
+        write_state(live_state_path(settings), snapshot)
+
+        body = client.get("/api/live/latency").json()
+
+        assert body["submit_ack_p50"] == 41.5
+        assert body["submit_ack_p95"] == 190.0
+        assert body["ws_ping"] == [[1_788_784_000_000, 3.7], [1_788_784_020_000, 4.1]]
+        assert body["rest"] == [[1_788_784_000_000, 76.2]]
+
+    def test_no_loop_running_is_an_empty_chart_not_an_error(self, client: TestClient) -> None:
+        """Same rule as the recorder's chart: a gap is the honest picture, not a 503."""
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.get("/api/live/latency").json()
+        assert body["ws_ping"] == []
+        assert body["submit_ack_p50"] is None
+
+    def test_a_loop_that_has_placed_nothing_reports_no_submit_ack(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """None is "not measured", which the page must not draw as a zero."""
+        client.post("/api/login", json={"password": PASSWORD})
+        write_state(
+            live_state_path(settings),
+            StateSnapshot(
+                proc="paper",
+                env="paper",
+                risk=RiskState(paused=False),
+                latency=LatencyState(ws_ping_p50=3.0),
+            ),
+        )
+        body = client.get("/api/live/latency").json()
+        assert body["ws_ping_p50"] == 3.0
+        assert body["submit_ack_p50"] is None
+        assert body["submit_ack_p95"] is None
+
+
+# --- controls -------------------------------------------------------------------
+
+
+@pytest.fixture
+def loop_socket(settings: Settings) -> Iterator[NoopBackend]:
+    """A real ControlServer on the path the panel expects, behind a NoopBackend.
+
+    Real socket, real wire format, real ControlClient: what is worth testing is that the
+    panel reaches the loop's socket and reports what came back, and a mocked client would
+    test neither. NoopBackend records every call and places nothing.
+
+    On its own thread and its own event loop, because TestClient's calls block the
+    caller: served from the test's loop, the blocking POST would starve the accept and
+    every request would time out against a socket that is listening. The `settings` it
+    resolves is whichever one is in scope, so a class that needs a short data_dir gets
+    its socket there.
+    """
+    backend = NoopBackend(env="paper", proc="paper")
+    server = ControlServer(backend, live_socket_path(settings))
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.start())
+        loop.call_soon(ready.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run, name="fake-control", daemon=True)
+    thread.start()
+    assert ready.wait(timeout=5.0), "the fake control server never came up"
+    try:
+        yield backend
+    finally:
+        asyncio.run_coroutine_threadsafe(server.stop(), loop).result(timeout=5.0)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+
+
+class TestControls:
+    """Pause, resume and flat, through the loop's own control socket.
+
+    There is no kill button here on purpose: `/kill` stays Telegram and the flag file.
+    A kill is the one action that must work when the panel is what is broken, and a
+    button in a browser tab is the easiest thing in this system to click by accident.
+    """
+
+    @pytest.fixture
+    def settings(self, sock_dir: Path) -> Settings:
+        """data_dir on a short path: pytest's tmp_path blows the sockaddr_un limit."""
+        return load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(sock_dir)})
+
+    def test_they_need_a_session(self, client: TestClient) -> None:
+        assert client.post("/api/live/pause", json={"confirm": True}).status_code == 401
+        assert client.post("/api/live/resume", json={"confirm": True}).status_code == 401
+        assert client.post("/api/live/flat", json={"confirm": True}).status_code == 401
+
+    def test_no_route_can_send_a_kill(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        """The rule is that no HTTP request reaches the loop's kill, not that one 404s.
+
+        The SPA catch-all answers unknown paths, so the status is 405 rather than 404;
+        what matters is the command the loop never received.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+
+        assert client.post("/api/live/kill", json={"confirm": True}).status_code >= 400
+
+        assert loop_socket.calls == []
+
+    def test_pause_reaches_the_loop_and_reports_what_came_back(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+
+        body = client.post("/api/live/pause", json={"confirm": True}).json()
+
+        assert body["ok"] is True
+        assert body["result"]["paused"] is True
+        assert [name for name, _ in loop_socket.calls] == ["pause"]
+        # Who asked, so the loop's own log says a human did this from the panel.
+        assert loop_socket.calls[0][1]["reason"] == "panel"
+
+    def test_resume_reaches_the_loop(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/resume", json={"confirm": True}).json()
+        assert body["result"]["paused"] is False
+        assert [name for name, _ in loop_socket.calls] == ["resume"]
+
+    def test_flat_closes_everything_when_no_coin_is_named(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/flat", json={"confirm": True}).json()
+        assert body["ok"] is True
+        assert loop_socket.calls == [("flat", {"coin": None})]
+
+    def test_flat_takes_one_coin(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/flat", json={"confirm": True, "coin": "btc"}).json()
+        assert body["result"]["closing"] == ["BTC"]  # upper cased on the way in
+        assert loop_socket.calls == [("flat", {"coin": "BTC"})]
+
+    def test_an_unconfirmed_action_is_refused_and_never_reaches_the_loop(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        """The confirm step is enforced here, not only in the browser.
+
+        A page can be reloaded mid-dialog and a curl has no dialog at all. Flattening is
+        not something to do because a request arrived.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+
+        response = client.post("/api/live/flat", json={"confirm": False})
+
+        assert response.status_code == 400
+        assert "confirm" in response.json()["detail"]
+        assert loop_socket.calls == []
+
+    def test_no_loop_running_is_a_503_that_says_so(self, client: TestClient) -> None:
+        """Nothing is listening: the page has to say the loop is down, not "failed"."""
+        client.post("/api/login", json={"password": PASSWORD})
+        response = client.post("/api/live/pause", json={"confirm": True})
+        assert response.status_code == 503
+        assert "control socket" in response.json()["detail"]
+
+    def test_every_action_is_logged_with_its_result(
+        self, client: TestClient, loop_socket: NoopBackend, settings: Settings
+    ) -> None:
+        """The audit log is the record of who changed what, and it is what the page shows."""
+        client.post("/api/login", json={"password": PASSWORD})
+
+        client.post("/api/live/flat", json={"confirm": True, "coin": "ETH"})
+
+        entries = client.get("/api/audit").json()["entries"]
+        assert len(entries) == 1
+        assert entries[0]["action"] == "flat"
+        assert entries[0]["args"] == {"coin": "ETH"}
+        assert entries[0]["ok"] is True
+        assert entries[0]["result"]["closing"] == ["ETH"]
+        assert entries[0]["ts_ms"] > 0
+
+
+# --- settings writes ------------------------------------------------------------
+
+
+class TestSettingsWrites:
+    """The only thing in this system that changes a running config from a browser.
+
+    Four rules, each enforced here rather than in the frontend, because a page can be
+    reloaded mid-flow and a curl has no frontend at all: an allowlist of writable
+    sections, a typed confirmation for anything that decides how much money is at risk,
+    a validation pass through the same model the YAML goes through, and an audit entry
+    whatever the outcome.
+    """
+
+    @pytest.fixture
+    def settings(self, sock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+        """data_dir on a short path, set in the environment rather than passed in.
+
+        The endpoint resolves the config from the process environment, the way the real
+        panel does, so a data_dir the test knows about and the process does not would
+        have the two looking at different overrides files.
+        """
+        monkeypatch.setenv("LIQFADE_PATHS__DATA_DIR", str(sock_dir))
+        return load_settings("paper")
+
+    @pytest.fixture
+    def signed_in(self, client: TestClient) -> TestClient:
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.post("/api/config", json={"changes": {}}).status_code == 401
+
+    def test_the_config_endpoint_now_says_it_is_writable_and_where(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        body = signed_in.get("/api/config").json()
+        assert body["writable"] is True
+        assert body["overrides_path"] == str(settings.paths.data_dir / "overrides.yaml")
+        # The sections a settings page may touch, so the form is built from the answer
+        # rather than from a list the frontend keeps its own copy of.
+        assert set(body["writable_sections"]) == {
+            "cascade",
+            "exhaustion",
+            "filters",
+            "intent",
+            "risk",
+            "sizing",
+            "strategy",
+            "universe",
+        }
+
+    def test_a_dry_run_returns_the_diff_and_writes_nothing(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """The preview is the write, minus the write, so they cannot disagree."""
+        body = signed_in.post(
+            "/api/config",
+            json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets", "dry_run": True},
+        ).json()
+
+        assert body["ok"] is True
+        assert body["diff"] == [
+            {"key": "intent.k_target", "before": 0.8, "after": 1.4, "source": "default.yaml"}
+        ]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_a_write_lands_in_the_overrides_file_with_its_timestamp_and_reason(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        import yaml
+
+        response = signed_in.post(
+            "/api/config",
+            json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets"},
+        )
+
+        assert response.status_code == 200
+        path = settings.paths.data_dir / "overrides.yaml"
+        written = yaml.safe_load(path.read_text())
+        assert written["intent"]["k_target"] == 1.4
+        header = path.read_text().splitlines()[0]
+        assert "wider targets" in path.read_text()
+        assert header.startswith("#")  # the timestamp and reason are a comment, not config
+
+    def test_a_second_write_keeps_the_first(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Two changes on different days are two overrides, not the second one only."""
+        import yaml
+
+        signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "a"})
+        signed_in.post("/api/config", json={"changes": {"intent.k_stop": 0.9}, "reason": "b"})
+
+        written = yaml.safe_load((settings.paths.data_dir / "overrides.yaml").read_text())
+        assert written["intent"] == {"k_target": 1.4, "k_stop": 0.9}
+
+    def test_the_written_config_still_loads(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """What the panel writes has to be a config the next process start can read."""
+        signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"sizing.risk_frac": 0.004},
+                "reason": "r",
+                "confirm": {"sizing.risk_frac": "sizing.risk_frac"},
+            },
+        )
+
+        reloaded = load_settings(
+            "paper", environ={"LIQFADE_PATHS__DATA_DIR": str(settings.paths.data_dir)}
+        )
+
+        assert reloaded.sizing.risk_frac == 0.004
+
+    # --- what it refuses ---------------------------------------------------------
+
+    def test_a_value_the_model_refuses_is_refused_before_it_is_written(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Validated through the same model as the YAML, so the page cannot write a
+        config that only fails at the next process start."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"sizing.risk_frac": 5.0}, "reason": "oops"}
+        )
+
+        assert response.status_code == 400
+        assert "risk_frac" in response.json()["detail"]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_a_cross_field_rule_is_refused_too(self, signed_in: TestClient) -> None:
+        """One field at a time is valid; the pair is not. Only whole-model validation
+        catches that, which is why the check is a load and not a field lookup."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"risk.kill_budget_s": 30.0}, "reason": "oops"}
+        )
+        assert response.status_code == 400
+        assert "kill_budget_s" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "env",
+            "execution.entry_tif",
+            "panel.allow_non_loopback",
+            "paths.data_dir",
+            "venues.hyperliquid.info_base",
+            "telegram.enabled",
+        ],
+    )
+    def test_only_the_allowlisted_sections_may_be_written(
+        self, signed_in: TestClient, key: str
+    ) -> None:
+        """An allowlist, not a blocklist. Nothing on this page can enable live trading,
+        and the way to be sure of that is that it cannot write anything it was not
+        named for, rather than that someone remembered every key that would do it."""
+        response = signed_in.post("/api/config", json={"changes": {key: "x"}, "reason": "no"})
+
+        assert response.status_code == 400
+        assert "not writable" in response.json()["detail"]
+
+    def test_a_risk_field_needs_its_own_name_typed_back(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        response = signed_in.post(
+            "/api/config",
+            json={"changes": {"risk.max_daily_loss_frac": 0.05}, "reason": "tighter"},
+        )
+
+        assert response.status_code == 400
+        assert "risk.max_daily_loss_frac" in response.json()["detail"]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_the_typed_confirmation_has_to_be_the_right_name(self, signed_in: TestClient) -> None:
+        response = signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"risk.max_daily_loss_frac": 0.05},
+                "reason": "tighter",
+                "confirm": {"risk.max_daily_loss_frac": "risk.max_dd_frac"},
+            },
+        )
+        assert response.status_code == 400
+
+    def test_a_confirmed_risk_field_is_written(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        import yaml
+
+        response = signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"risk.max_daily_loss_frac": 0.05},
+                "reason": "tighter after the drawdown",
+                "confirm": {"risk.max_daily_loss_frac": "risk.max_daily_loss_frac"},
+            },
+        )
+
+        assert response.status_code == 200
+        written = yaml.safe_load((settings.paths.data_dir / "overrides.yaml").read_text())
+        assert written["risk"]["max_daily_loss_frac"] == 0.05
+
+    def test_sizing_counts_as_a_risk_field(self, signed_in: TestClient) -> None:
+        """Sizing decides how much is at risk, so it gets the same typed confirmation."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"sizing.risk_frac": 0.004}, "reason": "smaller"}
+        )
+        assert response.status_code == 400
+        assert "sizing.risk_frac" in response.json()["detail"]
+
+    def test_a_key_an_env_var_already_wins_is_refused(
+        self, sock_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An override under an env var is a change the owner would watch do nothing.
+
+        The env layer merges last, so writing the file would leave the page showing a
+        value the process never adopts. Better to say so than to write it.
+        """
+        settings = load_settings(
+            "paper",
+            environ={
+                "LIQFADE_PATHS__DATA_DIR": str(sock_dir),
+                "LIQFADE_INTENT__K_TARGET": "1.9",
+            },
+        )
+        monkeypatch.setenv("LIQFADE_INTENT__K_TARGET", "1.9")
+        auth = SessionAuth(password_hash=hash_password(PASSWORD), secret="s", ttl_s=60)
+        with TestClient(create_app(settings, auth)) as client:
+            client.post("/api/login", json={"password": PASSWORD})
+            response = client.post(
+                "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "no"}
+            )
+
+        assert response.status_code == 400
+        assert "env var" in response.json()["detail"]
+
+    def test_a_write_with_no_reason_is_refused(self, signed_in: TestClient) -> None:
+        """The audit log's whole value is the why; a blank one makes it a diff."""
+        response = signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}})
+        assert response.status_code == 422
+
+    def test_an_empty_change_set_is_refused(self, signed_in: TestClient) -> None:
+        response = signed_in.post("/api/config", json={"changes": {}, "reason": "nothing"})
+        assert response.status_code == 400
+
+    # --- the reload and the audit trail ------------------------------------------
+
+    def test_a_write_reloads_the_loop_and_reports_what_it_said(
+        self, signed_in: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert [name for name, _ in loop_socket.calls] == ["reload_config"]
+        assert body["reload"]["error"] is None
+
+    def test_a_loop_that_refuses_the_reload_does_not_undo_the_write(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Nothing is listening, or the loop says it cannot reload. Either way the file
+        is written and the page says the running process has not picked it up: an
+        override that vanishes because the loop was down would be worse than a stale one.
+        """
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert body["ok"] is True
+        assert (settings.paths.data_dir / "overrides.yaml").exists()
+        assert "control socket" in body["reload"]["error"]
+
+    def test_every_write_is_audited_with_its_before_and_after(self, signed_in: TestClient) -> None:
+        signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets"}
+        )
+
+        entry = signed_in.get("/api/audit").json()["entries"][0]
+
+        assert entry["action"] == "settings"
+        assert entry["reason"] == "wider targets"
+        assert entry["args"]["changed"] == {"intent.k_target": 1.4}
+        assert entry["args"]["diff"] == [
+            {"key": "intent.k_target", "before": 0.8, "after": 1.4, "source": "default.yaml"}
+        ]
+
+    def test_a_refused_write_is_audited_too(self, signed_in: TestClient) -> None:
+        """What the owner tried is as worth reading back as what they managed."""
+        signed_in.post("/api/config", json={"changes": {"env": "mainnet"}, "reason": "no"})
+
+        entry = signed_in.get("/api/audit").json()["entries"][0]
+
+        assert entry["action"] == "settings"
+        assert entry["ok"] is False
+        assert "not writable" in entry["error"]
