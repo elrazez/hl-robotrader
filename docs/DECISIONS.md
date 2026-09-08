@@ -2651,3 +2651,109 @@ came from reasoning about a symptom instead of asking the venue a direct questio
 `userRole` call would have found the address error immediately; one `market_open` would
 have disproved the funding theory in seconds. The probe script now has `state_shape`, and
 it should be run and read before any theory is written down, not after.
+
+## 2026-09-08 (05c: the four Phase 5 drills, and the kill switch that did not work)
+
+All four drills pass. Every one of them failed first, and the failures are the point: the
+testnet execution path did not work at all, and 1,480 passing unit tests said nothing
+about it. Each bug below needed a real venue, a real position and a real kill to appear.
+
+### The drills, timed, each passed by a read of the venue rather than by a log counter
+
+| Drill | Measured | Result |
+| --- | --- | --- |
+| Kill from `data/KILL` | flag at `1788869127047`, seen +886ms, `kill_fired` +1,852ms | `venue_flat: true`, venue read `FLAT=True` |
+| Kill over the control plane, from a position **and** a bracket **and** a resting order | 3,880ms end to end | `venue_flat: true`, `positions {}`, `orders 0` |
+| Watchdog against a wedged loop (`SIGSTOP`) | stopped at `1788869332870`, `watchdog_stale` +10,197ms | flag written, alert sent |
+| Reconnect-triggered reconciliation (socket dropped with `ss -K`) | dropped at `1788869416192`, reconcile +233ms | `trigger: reconnect`, clean, equity read from the venue |
+
+The kill deadline in CLAUDE.md rule 5 is five seconds; the slowest kill was 3.9s including
+the client's own startup. The watchdog's 10.2s is `risk.watchdog_stale_s` of 10.0 plus one
+poll, which is the threshold working rather than a delay.
+
+**`SIGKILL` is not the watchdog's drill.** `Restart=always` brings the process back inside
+`RestartSec=3`, so the heartbeat never goes stale and the watchdog correctly says nothing.
+`SIGSTOP` is the honest simulation of the thing it exists for: a process systemd still
+believes is healthy and which has stopped doing anything.
+
+**What was not drilled: the Telegram transport itself.** Drill 2 sent `kill` over the
+control socket, which is the command `/kill` dispatches into, so everything from the
+command to the venue is covered. Sending the message as the owner is not something this
+chat can do, and claiming a Telegram drill on that basis would be a claim about the one
+link it did not exercise.
+
+### The kill switch reported success and closed nothing
+
+The first run said `cancelled 2, closed 1, elapsed_s 0.811` and Hyperliquid still held the
+position, an order and a bracket leg. Seven bugs sat behind that line.
+
+1. **The kill's own closing order was refused by the kill's own flag.** `submit` re-checks
+   the flag on every order; the kill writes the flag and then submits a reduce-only Ioc.
+   A reduce-only order cannot open or increase a position, so it passes the flag now, on
+   the same principle the action budget already follows.
+2. **Duplicate nonces.** Nonces are millisecond timestamps and three cancels back to back
+   put two in one millisecond: `Invalid nonce: duplicate nonce`. The registry recorded the
+   cancel and the venue kept the order. Signed actions now pass a gate that serialises
+   them and waits for the clock to advance, because a lock does not make time pass.
+3. **`close_out` was never awaited**, so a deploy restart cancelled nothing at all and a
+   `RuntimeWarning` was the only sign.
+4. **The kill closed what it remembered.** The position book is a mirror refreshed on
+   reconciliation, so it lags by up to `execution.reconcile_s`; a position opened since the
+   last one is invisible to it. A kill asks the venue.
+5. **`close_position` read that same mirror** and returned early, so `closed: 1` submitted
+   nothing. The caller's signed size wins now.
+6. **The closing order sat inside the spread.** Closing a long sells and only matches by
+   reaching the bid; it was priced from the ask minus slippage, which never crosses a wide
+   book, and an Ioc that cannot match is cancelled rather than filled.
+7. **A reprice's `canceled` frame marked the live order dead.** A reprice is
+   cancel-and-replace at the venue: it retires one oid and rests another under the same
+   cloid, and the retirement frame arrives after we already hold the new one. The registry
+   believed the entry was gone, the entry policy stopped managing it, and the kill skipped
+   it. That is why a repriced order survived a kill that reported cancelling it.
+
+**The fix that matters most is not any of those.** The kill now reads `clearinghouseState`
+and `frontendOpenOrders` after its sweep, retries the close while the budget lasts, and
+reports `VENUE FLAT` or `VENUE NOT FLAT: still holding ...`. The counters say what was
+attempted; only the venue says what is true, and a kill that cannot confirm flat must say
+so rather than declare success. Unverifiable stays unverified: paper has no account to
+read, and "not checked" is never reported as "flat".
+
+### Others the drills turned up on the way
+
+- **An urgent entry could never fill.** A high urgency intent is an `Ioc` and was priced at
+  its own side of the book: "Order could not immediately match against any resting orders".
+  Every urgent entry would have been refused, so the loop would take the trades the
+  strategy considers least worth chasing and refuse the ones it flags as most urgent.
+- **A fill that beat its own submit response found no intent to bracket**, leaving two
+  positions with no stop. An Ioc fills in a few hundred milliseconds and the user stream
+  pushes the fill while `submit` is still waiting on its HTTP response.
+- **A partly filled entry bracketed only the first partial**: a 0.0076 position wearing a
+  0.0019 stop, which reads as protected.
+- **`szDecimals` came from `_resolve_meta`**, which answers 5 for every coin. ETH is 4 and
+  the venue refused the size. The rules come from the venue's `meta` now.
+- **Equity read `accountValue`**, which is 0.0 on a flat account whose USDC sits in spot,
+  so sizing refused every entry for `risk_budget`, which is indistinguishable from a
+  strategy finding nothing.
+- **`flatten` left the mirror holding a position it had just closed** until the next
+  reconcile, refusing every new entry in that coin meanwhile and saying only
+  "position already open".
+- **The first kill reason did not survive.** The watchdog wrote "paper loop is stale", the
+  loop saw the flag and rewrote it with "kill file at data/KILL", and the diagnosis was
+  gone before anyone read it. An existing flag is left alone.
+- **The Telegram bot token reached the journal**, five times per unit, from an httpx error
+  carrying the full request URL after a 409. The owner must rotate it. One `redact()` now
+  covers the polling path and the outbound alert path.
+- **Two loops polling one bot token is a 409** and neither reliably receives a command.
+  `telegram.commands` is a config key now; paper owns the channel and testnet sends alerts
+  only. `/kill` still reaches both, because it writes the shared flag.
+- **Clearing a deliberate kill killed the box again immediately.** A kill stops the loop,
+  so its heartbeat ages for as long as the flag is up; the next poll after clearing read a
+  353s old stamp and wrote the flag straight back, and the unit failed to start 131 times.
+  Clearing the flag now starts a grace of one stale limit.
+
+### The drill state is a script now
+
+`scripts/drill/testnet_state.py build` flattens, injects a crossing entry, waits for the
+venue to show the position and its bracket, rests a second entry, and prints one line.
+`check` prints what the venue holds and is the pass criterion for every drill. Rebuilding
+that state by hand, once per fix, is where most of the hours went.
