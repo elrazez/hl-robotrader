@@ -166,3 +166,29 @@ likely the cost of a rejected one. None of this is evidence until an order actua
 Probe 4 writes the number `docs/STRATEGY_AND_RISK.md` uses for the latency model, and
 probe 5 decides whether `execution/watchdog.py` is a convenience or the only dead man's
 switch we have.
+
+## What an agent key can and cannot do, measured 2026-09-08
+
+Established by doing each one on testnet with the agent key and watching which address's
+balance moved. The split is sharper than the docs suggest and it matters twice: for
+recovering misplaced testnet funds, and as a security property on mainnet.
+
+| Action | SDK call | Acts on |
+| --- | --- | --- |
+| Place, modify, cancel an order | `order`, `modify_order`, `cancel_by_cloid` | **the master account** |
+| `scheduleCancel` | `schedule_cancel` | **the master account** |
+| Spot to perps and back | `usd_class_transfer` | the agent's own address |
+| Send spot tokens | `spot_transfer` | the agent's own address |
+| Send perps USDC | `usd_transfer` | the agent's own address |
+
+**Trading acts on the master; moving money acts on the signer.** An agent key can open,
+close and cancel positions on the master account and cannot move a cent of the master's
+money anywhere. That is the security property the agent-wallet design exists for: a leaked
+bot key is a trading risk, not a withdrawal risk. `docs/RUNBOOK.md` should say so, because
+it changes what a key compromise costs and therefore how it should be responded to.
+
+The practical consequence: **the master's spot-to-perps transfer cannot be done by the
+bot.** Only the master's own wallet can move its USDC between spot and perps, which is one
+click in the UI and no API call the bot is able to make. Fund the perps account before
+expecting the bot to trade, and remember that an agent address holding a balance is a
+balance no order will ever use.
