@@ -920,6 +920,7 @@ say "hashed on the box with the app's own bcrypt code, and only the hash is stor
 while :; do
   ask_secret PANEL_PW "Choose a panel password:"
   ask_secret PANEL_PW2 "Repeat it:"
+  # shellcheck disable=SC2153  # ask_secret assigns via printf -v, which shellcheck cannot see
   if [[ -n "$PANEL_PW" && "$PANEL_PW" == "$PANEL_PW2" ]]; then break; fi
   warn "empty or the two did not match, try again"
 done

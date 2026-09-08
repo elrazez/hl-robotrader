@@ -14,6 +14,7 @@ import structlog
 
 from liqfade.config import resolve
 from liqfade.config.models import Settings
+from liqfade.data.ingest import common as ingest_common
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +43,19 @@ def restore_structlog() -> Iterator[None]:
             structlog.reset_defaults()
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(**context)
+
+
+@pytest.fixture(autouse=True)
+def plenty_of_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide the host's real free space from the ingest disk floor.
+
+    MIN_FREE_GIB is 30, tuned for the VPS lake drive; a GitHub runner has about 20 free,
+    so every ingest test stopped at "free disk is under the floor" in CI and nowhere else.
+    Patched at `free_gib`, the one place both floors read, so the copy of `enough_disk`
+    imported into hl_asset_ctxs is covered too. Tests that want a full disk still
+    monkeypatch `enough_disk` themselves, and that patch wins over this one.
+    """
+    monkeypatch.setattr(ingest_common, "free_gib", lambda path: 1024.0)
 
 
 @pytest.fixture
