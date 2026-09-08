@@ -568,3 +568,53 @@ async def test_flatten_refreshes_the_local_book_from_the_venue(tmp_path: Path) -
         assert await session.open_positions() == {}, "the mirror follows the venue at once"
     finally:
         await session._store.close()
+
+
+async def test_closing_a_long_reaches_through_the_bid(tmp_path: Path) -> None:
+    """Drilled: the kill retried and the position stayed open.
+
+    Closing a long sells, and a sell only matches by reaching the bid. Pricing from the
+    ask and shaving the slippage off leaves the order inside the spread on anything but
+    the tightest book, where an Ioc is cancelled rather than filled.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2990.0, 3010.0)  # a wide spread, as testnet often has
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=3000.0)},
+            )
+        )
+
+        await session.close_position(COIN)
+
+        (order,) = venue.placed
+        assert order.is_buy is False
+        assert order.px < 2990.0, "must reach through the bid, not sit inside the spread"
+    finally:
+        await session._store.close()
+
+
+async def test_closing_a_short_reaches_through_the_ask(tmp_path: Path) -> None:
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2990.0, 3010.0)
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=-0.01, entry_px=3000.0)},
+            )
+        )
+
+        await session.close_position(COIN)
+
+        (order,) = venue.placed
+        assert order.is_buy is True
+        assert order.px > 3010.0
+    finally:
+        await session._store.close()

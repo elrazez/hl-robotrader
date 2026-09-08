@@ -492,7 +492,11 @@ class VenueSession:
         position = self.positions.get(coin)
         if position is None or position.size == 0:
             return
-        px = self.touch(coin, is_buy=position.size < 0)
+        # Cross into the far side: closing a long sells into the bid, closing a short
+        # buys from the ask. Taking our own side and shaving the slippage off leaves
+        # the order inside the spread on anything but the tightest book, and an Ioc
+        # that cannot match is cancelled rather than filled.
+        px = self.touch(coin, is_buy=position.size > 0)
         if px is None:
             book = self.books.get(coin)
             px = book.last_px if book else None
