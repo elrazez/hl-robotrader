@@ -35,6 +35,7 @@ def test_every_table_documented_in_data_sources_exists() -> None:
         "candles_1m",
         "xchg_ctx",
         "fills_full",
+        "hl_positions",
     }
 
 
@@ -97,6 +98,32 @@ def test_column_order_matches_the_schema_doc() -> None:
         "v",
         "n",
     ]
+    assert SCHEMAS["hl_positions"].names == [
+        "coin",
+        "ts_ms",
+        "rx_ms",
+        "source",
+        "address",
+        "szi",
+        "entry_px",
+        "liquidation_px",
+        "position_value_usd",
+        "margin_used_usd",
+        "leverage",
+        "leverage_type",
+        "max_leverage",
+    ]
+
+
+def test_hl_positions_keeps_a_missing_liquidation_price_null() -> None:
+    """A position with no liquidation level is a fact; a zero would bin it at price 0."""
+    table = rows_to_table(
+        "hl_positions",
+        [{"coin": "BTC", "ts_ms": 1, "rx_ms": 2, "address": "0xabc", "szi": -1.0}],
+        SOURCE_RECORDER,
+    )
+    validate_table("hl_positions", table)
+    assert table.column("liquidation_px").to_pylist() == [None]
 
 
 def test_a_good_table_validates() -> None:
