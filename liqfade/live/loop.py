@@ -356,6 +356,10 @@ class PaperLoop:
         """
         self.reconnects += 1
         self.reconnected.set()
+        # The gate that halts entries after `risk.max_reconnects_10min` counts them here
+        # and nowhere else: a feed that keeps dropping is a feed the strategy is deciding
+        # against blind, and until this line the counter was never incremented at all.
+        self.session.risk.on_reconnect(now_ms())
         log.warning("stream_reconnected", venue=venue, reconnects=self.reconnects)
         self._background(self.post(f"[{self.settings.env}] RECONNECT {venue}"))
 
