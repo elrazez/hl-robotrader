@@ -472,3 +472,42 @@ async def test_a_partly_filled_entry_brackets_the_whole_position(tmp_path: Path)
         assert len(venue.cancelled) == len(venue.groups) * 2 - 2
     finally:
         await session._store.close()
+
+
+async def test_an_urgent_entry_crosses_the_spread_instead_of_resting_on_it(
+    tmp_path: Path,
+) -> None:
+    """Drilled on testnet: "Order could not immediately match against any resting orders."
+
+    A high urgency entry is an `Ioc`, and an `Ioc` buy priced at the bid cannot match
+    anything. It has to reach through the offer by `execution.taker_slippage_bps`, which
+    is the same bound `close_position` crosses by. Priced at the touch, every urgent entry
+    was refused, so the loop would have taken exactly the trades the strategy considers
+    least worth chasing and refused the ones it considers most urgent.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        await session.place(an_intent("long", urgency="high"), START, Row())
+
+        (order,) = venue.placed
+        assert order.tif == "Ioc"
+        assert order.px > 3001.0, "a taker buy must reach through the offer"
+        bound = 1 + session.settings.execution.taker_slippage_bps / 1e4
+        assert order.px == pytest.approx(3001.0 * bound, rel=1e-6)
+    finally:
+        await session._store.close()
+
+
+async def test_an_urgent_short_crosses_down_through_the_bid(tmp_path: Path) -> None:
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        await session.place(an_intent("short", urgency="high"), START, Row())
+
+        (order,) = venue.placed
+        assert order.px < 2999.0
+        bound = 1 - session.settings.execution.taker_slippage_bps / 1e4
+        assert order.px == pytest.approx(2999.0 * bound, rel=1e-6)
+    finally:
+        await session._store.close()

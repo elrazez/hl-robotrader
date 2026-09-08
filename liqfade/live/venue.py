@@ -346,10 +346,19 @@ class VenueSession:
             return None
 
         is_buy = intent.side == "long"
-        px = self.touch(intent.coin, is_buy=is_buy)
+        # `Alo` at the touch, `Ioc` through it. strategy/types.py: only high urgency may
+        # take liquidity, and an Ioc priced at its own side of the book cannot match
+        # anything. Drilled on testnet: "Order could not immediately match against any
+        # resting orders", which would have refused every urgent entry, meaning the loop
+        # took the trades the strategy considers least urgent and refused the rest.
+        crossing = intent.urgency == "high"
+        px = self.touch(intent.coin, is_buy=not is_buy if crossing else is_buy)
         if px is None:
             log.warning("entry_unpriceable", coin=intent.coin)
             return None
+        if crossing:
+            bound = self.settings.execution.taker_slippage_bps / 1e4
+            px = px * (1 + bound) if is_buy else px * (1 - bound)
 
         cloid = new_cloid()
         order = await self.orders.submit(
@@ -362,7 +371,7 @@ class VenueSession:
                 # Alo at the touch, per docs/STRATEGY_AND_RISK.md section 3. A high
                 # urgency intent crosses instead: strategy/types.py says only high urgency
                 # may take liquidity, and the cascade it is fading does not wait.
-                tif="Ioc" if intent.urgency == "high" else "Alo",
+                tif="Ioc" if crossing else "Alo",
                 tag="entry",
             )
         )
