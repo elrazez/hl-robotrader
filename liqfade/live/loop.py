@@ -834,6 +834,7 @@ class VenueLoop(PaperLoop):
             address=signer.account_address,
             manager=session.orders,
             cfg=settings.recorder,
+            ping_s=settings.venues.hyperliquid.ws_ping_s,
             on_reconnect=self._on_reconnect,
             on_fill=lambda event: session.on_fill(
                 event.cloid, px=event.px, size=event.size, ts_ms=event.ts_ms

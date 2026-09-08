@@ -1039,3 +1039,45 @@ async def test_the_kill_can_cancel_an_order_the_registry_never_heard_of(
         assert sorted(cancelled_by_oid) == [(COIN, 11), (COIN, 12), (COIN, 13)]
     finally:
         await session._store.close()
+
+
+async def test_a_released_bracket_is_marked_cancelled_in_the_registry(tmp_path: Path) -> None:
+    """The venue removes both legs with the position, and the registry has to hear about it.
+
+    Measured on testnet 2026-09-08: a kill closed two bracketed positions and left one leg
+    ACKED in the registry, so every reconciliation from then on reported it as an order the
+    venue had lost, at INVESTIGATE, forever. No cancel is sent for it: the venue removed it
+    two seconds after the position closed, and spending an action to be told so is what
+    `execution/tpsl.py` says not to do.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.cancelled.clear()
+
+        # The position closed at the venue: its bracket went with it.
+        session.sync_account(
+            AccountSnapshot(equity=1001.0, margin_used=0.0, withdrawable=1001.0, positions={})
+        )
+        assert session.brackets == {}
+        await session.age_entries(START + 20)
+
+        assert session.orders.get(legs.tp_cloid).status is OrderStatus.CANCELED
+        assert session.orders.get(legs.sl_cloid).status is OrderStatus.CANCELED
+        live = [order.cloid for order in await session.orders.open_orders()]
+        assert live == [cloid], "only the part of the entry still resting, no leg to flag"
+        assert venue.cancelled == [], "the venue removed them; we spend no action saying so"
+    finally:
+        await session._store.close()

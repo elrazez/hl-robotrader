@@ -3103,3 +3103,104 @@ what an honest receive time looks like.
 `ts_ms` and `rx_ms` mean different things and both are now correct per row: `ts_ms` is the
 venue's own `time` and is the field research joins on; `rx_ms` is local receipt and is
 what no-lookahead checks must use.
+
+`ts_ms` genuinely leads `rx_ms` for a different and harmless reason: the response's `time`
+is the venue's, and it is the field research should join on, while `rx_ms` is what
+no-lookahead checks must use. Both are now honest per row.
+
+## 2026-09-08 (05e: the venue path re-drilled, and three of the gates fired for the first time)
+
+The seven venue-path findings of the review are fixed and the Phase 5 drills were re-run
+against them from `/srv/liqfade/paper` on the box. All of them pass, judged by a read of
+Hyperliquid rather than by a log counter. What the day is actually worth recording for is
+narrower and more useful: **three risk gates refused something real within twenty minutes
+of being wired up, and every one of those refusals broke a drill that had been passing.**
+
+### The deploys, timed
+
+| Step | Measured |
+| --- | --- |
+| `deploy.sh`, `LIQFADE_BRANCH=main` 9addc61 into `/srv/liqfade/paper` | 15:01:50 to 15:01:58 UTC, 8s. `5e8c0ee` to `9addc61`, 86 packages already synced |
+| Units | all three unchanged, so nothing restarted. `liqfade-recorder`, `-panel`, `-live` skipped: owned by `/srv/liqfade/app` |
+| Restart by hand, on purpose | 15:02:32.814. watchdog +0.0s, testnet +1.7s (157 asset rules from the venue), paper +6.2s |
+| Second deploy, `05g-drill-fixes` 7f283a4 (main e18973f plus the three drill fixes) | 16:00:06, restart 16:01:28.258, all three up by 16:01:34 |
+
+`paper_started` now carries `config_hash=c9cc76a1…`, so the soak's code and its config are
+both identifiable from one journal line.
+
+### The drills, each passed by a venue read
+
+| Drill | Measured | Result |
+| --- | --- | --- |
+| Deploy restart with **two** bracketed positions and four trigger legs open | shutdown 15:40:39.735, stopped +121ms, **zero cancels**, registry reloaded 4 live orders +2.42s, `paper_started` +2.46s, reconcile clean +2.76s | both positions and all four legs still at the venue |
+| Kill from `data/KILL` | flag 15:41:27.579, seen +813ms, `kill_fired` +4.45s, `elapsed_s 3.639` | `venue_flat: true`, venue read `FLAT=True` |
+| Kill over the control plane, position and bracket open | sent 15:50:54.367, answered **3,190ms** later, `elapsed_s 2.354` | `venue_flat: true`, `canceled_orders 2`, `closed_positions 1`, venue read `FLAT=True` |
+| Watchdog against a wedged loop (`SIGSTOP` on paper) | stopped 15:52:38.913, `watchdog_stale` +9,818ms ("heartbeat is 10.5s old") | flag written with the watchdog's own reason, alert sent |
+| Reconnect-triggered reconciliation (`ss -K` on the loop's HL sockets) | dropped 15:54:09.468, disconnect +19ms, reconcile `trigger: reconnect` +133ms | one difference, which was a real bug: see below |
+| Flat at the end | 15:55:19.378 | `FLAT=True`, and still flat at 16:06 on the final code |
+
+Both kills are inside CLAUDE.md rule 5's five seconds, and the flag was cleared by hand
+after each: both loops were back within 1.5s and the watchdog did not immediately re-arm,
+which is the 2026-09-08 grace working.
+
+### The three gates that fired, and the drills they broke
+
+None of these was a regression. Each is a limit that could not fire before today, firing
+correctly on the first state that reached it.
+
+- **`cluster_exposure`** refused the drill's second injected entry 143ms after the first
+  one filled. The position had taken 25% of equity, which is the whole cluster budget, and
+  the resting order was a second long. Telegram said so:
+  `RISK BLOCK risk/cluster_exposure on SOL (x1 so far)`. The drill's resting order is a
+  short now, because the cluster window is one sided.
+- **`coin_cooldown`** refused the next build. `build` flattens first and then enters the
+  coin it just closed, and a closed round trip puts that coin on 5 minutes, or 30 when it
+  lost. The drill reads the loop's own risk state now and says which coin is cooling and
+  for how long, instead of timing out after 90s with an empty account.
+- **`reconnect_storm`** refused every entry for ten minutes, and this one was not the
+  drill's fault. `hyperliquid_user` was being closed and reopened **every 60.4 seconds**,
+  thirteen times in the nineteen minutes before it was caught. The user socket never sent
+  a ping, and `config/default.yaml` says why in the comment beside `ws_ping_s`: the server
+  closes idle connections after 60s. The recorder's market streams have pinged since
+  Phase 1; this one was built without one and carries no traffic of its own on a quiet
+  account. Every close cost whatever fills landed in the gap. Zero closes in the 4m30s
+  after the fix, against thirteen before it.
+
+**The lesson worth keeping is the third one.** A counter wired to nothing hides what it
+counts: 8 reconnects were in the paper journal for the whole week and nobody read them,
+and the testnet loop was flapping once a minute in plain sight. The gate found it in twenty
+minutes.
+
+### Two more, from the same drills
+
+- **A released bracket leg stayed `ACKED` in the registry forever.** After the kill closed
+  two bracketed positions, one leg was still live for us while Hyperliquid had removed it
+  with its position, so every reconciliation reported it as an order the venue had lost, at
+  INVESTIGATE, on the interval and on every reconnect. `sync_account` already dropped the
+  bracket; it never told the registry. It records them cancelled now, with no cancel sent,
+  because `execution/tpsl.py` measured both legs going within two seconds of the close. The
+  one row left by the old code was written off by hand on the box, with the reason in
+  `reject_reason`.
+- **The watchdog does not watch the testnet loop.** `SIGSTOP` on the testnet process for
+  25s produced nothing, correctly: there is one watchdog unit and it reads `data/heartbeat`,
+  which is the paper loop's. The testnet loop writes `heartbeat-testnet` and nothing reads
+  it. Not fixed here, and not a Phase 5 gap, because testnet holds no money; it is a gap
+  before anything runs on `liqfade-live`.
+
+### What testnet can and cannot drill
+
+Its universe is four coins and only two of them can be sized: SOL is refused with
+`min_notional` at any stop distance because testnet volume makes `vol_cap` a couple of
+dollars, and HYPE has no book at all (`entry_unpriceable`). So a drill state is BTC and ETH,
+each cycle puts both on cooldown for 5 to 30 minutes, and a plain resting entry order
+alongside two positions was not obtainable at all: the four trigger legs were the resting
+orders the kill had to cancel, which is the harder case anyway since they live only in
+`frontendOpenOrders`.
+
+### The paper acceptance run
+
+The clock stands at **2026-09-07 17:51:34 UTC** through all of today's restarts, per the 05b
+definition that coverage is what counts. Counters for the window up to this deploy: 1,247
+clean reconciliations and **zero** differences, 8 reconnects, 19 process starts, 11 kills
+(yesterday's Telegram drill and today's), no halt, no trade, equity 10,000.00 with a peak of
+10,000.03. Latency: WS ping p50 2.1ms and p95 9.6ms, REST p50 44.7ms and p95 71.8ms.
