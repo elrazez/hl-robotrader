@@ -7,6 +7,8 @@ on:
 jobs:
   lint-test:
     runs-on: ubuntu-24.04
+    # A hung suite is a 6 hour runner bill by default; the job takes about 3 minutes.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 

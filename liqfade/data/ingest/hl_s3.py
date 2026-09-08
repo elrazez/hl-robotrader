@@ -38,6 +38,7 @@ from typing import Any
 import orjson
 
 from liqfade.data.ingest.common import (
+    MP_CONTEXT,
     BackfillError,
     Manifest,
     check_cost_gate,
@@ -827,7 +828,9 @@ def rederive(
         )
         print(f"{day}  {detail}  {seconds:7.1f}s", flush=True)
 
-    pool = concurrent.futures.ProcessPoolExecutor(max_workers=max(1, workers))
+    pool = concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(1, workers), mp_context=MP_CONTEXT
+    )
     started = {pool.submit(rederive_day, str(data_dir), day, force): day for day in days}
     seen: set[str] = set()
 

@@ -315,6 +315,14 @@ def write_partitioned(
 
 STAGE_MIN_FREE_GIB = 5.0  # floor for the local staging disk, distinct from the lake floor
 
+# Every worker pool in the ingest package uses this, not the platform default, which is
+# fork on Linux. fork copies the parent's locks without the threads holding them, and the
+# workers all read or write Parquet through pyarrow and polars, whose thread pools are
+# exactly that kind of lock: a child can block on one nothing will ever release. It cost
+# two CI runs that hung for 20 minutes where macOS, which already defaults to spawn, was
+# green. Pickling by reference is the contract these workers were written to anyway.
+MP_CONTEXT = multiprocessing.get_context("spawn")
+
 # (local raw file, key, staging parquet root) -> rows per table. Runs inside a worker
 # process, so it must be a module level function (pickled by reference) and must write
 # only under the staging root it was given.
@@ -473,15 +481,8 @@ def parallel_pull(
                 finish(*_stage_object(client, bucket, key, size, str(stage_base), handler))
         else:
             factory = client_factory or s3_client
-            # spawn, not the Linux default fork. fork copies the parent's locks but
-            # not the threads holding them, and every handler writes Parquet through
-            # pyarrow, whose thread pool and allocator are exactly that kind of lock: a
-            # child can block on one no thread will ever release. It cost a CI run that
-            # hung for 20 minutes where macOS, which already defaults to spawn, was
-            # green. Pickling by reference is the contract the handlers were written to
-            # anyway, so nothing else changes.
             with concurrent.futures.ProcessPoolExecutor(
-                max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+                max_workers=workers, mp_context=MP_CONTEXT
             ) as pool:
                 futures = [
                     pool.submit(
