@@ -2837,3 +2837,46 @@ read, and "not checked" is never reported as "flat".
 venue to show the position and its bracket, rests a second entry, and prints one line.
 `check` prints what the venue holds and is the pass criterion for every drill. Rebuilding
 that state by hand, once per fix, is where most of the hours went.
+
+## 2026-09-08 (05c: the Telegram drill passed, and then killed the box 42 times)
+
+The fifth drill, run by the owner from their phone.
+
+| Step | ts_ms | since the message |
+| --- | --- | --- |
+| paper receives `/kill` | 1788871680515 | 0 |
+| flag written | 1788871680516 | +1ms |
+| testnet sees the shared flag | 1788871681454 | +939ms |
+| testnet `kill_fired`, `venue_flat: true` | 1788871684369 | **+3,854ms** |
+
+Inside the five seconds rule 5 promises, through the real transport, with the venue
+confirming flat. It also proved two things designed earlier: one flag kills both loops,
+and the flag kept the reason `telegram /kill` rather than having it overwritten by the
+second loop to see it.
+
+**Then it would not come back.** Clearing the flag and restarting produced another
+`telegram_command` 994ms later, another flag, another failed start, 42 times. Not a second
+`/kill` from anyone: Telegram redelivers an update until `getUpdates` is called with an
+offset past it, the offset lived only in `CommandBot.self.offset`, and the command being
+handled is the one that stops the process. So the killed loop never acknowledged its own
+`/kill`, and Telegram handed the same update to whatever started next.
+
+**Every Telegram `/kill` was unrecoverable**, and the drill is the only reason we know:
+the command works perfectly and the box then cannot be restarted, which is the worst
+possible time to discover it. The offset is persisted under `data_dir` now, and written
+**before** the command is dispatched rather than after, because "after" is exactly the
+point a kill never reaches. The trade is that a crash between the write and the dispatch
+loses a command, which is the right way round here: a kill that did not run leaves the flag
+unwritten and the owner watching, while a kill that runs on every restart makes the box
+impossible to bring back. Tested against a fake Bot API that redelivers until acknowledged.
+
+Verified on the box after the fix: two full restart cycles of both loops with no flag and
+no redelivery, restart counters back to 0.
+
+**One wrong turn worth recording.** The first diagnosis was mine and it was wrong: I
+assumed the watchdog had killed a loop that was still starting, and added a startup grace
+for it. The flag said `reason: telegram /kill`, which is the watchdog ruling itself out in
+the one field that answers the question, and three existing tests failed because the grace
+changed behaviour they correctly asserted. Reverted. Reading the flag before theorising
+would have cost one command; this is the third time in this branch that the answer was one
+direct question away.
