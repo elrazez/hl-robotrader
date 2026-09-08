@@ -28,6 +28,13 @@ TOL = 2_000
 
 
 def ref(coin: str = "ETH", side: str = "long", offset_ms: int = 0, **over: object) -> IntentRef:
+    """An entry attempt that filled, unless the caller says otherwise.
+
+    A filled entry and a refusal are the two things both sides can list one by one; an
+    entry that was placed and abandoned is a tally on the replay side, not a list, so it
+    is not the useful default here.
+    """
+    over.setdefault("entry_px", 100.0)
     return IntentRef(coin=coin, side=side, ts_ms=START + offset_ms, **over)  # type: ignore[arg-type]
 
 
@@ -145,6 +152,7 @@ def side(**over: object) -> Side:
         "round_trips": [],
         "refusals": {},
         "config_hash": "abc",
+        "abandoned_entries": 0,
     }
     return Side(**{**base, **over})  # type: ignore[arg-type]
 
@@ -230,11 +238,16 @@ def test_entries_drift_when_the_median_price_gap_is_over_the_bar() -> None:
     assert entries.metrics[0].value > 5.0
 
 
-def test_an_intent_that_became_an_order_on_only_one_side_is_not_priced_against_a_default() -> None:
-    """A None entry price is not a zero. Diffing against one invents a 10,000 bps gap."""
-    live = [ref(offset_ms=0, entry_px=100.0)]
-    replay = [ref(offset_ms=0, entry_px=None)]
+def test_an_intent_the_live_side_refused_is_not_priced_against_a_default() -> None:
+    """A None entry price is not a zero. Diffing against one invents a 10,000 bps gap.
+
+    The live loop refused where the replay traded, so the pair matches on coin, side and
+    time and only one half of it has a fill price.
+    """
+    live = [ref(offset_ms=0, entry_px=None, stage="risk", reason="daily_loss")]
+    replay = [ref(offset_ms=0, entry_px=100.0)]
     report = compare(side(intents=live), side(intents=replay), settings=SETTINGS)
+    assert len(match_intents(live, replay, tol_ms=TOL).matched) == 1
     assert dimension(report, "entries").verdict is Verdict.NOT_COMPARABLE
 
 
@@ -411,3 +424,47 @@ def test_a_round_trip_inside_a_hole_is_left_out_of_the_exits_verdict_too() -> No
         side(round_trips=live), side(round_trips=replay), holes=[hole], settings=SETTINGS
     )
     assert dimension(report, "exits").verdict is Verdict.NOT_COMPARABLE
+
+
+def test_an_entry_that_was_placed_and_abandoned_is_counted_not_matched() -> None:
+    """The engine tallies an abandoned entry and does not log one.
+
+    Listing the live side's and matching them against a tally would report every one of
+    them as an intent the replay never had, which is drift the data cannot support.
+    """
+    live = [ref(offset_ms=i * 60_000, entry_px=None) for i in range(5)]
+    report = compare(
+        side(intents=live, abandoned_entries=5),
+        side(abandoned_entries=5),
+        settings=SETTINGS,
+    )
+    assert dimension(report, "intents").verdict is Verdict.MATCH
+
+
+def test_the_two_abandoned_tallies_drifting_apart_is_reported() -> None:
+    report = compare(side(abandoned_entries=40), side(abandoned_entries=0), settings=SETTINGS)
+    assert dimension(report, "intents").verdict is Verdict.DRIFT
+
+
+def test_one_side_trading_where_the_other_refused_is_drift_not_an_absent_number() -> None:
+    """The pair matches and the refused half has no fill price, so this used to fall
+    between the dimensions: intents agreed and entries reported NOT_COMPARABLE.
+
+    It is the most consequential disagreement there is and it now has to be reported.
+    """
+    live = [ref(offset_ms=0, entry_px=100.0)]
+    replay = [ref(offset_ms=0, entry_px=None, stage="risk", reason="daily_loss")]
+    report = compare(side(intents=live), side(intents=replay), settings=SETTINGS)
+    intents = dimension(report, "intents")
+    assert intents.verdict is Verdict.DRIFT
+    assert any("daily_loss" in line for line in intents.detail)
+
+
+def test_a_handful_of_trade_refuse_disagreements_in_a_busy_week_is_not_drift() -> None:
+    """A bar of zero on this would read DRIFT on every week and be ignored by the second."""
+    live = [ref(offset_ms=i * 60_000, entry_px=100.0) for i in range(20)]
+    replay = [ref(offset_ms=i * 60_000, entry_px=100.0) for i in range(19)] + [
+        ref(offset_ms=19 * 60_000, entry_px=None, stage="risk", reason="cooldown")
+    ]
+    report = compare(side(intents=live), side(intents=replay), settings=SETTINGS)
+    assert dimension(report, "intents").verdict is Verdict.MATCH

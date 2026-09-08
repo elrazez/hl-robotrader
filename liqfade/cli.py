@@ -627,6 +627,13 @@ def _with_latency(settings: Settings, latency_ms: int) -> Settings:
 # --- lab ----------------------------------------------------------------------
 
 
+def _midnight_ms(day: Any) -> int:
+    """UTC midnight of a `date`, in integer milliseconds."""
+    from datetime import UTC, datetime
+
+    return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
+
+
 def cmd_refusals(args: argparse.Namespace) -> int:
     """Price what the live loop refused, over the tape that followed each refusal.
 
@@ -634,7 +641,6 @@ def cmd_refusals(args: argparse.Namespace) -> int:
     from the run that produced the refusals, which the backtest cannot do: a replay
     answers the same question about a different week.
     """
-    from datetime import UTC, datetime
 
     from liqfade.backtest.shadow import (
         group_outcomes,
@@ -658,11 +664,8 @@ def cmd_refusals(args: argparse.Namespace) -> int:
         print(f"refusals error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    def midnight(day: Any) -> int:
-        return int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1000)
-
-    start_ms = midnight(start_day)
-    end_ms = midnight(end_day) + 86_400_000  # --end is inclusive of the whole day
+    start_ms = _midnight_ms(start_day)
+    end_ms = _midnight_ms(end_day) + 86_400_000  # --end is inclusive of the whole day
     if end_ms <= start_ms:
         print("refusals error: --end is before --start", file=sys.stderr)
         return EXIT_ERROR
@@ -718,6 +721,115 @@ def cmd_refusals(args: argparse.Namespace) -> int:
         print(f"  {group.verdict()}")
     if not refusals:
         print("  no refusals recorded in that window")
+    return 0
+
+
+def cmd_drift(args: argparse.Namespace) -> int:
+    """Replay the days the paper loop traded and diff the two, dimension by dimension.
+
+    The Phase 5 definition of done asks whether paper lands in a plausible band of the
+    backtest for the same days. `live/paper.py` argues it must, because paper is the
+    backtest engine on a live clock rather than a second implementation of it. This turns
+    that argument into a verdict per dimension, and names what is left over: the online
+    feature engine against the vectorised grid on real tape, wall-clock ticks against grid
+    ticks, two sockets with two sets of holes, and risk state carried across days.
+    """
+    import orjson
+
+    from liqfade.backtest.drift import (
+        compare,
+        find_holes,
+        read_live,
+        read_replay,
+        render_report,
+        report_payload,
+    )
+    from liqfade.backtest.engine import run_backtest
+    from liqfade.backtest.source import LakeSource
+    from liqfade.data.ingest.common import BackfillError, parse_day
+    from liqfade.execution.orders import OrderStore
+    from liqfade.log import setup_logging
+
+    settings = _settings(args)
+    setup_logging(proc="drift", env=settings.env, level=settings.logging.level)
+
+    try:
+        if not args.start or not args.end:
+            raise BackfillError("drift needs --start and --end (YYYY-MM-DD, inclusive, UTC)")
+        start_day, end_day = parse_day(args.start), parse_day(args.end)
+    except BackfillError as exc:
+        print(f"drift error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    start_ms = _midnight_ms(start_day)
+    end_ms = _midnight_ms(end_day) + 86_400_000  # --end is inclusive of the whole day
+    if end_ms <= start_ms:
+        print("drift error: --end is before --start", file=sys.stderr)
+        return EXIT_ERROR
+
+    coins = [coin.strip().upper() for coin in (args.coins or "").split(",") if coin.strip()]
+    if not coins:
+        coins = list(settings.universe.core_coins)
+
+    db_path = Path(args.db) if args.db else settings.order_db_path
+    if not db_path.exists():
+        print(f"drift error: no order registry at {db_path}", file=sys.stderr)
+        return EXIT_ERROR
+
+    async def read() -> object:
+        store = await OrderStore.open(db_path)
+        try:
+            return await read_live(store, start_ms, end_ms, config_hash=args.live_config_hash)
+        finally:
+            await store.close()
+
+    live = asyncio.run(read())
+    result = run_backtest(
+        LakeSource(
+            settings.paths.data_dir,
+            settings=settings,
+            coins=coins,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            starting_equity=args.equity,
+        ),
+        settings,
+    )
+    replay = read_replay(result, settings=settings)
+    holes = find_holes(
+        settings.paths.data_dir,
+        coins=coins,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        settings=settings,
+    )
+    report = compare(live, replay, settings=settings, holes=holes)  # type: ignore[arg-type]
+
+    out_dir = Path(args.out) if args.out else settings.paths.reports_dir / "live"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"drift_{args.start}_{args.end}"
+    (out_dir / f"{stem}.md").write_text(
+        render_report(
+            report,
+            start=args.start,
+            end=args.end,
+            coins=coins,
+            equity=args.equity,
+            db_path=db_path,
+            settings=settings,
+        )
+    )
+    (out_dir / f"{stem}.json").write_bytes(
+        orjson.dumps(
+            report_payload(report, start=args.start, end=args.end, coins=coins),
+            option=orjson.OPT_INDENT_2,
+        )
+    )
+
+    print(f"{out_dir / f'{stem}.md'}")
+    print(f"  {report.verdict}")
+    for dim in report.dimensions:
+        print(f"  {dim.name}: {dim.verdict}")
     return 0
 
 
@@ -1200,6 +1312,37 @@ def build_parser() -> argparse.ArgumentParser:
     refusals.add_argument("--out", default=None, help="report directory (default: reports/live/)")
     refusals.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
 
+    drift = sub.add_parser(
+        "drift",
+        parents=[common],
+        help="diff the days the paper loop traded against a replay of the same days",
+    )
+    drift.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    drift.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive, UTC")
+    drift.add_argument(
+        "--equity",
+        type=float,
+        default=DEFAULT_PAPER_EQUITY,
+        help="the replay's starting equity; match the soak's or the two are not comparable",
+    )
+    drift.add_argument(
+        "--coins",
+        default=None,
+        help="comma separated (default: the core universe). The soak's universe is dynamic "
+        "and is not persisted per day, so coverage beyond these is unknown, not equal",
+    )
+    drift.add_argument(
+        "--db", default=None, help="the order registry (default: <data-dir>/orders.sqlite)"
+    )
+    drift.add_argument(
+        "--live-config-hash",
+        default=None,
+        help="the config_hash the live run logged on `paper_started`. Without it the config "
+        "dimension reports NOT_COMPARABLE rather than assuming the two configs agreed",
+    )
+    drift.add_argument("--out", default=None, help="report directory (default: reports/live/)")
+    drift.add_argument("--data-dir", default=None, help="overrides paths.data_dir")
+
     lab = sub.add_parser(
         "lab", parents=[common], help="the terminal workbench: configs, runs, results"
     )
@@ -1308,6 +1451,7 @@ HANDLERS = {
     "panel": cmd_panel,
     "lab": cmd_lab,
     "refusals": cmd_refusals,
+    "drift": cmd_drift,
     "paper": cmd_paper,
     "testnet": cmd_testnet,
 }

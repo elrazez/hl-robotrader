@@ -282,3 +282,30 @@ async def test_an_empty_registry_reads_as_an_empty_side_rather_than_raising(
     assert side.round_trips == []
     assert side.refusals == {}
     assert side.config_hash is None
+
+
+@pytest.mark.asyncio
+async def test_a_resting_entry_is_timed_by_its_fill_not_by_its_submission(
+    tmp_path: Path,
+) -> None:
+    """The replay times an entry by when it filled, and an `Alo` rests before it trades.
+
+    Matching submission against fill would put every maker entry its own time-to-fill
+    away from its replay twin, which at a two second tolerance is drift on all of them.
+    """
+    store, manager = await a_store(tmp_path)
+    await place(manager, fill_ms=START + 45_000)
+    side = await read_live(store, START, START + DAY_MS)
+    await store.close()
+    assert side.intents[0].ts_ms == START + 45_000
+
+
+@pytest.mark.asyncio
+async def test_an_order_filled_inside_the_window_is_kept_though_it_was_placed_before_it(
+    tmp_path: Path,
+) -> None:
+    store, manager = await a_store(tmp_path)
+    await place(manager, fill_ms=START + 2 * DAY_MS)
+    side = await read_live(store, START + DAY_MS, START + 3 * DAY_MS)
+    await store.close()
+    assert len(side.intents) == 1

@@ -24,14 +24,22 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from itertools import pairwise
+from pathlib import Path
 from statistics import median
 from typing import Protocol, cast
 
+import polars as pl
+
 from liqfade.backtest.costs import fee_for
+from liqfade.backtest.data import load_day, utc_days
+from liqfade.backtest.engine import BacktestResult
 from liqfade.backtest.portfolio import Trade
+from liqfade.backtest.report import config_hash
 from liqfade.backtest.validate import bootstrap_mean_bps
 from liqfade.config.models import Settings
 from liqfade.execution.orders import Order, OrderStore
+from liqfade.features.grid import effective_ts
 
 __all__ = [
     "Dimension",
@@ -44,8 +52,12 @@ __all__ = [
     "Side",
     "Verdict",
     "compare",
+    "find_holes",
     "match_intents",
     "read_live",
+    "read_replay",
+    "render_report",
+    "report_payload",
 ]
 
 
@@ -190,12 +202,15 @@ class Side:
             soak that predates the refusals table has an empty table, not an empty week.
         config_hash: `report.config_hash` of the settings the side ran under, or None
             when the side does not record it.
+        abandoned_entries: entry orders that were placed and never filled. A tally rather
+            than a list, because the replay keeps a counter of these and not a log.
     """
 
     intents: list[IntentRef]
     round_trips: list[RoundTrip]
     refusals: dict[tuple[str, str], int]
     config_hash: str | None = None
+    abandoned_entries: int = 0
 
 
 @dataclass(frozen=True)
@@ -311,9 +326,10 @@ def compare(
     if config.verdict is Verdict.DRIFT:
         return DriftReport(dimensions=[config])
 
-    kept_live = [i for i in live.intents if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
-    kept_replay = [i for i in replay.intents if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
-    excluded = (len(live.intents) - len(kept_live)) + (len(replay.intents) - len(kept_replay))
+    live_items, replay_items = _itemised(live.intents), _itemised(replay.intents)
+    kept_live = [i for i in live_items if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
+    kept_replay = [i for i in replay_items if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
+    excluded = (len(live_items) - len(kept_live)) + (len(replay_items) - len(kept_replay))
     matched = match_intents(kept_live, kept_replay, tol_ms=tol_ms)
     trips = match_intents(
         [t for t in live.round_trips if not any(h.holds(t.coin, t.ts_ms) for h in holes)],
@@ -324,7 +340,7 @@ def compare(
     return DriftReport(
         dimensions=[
             config,
-            _intents_dimension(matched),
+            _intents_dimension(matched, live, replay),
             _entries_dimension(matched),
             _exits_dimension(trips),
             _pnl_dimension(live, replay, settings=settings),
@@ -370,7 +386,18 @@ def _share(part: int, whole: int) -> float:
     return part / whole if whole else 1.0
 
 
-def _intents_dimension(matched: Match[IntentRef]) -> Dimension:
+def _itemised(intents: Sequence[IntentRef]) -> list[IntentRef]:
+    """The intents both sides can list one by one, which is what the matcher may see.
+
+    A refusal is always listed. A placed entry is listed once it filled; one that was
+    placed and abandoned is not, because the replay keeps a tally of those and not a log,
+    and matching a list against a tally reports every entry on the listed side as
+    unmatched. The two tallies are compared as numbers instead.
+    """
+    return [i for i in intents if i.stage or i.entry_px is not None]
+
+
+def _intents_dimension(matched: Match[IntentRef], live: Side, replay: Side) -> Dimension:
     live_total = len(matched.matched) + len(matched.live_only)
     replay_total = len(matched.matched) + len(matched.replay_only)
     live_share = _share(len(matched.matched), live_total)
@@ -391,7 +418,49 @@ def _intents_dimension(matched: Match[IntentRef]) -> Dimension:
             ok=replay_share >= MATCHED_SHARE_MIN,
         ),
     ]
-    detail = [f"{len(matched.matched)} matched, {live_total} live, {replay_total} replay"]
+    # A matched pair where one side placed the order and the other refused it is the two
+    # sides disagreeing about whether to trade at all, which is the most consequential
+    # drift there is. It used to fall between the dimensions: the pair matched, so intents
+    # agreed, and the refused half had no fill price, so entries reported NOT_COMPARABLE
+    # and nothing said anything. As a share rather than a count, because one disagreement
+    # out of one is a different fact from two out of fifty.
+    agreed = sum(1 for left, right in matched.matched if bool(left.stage) == bool(right.stage))
+    traded_share = _share(agreed, len(matched.matched))
+    metrics.append(
+        Metric(
+            name="matched intents agreeing on whether to trade",
+            value=traded_share,
+            threshold=MATCHED_SHARE_MIN,
+            units="share",
+            ok=traded_share >= MATCHED_SHARE_MIN,
+        )
+    )
+    abandoned_gap = abs(live.abandoned_entries - replay.abandoned_entries)
+    abandoned_allowance = max(
+        REFUSAL_FLOOR, REFUSAL_FRAC * max(live.abandoned_entries, replay.abandoned_entries)
+    )
+    metrics.append(
+        Metric(
+            name="abandoned entries gap",
+            value=float(abandoned_gap),
+            threshold=abandoned_allowance,
+            units="entries",
+            ok=abandoned_gap <= abandoned_allowance,
+        )
+    )
+    disagreed = [
+        f"{left.coin} {left.side} at {left.ts_ms}: "
+        f"live {left.reason or 'traded'}, replay {right.reason or 'traded'}"
+        for left, right in matched.matched
+        if bool(left.stage) != bool(right.stage)
+    ]
+    detail = [
+        f"{len(matched.matched)} matched, {live_total} live, {replay_total} replay",
+        *disagreed[:20],
+        f"entries placed and never filled: live {live.abandoned_entries}, "
+        f"replay {replay.abandoned_entries}. Counted rather than matched: the engine "
+        f"tallies an abandoned entry and does not log one.",
+    ]
     if not live_total and not replay_total:
         detail.append("no intents on either side in this window; nothing disagreed")
     detail += [f"live only:   {i.coin} {i.side} at {i.ts_ms}" for i in matched.live_only[:20]]
@@ -616,8 +685,8 @@ async def read_live(
 
     Args:
         store: the order registry, already open. `liqfade sync` pulls the soak's copy.
-        start_ms: window start, inclusive. Orders are placed by submission time and
-            refusals by their own `ts_ms`.
+        start_ms: window start, inclusive. An order is placed in the window by when it
+            filled, or by its submission when it never did; a refusal by its own `ts_ms`.
         end_ms: window end, exclusive.
         config_hash: what the live run reported, when it reported one. None means the run
             did not say, which the config dimension reports as not comparable rather than
@@ -626,18 +695,29 @@ async def read_live(
     Returns:
         The live half of the comparison.
     """
-    orders = [o for o in await store.all_orders() if start_ms <= o.submitted_ms < end_ms]
-    fills = await store.fills()
     filled_at: dict[str, int] = {}
-    for row in fills:
+    for row in await store.fills():
         cloid = row["cloid"]
         filled_at[cloid] = max(filled_at.get(cloid, 0), int(row["ts_ms"]))
 
+    def when(order: Order) -> int:
+        """The clock the replay is on: an order's fill time, or its submission if it never
+        filled.
+
+        Not `submitted_ms` for a filled order. The replay times an entry by when it
+        filled (`Trade.entry_ms`), and an `Alo` rests at the touch before it trades, so
+        matching submission against fill would put every maker entry its own
+        time-to-fill away from its replay twin and report drift on all of them. The
+        registry's fills carry the tick clock, which is the clock the replay is on.
+        """
+        return filled_at.get(order.cloid, order.submitted_ms)
+
+    orders = [o for o in await store.all_orders() if start_ms <= when(o) < end_ms]
     intents = [
         IntentRef(
             coin=order.coin,
             side="long" if order.intent.is_buy else "short",
-            ts_ms=order.submitted_ms,
+            ts_ms=when(order),
             entry_px=order.avg_px if order.filled > 0 else None,
         )
         for order in orders
@@ -662,6 +742,7 @@ async def read_live(
         round_trips=_round_trips(orders, filled_at),
         refusals=refusals,
         config_hash=config_hash,
+        abandoned_entries=sum(1 for o in orders if o.intent.tag == "entry" and o.filled == 0),
     )
 
 
@@ -710,3 +791,207 @@ def _round_trips(orders: Sequence[Order], filled_at: Mapping[str, int]) -> list[
                 )
             )
     return sorted(trips, key=lambda t: (t.ts_ms, t.coin))
+
+
+# --- the replay side ------------------------------------------------------------------
+
+
+def read_replay(result: BacktestResult, *, settings: Settings) -> Side:
+    """What the replay did, out of what `run_backtest` returned.
+
+    The refusal counts come from the run's **counters** rather than from `result.refused`,
+    which is a bounded deque a week of replay would overflow. The counters are exact, and
+    counts are all the refusals dimension compares.
+
+    The itemised intents are the entries that filled plus the refusals that are itemised.
+    An entry the engine placed and later abandoned past `max_reprices` is counted rather
+    than listed, because the engine keeps a tally of those and not a log; `compare` holds
+    the two tallies against each other instead of listing one side's and reporting every
+    one of them as unmatched.
+    """
+    intents = [
+        IntentRef(
+            coin=trade.coin,
+            side=trade.side,
+            ts_ms=trade.entry_ms,
+            entry_px=trade.entry_px,
+        )
+        for trade in result.trades
+    ]
+    intents += [
+        IntentRef(
+            coin=r.coin,
+            side=r.side,
+            ts_ms=r.ts_ms,
+            stage=r.stage,
+            reason=r.reason,
+        )
+        for r in (*result.rejections, *result.refused)
+    ]
+    intents.sort(key=lambda i: (i.ts_ms, i.coin))
+
+    refusals: dict[tuple[str, str], int] = {}
+    for stage, counts in (
+        ("sizing", result.sizing_blocks),
+        ("risk", result.risk_blocks),
+        ("filter", result.strategy.stats.filters),
+    ):
+        for reason, count in counts.items():
+            if count:
+                refusals[stage, reason] = count
+    for name, rule in result.strategy.stats.rules.items():
+        if rule.killed:
+            refusals["rule", name] = rule.killed
+
+    return Side(
+        intents=intents,
+        round_trips=[
+            RoundTrip(
+                coin=trade.coin,
+                side=trade.side,
+                ts_ms=trade.entry_ms,
+                exit_ms=trade.exit_ms,
+                exit_reason=trade.exit_reason,
+                entry_px=trade.entry_px,
+                exit_px=trade.exit_px,
+                net_pnl=trade.net_pnl,
+                notional=trade.size * trade.entry_px,
+            )
+            for trade in result.trades
+        ],
+        refusals=refusals,
+        config_hash=config_hash(settings),
+        abandoned_entries=result.portfolio.abandoned_entries,
+    )
+
+
+# --- the tape the comparison stands on ------------------------------------------------
+
+
+def find_holes(
+    data_dir: Path, *, coins: Sequence[str], start_ms: int, end_ms: int, settings: Settings
+) -> list[Hole]:
+    """Every stretch of one coin's Hyperliquid trade tape the lake does not have.
+
+    A gap longer than `recorder.trades_gap_s` is the recorder's own bar for a stream
+    having gone quiet, so it is the bar used here: below it the coin was merely not
+    trading, and above it the replay is deciding on tape the live loop had and it does not.
+
+    One UTC day of one table at a time, through `load_day`, because that is the only
+    reader in this package and the reason it is the only one is that a range read of a
+    year killed the machine twice.
+    """
+    gap_ms = int(settings.recorder.trades_gap_s * 1000)
+    holes: list[Hole] = []
+    for day in utc_days(start_ms, end_ms):
+        frame = load_day(data_dir, "trades", day, coins=list(coins), venue="hyperliquid")
+        if frame.is_empty():
+            continue
+        for coin in coins:
+            stamps = (
+                frame.filter(pl.col("coin") == coin)
+                .select(effective_ts())
+                .to_series()
+                .sort()
+                .to_list()
+            )
+            window = [t for t in stamps if start_ms <= t < end_ms]
+            if not window:
+                continue
+            for earlier, later in pairwise(window):
+                if later - earlier > gap_ms:
+                    holes.append(Hole(coin=coin, start_ms=earlier, end_ms=later))
+    return sorted(holes, key=lambda h: (h.coin, h.start_ms))
+
+
+# --- the report -----------------------------------------------------------------------
+
+
+def _fmt(metric: Metric) -> str:
+    if metric.units == "share":
+        return f"{metric.value:.0%} (bar: {metric.threshold:.0%})"
+    if metric.units == "USD":
+        return f"${metric.value:,.2f} (allowance: ${metric.threshold:,.2f})"
+    return f"{metric.value:,.2f} {metric.units} (bar: {metric.threshold:,.2f})"
+
+
+def report_payload(
+    report: DriftReport, *, start: str, end: str, coins: Sequence[str]
+) -> dict[str, object]:
+    """The same verdicts as JSON, for anything that wants to read them back."""
+    return {
+        "start": start,
+        "end": end,
+        "coins": list(coins),
+        "verdict": str(report.verdict),
+        "excluded_by_hole": report.excluded_by_hole,
+        "dimensions": [
+            {
+                "name": d.name,
+                "verdict": str(d.verdict),
+                "metrics": [
+                    {
+                        "name": m.name,
+                        "value": m.value,
+                        "threshold": m.threshold,
+                        "units": m.units,
+                        "ok": m.ok,
+                    }
+                    for m in d.metrics
+                ],
+                "detail": d.detail,
+            }
+            for d in report.dimensions
+        ],
+    }
+
+
+def render_report(
+    report: DriftReport,
+    *,
+    start: str,
+    end: str,
+    coins: Sequence[str],
+    equity: float,
+    db_path: Path,
+    settings: Settings,
+) -> str:
+    """One page: the verdict per dimension, then what each one measured."""
+    lines = [
+        f"# Live versus replay, {start} to {end}",
+        "",
+        f"**{report.verdict}**",
+        "",
+        "The Phase 5 definition of done asks whether paper lands in a plausible band of "
+        "the backtest for the same days. This is that question with a number per "
+        "dimension. The live side is the paper loop's own order registry; the replay side "
+        "is `run_backtest` over the recorder's lake for the same days, under the same "
+        "resolved config and the same starting equity.",
+        "",
+        "`NOT_COMPARABLE` is not a near miss and not a quiet pass. It means the live side "
+        "does not persist what the replay computes, so there is nothing to diff. A "
+        "comparator that defaults the missing half to zero and diffs against the default "
+        "reports agreement it has not measured.",
+        "",
+        f"- coins: {', '.join(coins)}. The soak's universe is dynamic and is not persisted "
+        "per day, so coverage beyond these coins is unknown rather than assumed equal.",
+        f"- equity: {equity:,.0f}",
+        f"- registry: `{db_path}`",
+        f"- replay config_hash: `{config_hash(settings)}`",
+        "",
+        "| dimension | verdict | measured |",
+        "| --- | --- | --- |",
+    ]
+    for dim in report.dimensions:
+        measured = "; ".join(_fmt(m) for m in dim.metrics) or "-"
+        lines.append(f"| {dim.name} | {dim.verdict} | {measured} |")
+    lines.append("")
+    for dim in report.dimensions:
+        lines += [f"## {dim.name}: {dim.verdict}", ""]
+        for metric in dim.metrics:
+            lines.append(f"- {metric.name}: {_fmt(metric)}")
+        if dim.metrics:
+            lines.append("")
+        lines += list(dim.detail)
+        lines.append("")
+    return "\n".join(lines) + "\n"
