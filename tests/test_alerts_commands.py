@@ -36,8 +36,10 @@ def bot(tmp_path: Path) -> CommandBot:
     return _a_bot(kill_file=tmp_path / "KILL")
 
 
-def _a_bot(*, offset_path: Path | None = None, kill_file: Path | None = None) -> CommandBot:
-    backend = NoopBackend(env="paper", proc="paper", kill_file=kill_file or Path("KILL"))
+def _a_bot(*, kill_file: Path, offset_path: Path | None = None) -> CommandBot:
+    # kill_file is required: a default of Path("KILL") wrote a real flag into whatever
+    # directory ran the suite, and one such flag was swept into a commit on 2026-09-08.
+    backend = NoopBackend(env="paper", proc="paper", kill_file=kill_file)
     return CommandBot(backend, allowed_chat_ids={ALLOWED}, env="paper", offset_path=offset_path)
 
 
@@ -207,13 +209,13 @@ async def test_a_kill_is_not_redelivered_to_the_process_that_starts_next(tmp_pat
     api = FakeBotAPI([a_kill_update()])
     offset_file = tmp_path / "telegram_offset"
 
-    first = _a_bot(offset_path=offset_file)
+    first = _a_bot(offset_path=offset_file, kill_file=tmp_path / "KILL")
     for update in api.get_updates(first.offset):
         await first.handle_update(update)
     assert first.backend._killed, "the first process ran the kill"
 
     # The process died here. A new one starts and asks Telegram what it missed.
-    second = _a_bot(offset_path=offset_file)
+    second = _a_bot(offset_path=offset_file, kill_file=tmp_path / "KILL")
     redelivered = api.get_updates(second.offset)
 
     assert redelivered == [], "the offset on disk consumed it"
@@ -243,7 +245,7 @@ async def test_the_offset_is_written_before_the_command_runs(tmp_path) -> None:
 
 async def test_an_unwritable_offset_still_handles_the_command(tmp_path) -> None:
     """A read-only data dir must not silence the kill switch. It is logged, not raised."""
-    bot = _a_bot(offset_path=tmp_path / "nope" / "offset")
+    bot = _a_bot(offset_path=tmp_path / "nope" / "offset", kill_file=tmp_path / "KILL")
     (tmp_path / "nope").write_text("a file where the directory should be")
 
     await bot.handle_update(a_kill_update())
