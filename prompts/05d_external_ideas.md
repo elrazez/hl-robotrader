@@ -21,8 +21,8 @@ gated on D saying yes.
 | E | `hl_triggers` table from `frontendOpenOrders` | `07c-trigger-map` | NEW | only after D's report says yes | D |
 
 Each prompt's first line is its routing line. Each chat sends its final report to the control
-chat by `SendMessage` (session `hl-robotrader-ac` at the time of writing; if that name is
-gone, `ListAgents` and pick the `hl-robotrader-` session that is not itself). The control chat
+chat by `SendMessage` (session `hl-robotrader-38` at the time of writing; the name changes when the
+session restarts, so ask the owner if it is gone rather than guessing from `ListAgents`). The control chat
 merges. Paste only the part below each `---`.
 
 Before pasting A, optionally paste this whole file into a chat with
@@ -35,7 +35,7 @@ scan doc already lists what could kill the map; the grill is for what the scan m
 
 ROUTING: NEW chat. Runs concurrently with prompt B. Branch `07a-liqmap-recorder` off `main`.
 When done, send the final report (prompt name, branch, tip hash, what was deployed and what
-the first hour on the VPS showed) to the control chat `hl-robotrader-ac` with `SendMessage`.
+the first hour on the VPS showed) to the control chat `hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -240,7 +240,7 @@ from this machine), print the checklist and stop; never simulate having done it.
 
 ROUTING: NEW chat. Runs concurrently with prompt A. Branch `05d-refusals` off `main`. When
 done, send the final report (prompt name, branch, tip hash) to the control chat
-`hl-robotrader-ac` with `SendMessage`.
+`hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -367,7 +367,7 @@ ROUTING: NEW chat. Start only after **both** of these are true: prompt B is merg
 by the live path — the qualification in `docs/DECISIONS.md`, 2026-09-07 "05c: the seven day
 paper acceptance run", has been lifted by a later entry. If either is false, say so and
 stop. Branch `05e-drift-check` off `main`. When done, send the final report to the control
-chat `hl-robotrader-ac` with `SendMessage`.
+chat `hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -488,7 +488,7 @@ end-to-end (MATCH, then perturb, then DRIFT). 6. Run it on the soak's synced win
 
 ROUTING: NEW chat. Start only when the data precondition below holds. Branch
 `07b-q9-liqmap` off `main`. When done, send the final report (the DECISION lines verbatim)
-to the control chat `hl-robotrader-ac` with `SendMessage`.
+to the control chat `hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -590,7 +590,7 @@ three verdicts.
 
 ROUTING: NEW chat. Start only if Q9's report says yes on Q9a or Q9b; otherwise this prompt
 is never run. Branch `07c-trigger-map` off `main`. When done, send the final report to the
-control chat `hl-robotrader-ac` with `SendMessage`.
+control chat `hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
