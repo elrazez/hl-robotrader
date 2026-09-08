@@ -178,6 +178,35 @@ Read the table bottom-up. A gate with a large negative net saved money and is ea
 keep; a large positive net is a gate to argue about. `no tape` is its own column and is
 never counted as a break-even.
 
+### Did paper and the backtest agree?
+
+The Phase 5 definition of done asks whether paper landed in a plausible band of the
+backtest for the same days. This is that question as a command:
+
+    liqfade drift --start 2026-09-01 --end 2026-09-07 --data-dir <lake> --equity 10000 \
+      --live-config-hash <hex from the paper_started log line>
+
+Writes `reports/live/drift_<start>_<end>.md` and `.json`. Every dimension answers
+**MATCH**, **DRIFT** or **NOT_COMPARABLE**, with its threshold printed beside its number.
+
+`NOT_COMPARABLE` is not a near miss and not a quiet pass. It means the live side does not
+persist what the replay computes, so there is nothing to diff. The two you will meet
+first: the config dimension without `--live-config-hash`, and the refusals dimension over
+any window predating the `refusals` table.
+
+Get the hash from the journal on the box, which is why it is on the line:
+
+    journalctl -u liqfade-paper -o cat | jq -r 'select(.event=="paper_started") | .config_hash'
+
+The lake lives on the external drive, so `--data-dir` is always explicit, and one lake job
+at a time on the laptop: check with `pgrep -f liqfade` before launching.
+
+Read the dimensions in order. A `config` disagreement stops the report there on purpose:
+nothing below it is a comparison between the same strategy. `intents` disagreeing means
+the two sides did not see the same market or did not decide the same way about it.
+`entries` and `pnl` disagreeing while `intents` and `exits` match points at the plumbing
+between the engine and the registry rather than at the strategy.
+
 ## Pull data to the laptop
 
 From the laptop, not the VPS:

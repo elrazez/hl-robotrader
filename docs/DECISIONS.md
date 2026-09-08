@@ -2974,3 +2974,70 @@ by every deploy anyway.
 **Not in `CONTINUOUS_STREAMS`.** A poll is sparse by nature, so only its connection is
 monitored, exactly like `coinalyze.xchg_ctx`. A declared-but-idle stream pages Telegram
 every ten minutes, which is why the poller declares no stream at all when it is disabled.
+
+## 2026-09-08 (05e: live versus replay, and the qualification lifted)
+
+`liqfade drift` on `05e-drift-check`. The Phase 5 DoD asks whether paper lands in a
+plausible band of the backtest for the same days; until now that was a sentence in this
+file. It is a command with a verdict per dimension.
+
+**The 2026-09-07 qualification is lifted, and this is the entry that lifts it.** That
+entry says `execution.entry_ttl_s` and `execution.max_reprices` are honoured by
+`backtest/engine.py` "and by nothing in the live path". Since 05c that is no longer true
+and no entry had said so. `execution/policy.py::entry_action` is now the one decision
+table: `VenueSession` calls it at `venue.py:288`, and `PaperSession` reaches it through
+the engine tick it imports (`paper.py` imports `_on_tick`, which calls `_expire_entries`,
+which calls `entry_action`). Both live sessions and the backtest run one policy. The
+prompt's second gate is therefore met in the code, and was met before this entry existed.
+
+**Seven dimensions, three verdicts.** `NOT_COMPARABLE` is never a quiet `MATCH`: it means
+the live side does not persist what the replay computes. Two calls the design left open
+were taken the conservative way. A tape hole is `NOT_COMPARABLE`, not `DRIFT`: a dropped
+recorder socket is missing input rather than the two sides disagreeing, and a verdict that
+reads DRIFT on every week containing one gap is a verdict nobody reads. An empty live
+refusals table is `NOT_COMPARABLE`, not agreement with a replay that also refused nothing:
+the soak predating the table recorded none, which is not the same fact as a week in which
+nothing was refused.
+
+**Three things the golden-lake tracer found that the design could not have known.**
+
+1. *The paper loop cannot run the trigger the fixture is built for.* `config/paper.yaml`
+   defaults to `exact`, and `LiveFeatureEngine` refuses it outright: hl_s3 liquidations
+   arrive a day late and no live feed carries them. The fixture's liquidations are written
+   and fed again under Bybit so both sides see one cross-venue tape. A comparison run on
+   `exact` would have compared two trigger definitions rather than two engines.
+2. *One side trading where the other refused fell between the dimensions.* The pair
+   matched on coin, side and time, so intents agreed; the refused half had no fill price,
+   so entries answered `NOT_COMPARABLE`; and nothing reported the most consequential
+   disagreement there is. It is now a metric on the intents dimension, as a share, because
+   one disagreement out of one is a different fact from two out of fifty.
+3. *An entry has to be timed by its fill, not by its submission.* The replay times an
+   entry by `Trade.entry_ms`, and an `Alo` rests at the touch before it trades. Keying the
+   live side on `submitted_ms` would put every maker entry its own time-to-fill away from
+   its replay twin, which at a two second tolerance is drift on all of them.
+
+**A real finding, and it is not in the strategy.** On the golden fixture the two
+portfolios agree to the cent: same entry, same exit, same size, same net. What disagrees
+is the order registry. `PaperSession._book_fill` records `px=order.px`, the price the
+order was placed at, while the fill model fills a crossing entry at the touch and the
+portfolio books that. The gap is exactly the trade's own `entry_slippage_bps`, ten basis
+points on this fixture, and it flows through into the reconstructed PnL as an entry that
+looks cheaper than the one that was paid. **The panel, `/status` and `liqfade drift` all
+read the registry, so all three currently show a better entry price than the portfolio
+booked.** It is a paper-mode fidelity gap rather than a drift between engines: on a real
+venue `record_fill` is handed the venue's own price. `SimOrder` carries no fill price, so
+fixing it means threading the fill model's `Fill` into `_book_fill`, which belongs in
+`live/paper.py` and not in this session. Pinned by a test that names the cause, so the fix
+fails that test rather than passing quietly.
+
+**Not yet run on real data.** The command has never seen the soak. The soak started
+2026-09-07 17:51 UTC, before the refusals table and before `paper_started` carried a
+config hash, so a run today would grade about one day with two of seven dimensions not
+comparable. The first real run waits for the soak to restart on code carrying both.
+
+## 2026-09-08 (05e: the first real drift run): PLACEHOLDER, not yet run
+
+Reserved for the first `liqfade drift` over the soak's own window, on the synced lake,
+once the soak has a day on code carrying the refusals table and the config hash. Record
+every verdict, every `NOT_COMPARABLE` and why it was not comparable, and the command line
+that produced the report.
