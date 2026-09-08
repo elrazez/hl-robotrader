@@ -281,6 +281,10 @@ def _day_prints(
 # --- the report ------------------------------------------------------------------
 
 
+def _entries(count: int) -> str:
+    return "entry" if count == 1 else "entries"
+
+
 @dataclass(frozen=True, slots=True)
 class Group:
     """Every refusal that shares a `(stage, reason)`, and what they came to."""
@@ -302,11 +306,14 @@ class Group:
     def verdict(self) -> str:
         """The line a reader takes away, in plain words rather than a sign convention."""
         if self.scored == 0:
-            return f"`{self.reason}` refused {self.total} entries the lake cannot price."
+            return (
+                f"`{self.reason}` refused {self.total} {_entries(self.total)} the lake "
+                "cannot price."
+            )
         earned = "the gate earned its keep" if self.net_pnl < 0 else "the gate cost money"
         return (
-            f"`{self.reason}` refused {self.scored} entries that would have netted "
-            f"{self.net_pnl:+,.2f} USD: {earned}."
+            f"`{self.reason}` refused {self.scored} {_entries(self.scored)} that would have "
+            f"netted {self.net_pnl:+,.2f} USD: {earned}."
         )
 
 
