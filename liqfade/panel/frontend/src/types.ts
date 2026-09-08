@@ -91,7 +91,12 @@ export interface DiskStats {
   used_pct: number;
 }
 
-/** GET /api/recorder/latency: the retained round trip samples as [ts_ms, ms] pairs. */
+/**
+ * GET /api/recorder/latency and /api/live/latency: the retained round trip samples as
+ * [ts_ms, ms] pairs, plus every percentile that process measured. submit_ack is null on
+ * the recorder, which places no orders, and there is no sample series behind it, so it
+ * renders as two numbers beside the two drawn series.
+ */
 export interface Latency {
   ws_ping: [number, number][];
   rest: [number, number][];
@@ -99,6 +104,8 @@ export interface Latency {
   ws_ping_p95: number | null;
   rest_p50: number | null;
   rest_p95: number | null;
+  submit_ack_p50: number | null;
+  submit_ack_p95: number | null;
 }
 
 /** GET /api/recorder/liquidations: hourly notional per venue, aligned on hour_ms. */

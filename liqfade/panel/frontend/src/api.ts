@@ -81,7 +81,16 @@ export async function fetchDisk(): Promise<DiskStats | null> {
 }
 
 export async function fetchLatency(): Promise<Latency | null> {
-  const res = await fetch("/api/recorder/latency", { credentials: "same-origin" });
+  return fetchLatencyFrom("/api/recorder/latency");
+}
+
+/** The trading loop's latency. The only place submit-to-ack is ever measured. */
+export async function fetchLiveLatency(): Promise<Latency | null> {
+  return fetchLatencyFrom("/api/live/latency");
+}
+
+async function fetchLatencyFrom(url: string): Promise<Latency | null> {
+  const res = await fetch(url, { credentials: "same-origin" });
   return res.ok ? ((await res.json()) as Latency) : null;
 }
 

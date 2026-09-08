@@ -422,6 +422,8 @@ def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
 ) -> None:
     client.post("/api/login", json={"password": PASSWORD})
     body = client.get("/api/recorder/latency").json()
+    # submit_ack is in the shape both latency endpoints share and is always None here:
+    # the recorder places no orders. One shape, so the two charts read the same fields.
     assert body == {
         "ws_ping": [],
         "rest": [],
@@ -429,6 +431,8 @@ def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
         "ws_ping_p95": None,
         "rest_p50": None,
         "rest_p95": None,
+        "submit_ack_p50": None,
+        "submit_ack_p95": None,
     }
 
 
@@ -955,3 +959,73 @@ class TestTheRealizedEquityCurve:
         body = filled.get("/api/live/equity?coin=ETH").json()
         assert len(body["ts_ms"]) == 2
         assert body["equity"][0] == pytest.approx(3099.54)
+
+
+# --- submit to ack latency ------------------------------------------------------
+
+
+class TestTheLiveLatencyEndpoint:
+    """Submit-to-ack is measured by the trading loop and by nothing else.
+
+    The recorder pings a websocket and calls REST; it never places an order, so its
+    snapshot's submit_ack percentiles are permanently None. The Live page therefore
+    reads the loop's own latency, which carries all three, rather than the recorder's.
+    """
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/latency").status_code == 401
+
+    def test_it_serves_the_loops_percentiles_and_its_rtt_series(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        snapshot = StateSnapshot(
+            proc="paper",
+            env="paper",
+            risk=RiskState(paused=False),
+            latency=LatencyState(
+                ws_ping_p50=3.7,
+                ws_ping_p95=14.2,
+                rest_p50=76.2,
+                rest_p95=88.0,
+                submit_ack_p50=41.5,
+                submit_ack_p95=190.0,
+                samples=7,
+                ws_ping_samples=[(1_788_784_000_000, 3.7), (1_788_784_020_000, 4.1)],
+                rest_samples=[(1_788_784_000_000, 76.2)],
+            ),
+        )
+        write_state(live_state_path(settings), snapshot)
+
+        body = client.get("/api/live/latency").json()
+
+        assert body["submit_ack_p50"] == 41.5
+        assert body["submit_ack_p95"] == 190.0
+        assert body["ws_ping"] == [[1_788_784_000_000, 3.7], [1_788_784_020_000, 4.1]]
+        assert body["rest"] == [[1_788_784_000_000, 76.2]]
+
+    def test_no_loop_running_is_an_empty_chart_not_an_error(self, client: TestClient) -> None:
+        """Same rule as the recorder's chart: a gap is the honest picture, not a 503."""
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.get("/api/live/latency").json()
+        assert body["ws_ping"] == []
+        assert body["submit_ack_p50"] is None
+
+    def test_a_loop_that_has_placed_nothing_reports_no_submit_ack(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """None is "not measured", which the page must not draw as a zero."""
+        client.post("/api/login", json={"password": PASSWORD})
+        write_state(
+            live_state_path(settings),
+            StateSnapshot(
+                proc="paper",
+                env="paper",
+                risk=RiskState(paused=False),
+                latency=LatencyState(ws_ping_p50=3.0),
+            ),
+        )
+        body = client.get("/api/live/latency").json()
+        assert body["ws_ping_p50"] == 3.0
+        assert body["submit_ack_p50"] is None
+        assert body["submit_ack_p95"] is None

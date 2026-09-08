@@ -267,6 +267,33 @@ def realized_curve(
     return {"ts_ms": stamps, "equity": equity, "drawdown": drawdown}
 
 
+def latency_payload(state_path: Path) -> dict[str, Any]:
+    """One process's round trip series and every percentile it measured.
+
+    Read from the state file like everything else, so a slow browser can never make the
+    writing process wait. A process that is not running is an empty chart rather than a
+    503: the page shows a gap, which is the honest picture. `None` is "not measured",
+    which is a different thing from zero, and stays None all the way to the legend.
+    """
+    try:
+        latency = read_state(state_path).latency
+    except (FileNotFoundError, ValueError, OSError):
+        latency = LatencyState()
+    return {
+        "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
+        "rest": [list(sample) for sample in latency.rest_samples],
+        "ws_ping_p50": latency.ws_ping_p50,
+        "ws_ping_p95": latency.ws_ping_p95,
+        "rest_p50": latency.rest_p50,
+        "rest_p95": latency.rest_p95,
+        # Only the trading loop ever places an order, so only its snapshot carries these.
+        # There is no submit_ack sample series in the protocol, so the chart shows the
+        # two percentiles beside the two drawn series rather than a third line.
+        "submit_ack_p50": latency.submit_ack_p50,
+        "submit_ack_p95": latency.submit_ack_p95,
+    }
+
+
 def _run_dir(reports_dir: Path, run_id: str) -> Path:
     """Resolve a run id to its directory, refusing anything that escapes `reports/`.
 
@@ -678,25 +705,18 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/recorder/latency", dependencies=[Depends(require_session)])
     def recorder_latency() -> dict[str, Any]:
-        """WS ping and REST round trips as time series, plus the percentiles over them.
+        """The recorder's WS ping and REST round trips. Its submit_ack is always None."""
+        return latency_payload(settings.state_path)
 
-        The retained window straight out of the snapshot, as `[ts_ms, ms]` pairs. Read
-        from `data/state.json` like everything else the panel shows, so a slow browser
-        can never make the recorder wait. No recorder running is an empty chart rather
-        than a 503: the page shows a gap, which is the honest picture.
+    @api.get("/live/latency", dependencies=[Depends(require_session)])
+    def live_latency() -> dict[str, Any]:
+        """The trading loop's latency, including the submit-to-ack percentiles.
+
+        Submit-to-ack exists only here: the recorder pings a socket and calls REST, it
+        never places an order, so asking its snapshot for these two would always answer
+        None and the page would show a permanent dash next to a healthy recorder.
         """
-        try:
-            latency = read_state(settings.state_path).latency
-        except (FileNotFoundError, ValueError, OSError):
-            latency = LatencyState()
-        return {
-            "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
-            "rest": [list(sample) for sample in latency.rest_samples],
-            "ws_ping_p50": latency.ws_ping_p50,
-            "ws_ping_p95": latency.ws_ping_p95,
-            "rest_p50": latency.rest_p50,
-            "rest_p95": latency.rest_p95,
-        }
+        return latency_payload(live_state_path(settings))
 
     @api.get("/recorder/liquidations", dependencies=[Depends(require_session)])
     def recorder_liquidations(hours: int = 24) -> dict[str, Any]:

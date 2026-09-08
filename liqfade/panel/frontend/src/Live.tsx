@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchLiveState } from "./api";
+import { fetchLiveLatency, fetchLiveState } from "./api";
 import type { StateResult } from "./api";
-import type { OrderState, PositionState } from "./types";
+import LatencyChart from "./LatencyChart";
+import type { Latency, OrderState, PositionState } from "./types";
 import { Banner, Row, Section, pnlTone, stamp, usd } from "./ui";
 
 const POLL_MS = 1000;
+// The retained sample window, which the state poll deliberately strips. It moves at the
+// rate a ping is taken, not once a second.
+const LATENCY_POLL_MS = 30_000;
 
 function Positions({ positions }: { positions: PositionState[] }) {
   if (positions.length === 0) return <p className="text-sm text-neutral-500">flat</p>;
@@ -94,6 +98,7 @@ function Orders({ orders }: { orders: OrderState[] }) {
  */
 export default function Live({ onUnauthorized }: { onUnauthorized: () => void }) {
   const [result, setResult] = useState<StateResult | null>(null);
+  const [latency, setLatency] = useState<Latency | null>(null);
 
   const poll = useCallback(async () => {
     const next = await fetchLiveState();
@@ -109,6 +114,13 @@ export default function Live({ onUnauthorized }: { onUnauthorized: () => void })
     const timer = setInterval(poll, POLL_MS);
     return () => clearInterval(timer);
   }, [poll]);
+
+  useEffect(() => {
+    const load = () => fetchLiveLatency().then(setLatency);
+    load();
+    const timer = setInterval(load, LATENCY_POLL_MS);
+    return () => clearInterval(timer);
+  }, []);
 
   const state = result?.state ?? null;
   const risk = state?.risk;
@@ -197,6 +209,16 @@ export default function Live({ onUnauthorized }: { onUnauthorized: () => void })
         <div className="md:col-span-3">
           <Section title="open orders">
             <Orders orders={state?.orders ?? []} />
+          </Section>
+        </div>
+
+        <div className="md:col-span-3">
+          <Section title="round trip times from the trading loop, ms">
+            {latency ? (
+              <LatencyChart data={latency} />
+            ) : (
+              <p className="text-sm text-neutral-500">loading</p>
+            )}
           </Section>
         </div>
       </div>
