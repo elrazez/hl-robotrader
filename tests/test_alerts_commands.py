@@ -33,8 +33,12 @@ def an_update(text: str, chat_id: int = ALLOWED, update_id: int = 1) -> dict[str
 
 @pytest.fixture
 def bot(tmp_path: Path) -> CommandBot:
-    backend = NoopBackend(env="paper", proc="paper", kill_file=tmp_path / "KILL")
-    return CommandBot(backend, allowed_chat_ids={ALLOWED}, env="paper")
+    return _a_bot(kill_file=tmp_path / "KILL")
+
+
+def _a_bot(*, offset_path: Path | None = None, kill_file: Path | None = None) -> CommandBot:
+    backend = NoopBackend(env="paper", proc="paper", kill_file=kill_file or Path("KILL"))
+    return CommandBot(backend, allowed_chat_ids={ALLOWED}, env="paper", offset_path=offset_path)
 
 
 async def test_status_reports_the_state(bot: CommandBot) -> None:
@@ -168,3 +172,81 @@ def test_redacting_leaves_an_ordinary_message_alone() -> None:
     from liqfade.alerts.redact import redact
 
     assert redact("ConnectTimeout: timed out") == "ConnectTimeout: timed out"
+
+
+# --- a command is consumed exactly once, whatever the process does next -----------
+
+
+class FakeBotAPI:
+    """Telegram's actual contract: an update is redelivered until the offset moves past it."""
+
+    def __init__(self, updates: list[dict]) -> None:
+        self.updates = updates
+        self.deliveries = 0
+
+    def get_updates(self, offset: int) -> list[dict]:
+        self.deliveries += 1
+        return [u for u in self.updates if u["update_id"] >= offset]
+
+
+def a_kill_update(update_id: int = 77, chat_id: int = ALLOWED) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {"chat": {"id": chat_id}, "text": "/kill"},
+    }
+
+
+async def test_a_kill_is_not_redelivered_to_the_process_that_starts_next(tmp_path) -> None:
+    """Drilled on 2026-09-08: paper restarted and its own /kill killed it again, 42 times.
+
+    Telegram redelivers an update until the offset moves past it, the offset lived only in
+    memory, and the command in question is the one that stops the process. So the killed
+    process never acknowledged it and the next one was handed the same /kill on the first
+    poll, one second after starting.
+    """
+    api = FakeBotAPI([a_kill_update()])
+    offset_file = tmp_path / "telegram_offset"
+
+    first = _a_bot(offset_path=offset_file)
+    for update in api.get_updates(first.offset):
+        await first.handle_update(update)
+    assert first.backend._killed, "the first process ran the kill"
+
+    # The process died here. A new one starts and asks Telegram what it missed.
+    second = _a_bot(offset_path=offset_file)
+    redelivered = api.get_updates(second.offset)
+
+    assert redelivered == [], "the offset on disk consumed it"
+    assert second.backend._killed is False
+
+
+async def test_the_offset_is_written_before_the_command_runs(tmp_path) -> None:
+    """Before, not after: the command may be the one that stops this process.
+
+    Asserted from inside the handler, because "after" would still pass a test that only
+    looks at the file when the dust has settled, and the whole failure was a process that
+    never reached "after".
+    """
+    offset_file = tmp_path / "telegram_offset"
+    bot = _a_bot(offset_path=offset_file, kill_file=tmp_path / "KILL")
+    seen: list[str] = []
+
+    async def note_offset(reason: str | None = None):
+        seen.append(offset_file.read_text().strip() if offset_file.exists() else "missing")
+        return await NoopBackend.kill(bot.backend, reason)
+
+    bot.backend.kill = note_offset  # type: ignore[method-assign]
+    await bot.handle_update(a_kill_update())
+
+    assert seen == ["78"], "the update was consumed on disk before the kill ran"
+
+
+async def test_an_unwritable_offset_still_handles_the_command(tmp_path) -> None:
+    """A read-only data dir must not silence the kill switch. It is logged, not raised."""
+    bot = _a_bot(offset_path=tmp_path / "nope" / "offset")
+    (tmp_path / "nope").write_text("a file where the directory should be")
+
+    await bot.handle_update(a_kill_update())
+
+    assert bot.backend._killed, "the command still ran"
+    assert bot.offset == 78, "and the in-memory offset still moved"

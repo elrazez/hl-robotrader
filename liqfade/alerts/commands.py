@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -73,6 +74,7 @@ class CommandBot:
         allowed_chat_ids: set[int],
         env: str,
         offset: int = 0,
+        offset_path: Path | str | None = None,
     ) -> None:
         """
         Args:
@@ -80,14 +82,54 @@ class CommandBot:
             allowed_chat_ids: chat ids permitted to command. Empty refuses everyone.
             env: paper, testnet or mainnet. Shown in every reply, because knowing which
                 bot answered matters most when two are running.
-            offset: the update id to resume from, normally 0 on a fresh start.
+            offset: the update id to resume from. Overridden by `offset_path` when that
+                file exists, because the disk knows better than a fresh process does.
+            offset_path: where the next update id is kept between runs. **This is what
+                stops a command being executed twice.** Telegram redelivers an update
+                until the offset moves past it, and a `/kill` kills the process that is
+                handling it, so without this the next process is handed the same `/kill`
+                and kills itself: drilled on 2026-09-08, where paper restarted at
+                `...761206` and was killed again 994ms later by its own redelivered
+                command, 42 times over. None keeps the offset in memory, which is right
+                for a test and wrong for a process that can be restarted.
         """
         self.backend = backend
         self.allowed = set(allowed_chat_ids)
         self.env = env
-        self.offset = offset
+        self.offset_path = Path(offset_path) if offset_path else None
+        self.offset = self._load_offset(offset)
         if not self.allowed:
             log.warning("telegram_allowlist_empty", detail="every inbound command refused")
+
+    def _load_offset(self, fallback: int) -> int:
+        """The offset on disk, or the fallback. An unreadable file is a fresh start."""
+        if self.offset_path is None:
+            return fallback
+        try:
+            return max(fallback, int(self.offset_path.read_text().strip()))
+        except (OSError, ValueError):
+            return fallback
+
+    def _advance(self, update_id: int) -> None:
+        """Consume this update, on disk, **before** it is acted on.
+
+        Before, not after: the command being consumed may be the one that stops this
+        process, and an update acknowledged only in memory is redelivered to whatever
+        starts next. The cost of the ordering is that a crash between the write and the
+        dispatch loses a command, which is the right way round for a `/kill`: a kill that
+        did not run leaves the flag unwritten and the owner watching, while a kill that
+        runs on every restart makes the box impossible to bring back.
+        """
+        self.offset = max(self.offset, update_id + 1)
+        if self.offset_path is None:
+            return
+        try:
+            self.offset_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.offset_path.with_suffix(".tmp")
+            tmp.write_text(f"{self.offset}\n")
+            tmp.replace(self.offset_path)
+        except OSError as exc:
+            log.error("telegram_offset_not_persisted", error=str(exc), offset=self.offset)
 
     async def handle_update(self, update: dict[str, Any]) -> str | None:
         """Handle one update. Returns the reply to send, or None when there is nothing.
@@ -101,11 +143,11 @@ class CommandBot:
             return None
         message = update.get("message")
         if not isinstance(message, dict):
-            self.offset = max(self.offset, update_id + 1)
+            self._advance(update_id)
             return None
         chat_id = int(message.get("chat", {}).get("id", 0))
         text = str(message.get("text", "")).strip()
-        self.offset = max(self.offset, update_id + 1)
+        self._advance(update_id)
 
         if chat_id not in self.allowed:
             log.warning("telegram_chat_not_allowed", chat_id=chat_id, text=text[:64])

@@ -627,7 +627,14 @@ class PaperLoop:
         state_writer = StateWriter(
             backend.status, settings.state_path, settings.control.state_interval_s
         )
-        bot = CommandBot(backend, allowed_chat_ids=allowed_chat_ids(), env=settings.env)
+        bot = CommandBot(
+            backend,
+            allowed_chat_ids=allowed_chat_ids(),
+            env=settings.env,
+            # Persisted, so a /kill is consumed once rather than redelivered to the
+            # process that starts after it.
+            offset_path=settings.paths.data_dir / f"telegram_offset-{settings.env}",
+        )
 
         if settings.kill_switch_present:
             # The unit's ExecStartPre catches this too. Checked again here because a manual
