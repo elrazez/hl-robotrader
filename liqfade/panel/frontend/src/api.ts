@@ -1,6 +1,7 @@
 import type {
   DiskStats,
   EquityCurve,
+  FillsPage,
   Latency,
   Liquidations,
   ReportDetail,
@@ -89,6 +90,23 @@ export async function fetchLiquidations(hours = 24): Promise<Liquidations | null
     credentials: "same-origin",
   });
   return res.ok ? ((await res.json()) as Liquidations) : null;
+}
+
+/**
+ * The trading loop's fills, from `orders.sqlite`. `query` is the filter string built by
+ * Fills.tsx, shared with the curve below so the chart always plots the table's rows.
+ */
+export async function fetchFills(query: string, offset = 0, limit = 100): Promise<FillsPage> {
+  const res = await fetch(`/api/live/fills?${query}&limit=${limit}&offset=${offset}`, {
+    credentials: "same-origin",
+  });
+  if (!res.ok) return { total: 0, offset: 0, fills: [] };
+  return (await res.json()) as FillsPage;
+}
+
+export async function fetchLiveEquity(query: string): Promise<EquityCurve | null> {
+  const res = await fetch(`/api/live/equity?${query}`, { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as EquityCurve) : null;
 }
 
 /** Backtest reports. All of these are session gated like everything else. */

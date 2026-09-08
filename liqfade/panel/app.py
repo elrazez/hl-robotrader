@@ -66,6 +66,9 @@ LIVE_SOCKET_FILE = "control-paper.sock"
 # Trades returned in one page. The owner scrolls a table; a year of runs is not a dataset
 # to hand a browser in one response.
 MAX_TRADES_PAGE = 2000
+# Points in one equity curve. A curve is a picture, and past a few thousand points the
+# browser is drawing more line segments than the chart has pixels.
+MAX_CURVE_POINTS = 20_000
 
 
 def live_state_path(settings: Settings) -> Path:
@@ -120,6 +123,148 @@ def state_payload(path: Path, stale_s: float, *, absent: str) -> JSONResponse:
             },
         )
     return JSONResponse(payload)
+
+
+def _fill_filter(
+    coin: str | None, side: str | None, start_ms: int | None, end_ms: int | None
+) -> tuple[str, list[Any]]:
+    """The WHERE clause the fills table and its curve share, so they cannot disagree.
+
+    Every value is a bound parameter. `side` is checked against a literal pair rather
+    than interpolated, because it is the only one that maps onto a column expression.
+    """
+    clauses: list[str] = ["1=1"]
+    args: list[Any] = []
+    if coin:
+        clauses.append("o.coin = ?")
+        args.append(coin.upper())
+    if side in {"buy", "sell"}:
+        clauses.append("o.is_buy = ?")
+        args.append(1 if side == "buy" else 0)
+    if start_ms is not None:
+        clauses.append("f.ts_ms >= ?")
+        args.append(start_ms)
+    if end_ms is not None:
+        clauses.append("f.ts_ms <= ?")
+        args.append(end_ms)
+    return " AND ".join(clauses), args
+
+
+def _open_registry(db_path: Path) -> Any:
+    """The order registry, read only, or None when the loop has never run here.
+
+    Opened through a `mode=ro` URI so the panel physically cannot write the file the
+    trading loop owns. The store is in WAL, which is what lets this read happen while
+    the loop writes; see the note on OrderStore in execution/orders.py.
+    """
+    import sqlite3
+
+    if not Path(db_path).exists():
+        return None
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def read_fills(
+    db_path: Path,
+    *,
+    coin: str | None = None,
+    side: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """One page of fills with the coin, side and tag of the order each belongs to.
+
+    Newest first, because the question this page answers is what just happened. The
+    fills table alone carries only a cloid, so every row is joined to its order.
+    """
+    connection = _open_registry(db_path)
+    if connection is None:
+        return {"total": 0, "offset": 0, "fills": []}
+    where, args = _fill_filter(coin, side, start_ms, end_ms)
+    limit = max(1, min(limit, MAX_TRADES_PAGE))
+    offset = max(0, offset)
+    try:
+        total = connection.execute(
+            f"SELECT count(*) FROM fills f JOIN orders o USING (cloid) WHERE {where}",  # noqa: S608
+            args,
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""SELECT f.id, f.cloid, f.ts_ms, f.px, f.size, f.fee, f.maker,
+                       o.coin, o.is_buy, o.tag, o.reduce_only, o.status
+                FROM fills f JOIN orders o USING (cloid)
+                WHERE {where} ORDER BY f.ts_ms DESC, f.id DESC LIMIT ? OFFSET ?""",  # noqa: S608
+            [*args, limit, offset],
+        ).fetchall()
+    finally:
+        connection.close()
+    return {
+        "total": total,
+        "offset": offset,
+        "fills": [
+            {
+                "id": row["id"],
+                "cloid": row["cloid"],
+                "ts_ms": row["ts_ms"],
+                "coin": row["coin"],
+                "side": "buy" if row["is_buy"] else "sell",
+                "px": row["px"],
+                "size": row["size"],
+                "notional_usd": row["px"] * row["size"],
+                "fee": row["fee"],
+                "maker": bool(row["maker"]),
+                "tag": row["tag"],
+                "reduce_only": bool(row["reduce_only"]),
+                "status": row["status"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def realized_curve(
+    db_path: Path,
+    *,
+    coin: str | None = None,
+    side: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> dict[str, Any]:
+    """Cumulative realized cash flow across the fills, uplot shaped, with its drawdown.
+
+    A fill is a cash movement: a buy pays out `px * size`, a sell takes it in, and the
+    fee comes off either way. That is all these rows can honestly say. The registry
+    stores no per-trade PnL and pairing entry legs to exit legs would be a guess, so the
+    curve is cash rather than an attribution that could be wrong without looking wrong.
+    A flat account's curve therefore returns to its realized PnL; an open position shows
+    as the cash it is currently out.
+    """
+    connection = _open_registry(db_path)
+    if connection is None:
+        return {"ts_ms": [], "equity": [], "drawdown": []}
+    where, args = _fill_filter(coin, side, start_ms, end_ms)
+    try:
+        rows = connection.execute(
+            f"""SELECT f.ts_ms, f.px, f.size, f.fee, o.is_buy
+                FROM fills f JOIN orders o USING (cloid)
+                WHERE {where} ORDER BY f.ts_ms, f.id LIMIT ?""",  # noqa: S608
+            [*args, MAX_CURVE_POINTS],
+        ).fetchall()
+    finally:
+        connection.close()
+
+    stamps, equity, drawdown = [], [], []
+    running, peak = 0.0, float("-inf")
+    for row in rows:
+        running += (-1.0 if row["is_buy"] else 1.0) * row["px"] * row["size"] - row["fee"]
+        peak = max(peak, running)
+        stamps.append(row["ts_ms"])
+        equity.append(running)
+        drawdown.append(running - peak)
+    return {"ts_ms": stamps, "equity": equity, "drawdown": drawdown}
 
 
 def _run_dir(reports_dir: Path, run_id: str) -> Path:
@@ -488,6 +633,38 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
             path,
             settings.panel.state_stale_s,
             absent=f"no state file at {path}: the trading loop is not running",
+        )
+
+    @api.get("/live/fills", dependencies=[Depends(require_session)])
+    def live_fills(
+        coin: str | None = None,
+        side: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """A page of the order registry's fills. Read only, straight off the sqlite file."""
+        return read_fills(
+            settings.order_db_path,
+            coin=coin,
+            side=side,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=limit,
+            offset=offset,
+        )
+
+    @api.get("/live/equity", dependencies=[Depends(require_session)])
+    def live_equity(
+        coin: str | None = None,
+        side: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """The realized curve over the same rows the table is showing, for the chart."""
+        return realized_curve(
+            settings.order_db_path, coin=coin, side=side, start_ms=start_ms, end_ms=end_ms
         )
 
     @api.get("/recorder/disk", dependencies=[Depends(require_session)])

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import Fills from "./Fills";
 import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
 import Live from "./Live";
@@ -75,7 +76,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
   );
 }
 
-type Tab = "live" | "recorder" | "reports";
+type Tab = "live" | "fills" | "recorder" | "reports";
 
 function TabButton({
   tab,
@@ -165,6 +166,7 @@ export default function App() {
         </h1>
         <div className="flex items-center gap-2">
           <TabButton tab="live" current={tab} onPick={setTab} label="live" />
+          <TabButton tab="fills" current={tab} onPick={setTab} label="fills" />
           <TabButton tab="recorder" current={tab} onPick={setTab} label="recorder" />
           <TabButton tab="reports" current={tab} onPick={setTab} label="reports" />
           <button
@@ -177,6 +179,7 @@ export default function App() {
       </header>
 
       {tab === "live" ? <Live onUnauthorized={() => setAuthed(false)} /> : null}
+      {tab === "fills" ? <Fills /> : null}
       {tab === "reports" ? <Reports /> : null}
 
       {tab === "recorder" && problem && <Banner kind="warn">stale: {problem}</Banner>}

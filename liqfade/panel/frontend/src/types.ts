@@ -174,6 +174,29 @@ export interface EquityCurve {
   drawdown: number[];
 }
 
+/** GET /api/live/fills: one fill joined to the order it belongs to. */
+export interface FillRow {
+  id: number;
+  cloid: string;
+  ts_ms: number;
+  coin: string;
+  side: "buy" | "sell";
+  px: number;
+  size: number;
+  notional_usd: number;
+  fee: number;
+  maker: boolean;
+  tag: string;
+  reduce_only: boolean;
+  status: string;
+}
+
+export interface FillsPage {
+  total: number;
+  offset: number;
+  fills: FillRow[];
+}
+
 export interface Candle {
   ts_ms: number;
   o: number;

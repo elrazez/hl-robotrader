@@ -797,3 +797,161 @@ class TestTheLiveStateEndpoint:
 
         assert "ws_ping_samples" not in body["latency"]
         assert "submit_ack_p50" in body["latency"]
+
+
+# --- fills history and realized PnL --------------------------------------------
+
+
+def _order_db(path: Path) -> None:
+    """A small orders.sqlite with the columns `execution/orders.py` writes.
+
+    Built with sqlite3 rather than by driving OrderManager: the panel reads this file
+    with duckdb and never through the manager, so the schema is the contract under test.
+    """
+    import sqlite3
+
+    from liqfade.execution.orders import SCHEMA
+
+    connection = sqlite3.connect(path)
+    connection.executescript(SCHEMA)
+    orders = [
+        ("0x01", "BTC", 1, 79000.0, 0.03, "Alo", 0, "entry", "FILLED", 1_788_784_000_000),
+        ("0x02", "BTC", 0, 79400.0, 0.03, "Ioc", 1, "target", "FILLED", 1_788_784_600_000),
+        ("0x03", "ETH", 0, 3100.0, 1.0, "Alo", 0, "entry", "FILLED", 1_788_870_000_000),
+        ("0x04", "ETH", 1, 3080.0, 1.0, "Ioc", 1, "target", "FILLED", 1_788_870_600_000),
+    ]
+    for cloid, coin, is_buy, px, size, tif, reduce_only, tag, status_, submitted in orders:
+        connection.execute(
+            """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only, tag,
+                                   status, submitted_ms, updated_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (cloid, coin, is_buy, px, size, tif, reduce_only, tag, status_, submitted, submitted),
+        )
+    fills = [
+        ("0x01", 1_788_784_000_000, 79000.0, 0.03, 1.06, 0),
+        ("0x02", 1_788_784_600_000, 79400.0, 0.03, 1.07, 0),
+        ("0x03", 1_788_870_000_000, 3100.0, 1.0, 0.46, 1),
+        ("0x04", 1_788_870_600_000, 3080.0, 1.0, 1.38, 0),
+    ]
+    connection.executemany(
+        "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,?,?)", fills
+    )
+    connection.commit()
+    connection.close()
+
+
+class TestFillsHistory:
+    """Every fill the loop has taken, from the registry the loop already writes.
+
+    Paper fills land in the same `orders.sqlite` as testnet and mainnet ones, so there is
+    one store and the panel reads it rather than keeping a second one that could disagree.
+    """
+
+    @pytest.fixture
+    def filled(self, client: TestClient, settings: Settings) -> TestClient:
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        _order_db(settings.order_db_path)
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.get("/api/live/fills").status_code == 401
+
+    def test_no_registry_yet_is_an_empty_page_not_an_error(self, client: TestClient) -> None:
+        """The loop has never run on this box. That is an empty table, not a 500."""
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.get("/api/live/fills").json()
+        assert body == {"total": 0, "offset": 0, "fills": []}
+
+    def test_a_fill_carries_its_orders_coin_side_and_tag(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills").json()
+        assert body["total"] == 4
+        # The oldest row, which is the BTC entry: the page is newest first.
+        oldest = body["fills"][-1]
+        assert oldest["coin"] == "BTC"
+        assert oldest["side"] == "buy"
+        assert oldest["tag"] == "entry"
+        assert oldest["maker"] is False
+        assert oldest["ts_ms"] == 1_788_784_000_000
+        assert oldest["notional_usd"] == pytest.approx(2370.0)
+
+    def test_newest_first(self, filled: TestClient) -> None:
+        """The owner opens this page to see what just happened, not what happened first."""
+        stamps = [f["ts_ms"] for f in filled.get("/api/live/fills").json()["fills"]]
+        assert stamps == sorted(stamps, reverse=True)
+
+    def test_filters_by_coin_and_side(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills?coin=ETH").json()
+        assert body["total"] == 2
+        assert {f["coin"] for f in body["fills"]} == {"ETH"}
+
+        sells = filled.get("/api/live/fills?side=sell").json()
+        assert {f["side"] for f in sells["fills"]} == {"sell"}
+        assert sells["total"] == 2
+
+    def test_filters_by_date_range(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/fills?start_ms=1788870000000").json()
+        assert body["total"] == 2
+        assert {f["coin"] for f in body["fills"]} == {"ETH"}
+
+    def test_it_pages(self, filled: TestClient) -> None:
+        page = filled.get("/api/live/fills?limit=2&offset=1").json()
+        assert page["total"] == 4
+        assert page["offset"] == 1
+        assert len(page["fills"]) == 2
+
+    def test_an_unknown_coin_is_an_empty_page(self, filled: TestClient) -> None:
+        assert filled.get("/api/live/fills?coin=DOGE").json()["total"] == 0
+
+
+class TestTheRealizedEquityCurve:
+    """Cumulative realized cash flow across the fills, which is what these rows can say.
+
+    A fill row is a cash movement: a buy pays out, a sell takes in, and the fee comes off
+    either way. The registry stores no per-trade PnL, so this is the honest curve rather
+    than a round trip attribution that would have to guess how legs pair up.
+    """
+
+    @pytest.fixture
+    def filled(self, client: TestClient, settings: Settings) -> TestClient:
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        _order_db(settings.order_db_path)
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_no_registry_yet_is_an_empty_curve(self, client: TestClient) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        assert client.get("/api/live/equity").json() == {
+            "ts_ms": [],
+            "equity": [],
+            "drawdown": [],
+        }
+
+    def test_a_buy_pays_out_and_a_sell_takes_in_net_of_fees(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/equity").json()
+
+        # BTC: bought 0.03 at 79000 (-2370.00 - 1.06), sold at 79400 (+2382.00 - 1.07).
+        assert body["equity"][0] == pytest.approx(-2371.06)
+        assert body["equity"][1] == pytest.approx(9.87)
+        # ETH: sold 1 at 3100 (+3100.00 - 0.46), bought back at 3080 (-3080.00 - 1.38).
+        assert body["equity"][2] == pytest.approx(3109.41)
+        assert body["equity"][3] == pytest.approx(28.03)
+
+    def test_the_curve_is_in_time_order_even_though_the_table_is_not(
+        self, filled: TestClient
+    ) -> None:
+        """The fills table is newest first for reading; a curve has to run forwards."""
+        stamps = filled.get("/api/live/equity").json()["ts_ms"]
+        assert stamps == sorted(stamps)
+
+    def test_drawdown_is_the_distance_below_the_running_peak(self, filled: TestClient) -> None:
+        body = filled.get("/api/live/equity").json()
+        assert body["drawdown"][0] == pytest.approx(0.0)  # the first point is its own peak
+        assert body["drawdown"][1] == pytest.approx(9.87 - 9.87)
+        assert all(value <= 0 for value in body["drawdown"])
+
+    def test_it_honours_the_same_filters_as_the_table(self, filled: TestClient) -> None:
+        """The chart under the table has to be the same rows the table is showing."""
+        body = filled.get("/api/live/equity?coin=ETH").json()
+        assert len(body["ts_ms"]) == 2
+        assert body["equity"][0] == pytest.approx(3099.54)
