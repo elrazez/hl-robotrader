@@ -62,6 +62,7 @@ from liqfade.execution.orders import (
     OrderStore,
     new_cloid,
 )
+from liqfade.execution.ratelimit import ActionBudget
 from liqfade.live.features import LiveFeatureEngine
 from liqfade.log import get_logger
 from liqfade.risk.engine import RiskEngine
@@ -190,6 +191,11 @@ class PaperSession:
                 sz_decimals=self._sz_decimals(),
                 killed=lambda: settings.kill_switch_present,
                 retries=settings.execution.transient_retries,
+                # Paper sends no action to an address, so the budget here is not a limit
+                # but a measurement: it counts what the same policy would have spent
+                # against the venue, which is the number the seven day run has to show is
+                # under the ceiling before testnet inherits it.
+                budget=ActionBudget(settings.execution.action_budget_per_hour),
             )
             if store is not None
             else None
@@ -270,6 +276,10 @@ class PaperSession:
                 venue=venue,
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def actions_remaining(self) -> int | None:
+        """Venue actions left in this hour, or None when nothing is counted."""
+        return None if self.orders is None else self.orders.actions_remaining()
 
     # --- the clock -----------------------------------------------------------
 

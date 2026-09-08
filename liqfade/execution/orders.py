@@ -54,6 +54,7 @@ from typing import Protocol, Self
 import aiosqlite
 
 from liqfade.control.protocol import OrderState, now_ms
+from liqfade.execution.ratelimit import ActionBudget, BudgetExhaustedError
 from liqfade.execution.rounding import RoundingError, round_price, round_size
 from liqfade.log import get_logger
 
@@ -424,6 +425,7 @@ class OrderManager:
         killed: Callable[[], bool],
         retries: int = 3,
         backoff_s: float = 0.25,
+        budget: ActionBudget | None = None,
     ) -> None:
         """
         Args:
@@ -441,6 +443,9 @@ class OrderManager:
             backoff_s: base delay; each retry waits `backoff_s * 2**attempt` times a
                 random factor in [0.5, 1.5). Jittered because two coins rejected by the
                 same rate limit would otherwise retry in lockstep forever.
+            budget: the address action budget from `execution.action_budget_per_hour`.
+                None counts nothing, which is what the backtest and the paper fill model
+                want: neither sends an action to an address.
         """
         self.store = store
         self.transport = transport
@@ -448,8 +453,18 @@ class OrderManager:
         self.killed = killed
         self.retries = retries
         self.backoff_s = backoff_s
+        self.budget = budget
         self._orders: dict[str, Order] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def actions_remaining(self) -> int | None:
+        """What `RiskState.actions_remaining` reports, or None when nothing is counted."""
+        return None if self.budget is None else self.budget.remaining(now_ms=now_ms())
+
+    def _spend(self, *, reducing: bool) -> None:
+        """Take one action from the budget. Raises `BudgetExhaustedError` when it adds risk."""
+        if self.budget is not None:
+            self.budget.take(now_ms=now_ms(), reducing=reducing)
 
     async def load(self) -> list[Order]:
         """Read the registry back into memory. Called on startup, before anything trades."""
@@ -519,6 +534,17 @@ class OrderManager:
                 reduce_only=intent.reduce_only,
                 tag=intent.tag,
             )
+            try:
+                self._spend(reducing=intent.reduce_only)
+            except BudgetExhaustedError as exc:
+                # Refused here rather than at the venue, because a rejected order costs an
+                # action there too: hitting the real limit is how an account loses the
+                # ability to cancel.
+                order.reject_reason = str(exc)
+                await self._transition(
+                    order, OrderStatus.REJECTED, "order_budget_exhausted", reason=str(exc)
+                )
+                return order
             order.priced_ms = now_ms()
             return await self._place_with_retries(order)
 
@@ -606,6 +632,8 @@ class OrderManager:
         if order.status not in LIVE:
             log.info("order_cancel_skipped", cloid=cloid, status=str(order.status))
             return order
+        # Counted, never refused: see execution/ratelimit.py.
+        self._spend(reducing=True)
         await self.transport.cancel(order.coin, cloid)
         await self._transition(
             order,
@@ -647,6 +675,14 @@ class OrderManager:
                 intent = self._rounded(replace(order.intent, px=px))
             except RoundingError as exc:
                 log.error("order_reprice_unroundable", cloid=cloid, px=px, error=str(exc))
+                return order
+
+            try:
+                self._spend(reducing=False)
+            except BudgetExhaustedError as exc:
+                # The order stays where it is, still live. A reprice is the most
+                # discretionary action the loop takes and the first one to give up.
+                log.warning("order_reprice_over_budget", cloid=cloid, px=px, reason=str(exc))
                 return order
 
             was_px = order.intent.px

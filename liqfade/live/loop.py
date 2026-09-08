@@ -143,6 +143,7 @@ class PaperBackend:
                 consecutive_losses=risk_state.consecutive_losses,
                 open_positions=len(positions),
                 coin_cooldowns=dict(risk_state.coin_cooldowns),
+                actions_remaining=loop.session.actions_remaining(),
             ),
             latency=loop.latency.state(),
             universe=list(loop.universe.coins),

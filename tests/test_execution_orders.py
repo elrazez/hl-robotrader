@@ -453,3 +453,67 @@ async def test_the_reprice_count_survives_a_restart(tmp_path: Path) -> None:
         assert manager2.get(order.cloid).reprices == 1
     finally:
         await second.close()
+
+
+# --- the action budget ----------------------------------------------------------
+
+
+async def test_a_submit_past_the_budget_is_refused_before_the_venue(store: OrderStore) -> None:
+    """Refused here, not by Hyperliquid. A rejected order still costs an action there."""
+    from liqfade.execution.ratelimit import ActionBudget
+
+    transport = FakeTransport()
+    manager = a_manager(store, transport, budget=ActionBudget(per_hour=1))
+    await manager.submit(an_intent(px=2000.0))
+
+    second = await manager.submit(an_intent(px=2001.0))
+
+    assert second.status is OrderStatus.REJECTED
+    assert "budget" in (second.reject_reason or "").lower()
+    assert len(transport.placed) == 1, "the second order never reached the transport"
+
+
+async def test_a_cancel_is_never_refused_by_the_budget(store: OrderStore) -> None:
+    """CLAUDE.md rule 5. A limiter that can block a cancel can hold a position open."""
+    from liqfade.execution.ratelimit import ActionBudget
+
+    transport = FakeTransport()
+    manager = a_manager(store, transport, budget=ActionBudget(per_hour=1))
+    order = await manager.submit(an_intent(px=2000.0))
+
+    cancelled = await manager.cancel(order.cloid)
+
+    assert cancelled.status is OrderStatus.CANCELED
+    assert transport.cancelled == [("ETH", order.cloid)]
+
+
+async def test_a_reprice_past_the_budget_is_refused(store: OrderStore) -> None:
+    """Repricing is what spends this budget, so it is what the budget has to stop."""
+    from liqfade.execution.ratelimit import ActionBudget
+
+    transport = ModifyTransport()
+    manager = a_manager(store, transport, budget=ActionBudget(per_hour=1))
+    order = await manager.submit(an_intent(px=2000.0))
+
+    repriced = await manager.reprice(order.cloid, 2010.0)
+
+    assert repriced.intent.px == 2000.0, "unmoved"
+    assert repriced.status is OrderStatus.ACKED, "still live, just not moved"
+    assert transport.modified == []
+
+
+async def test_the_manager_reports_what_the_panel_renders(store: OrderStore) -> None:
+    from liqfade.execution.ratelimit import ActionBudget
+
+    manager = a_manager(store, FakeTransport(), budget=ActionBudget(per_hour=600))
+    await manager.submit(an_intent(px=2000.0))
+
+    assert manager.actions_remaining() == 599
+
+
+async def test_without_a_budget_nothing_is_counted(store: OrderStore) -> None:
+    """The budget is optional so the backtest and the tests that predate it still run."""
+    manager = a_manager(store, FakeTransport())
+    await manager.submit(an_intent(px=2000.0))
+
+    assert manager.actions_remaining() is None
