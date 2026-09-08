@@ -2,7 +2,7 @@
 
 Layer order, later wins:
 
-    config/default.yaml -> config/{env}.yaml -> config/overrides.yaml -> LIQFADE_ env vars
+    config/default.yaml -> config/{env}.yaml -> {data_dir}/overrides.yaml -> LIQFADE_ env vars
 
 Each layer is deep merged into one dict while a parallel dict records, per dotted key,
 which layer last wrote it. That provenance is what `liqfade config show` prints. We merge
@@ -29,6 +29,12 @@ from liqfade.config.models import Settings
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 ENV_PREFIX = "LIQFADE_"
+# The one layer written at runtime, so it lives with the data rather than with the code.
+# The panel writes it, and its unit is ProtectSystem=strict with only the data dir
+# writable; the trading loop reads it from a different checkout entirely. A file under
+# config/ would be unwritable by one and invisible to the other. docs/DECISIONS.md,
+# 2026-09-08.
+OVERRIDES_NAME = "overrides.yaml"
 # Env vars that configure something other than a config key, so the loader must not try
 # to map them onto the Settings tree. Secrets live here; they are read by the modules
 # that need them, never merged into the config.
@@ -48,6 +54,22 @@ ENV_ALIASES = {
     "LIQFADE_CONTROL_SOCKET": "control.socket_path",
     "LIQFADE_LOG_LEVEL": "logging.level",
 }
+
+
+def overrides_file(*trees: dict[str, Any]) -> Path:
+    """`overrides.yaml` under `paths.data_dir`, resolved from the layers given.
+
+    Trees come in merge order, later winning, and are the layers other than this one:
+    the file has to be located before it can be merged, so every other layer that could
+    set `paths.data_dir` is consulted first. That includes the env layer, which merges
+    last of all, because LIQFADE_DATA_DIR is how the box names its data dir.
+    """
+    data_dir: Any = "data"
+    for tree in trees:
+        node = tree.get("paths")
+        if isinstance(node, dict) and node.get("data_dir"):
+            data_dir = node["data_dir"]
+    return Path(str(data_dir)) / OVERRIDES_NAME
 
 
 class ConfigError(RuntimeError):
@@ -138,6 +160,8 @@ class ConfigLayer:
     what lets a reader say what the layer underneath an override will go back to saying.
     `exists` is False for a file that is not there; `overrides.yaml` legitimately is not
     until the panel writes one, and an empty layer is a different thing from a missing one.
+    `path` is the absolute path the loader looked at, which for overrides.yaml is under
+    data_dir rather than beside the other layers.
     """
 
     name: str
@@ -176,23 +200,28 @@ def _layers(
     env_path = directory / f"{chosen}.yaml"
     if not env_path.exists():
         raise ConfigError(f"unknown environment {chosen!r}: no {env_path}")
-    layers.append(ConfigLayer(env_path.name, str(env_path), True, flatten(_read_yaml(env_path))))
+    env_tree = _read_yaml(env_path)
+    layers.append(ConfigLayer(env_path.name, str(env_path), True, flatten(env_tree)))
 
+    trees = [default_tree, env_tree]
     for extra in extra_files or []:
         if not extra.exists():
             raise ConfigError(f"missing config file {extra}")
-        layers.append(ConfigLayer(extra.name, str(extra), True, flatten(_read_yaml(extra))))
+        extra_tree = _read_yaml(extra)
+        trees.append(extra_tree)
+        layers.append(ConfigLayer(extra.name, str(extra), True, flatten(extra_tree)))
 
-    overrides_path = directory / "overrides.yaml"
+    env_tree_layer = _env_layer(environ)
+    overrides_path = overrides_file(*trees, env_tree_layer)
     layers.append(
         ConfigLayer(
-            "overrides.yaml",
+            OVERRIDES_NAME,
             str(overrides_path),
             overrides_path.exists(),
             flatten(_read_yaml(overrides_path)),
         )
     )
-    layers.append(ConfigLayer("envvar", None, True, flatten(_env_layer(environ))))
+    layers.append(ConfigLayer("envvar", None, True, flatten(env_tree_layer)))
     return chosen, layers
 
 
@@ -230,10 +259,12 @@ def resolve(
             raise ConfigError(f"missing config file {extra}")
         _merge(merged, _read_yaml(extra), sources, extra.name)
 
-    # overrides.yaml is written by the panel and may legitimately not exist.
-    _merge(merged, _read_yaml(directory / "overrides.yaml"), sources, "overrides.yaml")
+    # overrides.yaml is written by the panel and may legitimately not exist. It lives
+    # under data_dir, which `merged` and the env layer between them already decide.
+    env_tree_layer = _env_layer(environ)
+    _merge(merged, _read_yaml(overrides_file(merged, env_tree_layer)), sources, OVERRIDES_NAME)
 
-    _merge(merged, _env_layer(environ), sources, "envvar")
+    _merge(merged, env_tree_layer, sources, "envvar")
 
     # An explicit --env argument beats whatever the files said about `env`.
     if env is not None:

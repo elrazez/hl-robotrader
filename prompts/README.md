@@ -22,6 +22,7 @@ exceptions are noted below.
 | `04b_backtest_streaming.md` | 4 | The backtester reads the lake a day at a time, caches the feature grid, replays only cascade windows | 04 done; the year run does not fit in 8 GB |
 | `04d_lab.md` | 4 | `liqfade lab`, the terminal workbench: configs, runs, results, status | 04b committed; Textual from the `lab` extra |
 | `05_execution.md` | 5 | Live loop, paper mode, testnet execution, Telegram bot + Panel v3 | Phase 4 done, testnet keys |
+| `05d_external_ideas.md` | 5 and 7 | Five prompts from the external bots scan: liquidation map recorder, refusals persisted and scored, `liqfade drift`, Q9, stop-order map | routing table inside the file; A and B any time beside the 05c soak, C after the entry policy, D after 21 days of A, E after D says yes |
 | `06_mainnet.md` | 6 | Mainnet go-live at minimum size, reporting | Phase 5 ran clean 1 week |
 | `07_iterate.md` | 7 | The process for every change after go-live | Phase 6 live |
 

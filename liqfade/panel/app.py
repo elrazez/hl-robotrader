@@ -18,13 +18,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from liqfade.config import config_layers, flatten, resolve
+from liqfade.config import config_layers, flatten, overrides_file, resolve
 from liqfade.config.models import Settings
-from liqfade.control.protocol import LatencyState, now_ms
+from liqfade.control.client import ControlClient
+from liqfade.control.protocol import ControlError, LatencyState, now_ms
 from liqfade.control.state import read_state
 from liqfade.log import get_logger, setup_logging
+from liqfade.panel import audit, overrides
 from liqfade.panel.auth import COOKIE_NAME, LoginLimiter, SessionAuth
 
 log = get_logger(__name__)
@@ -33,6 +35,37 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 class LoginBody(BaseModel):
     password: str = Field(..., min_length=1, max_length=1024)
+
+
+class ControlBody(BaseModel):
+    """What a control action needs. `confirm` is enforced here, not only in the browser.
+
+    A page can be reloaded mid-dialog and a curl has no dialog at all, so the second
+    step of "click, then confirm" is a field on the request rather than a state in the
+    frontend. Flattening a book is not something to do because a request arrived.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool = False
+    coin: str | None = Field(None, max_length=32, description="flat only; all coins when None")
+
+
+class SettingsBody(BaseModel):
+    """One settings write. `reason` is required: the audit log's value is the why.
+
+    `confirm` maps a risk field to the owner's typed confirmation of its own name, which
+    is the second pair of eyes CLAUDE.md asks for on anything that decides how much is at
+    risk. `dry_run` runs every check and returns the diff without writing, so the preview
+    the page shows is the write minus the write.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    changes: dict[str, Any] = Field(..., description="dotted key to new value")
+    reason: str = Field(..., min_length=1, max_length=500)
+    confirm: dict[str, str] = Field(default_factory=dict)
+    dry_run: bool = False
 
 
 def is_loopback(host: str) -> bool:
@@ -53,9 +86,278 @@ def is_loopback(host: str) -> bool:
 
 HOUR_MS = 3_600_000
 MINUTE_MS = 60_000
+# What the trading loop calls its snapshot and its control socket. Two processes write
+# state into one data dir on the box: the recorder keeps the defaults from
+# config/default.yaml, and the paper loop is given these by
+# scripts/systemd/liqfade-paper.service, because the control server takes an exclusive
+# lock on its socket and the second process to start would otherwise refuse outright.
+# Named here rather than read from config because the panel is a third process and does
+# not see the loop unit's Environment= lines. If the unit renames either, the panel says
+# so loudly: /api/live/state 503s naming the file it could not find.
+LIVE_STATE_FILE = "state-paper.json"
+LIVE_SOCKET_FILE = "control-paper.sock"
 # Trades returned in one page. The owner scrolls a table; a year of runs is not a dataset
 # to hand a browser in one response.
 MAX_TRADES_PAGE = 2000
+# Points in one equity curve. A curve is a picture, and past a few thousand points the
+# browser is drawing more line segments than the chart has pixels.
+MAX_CURVE_POINTS = 20_000
+
+
+def live_state_path(settings: Settings) -> Path:
+    """The trading loop's snapshot, beside the recorder's in the shared data dir."""
+    return settings.paths.data_dir / LIVE_STATE_FILE
+
+
+def live_socket_path(settings: Settings) -> Path:
+    """The trading loop's control socket. The panel is a client of it, never a server."""
+    return settings.paths.data_dir / LIVE_SOCKET_FILE
+
+
+def state_payload(path: Path, stale_s: float, *, absent: str) -> JSONResponse:
+    """One process's snapshot, or a 503 that still carries the last one it wrote.
+
+    Stale is an error rather than a warning field because every number on the page is a
+    trading number: showing a five second old position quietly is worse than an obvious
+    outage. The body carries the snapshot anyway, so the page can grey its controls out
+    behind the banner rather than going blank.
+
+    Args:
+        path: the state file to read.
+        stale_s: seconds of age past which the snapshot is refused.
+        absent: what to say when the file is not there, naming the process that is down.
+    """
+    try:
+        snapshot = read_state(path)
+    except FileNotFoundError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, absent) from None
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"state file unreadable: {exc}"
+        ) from None
+
+    age_s = (now_ms() - snapshot.ts_ms) / 1000.0
+    payload = snapshot.model_dump(mode="json") | {"age_s": age_s}
+    # The latency sample series belongs to the latency endpoints, which the page polls
+    # every thirty seconds. This one is polled every second, and several hundred points
+    # would be the whole payload, over an SSH tunnel, for a chart that has not moved.
+    payload["latency"] = {
+        key: value for key, value in payload["latency"].items() if not key.endswith("_samples")
+    }
+    if age_s > stale_s:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "detail": (
+                    f"state is {age_s:.1f}s old, over the {stale_s}s limit: "
+                    "the writing process is stalled or gone"
+                ),
+                "state": payload,
+            },
+        )
+    return JSONResponse(payload)
+
+
+def _fill_filter(
+    coin: str | None, side: str | None, start_ms: int | None, end_ms: int | None
+) -> tuple[str, list[Any]]:
+    """The WHERE clause the fills table and its curve share, so they cannot disagree.
+
+    Every value is a bound parameter. `side` is checked against a literal pair rather
+    than interpolated, because it is the only one that maps onto a column expression.
+    """
+    clauses: list[str] = ["1=1"]
+    args: list[Any] = []
+    if coin:
+        clauses.append("o.coin = ?")
+        args.append(coin.upper())
+    if side in {"buy", "sell"}:
+        clauses.append("o.is_buy = ?")
+        args.append(1 if side == "buy" else 0)
+    if start_ms is not None:
+        clauses.append("f.ts_ms >= ?")
+        args.append(start_ms)
+    if end_ms is not None:
+        clauses.append("f.ts_ms <= ?")
+        args.append(end_ms)
+    return " AND ".join(clauses), args
+
+
+def _open_registry(db_path: Path) -> Any:
+    """The order registry, read only, or None when the loop has never run here.
+
+    Opened through a `mode=ro` URI so the panel physically cannot write the file the
+    trading loop owns. The store is in WAL, which is what lets this read happen while
+    the loop writes; see the note on OrderStore in execution/orders.py.
+    """
+    import sqlite3
+
+    if not Path(db_path).exists():
+        return None
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def read_fills(
+    db_path: Path,
+    *,
+    coin: str | None = None,
+    side: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """One page of fills with the coin, side and tag of the order each belongs to.
+
+    Newest first, because the question this page answers is what just happened. The
+    fills table alone carries only a cloid, so every row is joined to its order.
+    """
+    connection = _open_registry(db_path)
+    if connection is None:
+        return {"total": 0, "offset": 0, "fills": []}
+    where, args = _fill_filter(coin, side, start_ms, end_ms)
+    limit = max(1, min(limit, MAX_TRADES_PAGE))
+    offset = max(0, offset)
+    try:
+        total = connection.execute(
+            f"SELECT count(*) FROM fills f JOIN orders o USING (cloid) WHERE {where}",  # noqa: S608
+            args,
+        ).fetchone()[0]
+        rows = connection.execute(
+            f"""SELECT f.id, f.cloid, f.ts_ms, f.px, f.size, f.fee, f.maker,
+                       o.coin, o.is_buy, o.tag, o.reduce_only, o.status
+                FROM fills f JOIN orders o USING (cloid)
+                WHERE {where} ORDER BY f.ts_ms DESC, f.id DESC LIMIT ? OFFSET ?""",  # noqa: S608
+            [*args, limit, offset],
+        ).fetchall()
+    finally:
+        connection.close()
+    return {
+        "total": total,
+        "offset": offset,
+        "fills": [
+            {
+                "id": row["id"],
+                "cloid": row["cloid"],
+                "ts_ms": row["ts_ms"],
+                "coin": row["coin"],
+                "side": "buy" if row["is_buy"] else "sell",
+                "px": row["px"],
+                "size": row["size"],
+                "notional_usd": row["px"] * row["size"],
+                "fee": row["fee"],
+                "maker": bool(row["maker"]),
+                "tag": row["tag"],
+                "reduce_only": bool(row["reduce_only"]),
+                "status": row["status"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def realized_curve(
+    db_path: Path,
+    *,
+    coin: str | None = None,
+    side: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> dict[str, Any]:
+    """Realized PnL across the fills, uplot shaped, with its drawdown.
+
+    Running average cost per coin: a fill that adds to a position moves its average, a
+    fill that reduces one realizes the difference between the fill price and that
+    average over the part it closed, and a fill that flips the sign does both. Fees come
+    off whatever the fill did. Nothing here needs to know which entry an exit belongs to,
+    which is what makes it exact rather than an attribution that could be quietly wrong.
+
+    This used to plot cumulative cash, which is what a fill row literally is, and it made
+    a useless chart: every entry dropped the line by the whole notional and every exit
+    put it back, so a 2,400 dollar swing drew over a 30 dollar edge. The two agree
+    wherever every book is flat, which is the check on the method.
+
+    A filter that cuts a coin's history in half leaves that coin's position opening
+    mid-flight, and its first reducing fill then realizes against a shorter average. The
+    filters exist to look at a window, and the window's own PnL is what the chart of it
+    should show.
+    """
+    connection = _open_registry(db_path)
+    if connection is None:
+        return {"ts_ms": [], "equity": [], "drawdown": []}
+    where, args = _fill_filter(coin, side, start_ms, end_ms)
+    try:
+        rows = connection.execute(
+            f"""SELECT f.ts_ms, f.px, f.size, f.fee, o.is_buy, o.coin
+                FROM fills f JOIN orders o USING (cloid)
+                WHERE {where} ORDER BY f.ts_ms, f.id LIMIT ?""",  # noqa: S608
+            [*args, MAX_CURVE_POINTS],
+        ).fetchall()
+    finally:
+        connection.close()
+
+    stamps: list[int] = []
+    equity: list[float] = []
+    drawdown: list[float] = []
+    # coin -> (signed size held, average cost of that size)
+    book: dict[str, tuple[float, float]] = {}
+    running, peak = 0.0, float("-inf")
+    for row in rows:
+        held, average = book.get(row["coin"], (0.0, 0.0))
+        signed = row["size"] if row["is_buy"] else -row["size"]
+        running -= row["fee"]
+
+        if held == 0.0 or (held > 0) == (signed > 0):
+            # Adding to a position, or opening one. Nothing closes, so nothing realizes.
+            total = held + signed
+            average = (abs(held) * average + abs(signed) * row["px"]) / abs(total)
+            held = total
+        else:
+            closed = min(abs(held), abs(signed))
+            # Long closes at a profit above its average, short below it.
+            running += closed * (row["px"] - average) * (1.0 if held > 0 else -1.0)
+            held += signed
+            if abs(signed) > closed:
+                # The fill was bigger than the position: the rest opens the other way.
+                average = row["px"]
+            elif held == 0.0:
+                average = 0.0
+        book[row["coin"]] = (held, average)
+
+        peak = max(peak, running)
+        stamps.append(row["ts_ms"])
+        equity.append(running)
+        drawdown.append(running - peak)
+    return {"ts_ms": stamps, "equity": equity, "drawdown": drawdown}
+
+
+def latency_payload(state_path: Path) -> dict[str, Any]:
+    """One process's round trip series and every percentile it measured.
+
+    Read from the state file like everything else, so a slow browser can never make the
+    writing process wait. A process that is not running is an empty chart rather than a
+    503: the page shows a gap, which is the honest picture. `None` is "not measured",
+    which is a different thing from zero, and stays None all the way to the legend.
+    """
+    try:
+        latency = read_state(state_path).latency
+    except (FileNotFoundError, ValueError, OSError):
+        latency = LatencyState()
+    return {
+        "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
+        "rest": [list(sample) for sample in latency.rest_samples],
+        "ws_ping_p50": latency.ws_ping_p50,
+        "ws_ping_p95": latency.ws_ping_p95,
+        "rest_p50": latency.rest_p50,
+        "rest_p95": latency.rest_p95,
+        # Only the trading loop ever places an order, so only its snapshot carries these.
+        # There is no submit_ack sample series in the protocol, so the chart shows the
+        # two percentiles beside the two drawn series rather than a third line.
+        "submit_ack_p50": latency.submit_ack_p50,
+        "submit_ack_p95": latency.submit_ack_p95,
+    }
 
 
 def _run_dir(reports_dir: Path, run_id: str) -> Path:
@@ -404,45 +706,120 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/state", dependencies=[Depends(require_session)])
     def state() -> JSONResponse:
-        """The snapshot from data/state.json, or 503 when it is missing or stale.
+        """The recorder's snapshot, which is what the recorder page reads."""
+        return state_payload(
+            settings.state_path,
+            settings.panel.state_stale_s,
+            absent=f"no state file at {settings.state_path}: no liqfade process is running",
+        )
 
-        Stale is an error rather than a warning field because every number on the page is
-        a trading number: showing a five second old position quietly is worse than an
-        obvious outage.
+    @api.get("/live/state", dependencies=[Depends(require_session)])
+    def live_state() -> JSONResponse:
+        """The trading loop's snapshot: positions, orders, risk, uptime, live_trading.
+
+        A separate route rather than a query parameter on /api/state, because the two
+        pages poll different files at different times and a page that asked for the
+        wrong one would show the recorder's empty position list as if it were the loop's.
         """
+        path = live_state_path(settings)
+        return state_payload(
+            path,
+            settings.panel.state_stale_s,
+            absent=f"no state file at {path}: the trading loop is not running",
+        )
+
+    async def _control(action: str, body: ControlBody, **args: Any) -> dict[str, Any]:
+        """Send one command to the loop, record what came back, and answer with both.
+
+        Every path through here writes an audit entry, including the refusals, because
+        an action the owner believes they took and that never happened is the failure
+        worth being able to read back afterwards.
+        """
+        if not body.confirm:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{action} needs confirm=true: this is the second half of click and confirm",
+            )
+        socket = live_socket_path(settings)
+        client = ControlClient(
+            socket,
+            connect_timeout_s=settings.control.connect_timeout_s,
+            request_timeout_s=settings.control.request_timeout_s,
+        )
         try:
-            snapshot = read_state(settings.state_path)
-        except FileNotFoundError:
+            result = await client.send(action, **args)  # type: ignore[arg-type]
+        except ControlError as exc:
+            log.warning("panel_control_failed", action=action, args=args, error=str(exc))
+            audit.record(
+                settings.paths.data_dir, action=action, args=args, ok=False, error=str(exc)
+            )
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
-                f"no state file at {settings.state_path}: no liqfade process is running",
+                f"control socket at {socket} did not answer: {exc}",
             ) from None
-        except (ValueError, OSError) as exc:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, f"state file unreadable: {exc}"
-            ) from None
+        payload = result.model_dump(mode="json")
+        log.warning("panel_control", action=action, args=args, result=payload)
+        entry = audit.record(
+            settings.paths.data_dir, action=action, args=args, ok=True, result=payload
+        )
+        return {"ok": True, "result": payload, "entry": entry}
 
-        age_s = (now_ms() - snapshot.ts_ms) / 1000.0
-        payload = snapshot.model_dump(mode="json") | {"age_s": age_s}
-        # The latency sample series belongs to /api/recorder/latency, which the page polls
-        # every thirty seconds. This one is polled every second, and several hundred
-        # points would be the whole payload, over an SSH tunnel, for a chart that has not
-        # moved.
-        payload["latency"] = {
-            key: value for key, value in payload["latency"].items() if not key.endswith("_samples")
-        }
-        if age_s > settings.panel.state_stale_s:
-            return JSONResponse(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                content={
-                    "detail": (
-                        f"state is {age_s:.1f}s old, over the {settings.panel.state_stale_s}s "
-                        "limit: the writing process is stalled or gone"
-                    ),
-                    "state": payload,
-                },
-            )
-        return JSONResponse(payload)
+    # No /live/kill, on purpose. The kill switch is Telegram and the data/KILL flag: it
+    # is the one control that has to work when the panel is the thing that is broken,
+    # and a button in a browser tab is the easiest thing here to click by accident.
+
+    @api.post("/live/pause", dependencies=[Depends(require_session)])
+    async def live_pause(body: ControlBody) -> dict[str, Any]:
+        """Block new entries. Open positions are left alone; use flat to close them."""
+        return await _control("pause", body, reason="panel")
+
+    @api.post("/live/resume", dependencies=[Depends(require_session)])
+    async def live_resume(body: ControlBody) -> dict[str, Any]:
+        """Lift a pause. The loop refuses while a halt reason or a kill still stands."""
+        return await _control("resume", body)
+
+    @api.post("/live/flat", dependencies=[Depends(require_session)])
+    async def live_flat(body: ControlBody) -> dict[str, Any]:
+        """Cancel and close, everything or one coin. The loop pauses itself afterwards."""
+        coin = body.coin.upper() if body.coin else None
+        return await _control("flat", body, coin=coin)
+
+    @api.get("/audit", dependencies=[Depends(require_session)])
+    def audit_log(limit: int = audit.DEFAULT_TAIL) -> dict[str, Any]:
+        """What the panel has done: control actions and settings writes, newest first."""
+        return {"entries": audit.tail(settings.paths.data_dir, limit)}
+
+    @api.get("/live/fills", dependencies=[Depends(require_session)])
+    def live_fills(
+        coin: str | None = None,
+        side: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """A page of the order registry's fills. Read only, straight off the sqlite file."""
+        return read_fills(
+            settings.order_db_path,
+            coin=coin,
+            side=side,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=limit,
+            offset=offset,
+        )
+
+    @api.get("/live/equity", dependencies=[Depends(require_session)])
+    def live_equity(
+        coin: str | None = None,
+        side: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """The realized curve over the same rows the table is showing, for the chart."""
+        return realized_curve(
+            settings.order_db_path, coin=coin, side=side, start_ms=start_ms, end_ms=end_ms
+        )
 
     @api.get("/recorder/disk", dependencies=[Depends(require_session)])
     def recorder_disk() -> dict[str, Any]:
@@ -455,25 +832,18 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/recorder/latency", dependencies=[Depends(require_session)])
     def recorder_latency() -> dict[str, Any]:
-        """WS ping and REST round trips as time series, plus the percentiles over them.
+        """The recorder's WS ping and REST round trips. Its submit_ack is always None."""
+        return latency_payload(settings.state_path)
 
-        The retained window straight out of the snapshot, as `[ts_ms, ms]` pairs. Read
-        from `data/state.json` like everything else the panel shows, so a slow browser
-        can never make the recorder wait. No recorder running is an empty chart rather
-        than a 503: the page shows a gap, which is the honest picture.
+    @api.get("/live/latency", dependencies=[Depends(require_session)])
+    def live_latency() -> dict[str, Any]:
+        """The trading loop's latency, including the submit-to-ack percentiles.
+
+        Submit-to-ack exists only here: the recorder pings a socket and calls REST, it
+        never places an order, so asking its snapshot for these two would always answer
+        None and the page would show a permanent dash next to a healthy recorder.
         """
-        try:
-            latency = read_state(settings.state_path).latency
-        except (FileNotFoundError, ValueError, OSError):
-            latency = LatencyState()
-        return {
-            "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
-            "rest": [list(sample) for sample in latency.rest_samples],
-            "ws_ping_p50": latency.ws_ping_p50,
-            "ws_ping_p95": latency.ws_ping_p95,
-            "rest_p50": latency.rest_p50,
-            "rest_p95": latency.rest_p95,
-        }
+        return latency_payload(live_state_path(settings))
 
     @api.get("/recorder/liquidations", dependencies=[Depends(require_session)])
     def recorder_liquidations(hours: int = 24) -> dict[str, Any]:
@@ -541,13 +911,16 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/config", dependencies=[Depends(require_session)])
     def config() -> dict[str, Any]:
-        """Read only for now. Phase 5 adds validated writes to config/overrides.yaml.
+        """The resolved config, what each layer set, and what the panel may write.
 
         Both views are returned. `values` is the resolved config with the label of the
         layer that won each key, which is what the page displays. `layers` is what each
         layer set, in merge order, which is what a settings page needs before it offers to
         change a number: the flattened resolution alone cannot say what a value is being
         changed from or what removing an override would go back to.
+
+        `writable_sections` is served rather than kept in the frontend, so the form and
+        the endpoint cannot disagree about what may be changed.
         """
         merged, sources = resolve(settings.env)
         flat = flatten(merged)
@@ -567,8 +940,82 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
                 }
                 for layer in config_layers(settings.env)
             ],
-            "writable": False,
+            "writable": True,
+            "overrides_path": str(overrides_file({"paths": {"data_dir": settings.paths.data_dir}})),
+            "writable_sections": sorted(overrides.WRITABLE_SECTIONS),
+            "confirm_sections": sorted(overrides.CONFIRM_SECTIONS),
         }
+
+    @api.post("/config", dependencies=[Depends(require_session)])
+    async def write_config(body: SettingsBody) -> dict[str, Any]:
+        """Validate a settings change, write it, reload the loop and audit all of it.
+
+        The order matters. Everything that can refuse the change runs before anything is
+        written, so a refusal leaves the file exactly as it was. The reload runs after
+        the write and cannot undo it: an override that vanished because the loop happened
+        to be down would be worse than one the running process has not picked up yet, and
+        the page says which of those it is.
+        """
+        merged, flat, sources = overrides.current(settings.env)
+        rows = overrides.diff(body.changes, flat, sources)
+
+        def refuse(message: str) -> HTTPException:
+            audit.record(
+                settings.paths.data_dir,
+                action="settings",
+                args={"changed": body.changes, "diff": rows},
+                ok=False,
+                error=message,
+                reason=body.reason,
+            )
+            log.warning("panel_settings_refused", changes=body.changes, error=message)
+            return HTTPException(status.HTTP_400_BAD_REQUEST, message)
+
+        try:
+            overrides.check(body.changes, body.confirm, sources)
+            overrides.validate(settings.env, body.changes, merged)
+        except overrides.OverridesError as exc:
+            raise refuse(str(exc)) from None
+
+        if body.dry_run:
+            return {"ok": True, "diff": rows, "written": False, "reload": None}
+
+        path = overrides_file({"paths": {"data_dir": settings.paths.data_dir}})
+        try:
+            overrides.write(path, body.changes, body.reason)
+        except (overrides.OverridesError, OSError) as exc:
+            raise refuse(f"could not write {path}: {exc}") from None
+
+        # The loop is told after the file is on disk, so a reload always reads the change
+        # that is actually there. A loop that is down or that refuses is reported, not
+        # rolled back.
+        reload: dict[str, Any] = {"changed": [], "error": None}
+        client = ControlClient(
+            live_socket_path(settings),
+            connect_timeout_s=settings.control.connect_timeout_s,
+            request_timeout_s=settings.control.request_timeout_s,
+        )
+        try:
+            reload = (await client.reload_config()).model_dump(mode="json")
+        except ControlError as exc:
+            reload = {"changed": [], "error": f"control socket: {exc}"}
+
+        log.warning(
+            "panel_settings_written",
+            changes=body.changes,
+            reason=body.reason,
+            path=str(path),
+            reload_error=reload.get("error"),
+        )
+        entry = audit.record(
+            settings.paths.data_dir,
+            action="settings",
+            args={"changed": body.changes, "diff": rows},
+            ok=True,
+            result={"path": str(path), "reload": reload},
+            reason=body.reason,
+        )
+        return {"ok": True, "diff": rows, "written": True, "reload": reload, "entry": entry}
 
     app.include_router(api)
 

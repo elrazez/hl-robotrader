@@ -11,6 +11,7 @@ from liqfade.config.loader import (
     config_layers,
     flatten,
     load_settings,
+    overrides_file,
     resolve,
 )
 from liqfade.config.models import Settings
@@ -23,5 +24,6 @@ __all__ = [
     "config_layers",
     "flatten",
     "load_settings",
+    "overrides_file",
     "resolve",
 ]

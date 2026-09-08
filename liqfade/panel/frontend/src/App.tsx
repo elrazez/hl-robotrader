@@ -1,39 +1,27 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import {
+  fetchDisk,
+  fetchHealth,
+  fetchLatency,
+  fetchLiquidations,
+  fetchState,
+  hasSession,
+  logout,
+} from "./api";
+import Fills from "./Fills";
 import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
+import Live from "./Live";
 import Login from "./Login";
 import Reports from "./Reports";
+import SettingsPage from "./Settings";
 import type { DiskStats, FeedState, Latency, Liquidations, StateSnapshot } from "./types";
+import { Banner, Row, Section, ms } from "./ui";
 
 const POLL_MS = 1000;
 // The lake does not move fast and duckdb has to read files for it, so poll it slowly.
 const RECORDER_POLL_MS = 30_000;
 const LIQ_HOURS = 24;
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="rounded-lg border border-neutral-800 bg-neutral-900/40 p-4">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-neutral-500">
-        {title}
-      </h2>
-      {children}
-    </section>
-  );
-}
-
-function Row({ label, value, tone }: { label: string; value: string; tone?: string }) {
-  return (
-    <div className="flex justify-between gap-4 py-1 text-sm">
-      <span className="text-neutral-400">{label}</span>
-      <span className={tone ?? "text-neutral-100"}>{value}</span>
-    </div>
-  );
-}
-
-function ms(value: number | null) {
-  return value === null ? "-" : `${value.toFixed(0)} ms`;
-}
 
 function gb(bytes: number) {
   return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -42,7 +30,7 @@ function gb(bytes: number) {
 function Feeds({ feeds }: { feeds: FeedState[] }) {
   if (feeds.length === 0) return <p className="text-sm text-neutral-500">no feeds registered</p>;
   return (
-    <table className="w-full text-sm">
+    <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
       <thead className="text-left text-xs uppercase text-neutral-500">
         <tr>
           <th className="pb-1 font-medium">stream</th>
@@ -97,7 +85,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
   );
 }
 
-type Tab = "recorder" | "reports";
+type Tab = "live" | "fills" | "recorder" | "reports" | "settings";
 
 function TabButton({
   tab,
@@ -125,16 +113,21 @@ function TabButton({
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("recorder");
+  const [tab, setTab] = useState<Tab>("live");
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [state, setState] = useState<StateSnapshot | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [disk, setDisk] = useState<DiskStats | null>(null);
   const [liquidations, setLiquidations] = useState<Liquidations | null>(null);
   const [latency, setLatency] = useState<Latency | null>(null);
+  // The env this panel is serving, which every tab shows and no tab's poll owns. It
+  // used to come from the recorder's snapshot, which only the recorder tab polls, so
+  // the header read "? / ?" everywhere else.
+  const [env, setEnv] = useState<string | null>(null);
 
   useEffect(() => {
     hasSession().then(setAuthed);
+    fetchHealth().then((health) => setEnv(health?.env ?? null));
   }, []);
 
   const poll = useCallback(async () => {
@@ -181,13 +174,14 @@ export default function App() {
       <header className="mb-4 flex items-baseline justify-between">
         <h1 className="text-lg font-semibold">
           liqfade{" "}
-          <span className="text-sm font-normal text-neutral-500">
-            {state?.env ?? "?"} / {state?.proc ?? "?"}
-          </span>
+          <span className="text-sm font-normal text-neutral-500">{env ?? "connecting"}</span>
         </h1>
         <div className="flex items-center gap-2">
+          <TabButton tab="live" current={tab} onPick={setTab} label="live" />
+          <TabButton tab="fills" current={tab} onPick={setTab} label="fills" />
           <TabButton tab="recorder" current={tab} onPick={setTab} label="recorder" />
           <TabButton tab="reports" current={tab} onPick={setTab} label="reports" />
+          <TabButton tab="settings" current={tab} onPick={setTab} label="settings" />
           <button
             onClick={() => logout().then(() => setAuthed(false))}
             className="ml-4 text-sm text-neutral-500 hover:text-neutral-300"
@@ -197,13 +191,12 @@ export default function App() {
         </div>
       </header>
 
+      {tab === "live" ? <Live onUnauthorized={() => setAuthed(false)} /> : null}
+      {tab === "fills" ? <Fills /> : null}
       {tab === "reports" ? <Reports /> : null}
+      {tab === "settings" ? <SettingsPage /> : null}
 
-      {tab === "recorder" && problem && (
-        <div className="mb-4 rounded border border-amber-700/60 bg-amber-950/40 px-4 py-2 text-sm text-amber-300">
-          stale: {problem}
-        </div>
-      )}
+      {tab === "recorder" && problem && <Banner kind="warn">stale: {problem}</Banner>}
 
       <div className={`grid gap-4 md:grid-cols-3 ${tab === "recorder" ? "" : "hidden"}`}>
         <Section title="status">
