@@ -20,10 +20,31 @@ missing half argues for changes nobody can check.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from datetime import UTC, datetime
+from enum import StrEnum
+from statistics import median
+from typing import Protocol, cast
 
-__all__ = ["IntentRef", "Match", "match_intents"]
+from liqfade.backtest.costs import fee_for
+from liqfade.backtest.portfolio import Trade
+from liqfade.backtest.validate import bootstrap_mean_bps
+from liqfade.config.models import Settings
+
+__all__ = [
+    "Dimension",
+    "DriftReport",
+    "Hole",
+    "IntentRef",
+    "Match",
+    "Metric",
+    "RoundTrip",
+    "Side",
+    "Verdict",
+    "compare",
+    "match_intents",
+]
 
 
 class Keyed(Protocol):
@@ -124,4 +145,449 @@ def match_intents[K: Keyed](live: list[K], replay: list[K], *, tol_ms: int) -> M
             (item for j, item in enumerate(replay) if j not in taken_replay),
             key=lambda item: item.ts_ms,
         ),
+    )
+
+
+# --- the two sides --------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RoundTrip:
+    """One completed entry-to-exit, on either side. `portfolio.Trade`, narrowed.
+
+    Only the fields the diff reads, so a test can build one by hand and so `read_live`
+    does not have to invent the slippage and funding columns a `Trade` carries and the
+    live registry does not record.
+    """
+
+    coin: str
+    side: str
+    ts_ms: int
+    exit_ms: int
+    exit_reason: str
+    entry_px: float
+    exit_px: float
+    net_pnl: float
+    notional: float
+
+    @property
+    def net_bps(self) -> float:
+        """Net PnL as basis points of entry notional. The name `bootstrap_mean_bps` reads."""
+        return 1e4 * self.net_pnl / self.notional if self.notional else 0.0
+
+
+@dataclass(frozen=True)
+class Side:
+    """One side of the comparison: what the live loop did, or what the replay did.
+
+    Args:
+        intents: every entry attempt, placed or refused.
+        round_trips: every completed entry-to-exit.
+        refusals: `(stage, reason)` to count. **Empty means the side recorded none at
+            all**, which is reported as not comparable rather than as agreement: the
+            soak that predates the refusals table has an empty table, not an empty week.
+        config_hash: `report.config_hash` of the settings the side ran under, or None
+            when the side does not record it.
+    """
+
+    intents: list[IntentRef]
+    round_trips: list[RoundTrip]
+    refusals: dict[tuple[str, str], int]
+    config_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class Hole:
+    """A stretch of one coin's tape the lake does not have, `[start_ms, end_ms)`."""
+
+    coin: str
+    start_ms: int
+    end_ms: int
+
+    def holds(self, coin: str, ts_ms: int) -> bool:
+        return coin == self.coin and self.start_ms <= ts_ms < self.end_ms
+
+
+# --- the verdict ----------------------------------------------------------------------
+
+
+class Verdict(StrEnum):
+    """What one dimension concluded. `NOT_COMPARABLE` is never a quiet `MATCH`."""
+
+    MATCH = "MATCH"
+    DRIFT = "DRIFT"
+    NOT_COMPARABLE = "NOT_COMPARABLE"
+
+
+@dataclass(frozen=True)
+class Metric:
+    """One number a dimension measured, with the bar it was held to."""
+
+    name: str
+    value: float
+    threshold: float
+    units: str
+    ok: bool
+
+
+@dataclass(frozen=True)
+class Dimension:
+    """One thing the two sides were compared on."""
+
+    name: str
+    verdict: Verdict
+    metrics: list[Metric] = field(default_factory=list)
+    detail: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DriftReport:
+    """Every dimension's verdict, and what the tape holes took out of the comparison."""
+
+    dimensions: list[Dimension]
+    excluded_by_hole: int = 0
+
+    @property
+    def verdict(self) -> Verdict:
+        """The worst dimension. `DRIFT` anywhere is `DRIFT`; nothing hides behind absence."""
+        verdicts = {d.verdict for d in self.dimensions}
+        if Verdict.DRIFT in verdicts:
+            return Verdict.DRIFT
+        if Verdict.NOT_COMPARABLE in verdicts:
+            return Verdict.NOT_COMPARABLE
+        return Verdict.MATCH
+
+
+# The bars. Fixed rather than configurable: a threshold the caller can move is a threshold
+# that moves until the report says MATCH.
+TOL_MS = 2_000
+MATCHED_SHARE_MIN = 0.90
+PRICE_BPS_MAX = 5.0
+EXIT_REASON_SHARE_MIN = 0.90
+REFUSAL_FRAC = 0.10
+REFUSAL_FLOOR = 2.0
+
+
+def _median(values: list[float]) -> float:
+    return float(median(values)) if values else 0.0
+
+
+def _bps(left: float, right: float) -> float:
+    """Absolute difference between two prices, in basis points of the replay's."""
+    return abs(left - right) / right * 1e4 if right else 0.0
+
+
+def compare(
+    live: Side,
+    replay: Side,
+    *,
+    settings: Settings,
+    holes: Sequence[Hole] = (),
+    tol_ms: int = TOL_MS,
+) -> DriftReport:
+    """Diff what the live loop did against what the replay did over the same window.
+
+    Args:
+        live: read off the running loop's order registry.
+        replay: what `run_backtest` produced over the same days and config.
+        settings: the resolved config, for the fee rate and the bootstrap draw count.
+        holes: stretches of tape the lake is missing. Intents and round trips inside one
+            are dropped from both sides before matching and counted separately: the
+            recorder's socket and the loop's socket are two connections, and an intent the
+            replay could not have seen is a gap in the data rather than a disagreement
+            about it. The holes dimension then reports `NOT_COMPARABLE`, because a stretch
+            of window with no tape was not compared, which is not the same as compared and
+            found to differ.
+        tol_ms: how far apart two entry attempts may be and still be one decision.
+
+    Returns:
+        One dimension per thing compared. When the two config hashes disagree the report
+        holds only the config dimension: every number below it would be a comparison
+        between two different strategies, which is worse than no number.
+    """
+    config = _config_dimension(live, replay)
+    if config.verdict is Verdict.DRIFT:
+        return DriftReport(dimensions=[config])
+
+    kept_live = [i for i in live.intents if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
+    kept_replay = [i for i in replay.intents if not any(h.holds(i.coin, i.ts_ms) for h in holes)]
+    excluded = (len(live.intents) - len(kept_live)) + (len(replay.intents) - len(kept_replay))
+    matched = match_intents(kept_live, kept_replay, tol_ms=tol_ms)
+    trips = match_intents(
+        [t for t in live.round_trips if not any(h.holds(t.coin, t.ts_ms) for h in holes)],
+        [t for t in replay.round_trips if not any(h.holds(t.coin, t.ts_ms) for h in holes)],
+        tol_ms=tol_ms,
+    )
+
+    return DriftReport(
+        dimensions=[
+            config,
+            _intents_dimension(matched),
+            _entries_dimension(matched),
+            _exits_dimension(trips),
+            _pnl_dimension(live, replay, settings=settings),
+            _refusals_dimension(live, replay),
+            _holes_dimension(holes, excluded),
+        ],
+        excluded_by_hole=excluded,
+    )
+
+
+def _config_dimension(live: Side, replay: Side) -> Dimension:
+    if live.config_hash is None:
+        return Dimension(
+            name="config",
+            verdict=Verdict.NOT_COMPARABLE,
+            detail=[
+                "The live run does not report a config hash. A soak started before "
+                "`paper_started` carried one cannot be shown to have run this config, and "
+                "an absent hash is not a matching hash.",
+                f"replay config_hash: {replay.config_hash}",
+            ],
+        )
+    if live.config_hash != replay.config_hash:
+        return Dimension(
+            name="config",
+            verdict=Verdict.DRIFT,
+            detail=[
+                "The two sides ran different config. Nothing below this line is a "
+                "comparison between the same strategy, so nothing below it is reported.",
+                f"live   config_hash: {live.config_hash}",
+                f"replay config_hash: {replay.config_hash}",
+            ],
+        )
+    return Dimension(
+        name="config",
+        verdict=Verdict.MATCH,
+        detail=[f"both sides: {replay.config_hash}"],
+    )
+
+
+def _share(part: int, whole: int) -> float:
+    """The share of `whole` that `part` covers. An empty whole is fully covered."""
+    return part / whole if whole else 1.0
+
+
+def _intents_dimension(matched: Match[IntentRef]) -> Dimension:
+    live_total = len(matched.matched) + len(matched.live_only)
+    replay_total = len(matched.matched) + len(matched.replay_only)
+    live_share = _share(len(matched.matched), live_total)
+    replay_share = _share(len(matched.matched), replay_total)
+    metrics = [
+        Metric(
+            name="live intents matched",
+            value=live_share,
+            threshold=MATCHED_SHARE_MIN,
+            units="share",
+            ok=live_share >= MATCHED_SHARE_MIN,
+        ),
+        Metric(
+            name="replay intents matched",
+            value=replay_share,
+            threshold=MATCHED_SHARE_MIN,
+            units="share",
+            ok=replay_share >= MATCHED_SHARE_MIN,
+        ),
+    ]
+    detail = [f"{len(matched.matched)} matched, {live_total} live, {replay_total} replay"]
+    if not live_total and not replay_total:
+        detail.append("no intents on either side in this window; nothing disagreed")
+    detail += [f"live only:   {i.coin} {i.side} at {i.ts_ms}" for i in matched.live_only[:20]]
+    detail += [f"replay only: {i.coin} {i.side} at {i.ts_ms}" for i in matched.replay_only[:20]]
+    return Dimension(
+        name="intents",
+        verdict=Verdict.MATCH if all(m.ok for m in metrics) else Verdict.DRIFT,
+        metrics=metrics,
+        detail=detail,
+    )
+
+
+def _entries_dimension(matched: Match[IntentRef]) -> Dimension:
+    both = [
+        (left.entry_px, right.entry_px)
+        for left, right in matched.matched
+        if left.entry_px is not None and right.entry_px is not None
+    ]
+    if not both:
+        return Dimension(
+            name="entries",
+            verdict=Verdict.NOT_COMPARABLE,
+            detail=[
+                "No matched intent became a filled order on both sides. An entry price "
+                "the live side never recorded is absent, not zero, and is not diffed "
+                "against a default."
+            ],
+        )
+    gaps = [_bps(left, right) for left, right in both]
+    value = _median(gaps)
+    return Dimension(
+        name="entries",
+        verdict=Verdict.MATCH if value <= PRICE_BPS_MAX else Verdict.DRIFT,
+        metrics=[
+            Metric(
+                name="median entry gap",
+                value=value,
+                threshold=PRICE_BPS_MAX,
+                units="bps",
+                ok=value <= PRICE_BPS_MAX,
+            )
+        ],
+        detail=[f"{len(both)} matched intents filled on both sides"],
+    )
+
+
+def _exits_dimension(trips: Match[RoundTrip]) -> Dimension:
+    if not trips.matched:
+        return Dimension(
+            name="exits",
+            verdict=Verdict.NOT_COMPARABLE,
+            detail=["No round trip matched on both sides."],
+        )
+    agreed = sum(1 for left, right in trips.matched if left.exit_reason == right.exit_reason)
+    share = _share(agreed, len(trips.matched))
+    gap = _median([_bps(left.exit_px, right.exit_px) for left, right in trips.matched])
+    metrics = [
+        Metric(
+            name="exit reasons agreeing",
+            value=share,
+            threshold=EXIT_REASON_SHARE_MIN,
+            units="share",
+            ok=share >= EXIT_REASON_SHARE_MIN,
+        ),
+        Metric(
+            name="median exit gap",
+            value=gap,
+            threshold=PRICE_BPS_MAX,
+            units="bps",
+            ok=gap <= PRICE_BPS_MAX,
+        ),
+    ]
+    disagreed = [
+        f"{left.coin} {left.side} at {left.ts_ms}: live {left.exit_reason}, "
+        f"replay {right.exit_reason}"
+        for left, right in trips.matched
+        if left.exit_reason != right.exit_reason
+    ]
+    return Dimension(
+        name="exits",
+        verdict=Verdict.MATCH if all(m.ok for m in metrics) else Verdict.DRIFT,
+        metrics=metrics,
+        detail=[f"{len(trips.matched)} matched round trips", *disagreed[:20]],
+    )
+
+
+def _pnl_dimension(live: Side, replay: Side, *, settings: Settings) -> Dimension:
+    if not replay.round_trips:
+        return Dimension(
+            name="pnl",
+            verdict=Verdict.NOT_COMPARABLE,
+            detail=["The replay completed no round trip, so there is nothing to interval."],
+        )
+    gap = abs(sum(t.net_pnl for t in live.round_trips) - sum(t.net_pnl for t in replay.round_trips))
+    count = max(len(live.round_trips), len(replay.round_trips))
+    notional = _median([t.notional for t in replay.round_trips])
+    # Two allowances, and the wider wins. The first is what a round trip of taker fees
+    # costs: two sides filling at different prices inside one spread cannot differ by less
+    # than the costs of getting in and out. The second is the sampling noise in the
+    # replay's own mean, converted from bps of notional to dollars over the same trades,
+    # because a difference smaller than the replay's own confidence interval is not a
+    # difference the data can see.
+    fee_allowance = count * 2 * fee_for(notional, maker=False, settings=settings)
+    interval = bootstrap_mean_bps(
+        cast("Sequence[Trade]", replay.round_trips),
+        draws=settings.backtest.bootstrap_samples,
+        seed=0,
+    )
+    noise_allowance = count * (interval.hi - interval.lo) / 1e4 * notional
+    allowance = max(fee_allowance, noise_allowance)
+    return Dimension(
+        name="pnl",
+        verdict=Verdict.MATCH if gap <= allowance else Verdict.DRIFT,
+        metrics=[
+            Metric(
+                name="net PnL gap",
+                value=gap,
+                threshold=allowance,
+                units="USD",
+                ok=gap <= allowance,
+            )
+        ],
+        detail=[
+            f"live {sum(t.net_pnl for t in live.round_trips):,.2f} against "
+            f"replay {sum(t.net_pnl for t in replay.round_trips):,.2f} over {count} trades",
+            f"allowance is the wider of {fee_allowance:,.2f} (a taker round trip each on "
+            f"the median notional {notional:,.0f}) and {noise_allowance:,.2f} (the "
+            f"replay's own bootstrap interval, {interval.lo:.1f} to {interval.hi:.1f} bps)",
+        ],
+    )
+
+
+def _refusals_dimension(live: Side, replay: Side) -> Dimension:
+    if not live.refusals:
+        return Dimension(
+            name="refusals",
+            verdict=Verdict.NOT_COMPARABLE,
+            detail=[
+                "The live refusals table is empty across this window. A soak started "
+                "before the table existed recorded none, which is not the same fact as a "
+                "week in which nothing was refused, and the two are not told apart here."
+            ],
+        )
+    off: list[str] = []
+    for key in sorted(live.refusals.keys() | replay.refusals.keys()):
+        left, right = live.refusals.get(key, 0), replay.refusals.get(key, 0)
+        allowance = max(REFUSAL_FLOOR, REFUSAL_FRAC * max(left, right))
+        if abs(left - right) > allowance:
+            off.append(f"{key[0]}/{key[1]}: live {left}, replay {right} (allowed ±{allowance:.0f})")
+    return Dimension(
+        name="refusals",
+        verdict=Verdict.MATCH if not off else Verdict.DRIFT,
+        metrics=[
+            Metric(
+                name="reasons outside their allowance",
+                value=float(len(off)),
+                threshold=0.0,
+                units="reasons",
+                ok=not off,
+            )
+        ],
+        detail=[
+            f"{len(live.refusals.keys() | replay.refusals.keys())} reasons compared, "
+            f"each allowed {REFUSAL_FRAC:.0%} or ±{REFUSAL_FLOOR:.0f}, whichever is larger",
+            "Day one risk refusals may legitimately differ: the replay opens a clean "
+            "RiskState and the soak carries the one its previous days left it.",
+            *off,
+        ],
+    )
+
+
+def _holes_dimension(holes: Sequence[Hole], excluded: int) -> Dimension:
+    if not holes:
+        return Dimension(
+            name="holes",
+            verdict=Verdict.MATCH,
+            metrics=[Metric(name="tape holes", value=0.0, threshold=0.0, units="holes", ok=True)],
+            detail=["No gap over the recorder's own bar on any coin-day in the window."],
+        )
+    return Dimension(
+        name="holes",
+        verdict=Verdict.NOT_COMPARABLE,
+        metrics=[
+            Metric(
+                name="tape holes",
+                value=float(len(holes)),
+                threshold=0.0,
+                units="holes",
+                ok=False,
+            )
+        ],
+        detail=[
+            f"{excluded} intents fell inside a hole and were left out of the intents "
+            f"verdict rather than counted against it.",
+            *(
+                f"{h.coin}: {datetime.fromtimestamp(h.start_ms / 1000, UTC):%Y-%m-%d %H:%M:%S}"
+                f" for {(h.end_ms - h.start_ms) / 1000:.0f}s"
+                for h in sorted(holes, key=lambda h: (h.coin, h.start_ms))[:40]
+            ),
+        ],
     )
