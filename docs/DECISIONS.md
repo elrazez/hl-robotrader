@@ -2974,3 +2974,24 @@ by every deploy anyway.
 **Not in `CONTINUOUS_STREAMS`.** A poll is sparse by nature, so only its connection is
 monitored, exactly like `coinalyze.xchg_ctx`. A declared-but-idle stream pages Telegram
 every ten minutes, which is why the poller declares no stream at all when it is disabled.
+
+## 2026-09-08 (05f: the settings write nobody announced)
+
+**A settings write the running loop did not take is posted to Telegram by the panel
+itself.** The `CONFIG RELOADED` message is a side effect of a reload that applied. When
+the control socket is down, when the loop refuses restart-only keys, or when the values
+were already live, the write existed only in `overrides.yaml` and `panel_audit.jsonl`,
+both of which need someone to go and look. CLAUDE.md's settings flow promises the owner
+hears about every change, and the change made while the loop is down is exactly the one
+that is easiest to forget was ever made.
+
+Two alternatives were rejected. The panel posting **every** write would put two messages
+on the phone for the write the loop did announce, for one event. The loop posting it on
+its **next** reload is minutes away at best and never if it is down, which is the case
+this exists for. So: the loop announces what it applied, the panel announces what the
+loop did not take, and there is exactly one message per write either way.
+
+The panel unit already loads the same `/srv/liqfade/.env` as the loops, so the token and
+the chat id are in its environment, and `send_alert` never raises into the request.
+Reverse if the panel is ever run somewhere that env is not available; the message would
+then have to come from a process that has it.

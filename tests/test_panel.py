@@ -6,7 +6,7 @@ import asyncio
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -221,6 +221,28 @@ def test_config_endpoint_reports_sources_and_the_live_trading_gate(client: TestC
     keys = {row["key"]: row for row in body["values"]}
     assert keys["sizing.risk_frac"]["value"] == 0.005
     assert keys["sizing.risk_frac"]["source"] == "default.yaml"
+
+
+def test_the_config_endpoint_serves_what_the_process_runs_not_the_raw_merge(
+    client: TestClient,
+) -> None:
+    """The page has to show the config the loop is on, and that is the validated model.
+
+    The merge is what the YAML layers and the env spell; the model is what the loop
+    reads. Every field a layer leaves out is a value the process still has and the page
+    did not show at all.
+    """
+    from liqfade.config import flatten, load_settings
+
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/config").json()
+
+    served = {row["key"]: row["value"] for row in body["values"]}
+    assert served == flatten(load_settings("paper").model_dump(mode="json"))
+    sources = {row["key"]: row["source"] for row in body["values"]}
+    assert sources["sizing.risk_frac"] == "default.yaml"
+    # A field no layer sets is the model's, and says so rather than reading as unset.
+    assert sources["venues.hyperliquid.info_url"] == "model default"
 
 
 def test_the_built_bundle_is_served(client: TestClient) -> None:
@@ -1358,6 +1380,22 @@ class TestSettingsWrites:
         assert "wider targets" in path.read_text()
         assert header.startswith("#")  # the timestamp and reason are a comment, not config
 
+    def test_the_overrides_file_is_readable_only_by_the_service_user(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """0600, like the audit log and the state files it sits beside.
+
+        It carries risk limits and sizing fractions, and it is the file that decides what
+        the loop reloads. Written at the process umask it was world readable on a box
+        whose umask says so.
+        """
+        import stat
+
+        signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"})
+
+        path = settings.paths.data_dir / "overrides.yaml"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
     def test_a_second_write_keeps_the_first(
         self, signed_in: TestClient, settings: Settings
     ) -> None:
@@ -1530,6 +1568,59 @@ class TestSettingsWrites:
 
         assert [name for name, _ in loop_socket.calls] == ["reload_config"]
         assert body["reload"]["error"] is None
+
+    def test_a_write_the_loop_never_took_is_announced_on_telegram(
+        self, signed_in: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is listening, so nothing posted `CONFIG RELOADED`, so the panel does.
+
+        The owner hears about every settings write within a minute of it, whether or not
+        the loop is up. A write that only exists in the overrides file and the audit log
+        is the one an owner is most likely to forget was ever made.
+        """
+        posted: list[str] = []
+
+        async def capture(text: str, **_: Any) -> bool:
+            posted.append(text)
+            return True
+
+        monkeypatch.setattr("liqfade.panel.app.send_alert", capture)
+
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert "control socket" in body["reload"]["error"]
+        assert len(posted) == 1
+        assert "intent.k_target" in posted[0]
+        assert "0.8 -> 1.4" in posted[0]
+        assert "wider" in posted[0]
+        assert "control socket" in posted[0], "and why the running loop has not got it"
+
+    def test_a_write_the_loop_applied_is_left_for_the_loop_to_announce(
+        self, signed_in: TestClient, loop_socket: NoopBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One message per write. The loop posts what it reloaded; two would be noise."""
+        from liqfade.control.protocol import ReloadResult
+
+        posted: list[str] = []
+
+        async def capture(text: str, **_: Any) -> bool:
+            posted.append(text)
+            return True
+
+        async def applied(_self: NoopBackend) -> ReloadResult:
+            return ReloadResult(changed=["intent.k_target"])
+
+        monkeypatch.setattr("liqfade.panel.app.send_alert", capture)
+        monkeypatch.setattr(NoopBackend, "reload_config", applied)
+
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert body["reload"]["changed"] == ["intent.k_target"]
+        assert posted == []
 
     def test_a_loop_that_refuses_the_reload_does_not_undo_the_write(
         self, signed_in: TestClient, settings: Settings
