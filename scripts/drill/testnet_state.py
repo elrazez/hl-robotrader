@@ -65,6 +65,13 @@ def wait_for(address: str, predicate, *, timeout_s: float, what: str) -> bool:
     return False
 
 
+def cooldown_s(coin: str) -> float:
+    """Seconds of `coin_cooldown` left on this coin, from the loop's own risk state."""
+    status = asyncio.run(control("status"))
+    until = getattr(status, "risk", None) and status.risk.coin_cooldowns.get(coin)
+    return max((until - time.time() * 1000.0) / 1000.0, 0.0) if until else 0.0
+
+
 async def control(cmd: str, **args: object) -> object:
     from liqfade.control import ControlClient
 
@@ -115,6 +122,19 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print(line(address))
         return 1
+    # A coin the loop has just exited is on `risk.coin_cooldown_after_exit_min`, and 30
+    # minutes of it when the round trip lost. `build` flattens first, so the coin it then
+    # enters is always the coin it just closed: say so plainly rather than time out with an
+    # empty account, which is what the first re-drill after the risk hooks landed did.
+    cooling = cooldown_s(args.position_coin)
+    if cooling > 0:
+        print(
+            f"{args.position_coin} is in coin_cooldown for another {cooling:.0f}s. "
+            f"Wait it out, or pass --position-coin with a coin the loop has not just exited.",
+            file=sys.stderr,
+        )
+        return 1
+
     asyncio.run(control("resume"))
     asyncio.run(
         control(
