@@ -16,8 +16,15 @@ import pytest
 from liqfade.config import load_settings
 from liqfade.config.models import Settings
 from liqfade.control.protocol import now_ms
+from liqfade.recorder.addresses import FILENAME as ADDRESS_FILE
+from liqfade.recorder.addresses import AddressBook
 from liqfade.recorder.main import Recorder, _seconds_until_utc_hour
 from liqfade.recorder.writer import write_rows
+
+_HL_TRADE = (
+    b'{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1.0","sz":"2.0",'
+    b'"time":1788648000000,"hash":"0xab","tid":9,"users":["0x01","0x02"]}]}'
+)
 
 
 @pytest.fixture
@@ -41,6 +48,7 @@ def test_every_enabled_venue_gets_a_stream_and_shows_up_in_the_feeds(
     assert names == sorted(names)
     assert "hyperliquid.l2" in names
     assert "coinalyze.xchg_ctx" in names
+    assert "hyperliquid.positions" in names
     assert all(state.connected is False for state in recorder.feed_states(now_ms()))
 
 
@@ -65,6 +73,54 @@ async def test_the_universe_reaches_every_venue_in_its_own_spelling(
     assert symbols["bybit"] == ["1000PEPEUSDT", "BTCUSDT"]
     assert symbols["okx"] == ["1000PEPE-USDT-SWAP", "BTC-USDT-SWAP"]
     assert recorder.poller.coins == ["BTC", "kPEPE"]
+    assert recorder.positions.coins == ["BTC", "kPEPE"]
+
+
+def test_the_positions_poller_is_absent_when_it_is_switched_off(settings: Settings) -> None:
+    """A declared-but-idle stream reads as disconnected and pages every ten minutes."""
+    off = _without_positions(settings)
+    recorder = Recorder(off)
+    assert recorder.positions.stats == {}
+    assert "hyperliquid.positions" not in [s.name for s in recorder.feed_states(now_ms())]
+
+
+def test_the_addresses_are_only_harvested_when_something_will_poll_them(
+    settings: Settings,
+) -> None:
+    """The book is fed from every trade the parser takes, so it is not free: with the
+    poller off nothing would ever read it and nothing would ever prune it either."""
+    fed = Recorder(settings)
+    fed.streams[0].parse(_HL_TRADE, now_ms())
+    assert fed.book.top(2) == ["0x01", "0x02"]
+
+    off = Recorder(_without_positions(settings))
+    off.streams[0].parse(_HL_TRADE, now_ms())
+    assert off.book.entries == {}
+
+
+def test_the_address_book_is_read_back_at_start(settings: Settings) -> None:
+    """It ranks weeks of tape; a restart must not begin from an empty one."""
+    book = AddressBook()
+    book.note("0xwhale", 1_000.0, 1)
+    book.save(Path(settings.paths.data_dir) / ADDRESS_FILE)
+    assert Recorder(settings).book.top(1) == ["0xwhale"]
+
+
+def _without_positions(settings: Settings) -> Settings:
+    hyperliquid = settings.venues.hyperliquid
+    return settings.model_copy(
+        update={
+            "venues": settings.venues.model_copy(
+                update={
+                    "hyperliquid": hyperliquid.model_copy(
+                        update={
+                            "positions": hyperliquid.positions.model_copy(update={"enabled": False})
+                        }
+                    )
+                }
+            )
+        }
+    )
 
 
 async def test_shutdown_flushes_every_buffer_to_parquet(settings: Settings) -> None:
