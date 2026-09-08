@@ -45,19 +45,23 @@ from __future__ import annotations
 import asyncio
 import random
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import TYPE_CHECKING, Any, Protocol, Self
 
 import aiosqlite
+import orjson
 
 from liqfade.control.protocol import OrderState, now_ms
 from liqfade.execution.ratelimit import ActionBudget, BudgetExhaustedError
 from liqfade.execution.rounding import RoundingError, round_price, round_size
 from liqfade.execution.tpsl import TpslLegs, tpsl_requests
 from liqfade.log import get_logger
+
+if TYPE_CHECKING:  # execution sits below strategy; the refusal is only an annotation
+    from liqfade.strategy.engine import Rejection
 
 log = get_logger(__name__)
 
@@ -255,6 +259,21 @@ CREATE TABLE IF NOT EXISTS fills (
     maker  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS fills_cloid ON fills(cloid);
+CREATE TABLE IF NOT EXISTS refusals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms       INTEGER NOT NULL,
+    coin        TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    entry_px    REAL NOT NULL,
+    target_px   REAL NOT NULL,
+    stop_px     REAL NOT NULL,
+    time_stop_s REAL NOT NULL,
+    urgency     TEXT NOT NULL,
+    explain_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS refusals_ts ON refusals(ts_ms);
 """
 
 
@@ -336,6 +355,48 @@ class OrderStore:
             ),
         )
         await self._db.commit()
+
+    async def add_refusals(self, refusals: Sequence[Rejection]) -> None:
+        """Write one tick's refused intents. One statement, because most ticks refuse none.
+
+        The intents the strategy, sizing and risk threw away, kept so `liqfade refusals`
+        can price what each gate cost over a week that has already happened. Nothing reads
+        this in the trading path.
+        """
+        if not refusals:
+            return
+        await self._db.executemany(
+            """
+            INSERT INTO refusals (ts_ms, coin, side, stage, reason, entry_px, target_px,
+                                  stop_px, time_stop_s, urgency, explain_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    r.ts_ms,
+                    r.coin,
+                    r.side,
+                    r.stage,
+                    r.reason,
+                    r.entry_px,
+                    r.target_px,
+                    r.stop_px,
+                    r.time_stop_s,
+                    r.urgency,
+                    orjson.dumps(dict(r.explain)).decode(),
+                )
+                for r in refusals
+            ],
+        )
+        await self._db.commit()
+
+    async def refusals(self, start_ms: int, end_ms: int) -> list[aiosqlite.Row]:
+        """Every refusal in `[start_ms, end_ms)`, oldest first."""
+        async with self._db.execute(
+            "SELECT * FROM refusals WHERE ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms, id",
+            (start_ms, end_ms),
+        ) as cursor:
+            return list(await cursor.fetchall())
 
     async def add_fill(
         self, cloid: str, *, ts_ms: int, px: float, size: float, fee: float, maker: bool
