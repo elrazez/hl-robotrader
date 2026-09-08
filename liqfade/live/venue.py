@@ -303,12 +303,17 @@ class VenueSession:
         no book to rest against. Every refusal is logged with its reason, because a gate
         that quietly stops trading looks exactly like a strategy finding nothing.
         """
+        # Logged, not silent. An intent that produces no order and says nothing is the
+        # 05b lesson: to an owner watching, a refused entry and a strategy finding nothing
+        # look identical.
         if intent.coin in self.positions:
-            return None  # already on; the policy reprices rather than stacking
+            log.info("entry_skipped", coin=intent.coin, reason="position already open")
+            return None
         if any(
             o.coin == intent.coin and o.intent.tag == "entry"
             for o in await self.orders.open_orders()
         ):
+            log.info("entry_skipped", coin=intent.coin, reason="entry already working")
             return None
 
         if intent.coin not in self.orders.sz_decimals:

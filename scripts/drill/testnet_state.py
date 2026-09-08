@@ -104,7 +104,17 @@ def main(argv: list[str] | None = None) -> int:
         print(line(address))
         return 0 if ok else 1
 
-    # build: a crossing entry becomes a position and a bracket, then a resting entry.
+    # build: flatten first. A coin already held is refused by the entry path, so a
+    # leftover position from the last drill silently produces no new state at all.
+    asyncio.run(control("flat"))
+    if not wait_for(
+        address,
+        lambda p, o, t: not p and not o and not t,
+        timeout_s=args.timeout,
+        what="the account to go flat first",
+    ):
+        print(line(address))
+        return 1
     asyncio.run(control("resume"))
     asyncio.run(
         control(
