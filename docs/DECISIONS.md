@@ -3074,6 +3074,32 @@ and the test that now guards it fails against the old stamping. The general less
 one the deploy checklist already encodes: the first hour in the lake gets read, not
 assumed.
 
-`ts_ms` genuinely leads `rx_ms` for a different and harmless reason: the response's `time`
-is the venue's, and it is the field research should join on, while `rx_ms` is what
-no-lookahead checks must use. Both are now honest per row.
+**The cutover, and the rule Q9 needs.** The recorder restarted onto the fix at
+**2026-09-08 15:19:22 UTC**. In `hl_positions`, a row with **`rx_ms < 1788880763381`**
+carries the old poll-start stamping and a row at or above it is stamped per address. The
+boundary is unambiguous in the data: the last old-stamped row is `rx_ms 1788880707350` and
+the first new one is `1788880763381`, 56 seconds apart, because the restart fell between
+two polls. That is 65 minutes of affected rows, all on 2026-09-08. Nothing needs deleting:
+`ts_ms` was always correct and per row, and the error is bounded by one poll interval, so
+those rows stay usable for anything joining on venue time. **Q9 should exclude
+`rx_ms < 1788880763381` from any receive-time or availability analysis.** After the
+nightly compaction folds the day into one file the file boundary is gone, which is why the
+rule is stated as an `rx_ms` threshold rather than as a filename.
+
+Measured either side of it, which is what confirmed the fix rather than the test alone:
+
+| | rows | distinct `rx_ms` | `ts_ms - rx_ms` p50 | p100 | rows dated before they arrived |
+|---|---|---|---|---|---|
+| before | 14,554 | 19 | +1,569 ms | +6,038 ms | 13,631 of 14,554 |
+| after | 31,724 | 7,438 | -240 ms | -146 ms | **0 of 31,724** |
+
+Nineteen distinct stamps across 14,554 rows is one per poll, reused for every address,
+which is the bug stated in data. After the fix there are about four rows per stamp, which
+is one stamp per address answer times the coins that address holds in the universe, and
+the sign of the offset flips: `ts_ms` now precedes `rx_ms` by a steady ~240 ms, which is
+the venue stamping its response and us receiving it a quarter of a second later. That is
+what an honest receive time looks like.
+
+`ts_ms` and `rx_ms` mean different things and both are now correct per row: `ts_ms` is the
+venue's own `time` and is the field research joins on; `rx_ms` is local receipt and is
+what no-lookahead checks must use.
