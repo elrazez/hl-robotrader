@@ -8,6 +8,7 @@ logged when it happens.
 from __future__ import annotations
 
 import pytest
+from _wait import eventually
 
 from liqfade.execution.hl import VenueOrder, VenuePosition
 from liqfade.execution.orders import Order, OrderIntent, OrderStatus
@@ -262,6 +263,14 @@ async def test_a_failed_query_is_never_reported_as_clean() -> None:
 
 
 async def test_the_loop_checks_on_startup_on_reconnect_and_on_the_interval() -> None:
+    """Three triggers, and the reconnect one is proved with the interval out of the way.
+
+    The old version slept 10 ms, shorter than the 50 ms interval, so that a second check
+    could only have come from the reconnect. That is a bet on the scheduler: the check is
+    a task, and on a loaded machine it has not run yet at 10 ms. Here the interval is 30
+    seconds for that half, so the same fact holds however late the task is scheduled, and
+    the interval trigger gets a reconciler of its own.
+    """
     import asyncio
 
     from liqfade.execution.reconcile import Reconciler
@@ -272,20 +281,33 @@ async def test_the_loop_checks_on_startup_on_reconnect_and_on_the_interval() -> 
         address="0x1",
         orders=_no_orders,
         positions=dict,
-        interval_s=0.05,
+        interval_s=30.0,
     )
     stop, reconnected = asyncio.Event(), asyncio.Event()
     task = asyncio.create_task(reconciler.run(stop, reconnected=reconnected))
+    try:
+        await eventually("the startup check", lambda: reader.calls == 1)
+        reconnected.set()
+        await eventually("the reconnect check", lambda: reader.calls == 2)
+    finally:
+        stop.set()
+        await task
 
-    await asyncio.sleep(0.01)
-    assert reader.calls == 1  # startup
-    reconnected.set()
-    await asyncio.sleep(0.01)
-    assert reader.calls == 2  # reconnect, without waiting out the interval
-    await asyncio.sleep(0.12)
-    stop.set()
-    await task
-    assert reader.calls >= 3  # and then on the interval
+    ticking = FakeReader()
+    on_the_interval = Reconciler(
+        reader=ticking,  # type: ignore[arg-type]
+        address="0x1",
+        orders=_no_orders,
+        positions=dict,
+        interval_s=0.01,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(on_the_interval.run(stop))
+    try:
+        await eventually("three checks on the interval", lambda: ticking.calls >= 3)
+    finally:
+        stop.set()
+        await task
 
 
 async def _no_orders():

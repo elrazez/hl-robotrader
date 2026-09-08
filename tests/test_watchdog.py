@@ -10,6 +10,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from _wait import eventually
 
 from liqfade.execution.watchdog import (
     Watchdog,
@@ -103,7 +104,7 @@ async def test_the_run_loop_polls_until_stopped(tmp_path: Path) -> None:
     stop = asyncio.Event()
 
     task = asyncio.create_task(dog.run(stop))
-    await asyncio.sleep(0.1)
+    await eventually("three polls", lambda: dog.checks >= 3)
     stop.set()
     await task
 

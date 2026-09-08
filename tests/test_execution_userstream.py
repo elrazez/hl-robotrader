@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from _wait import eventually
+
 from liqfade.execution.orders import (
     OrderIntent,
     OrderManager,
@@ -281,7 +283,7 @@ async def test_a_frame_off_the_socket_reaches_the_registry(tmp_path: Path) -> No
 
         stop = asyncio.Event()
         drain = asyncio.create_task(stream.drain(stop))
-        await asyncio.sleep(0.05)
+        await eventually("the queued update to be applied", lambda: stream.applied == 1)
         stop.set()
         await drain
 

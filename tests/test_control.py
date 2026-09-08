@@ -10,6 +10,7 @@ from pathlib import Path
 
 import orjson
 import pytest
+from _wait import eventually
 
 from liqfade.control import (
     RESULT_MODELS,
@@ -201,7 +202,7 @@ async def test_state_writer_runs_on_its_interval_and_stops(tmp_path: Path) -> No
     stop = asyncio.Event()
     writer = StateWriter(NoopBackend().status, path, interval_s=0.01)
     task = writer.start(stop)
-    await asyncio.sleep(0.05)
+    await eventually("the first snapshot", path.exists)
     stop.set()
     await asyncio.wait_for(task, timeout=1.0)
     first = read_state(path)

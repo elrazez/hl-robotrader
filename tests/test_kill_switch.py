@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _wait import eventually
 
 from liqfade.execution.kill import KillSwitch, KillWatcher
 
@@ -179,13 +180,13 @@ async def test_the_file_watcher_fires_the_switch(tmp_path: Path) -> None:
     watcher = KillWatcher(switch, poll_s=0.02)
     task = asyncio.create_task(watcher.run(stop))
 
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.05)  # two poll intervals with no flag, in which nothing may fire
     assert not switch.fired
     (tmp_path / "KILL").write_text("killed_at: by hand\n")
 
-    await asyncio.sleep(0.2)  # ten poll intervals, so a miss is a bug and not a race
+    await eventually("the watcher to see the flag", lambda: switch.fired)
     stop.set()
-    await task
+    await task  # the sweep runs to the end before run() returns
 
     assert switch.fired is True
 
@@ -201,7 +202,8 @@ async def test_the_watcher_fires_once_for_one_file(tmp_path: Path) -> None:
     watcher = KillWatcher(switch, poll_s=0.01)
     task = asyncio.create_task(watcher.run(stop))
 
-    await asyncio.sleep(0.1)
+    await eventually("the flag already on disk to fire the switch", lambda: switch.fired)
+    await asyncio.sleep(0.05)  # five more polls, which is where a second fire would land
     stop.set()
     await task
 

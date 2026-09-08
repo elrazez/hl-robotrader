@@ -8,12 +8,12 @@ the session, and that a kill flag already on disk stops the loop before it trade
 from __future__ import annotations
 
 import asyncio
-import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _wait import eventually
 
 from liqfade.backtest.report import config_hash
 from liqfade.config import resolve
@@ -79,20 +79,6 @@ def a_market(loop: PaperLoop, px: float = 3000.0, at: int = START) -> None:
             "tid": 1,
         },
     )
-
-
-async def eventually(what: str, condition: Callable[[], bool], timeout_s: float = 5.0) -> None:
-    """Wait for a background loop to get there, rather than guessing how long it takes.
-
-    A fixed sleep is a bet on the scheduler: on a loaded machine the task under test has
-    not run yet when the assertion fires, and the test fails on a run that was only late.
-    Waiting on the condition itself is slow only when the code is wrong.
-    """
-    deadline = time.monotonic() + timeout_s
-    while not condition():
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"timed out after {timeout_s}s waiting for {what}")
-        await asyncio.sleep(0.001)
 
 
 async def reconciles(reconciler: Reconciler, n: int, timeout_s: float = 5.0) -> None:
