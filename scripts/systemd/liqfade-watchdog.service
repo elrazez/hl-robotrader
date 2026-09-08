@@ -1,5 +1,5 @@
 [Unit]
-Description=liqfade watchdog: writes the kill flag if the trading loop stops breathing
+Description=liqfade watchdog: writes the kill flag if a trading loop stops breathing
 Documentation=file:/srv/liqfade/app/docs/STRATEGY_AND_RISK.md
 After=network-online.target
 Wants=network-online.target
@@ -8,8 +8,13 @@ Wants=network-online.target
 Type=simple
 # Deliberately independent of the loop units: a watchdog that dies with the process it
 # watches is not a watchdog, so there is no After= or Requires= on either of them. It
-# reads data/heartbeat and data/KILL and nothing else, which is why it needs no socket, no
-# key and no config beyond the env file.
+# reads the heartbeat files and data/KILL and nothing else, which is why it needs no
+# socket, no key and no config beyond the env file.
+#
+# One process watches every loop. Which files those are is risk.watchdog_heartbeats in the
+# config, label and all, not an environment override here: this unit knew one heartbeat
+# path until 2026-09-08, and SIGSTOP on the testnet loop went unnoticed for 25s because
+# the file it read was the paper loop's.
 #
 # On a stale heartbeat it writes data/KILL, which is where the loop's own watcher and the
 # loop unit's ExecStartPre both look, so it cancels, flattens and stops the restart with
@@ -24,7 +29,6 @@ Group=liqfade
 EnvironmentFile=/srv/liqfade/.env
 # Seconds of silence before it kills is risk.watchdog_stale_s in the config, validated
 # against risk.heartbeat_s, and is deliberately not set here: one definition of it.
-Environment="LIQFADE_WATCH_LABEL=paper loop"
 WorkingDirectory=/srv/liqfade/app
 Restart=always
 RestartSec=3
