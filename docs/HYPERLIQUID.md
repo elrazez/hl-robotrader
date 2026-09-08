@@ -90,82 +90,125 @@ URL without "testnet" in it and reads no key itself; `execution/signer.py` does 
 
 | # | Probe | Subcommand | Answer |
 | --- | --- | --- | --- |
-| 1 | `Gtc` limit far from market, cancel by cloid, confirm the `orderUpdates` sequence | `gtc_cancel` | **run 2026-09-07, void: unfunded account** |
-| 2 | `Alo` that would cross, confirm the rejection string | `alo_cross` | **run 2026-09-07** |
-| 3 | Entry then TP/SL with `positionTpsl` grouping, fill one, confirm the other cancels | `tpsl_group` | **not run: needs margin** |
-| 4 | 50 submit-to-ack latencies at a quiet and a busy time | `latency` | **not run: would measure void orders** |
-| 5 | `scheduleCancel` availability and its exact error when gated | `schedule_cancel` | **run 2026-09-07** |
-| 6 | `userFees` payload shape and current rates | `user_fees` | **run 2026-09-07** |
-| 7 | Reprice by cloid and by oid, and after a cancel | `modify` | **run 2026-09-07, void: unfunded account** |
-| 8 | Reduce-only with and without a position | `reduce_only` | **not run: needs margin** |
-| 9 | Raw `clearinghouseState`, `openOrders`, `frontendOpenOrders`, `userFills` | `state_shape` | **run 2026-09-07, empty account** |
+| 1 | `Gtc` far from market, cancel by cloid, the `orderUpdates` sequence | `gtc_cancel` | **run 2026-09-08** |
+| 2 | `Alo` that would cross, the rejection string | `alo_cross` | **run 2026-09-08** |
+| 3 | Entry then TP/SL with `positionTpsl`, confirm the legs die with the position | `tpsl_group` | **run 2026-09-08** |
+| 4 | 50 submit-to-ack latencies | `latency` | **run 2026-09-08, quiet hour only** |
+| 5 | `scheduleCancel` availability and its error when gated | `schedule_cancel` | **run 2026-09-08** |
+| 6 | `userFees` payload and current rates | `user_fees` | **run 2026-09-08** |
+| 7 | Reprice by cloid and by a stale oid | `modify` | **run 2026-09-08** |
+| 8 | Reduce-only with and without a position | `reduce_only` | **run 2026-09-08** |
+| 9 | Raw `clearinghouseState`, `openOrders`, `frontendOpenOrders`, `userFills` | `state_shape` | **run 2026-09-08** |
 
-**Read the "void" rows as not run, and read the reason below as superseded.** The cause
-was found on 2026-09-08 and it was not funding: `HL_TESTNET_ACCOUNT_ADDRESS` held the agent
-wallet's own address rather than the master account it signs for, so every read was pointed
-somewhere the orders never went. `userRole` on the configured address returns
-`{"role": "agent", "data": {"user": "0x000000000000000000000000000000000000beef..."}}`, and `orderStatus` against that master
-returns the orders in full. **Run `userRole` before trusting any probe result.** What
-follows is what the symptoms looked like from the wrong address.
+**Run `userRole` first, every time.** Everything below was measured twice: once against the
+agent wallet's own address, where it produced a coherent and completely wrong picture, and
+once against the master account. See `docs/DECISIONS.md` 2026-09-08.
 
-The testnet account read `accountValue: 0.0` on 2026-09-07. On a zero-equity account Hyperliquid answers an order with
-`{"resting": {"oid": ...}}` and a real oid, and then books nothing: `openOrders`,
-`frontendOpenOrders` and `historicalOrders` all stay empty, `totalMarginUsed` stays 0.0,
-`orderUpdates` sends no frame, and `cancel_by_cloid` on the phantom returns
-`statuses: ["success"]`. Every probe whose answer depends on an order actually resting
-therefore measured nothing. Claim the faucet, then re-run 1, 3, 4, 7 and 8.
+### 1. The `orderUpdates` sequence
 
-### What the three trustworthy probes found
+A place-and-cancel produces exactly two frames, each carrying the full order and the cloid:
 
-**Probe 6, `userFees`.** `userCrossRate: "0.00045"` and `userAddRate: "0.00015"`: 0.045%
-taker and 0.015% maker, exactly the defaults CLAUDE.md rule 2 puts in every backtest. The
-cost model is confirmed against the venue rather than against a doc. No referral or
-staking discount is active (`activeReferralDiscount: "0.0"`), so there is no hidden edge
-in the fee line and none to lose.
+    {"channel": "orderUpdates", "data": [{"order": {"coin": "ETH", "side": "B",
+      "limitPx": "1239.3", "sz": "0.0096", "oid": 59610337202, "origSz": "0.0096",
+      "cloid": "0xec15..."}, "status": "open", "statusTimestamp": 1788859194749}]}
+    ... same order, "status": "canceled", "statusTimestamp": 1788859195525
 
-**Probe 2, `Alo` that crosses.** The exact string, verbatim:
+`status` is the state machine: `open`, `canceled`, and `filled` for the fill path. Every
+frame carries the cloid, so the user-stream client can key on it and never needs the oid.
+
+### 2. `Alo` that would cross
 
     Post only order would have immediately matched, bbo was 2491.3@2491.4. asset=4
 
-It arrives with HTTP 200 and a top-level `"status": "ok"`, inside
-`response.data.statuses[0].error`. **A rejected order is an `ok` response.** Anything that
-branches on the envelope's status treats a rejection as a fill; `classify_order_response`
-has to keep reading down to the per-status objects. The same holds for the modify refusal,
-`"Cannot modify canceled or filled order"`, which is also carried inside an `ok`.
+HTTP 200, top-level `"status": "ok"`, words in `response.data.statuses[0].error`. **A
+rejection is an `ok` response.** Anything branching on the envelope reads a rejection as a
+fill; keep reading down to the per-status objects.
 
-**Probe 5, `scheduleCancel`: gated, and this settles an open design question.**
+### 3. TP/SL with `positionTpsl`
 
-    Cannot set scheduled cancel time until enough volume traded. Required: $1000000. Traded: $0.
+`bulk_orders(requests, grouping="positionTpsl")` answers
+`{"statuses": ["waitingForTrigger", "waitingForTrigger"]}`. Both legs appear in
+`frontendOpenOrders` (not in `openOrders`) as `Take Profit Market` and `Stop Market`, each
+`isTrigger: true`, `reduceOnly: true`, with its own cloid and a readable
+`triggerCondition` ("Price above 2490.8" / "Price below 2466.1"). Note `isPositionTpsl`
+reads **false** on both despite the grouping, so it cannot be used to identify them; the
+cloid is the identity to track.
 
-Clearing it (`schedule_cancel(None)`) is refused by the same gate, so the dead man's
-switch is not available to this account and will not be until a million dollars of volume
-has gone through it. `execution/watchdog.py` says the venue half of the kill path is
-"owed" and that this probe would decide whether `scheduleCancel` or a signing watchdog
-closes it. It has decided: **the file-based watchdog is the only dead man's switch we
-have.** An order resting at Hyperliquid when the whole box dies stays there until someone
-cancels it by hand. Phase 6 must either accept that or fund a signing watchdog.
+**They die with the position.** `market_close` on the position left `positions=[]` and
+`frontendOpenOrders=[]` within 2 seconds, with no cancel of our own. The bot must still
+track them by cloid, but it does not have to cancel them on a normal exit.
 
-**The WebSocket user channel, observed while the probes ran.** Both `orderUpdates` and
-`userFills` accept a subscription for the account and echo it back with the address
-lowercased, whichever case is sent. `userFills` immediately pushes a snapshot frame
-(`{"channel": "userFills", "data": {"isSnapshot": true, "fills": []}}`); `orderUpdates`
-sends nothing until an order changes state, and on the unfunded account nothing ever did.
-So the shape of a live `orderUpdates` frame is still unknown and the user-stream client
-cannot be written against a measured payload yet. That is probe 1's job once funded.
+### 4. Submit-to-ack latency, from the Tokyo VPS, quiet hour
 
-### Provisional, from the void runs. Do not build on these.
+50 REST order round trips, testnet:
 
-Recorded only so the re-run has something to disagree with. `modify` addressed by cloid
-answered with a **new oid** and the same cloid, which if real would mean a reprice is a
-cancel-and-replace at the venue and loses queue priority, making the "prefer modify"
-preference worth one round trip rather than any priority. The original oid then answered
-`"Cannot modify canceled or filled order"`. One modify round trip measured 789ms, which is
-a REST number from Tokyo to Tokyo and is implausibly slow for a booked order; it is more
-likely the cost of a rejected one. None of this is evidence until an order actually rests.
+| | min | p50 | p95 | max | mean |
+| --- | --- | --- | --- | --- | --- |
+| submit | 656.6 | **718.9** | 819.0 | 982.4 | 735.4 |
+| cancel | 657.8 | 718.6 | 792.1 | 821.1 | 727.6 |
 
-Probe 4 writes the number `docs/STRATEGY_AND_RISK.md` uses for the latency model, and
-probe 5 decides whether `execution/watchdog.py` is a convenience or the only dead man's
-switch we have.
+All ms. This is much slower than a Tokyo-to-Tokyo round trip has any right to be, and it
+matters: `docs/STRATEGY_AND_RISK.md` assumes a 1.0s signal-to-fill model, and a 719ms
+median submit plus fill time makes that assumption roughly right rather than conservative.
+**Still owed: the same 50 at a busy hour**, and the same on mainnet, since testnet
+infrastructure is not the one that will take the orders.
+
+### 5. `scheduleCancel` is gated, and this settles a design question
+
+    Cannot set scheduled cancel time until enough volume traded. Required: $1000000. Traded: $89.21.
+
+Clearing it (`schedule_cancel(None)`) is refused by the same gate. The `$89.21` is this
+session's own probe volume, which is how we know the actions reached the master account.
+
+`execution/watchdog.py` said the venue half of the kill path was owed, and that this probe
+would decide between `scheduleCancel` and a signing watchdog. **It has decided: the
+file-based watchdog is the only dead man's switch this account has**, and an order resting
+at Hyperliquid when the box dies stays there until a human cancels it. Phase 6 accepts that
+or funds a signing watchdog.
+
+### 6. Fees
+
+`userCrossRate: "0.00045"`, `userAddRate: "0.00015"`. 0.045% taker, 0.015% maker, exactly
+the defaults CLAUDE.md rule 2 puts in every backtest, now confirmed against the venue. No
+referral or staking discount active.
+
+### 7. `modify` keeps the cloid and loses the queue
+
+Placed at 1239.3 as oid 59610349613. Modified by cloid to 1251.7:
+
+    {"resting": {"oid": 59610350495, "cloid": "0xe9589f08..."}}   <- new oid, same cloid
+
+`openOrders` then shows one order at the new price with the **new oid and a new
+timestamp**. So a modify is a cancel-and-replace at the venue: **queue priority is not
+preserved.** What it does buy is one round trip instead of two (794ms measured) and a
+stable cloid, which is the identity the registry tracks an entry by across its reprices.
+
+Modifying by the **stale** oid answers `"Cannot modify canceled or filled order"` and
+leaves the live order untouched, so a reprice racing a fill is a safe no-op rather than a
+double order. The order manager should therefore address reprices **by cloid**, and treat
+that error as "already gone, reconcile" rather than as a transport failure.
+
+### 8. Reduce-only
+
+With no position behind it:
+
+    Reduce only order would increase position. asset=4
+
+Against a position it rests normally and `openOrders` carries `"reduceOnly": true`. The
+refusal is the case that matters: it is how an exit for a position that has already closed
+comes back, and it must be read as "position gone" rather than retried.
+
+### 9. The shapes reconciliation reads
+
+`openOrders` rows carry `coin, side, limitPx, sz, oid, timestamp, origSz, cloid` plus
+`reduceOnly` when set. Trigger orders appear only in `frontendOpenOrders`, with the extra
+`triggerCondition, isTrigger, triggerPx, children, isPositionTpsl, orderType, tif`.
+An `assetPositions[].position` carries `coin, szi, leverage {type, value}, entryPx,
+positionValue, unrealizedPnl, returnOnEquity, liquidationPx, marginUsed, maxLeverage,
+cumFunding {allTime, sinceOpen, sinceChange}`.
+
+**`accountValue` is 0.0 while flat.** It reported 0.0 flat, 1.48872 holding 0.006 ETH and
+0.0 again after closing. It is not a funding indicator; the spot USDC balance is.
 
 ## What an agent key can and cannot do, measured 2026-09-08
 
