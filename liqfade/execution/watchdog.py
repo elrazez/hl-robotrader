@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -125,15 +126,32 @@ class Watchdog:
         self.alerts = 0
         self.kills = 0
         self._killed_by_us = False
+        # Wall clock after which a stale heartbeat is judged again. Set when the flag
+        # is cleared and at startup, because a loop that has not started yet has not
+        # failed yet.
+        self._grace_until = 0.0
+        # Whether the flag was there last poll, so its removal is an edge we can see.
+        self._flag_was_there = self.kill_file.exists()
 
     async def check(self, now_ms: int | None = None) -> bool:
         """One look. Returns whether the loop is breathing, and posts only on a change."""
-        import time
 
         self.checks += 1
         now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
 
-        if self.kill_file.exists():
+        flagged = self.kill_file.exists()
+        if self._flag_was_there and not flagged:
+            # A kill stops the loop, so its heartbeat has been ageing for as long as the
+            # flag was up. The very next poll after the flag is cleared reads that old
+            # stamp and writes the flag straight back, before the loop it is judging has
+            # had a chance to start: on 2026-09-08 the unit then failed to start 131
+            # times. Give it one stale limit to come back. The watchdog exists to notice
+            # a loop that stopped, not to judge one that has not started.
+            self._grace_until = time.monotonic() + self.stale_s
+            log.info("watchdog_grace_started", seconds=self.stale_s)
+        self._flag_was_there = flagged
+
+        if flagged:
             if not self._killed_by_us:
                 # Somebody else's kill. Deliberately dead; reset the edge so a later
                 # restart alerts properly.
@@ -144,6 +162,10 @@ class Watchdog:
             self._killed_by_us = False
 
         age = heartbeat_age_s(self.heartbeat, now_ms=now_ms)
+        if (age is None or age > self.stale_s) and time.monotonic() < self._grace_until:
+            # Starting, not dead. Reported as healthy so a recovery message is posted when
+            # it does come back rather than a second stale alert.
+            return True
         if age is None:
             return await self._unhealthy(f"no heartbeat file at {self.heartbeat}")
         if age > self.stale_s:

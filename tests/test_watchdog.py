@@ -255,3 +255,46 @@ def test_the_stale_limit_must_be_several_heartbeats_not_one_and_a_bit() -> None:
     fields = load_settings("paper", environ={}).risk.model_dump()
     with pytest.raises(ValidationError, match="heartbeat"):
         Risk.model_validate({**fields, "heartbeat_s": 9.9, "watchdog_stale_s": 10.0})
+
+
+async def test_clearing_the_flag_gives_the_loop_time_to_start_beating(tmp_path: Path) -> None:
+    """Drilled on 2026-09-08: clearing a deliberate kill killed the box again at once.
+
+    A kill stops the loop, so its heartbeat file stops moving and ages for as long as the
+    flag is up. Remove the flag and the watchdog's very next poll reads a heartbeat six
+    minutes old and writes the flag straight back, before the loop it is judging has had a
+    chance to start. The unit then failed to start 131 times.
+
+    The watchdog exists to notice a loop that stopped, not to judge one that has not
+    started. Clearing the flag starts a grace period of one stale limit.
+    """
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+    kill = tmp_path / "KILL"
+    kill.write_text("killed_at: deliberately\n")
+    write_heartbeat(tmp_path / "heartbeat", _now() - 300_000)
+
+    assert await dog.check() is True, "silent while the flag is up"
+
+    kill.unlink()
+
+    assert await dog.check() is True, "the loop is starting, not dead"
+    assert not kill.exists(), "and the flag stays cleared"
+    assert posted == []
+
+
+async def test_the_grace_runs_out_if_the_loop_never_comes_back(tmp_path: Path) -> None:
+    """A grace that never ends is not a watchdog."""
+    posted: list[str] = []
+    dog = _a_watchdog(tmp_path, posted, stale_s=0.05)
+    kill = tmp_path / "KILL"
+    kill.write_text("killed_at: deliberately\n")
+    write_heartbeat(tmp_path / "heartbeat", _now() - 300_000)
+    await dog.check()
+    kill.unlink()
+    await dog.check()
+
+    await asyncio.sleep(0.12)
+
+    assert await dog.check() is False, "grace expired and the loop is still not beating"
+    assert kill.exists()
