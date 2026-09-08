@@ -660,7 +660,7 @@ class OrderManager:
 
     async def submit_bracket(
         self, *, coin: str, is_long: bool, size: float, tp_px: float, sl_px: float
-    ) -> TpslLegs:
+    ) -> TpslLegs | None:
         """Attach a take profit and a stop to a position as one `positionTpsl` group.
 
         Both legs are registered here before they are placed, and persisted, because a
@@ -673,9 +673,18 @@ class OrderManager:
         legs REJECTED rather than leaving one live.
 
         Returns:
-            The two cloids. `execution/tpsl.py` explains why they are the only handle:
-            the venue answers `waitingForTrigger` with no oid, and `isPositionTpsl` reads
-            false on both legs of the group that created them.
+            The two cloids of a bracket the venue took, or **None when it refused the
+            group**. None is the whole point of the return type: the caller records a
+            bracket from a confirmed placement and from nothing else, because a position
+            that reads as protected and is not is worse than one that reads as naked.
+            `execution/tpsl.py` explains why the cloids are the only handle: the venue
+            answers `waitingForTrigger` with no oid, and `isPositionTpsl` reads false on
+            both legs of the group that created them.
+
+        Raises:
+            TransientTransportError: the group may or may not have landed. Raised rather
+                than swallowed, same as `submit`, because the caller has to decide whether
+                to try again or to close the position it cannot protect.
         """
         legs = TpslLegs(tp_cloid=new_cloid(), sl_cloid=new_cloid())
         orders = []
@@ -718,7 +727,7 @@ class OrderManager:
                 await self._transition(
                     order, OrderStatus.REJECTED, "bracket_rejected", reason=str(exc)
                 )
-            return legs
+            return None
 
         for order in orders:
             await self._transition(order, OrderStatus.ACKED, "bracket_acked", statuses=statuses)

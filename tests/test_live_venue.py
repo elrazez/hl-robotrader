@@ -13,7 +13,14 @@ from typing import Any
 import pytest
 
 from liqfade.execution.hl import AccountSnapshot, VenuePosition
-from liqfade.execution.orders import OrderIntent, OrderManager, OrderStatus, OrderStore
+from liqfade.execution.orders import (
+    OrderIntent,
+    OrderManager,
+    OrderStatus,
+    OrderStore,
+    RejectError,
+    TransientTransportError,
+)
 from liqfade.live.venue import VenueSession
 from liqfade.strategy.types import Intent
 from tests.test_live_loop import paper_settings
@@ -758,5 +765,67 @@ async def test_flattening_a_coin_cancels_that_coins_legs_after_the_close(
             f"cancel:{legs.sl_cloid}"
         ), "the stop came off after the close, never before it"
         assert COIN not in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_a_position_the_venue_would_not_bracket_is_not_held(tmp_path: Path) -> None:
+    """A refused group was recorded as a placed bracket, and the position stayed open.
+
+    `submit_bracket` answered with the two cloids whether or not the venue took the group,
+    so `brackets[coin]` read as protection and `bracket_placed` said so in the journal over
+    a position wearing nothing at all.
+    """
+    session, venue = await a_session(tmp_path)
+    attempts: list[int] = []
+
+    async def refuse(requests: list[dict[str, Any]]) -> list[str]:
+        attempts.append(1)
+        raise RejectError("Order must have minimum value of $10")
+
+    try:
+        venue.place_group = refuse  # type: ignore[assignment]
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+
+        assert len(attempts) == 2, "refused once, tried once more, then gave up"
+        assert COIN not in session.brackets
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.size == 0.01, "what the entry had actually filled"
+        assert session.orders.get(cloid).status is OrderStatus.CANCELED, "no more of it fills"
+        assert session.result.risk_blocks == {"bracket_failed": 1}, "and Telegram hears it"
+    finally:
+        await session._store.close()
+
+
+async def test_a_bracket_that_lost_its_response_is_placed_on_the_retry(tmp_path: Path) -> None:
+    """A transport failure used to escape into the user stream, which swallowed it."""
+    session, venue = await a_session(tmp_path)
+    attempts: list[int] = []
+    group = venue.place_group
+
+    async def fail_once(requests: list[dict[str, Any]]) -> list[str]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TransientTransportError("connection reset")
+        return await group(requests)
+
+    try:
+        venue.place_group = fail_once  # type: ignore[assignment]
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        before = len(venue.placed)
+
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+
+        assert len(attempts) == 2
+        assert COIN in session.brackets
+        assert len(venue.placed) == before, "the position is protected, not closed"
+        assert session.result.risk_blocks == {}
     finally:
         await session._store.close()

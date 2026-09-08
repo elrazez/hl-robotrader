@@ -448,13 +448,10 @@ class VenueSession:
         if previous is not None:
             await self._cancel_legs(previous)
 
-        legs = await self.orders.submit_bracket(
-            coin=intent.coin,
-            is_long=intent.side == "long",
-            size=total,
-            tp_px=intent.target_px,
-            sl_px=intent.stop_px,
-        )
+        legs = await self._bracket(intent, total)
+        if legs is None:
+            await self._abandon_unbracketed(cloid, intent, total, ts_ms)
+            return
         self.brackets[intent.coin] = legs
         log.info(
             "bracket_placed",
@@ -466,6 +463,62 @@ class VenueSession:
             tp_cloid=legs.tp_cloid,
             sl_cloid=legs.sl_cloid,
         )
+
+    async def _bracket(self, intent: Intent, size: float) -> TpslLegs | None:
+        """Ask the venue for the bracket, once and then once more. None if it will not.
+
+        One retry, because the two ways this fails are worth one more attempt each: a
+        refusal that came from a size or a price the venue disliked for a moment, and a
+        transport failure where the group may equally well have landed. A duplicate bracket
+        from the second case is reduce-only and dies with the position, which is the
+        cheaper of the two ways to be wrong.
+        """
+        for attempt in (0, 1):
+            try:
+                legs = await self.orders.submit_bracket(
+                    coin=intent.coin,
+                    is_long=intent.side == "long",
+                    size=size,
+                    tp_px=intent.target_px,
+                    sl_px=intent.stop_px,
+                )
+            except Exception as exc:
+                # Including `TransientTransportError`, which used to propagate into the
+                # user stream's fill hook and be logged there as a failed hook, leaving a
+                # position open with nothing on it and nothing said about it.
+                log.error(
+                    "bracket_attempt_failed",
+                    coin=intent.coin,
+                    attempt=attempt,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                continue
+            if legs is not None:
+                return legs
+            log.error("bracket_refused", coin=intent.coin, attempt=attempt, size=size)
+        return None
+
+    async def _abandon_unbracketed(
+        self, cloid: str, intent: Intent, size: float, ts_ms: int
+    ) -> None:
+        """Close a position the venue would not let us protect, and say why.
+
+        A position without a confirmed bracket is not held. The alternative is carrying an
+        unattended position with no stop through whatever the cascade does next, which is
+        the one thing Phase 6 running unattended cannot survive.
+
+        The rest of the entry is cancelled first: it would otherwise keep filling into a
+        coin we have just decided not to be in. The reason goes to the counters rather than
+        straight to Telegram because the loop is what drains them, and `report_risk_blocks`
+        posts `bracket_failed` like any other refusal.
+        """
+        log.error("position_unbracketed", coin=intent.coin, size=size)
+        self.result.blocked(now_ms=ts_ms, coin=intent.coin, gate="risk", reason="bracket_failed")
+        with contextlib.suppress(KeyError):
+            await self.orders.cancel(cloid)
+        self.entry_intents.pop(cloid, None)
+        self.filled.pop(cloid, None)
+        await self.close_position(intent.coin, size if intent.side == "long" else -size)
 
     async def _on_exit_fill(self, cloid: str, ts_ms: int) -> None:
         """A bracket leg or a flattening order filled: one round trip is closed.
