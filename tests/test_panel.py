@@ -1358,6 +1358,22 @@ class TestSettingsWrites:
         assert "wider targets" in path.read_text()
         assert header.startswith("#")  # the timestamp and reason are a comment, not config
 
+    def test_the_overrides_file_is_readable_only_by_the_service_user(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """0600, like the audit log and the state files it sits beside.
+
+        It carries risk limits and sizing fractions, and it is the file that decides what
+        the loop reloads. Written at the process umask it was world readable on a box
+        whose umask says so.
+        """
+        import stat
+
+        signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"})
+
+        path = settings.paths.data_dir / "overrides.yaml"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
     def test_a_second_write_keeps_the_first(
         self, signed_in: TestClient, settings: Settings
     ) -> None:

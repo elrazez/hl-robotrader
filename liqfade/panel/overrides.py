@@ -24,6 +24,7 @@ The file itself lives under `data_dir`; `config/loader.py` says why.
 from __future__ import annotations
 
 import datetime as dt
+import os
 from pathlib import Path
 from typing import Any
 
@@ -180,8 +181,12 @@ def write(path: Path, changes: dict[str, Any], reason: str) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     # Written to a sibling and renamed: a process reloading its config must see the old
-    # file or the new one, never the half of a new one that has reached the disk.
-    tmp.write_text(header + body)
+    # file or the new one, never the half of a new one that has reached the disk. 0600
+    # like `panel/audit.py` and the state files, and set at creation rather than after,
+    # because the file carries risk limits and the process umask is not ours to assume.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        handle.write(header + body)
+    tmp.chmod(0o600)  # a temp file left by a crash keeps its old mode through O_CREAT
     tmp.replace(path)
     return tree
 
