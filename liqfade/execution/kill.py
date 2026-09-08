@@ -40,6 +40,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from enum import StrEnum
 from pathlib import Path
 
 from liqfade.control.backend import kill_not_persisted, write_kill_file
@@ -48,7 +49,7 @@ from liqfade.log import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["KillSwitch", "KillWatcher"]
+__all__ = ["KillSwitch", "KillWatcher", "VenueCheck"]
 
 DEFAULT_POLL_S = 1.0  # the flag is checked this often; the budget is 5s and this leaves room
 # Seconds the whole sweep gets. Under `risk.kill_deadline_s`, which is the promise, so the
@@ -59,6 +60,22 @@ DEFAULT_BUDGET_S = 4.0
 # list goes in the log line, where a machine reads it.
 RETRY_PAUSE_S = 0.25  # between kill retries, so a sweep does not rate limit itself
 NAMED_IN_CONFIRMATION = 5
+# Seconds the local book gets when the venue could not be read. Outside the sweep budget
+# on purpose: this reads a dict in memory and only shapes the sentence the owner gets.
+LAST_KNOWN_S = 0.25
+
+
+class VenueCheck(StrEnum):
+    """Which of the three answers the post-sweep read gave.
+
+    `NO_ACCOUNT` is paper, `UNVERIFIED` is a venue that did not answer in time, and only
+    `CHECKED` lets `venue_flat` mean anything. Collapsing the first two into one bool is
+    what made a timed-out mainnet read look like paper mode.
+    """
+
+    NO_ACCOUNT = "no_account"
+    UNVERIFIED = "unverified"
+    CHECKED = "checked"
 
 
 class KillSwitch:
@@ -142,7 +159,8 @@ class KillSwitch:
         # Retry the close for as long as the budget allows: a close the venue accepts and
         # ignores is exactly what the refused reduce-only order looked like, and counting
         # it as done is how a kill reports success over an open position.
-        venue_positions, venue_orders, verified = await self._verify(started + self.budget_s)
+        venue_positions, venue_orders, checked = await self._verify(started + self.budget_s)
+        verified = checked is VenueCheck.CHECKED
 
         if self._stop is not None:
             self._stop.set()
@@ -187,42 +205,49 @@ class KillSwitch:
             closed_positions=closed,
             reason=detail,
             venue_flat=(not venue_positions and venue_orders == 0) if verified else None,
-            venue_positions=dict(venue_positions),
-            venue_orders=venue_orders,
+            venue_positions=dict(venue_positions) if verified else {},
+            venue_orders=venue_orders if verified else 0,
         )
-        await self._confirm(result)
+        # The unread account's last known contents go to the owner and not into the
+        # result: `venue_positions` means what the venue said, and on this path it did
+        # not say anything.
+        await self._confirm(result, checked, {} if verified else dict(venue_positions))
         return result
 
-    async def _verify(self, deadline: float) -> tuple[dict[str, float], int, bool]:
+    async def _verify(self, deadline: float) -> tuple[dict[str, float], int, VenueCheck]:
         """Read the venue, and keep closing what it still holds until the budget runs out.
 
-        Returns the venue's last known positions, its open order count, and whether the
-        read succeeded at all. An unverified kill is reported as unverified: paper has no
-        venue to ask, and a read that timed out is not the same as a flat account.
+        Returns the venue's last known positions, its open order count, and which of the
+        three answers this is. The three are not two: paper has no account to ask, a read
+        that ran out of budget is an account nobody has looked at, and only a read that
+        came back decides whether the kill worked. Reporting the middle one as the first
+        tells an owner the kill was as good as this loop gets.
         """
         if self._venue_state is None:
-            return {}, 0, False
+            return {}, 0, VenueCheck.NO_ACCOUNT
 
         positions: dict[str, float] = {}
         orders = 0
-        verified = False
+        checked = VenueCheck.UNVERIFIED
         while True:
             try:
                 venue_positions, cloids = await _before(self._venue_state(), deadline)
                 orders = len(cloids)
             except Exception as exc:
                 log.error("kill_verify_failed", error=f"{type(exc).__name__}: {exc}")
-                return positions, orders, verified
+                if not positions and checked is VenueCheck.UNVERIFIED:
+                    positions = await self._last_known()
+                return positions, orders, checked
             positions = dict(venue_positions)
-            verified = True
+            checked = VenueCheck.CHECKED
 
             if not positions and orders == 0:
                 log.info("kill_verified_flat")
-                return positions, orders, True
+                return positions, orders, checked
             if time.monotonic() + RETRY_PAUSE_S >= deadline:
                 # No time left to try again and confirm it, so report what is still there.
                 log.error("kill_venue_not_flat", positions=positions, orders=orders)
-                return positions, orders, True
+                return positions, orders, checked
 
             log.warning("kill_retrying_close", positions=positions, orders=orders)
             # A pause between attempts: hammering the venue inside a kill spends the
@@ -235,11 +260,27 @@ class KillSwitch:
                 with contextlib.suppress(Exception):
                     await _before(self._close(coin, size), deadline)
             if orders and time.monotonic() < deadline:
-                with contextlib.suppress(Exception):
-                    for cloid in list(cloids):
-                        if time.monotonic() >= deadline:
-                            break
-                        await _before(self._cancel(cloid), deadline)
+                for ref in list(cloids):
+                    if time.monotonic() >= deadline:
+                        break
+                    # Suppressed per order, not around the loop: one order the venue
+                    # refuses to cancel must not end a pass that has budget left for the
+                    # ones behind it.
+                    with contextlib.suppress(Exception):
+                        await _before(self._cancel(ref), deadline)
+
+    async def _last_known(self) -> dict[str, float]:
+        """The local book, for the confirmation line only. Never a pass criterion.
+
+        The mirror is stale by up to `execution.reconcile_s` and that is precisely why it
+        does not decide whether a kill worked. It is still the last thing anybody knew
+        about the account, and an owner reading "VENUE UNVERIFIED" needs somewhere to look.
+        """
+        try:
+            return dict(await asyncio.wait_for(self._open_positions(), timeout=LAST_KNOWN_S))
+        except Exception as exc:
+            log.error("kill_last_known_failed", error=f"{type(exc).__name__}: {exc}")
+            return {}
 
     async def _cancel_everything(self, deadline: float) -> tuple[int, int, list[str]]:
         try:
@@ -303,7 +344,9 @@ class KillSwitch:
         )
         return _count(outcomes, "kill_close_failed", coins)
 
-    async def _confirm(self, result: KillResult) -> None:
+    async def _confirm(
+        self, result: KillResult, checked: VenueCheck, last_known: Mapping[str, float]
+    ) -> None:
         if self._alert is None:
             return
         # The venue's verdict leads, because the counters say what was attempted and
@@ -315,6 +358,12 @@ class KillSwitch:
             verdict = (
                 f"VENUE NOT FLAT: still holding {held or 'nothing'}, "
                 f"{result.venue_orders} order(s). ACT BY HAND."
+            )
+        elif checked is VenueCheck.UNVERIFIED:
+            held = ", ".join(f"{c} {s:g}" for c, s in sorted(last_known.items()))
+            verdict = (
+                "VENUE UNVERIFIED: the account could not be read inside the budget. "
+                f"Last known: {held or 'nothing'}. CHECK BY HAND."
             )
         else:
             verdict = "Venue not checked (no account to read)."

@@ -194,13 +194,16 @@ def test_the_worst_severity_is_what_the_report_leads_with() -> None:
 class FakeReader:
     """Answers the two info queries, or raises whatever the test queued."""
 
-    def __init__(self, positions=None, orders=None, error: Exception | None = None) -> None:
+    def __init__(
+        self, positions=None, orders=None, triggers=None, error: Exception | None = None
+    ) -> None:
         from liqfade.execution.hl import AccountSnapshot
 
         self.snapshot = AccountSnapshot(
             equity=1000.0, margin_used=0.0, withdrawable=1000.0, positions=positions or {}
         )
         self.orders = orders or []
+        self.triggers = triggers or []
         self.error = error
         self.calls = 0
 
@@ -212,6 +215,9 @@ class FakeReader:
 
     async def open_orders(self, address: str):
         return self.orders
+
+    async def trigger_orders(self, address: str):
+        return self.triggers
 
 
 async def test_the_loop_posts_once_per_run_that_found_something() -> None:
@@ -317,6 +323,9 @@ async def test_the_account_snapshot_is_handed_to_the_caller_before_the_compariso
         async def open_orders(self, address: str):
             return []
 
+        async def trigger_orders(self, address: str):
+            return []
+
         async def account(self, address: str) -> AccountSnapshot:
             return snapshot
 
@@ -342,3 +351,123 @@ async def test_the_account_snapshot_is_handed_to_the_caller_before_the_compariso
 
 async def _none():
     return []
+
+
+# --- the bracket legs, which live in a different query ----------------------------
+
+
+def venue_trigger(cloid: str | None, *, oid: int = 9, coin: str = "ETH", size: float = 0.01):
+    from liqfade.execution.hl import TriggerOrder
+
+    return TriggerOrder(
+        cloid=cloid,
+        coin=coin,
+        oid=oid,
+        trigger_px=100.0,
+        is_stop=True,
+        size=size,
+        reduce_only=True,
+    )
+
+
+async def test_a_bracketed_position_reconciles_clean(tmp_path) -> None:
+    """The legs of a bracket rest in `frontendOpenOrders`, not in `openOrders`.
+
+    Read from `openOrders` alone, every bracketed position reports its two legs missing
+    every interval, and the week without a mismatch the ROADMAP asks for cannot happen.
+    """
+    from tests.test_live_venue import COIN, START, Row, a_session, an_intent, quote
+
+    session, _venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        await session.on_fill(cloid, px=3000.0, size=0.01, ts_ms=START + 10)
+        ours = await session.orders.store.open_orders()
+        legs = session.brackets[COIN]
+        entry = next(o for o in ours if o.intent.tag == "entry")
+
+        result = reconcile(
+            our_orders=ours,
+            venue_orders=[venue_order(entry.cloid, coin=COIN, size=entry.remaining)],
+            venue_triggers=[
+                venue_trigger(legs.tp_cloid, coin=COIN),
+                venue_trigger(legs.sl_cloid, coin=COIN),
+            ],
+            our_positions={COIN: 0.01},
+            venue_positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=3000.0)},
+        )
+
+        assert result.clean, [d.detail for d in result.differences]
+        assert result.checked_orders == 6  # three ours, three theirs
+    finally:
+        await session._store.close()
+
+
+def test_a_bracket_leg_the_venue_no_longer_has_is_reported() -> None:
+    """The stop is gone and the position is not. That is the difference worth waking for."""
+    result = reconcile(
+        our_orders=[our_order("0xtp", size=0.01), our_order("0xsl", size=0.01)],
+        venue_orders=[],
+        venue_triggers=[venue_trigger("0xtp")],
+        our_positions={},
+        venue_positions={},
+    )
+
+    assert [(d.kind, d.cloid) for d in result.differences] == [("missing_order", "0xsl")]
+    assert result.worst is Severity.INVESTIGATE
+
+
+def test_a_trigger_order_we_never_placed_is_reported_like_any_other_stranger() -> None:
+    """A stop placed by hand in the UI is one the bot did not put there. Same finding."""
+    result = reconcile(
+        our_orders=[],
+        venue_orders=[],
+        venue_triggers=[venue_trigger("0xstranger")],
+        our_positions={},
+        venue_positions={},
+    )
+
+    assert [(d.kind, d.severity) for d in result.differences] == [
+        ("unknown_order", Severity.CANCEL)
+    ]
+
+
+async def test_the_reconciler_asks_the_venue_for_its_trigger_orders() -> None:
+    """`InfoReader.trigger_orders` is the second query, and it has to be made."""
+
+    class Reader:
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        async def account(self, address: str):
+            from liqfade.execution.hl import AccountSnapshot
+
+            self.asked.append("account")
+            return AccountSnapshot(equity=1.0, margin_used=0.0, withdrawable=1.0, positions={})
+
+        async def open_orders(self, address: str):
+            self.asked.append("open_orders")
+            return []
+
+        async def trigger_orders(self, address: str):
+            self.asked.append("trigger_orders")
+            return [venue_trigger("0xsl")]
+
+    reader = Reader()
+    reconciler = Reconciler(
+        reader=reader,
+        address="0x1",
+        orders=lambda: _one_leg(),
+        positions=dict,
+        compare_positions=False,
+    )
+
+    result = await reconciler.check("startup")
+
+    assert "trigger_orders" in reader.asked
+    assert result is not None and result.clean, "the leg is at the venue, in the other query"
+
+
+async def _one_leg():
+    return [our_order("0xsl", size=0.01)]

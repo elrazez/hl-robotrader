@@ -32,6 +32,7 @@ class FakeTransport:
     def __init__(self, *, acks: list[Any] | None = None) -> None:
         self.placed: list[OrderIntent] = []
         self.cancelled: list[tuple[str, str]] = []
+        self.cancelled_oids: list[tuple[str, int]] = []
         self.acks = acks or []
         self.next_oid = 1000
 
@@ -47,6 +48,9 @@ class FakeTransport:
 
     async def cancel(self, coin: str, cloid: str) -> None:
         self.cancelled.append((coin, cloid))
+
+    async def cancel_oid(self, coin: str, oid: int) -> None:
+        self.cancelled_oids.append((coin, oid))
 
 
 # Real Hyperliquid szDecimals, so the rounding these tests assert is the rounding the
@@ -622,5 +626,26 @@ async def test_an_existing_registry_without_the_table_gains_it(tmp_path: Path) -
     try:
         await store.add_refusals([a_refusal()])
         assert len(await store.refusals(0, 2_000_000_000_000)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_foreign_order_is_cancelled_by_oid_and_not_recorded(tmp_path: Path) -> None:
+    """The kill has to be able to cancel what the registry never placed.
+
+    Nothing is written down for it: there is no row to move to CANCELED, and inventing one
+    for somebody else's order is what `record_fill` already refuses to do for a fill we did
+    not expect. Reconciliation is what reasons about strangers.
+    """
+    transport = FakeTransport()
+    store = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = a_manager(store, transport)
+
+        await manager.cancel_foreign("ETH", oid=4242)
+
+        assert transport.cancelled_oids == [("ETH", 4242)]
+        assert transport.cancelled == [], "by oid, because there is no cloid to use"
+        assert await store.all_orders() == []
     finally:
         await store.close()

@@ -5,6 +5,10 @@
 
 # Data lake and run artifacts
 /data/
+# The kill flag, wherever paths.data_dir points. `/data/KILL` is covered above; this is
+# the one a run with data_dir at the repo root leaves behind. Committing a kill flag
+# would stop the next box that pulled it from starting at all.
+/KILL
 # The backtest's per-day feature cache, wherever paths.data_dir points. Derived and
 # disposable: see docs/DATA_SOURCES.md.
 cache/features/

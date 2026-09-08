@@ -312,23 +312,52 @@ async def test_a_hung_cancel_does_not_stop_the_close_from_being_tried(tmp_path: 
 
 
 async def test_a_second_kill_during_one_joins_it_rather_than_waiting_for_it(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A retried /kill during a slow kill must answer with the one in flight.
 
     The lock made the second caller wait for the first sweep and then run a second, which
     is two budgets for one question, from a caller who has already
     typed /kill twice.
+
+    Timed on a clock the test owns, the way `tests/test_backtest_progress.py` does it: the
+    venue calls charge fake seconds and the wall clock is never read. The wall clock read
+    0.4s for one sweep on an idle box and anything at all under `-n auto`, so the same
+    passing kill failed by the load on the machine it ran on.
+
+    The clock is swapped into `kill.py`'s own namespace rather than into `time` itself:
+    `asyncio` reads `time.monotonic` for every timer it holds, and a frozen one there
+    means `asyncio.sleep` never returns.
     """
-    executor = FakeExecutor(orders=["0xa"], positions={"ETH": 1.0}, slow_s=0.2)
+    clock = {"wall": 100.0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return clock["wall"]
+
+    monkeypatch.setattr("liqfade.execution.kill.time", FakeTime)
+
+    class Charged(FakeExecutor):
+        """Every venue call costs its `slow_s` in fake seconds as well as real ones."""
+
+        async def cancel(self, cloid: str) -> None:
+            clock["wall"] += self.slow_s
+            await super().cancel(cloid)
+
+        async def close_position(self, coin: str, size: float) -> None:
+            clock["wall"] += self.slow_s
+            await super().close_position(coin, size)
+
+    executor = Charged(orders=["0xa"], positions={"ETH": 1.0}, slow_s=0.2)
     switch = a_switch(tmp_path, executor, budget_s=2.0)
 
-    started = time.monotonic()
+    started = clock["wall"]
     first, second = await asyncio.gather(switch.fire(reason="one"), switch.fire(reason="two"))
-    elapsed = time.monotonic() - started
+    elapsed = clock["wall"] - started
 
     assert first == second
-    assert elapsed < 0.6  # one sweep, not two queued behind each other
+    assert 0.3 < elapsed < 0.6, elapsed  # one sweep of two calls, not two sweeps of two
     assert executor.cancelled == ["0xa"]
     assert executor.closed == [("ETH", 1.0)]
 
@@ -536,3 +565,87 @@ def test_the_first_reason_survives_a_second_writer(tmp_path: Path) -> None:
     assert write_kill_file(flag, "kill file at data/KILL") is True
     assert flag.read_text() == first
     assert "watchdog" in flag.read_text()
+
+
+async def test_a_kill_whose_venue_read_timed_out_says_unverified(tmp_path: Path) -> None:
+    """A venue that accepted and never answered is not paper, and must not read as paper.
+
+    "Venue not checked (no account to read)" is the paper sentence: there is no account.
+    Sending it after a read that ran out of budget tells an owner the kill was as good as
+    it gets on this loop, when in fact nobody knows what the account holds.
+    """
+    posted: list[str] = []
+
+    async def never_answers() -> tuple[dict[str, float], list[str]]:
+        await asyncio.sleep(5.0)
+        return {"ETH": 0.01}, []
+
+    async def slow_close(coin: str, size: float) -> None:
+        await asyncio.sleep(5.0)
+
+    async def alert(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=lambda: asyncio.sleep(0, result=[]),
+        cancel_all=lambda cloid: asyncio.sleep(0),
+        open_positions=lambda: asyncio.sleep(0, result={"ETH": 0.01}),
+        close_position=slow_close,
+        venue_state=never_answers,
+        alert=alert,
+        budget_s=0.4,
+    )
+
+    result = await switch.fire(reason="drill")
+
+    assert result.venue_flat is None, "unknown, which is neither flat nor not flat"
+    assert "no account to read" not in posted[0]
+    assert "VENUE UNVERIFIED" in posted[0]
+    assert "ETH 0.01" in posted[0], "and what was last known, so the owner knows where to look"
+
+
+async def test_a_kill_with_no_account_to_read_still_says_so(tmp_path: Path) -> None:
+    """Paper. There is no venue behind it, and that is a different sentence."""
+    posted: list[str] = []
+    executor = FakeExecutor(orders=["0xa"], positions={"ETH": 1.0})
+    switch = a_switch(tmp_path, executor, posted)
+
+    result = await switch.fire(reason="drill")
+
+    assert result.venue_flat is None
+    assert "no account to read" in posted[0]
+    assert "UNVERIFIED" not in posted[0]
+
+
+async def test_one_failed_cancel_does_not_skip_the_orders_behind_it(tmp_path: Path) -> None:
+    """The retry loop suppressed exceptions around the whole loop, not around each cancel.
+
+    So the first order the venue refused to cancel ended the pass, and everything after it
+    was left resting by a kill that had budget left to try.
+    """
+    attempts: list[str] = []
+    orders = ["0xa", "0xb"]
+
+    async def venue_state() -> tuple[dict[str, float], list[str]]:
+        return {}, list(orders)
+
+    async def cancel(ref: str) -> None:
+        attempts.append(ref)
+        if ref == "0xa":
+            raise RuntimeError("Order was never placed, already canceled, or filled")
+
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=lambda: asyncio.sleep(0, result=list(orders)),
+        cancel_all=cancel,
+        open_positions=lambda: asyncio.sleep(0, result={}),
+        close_position=lambda coin, size: asyncio.sleep(0),
+        venue_state=venue_state,
+        budget_s=1.0,
+    )
+
+    await switch.fire(reason="drill")
+
+    assert attempts.count("0xb") >= 2, "the sweep, and then the retry the failure ate"

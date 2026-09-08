@@ -204,7 +204,11 @@ async def test_a_bracket_is_registered_under_both_cloids_before_it_is_placed(
 
 
 async def test_a_refused_bracket_leaves_no_half_tracked_orders(tmp_path) -> None:
-    """If the venue refuses the group, neither leg is out there and neither is live here."""
+    """If the venue refuses the group, neither leg is out there and neither is live here.
+
+    And the caller is told: `None` rather than two cloids, so nothing can record a bracket
+    the venue never took.
+    """
     from liqfade.execution.orders import OrderIntent, OrderManager, OrderStatus, OrderStore
 
     class Transport:
@@ -228,8 +232,10 @@ async def test_a_refused_bracket_leaves_no_half_tracked_orders(tmp_path) -> None
             coin="ETH", is_long=True, size=0.006, tp_px=2490.8, sl_px=2466.1
         )
 
-        assert manager.get(legs.tp_cloid).status is OrderStatus.REJECTED
-        assert manager.get(legs.sl_cloid).status is OrderStatus.REJECTED
+        assert legs is None
+        registered = await store.all_orders()
+        assert len(registered) == 2
+        assert {order.status for order in registered} == {OrderStatus.REJECTED}
         assert await manager.open_orders() == []
     finally:
         await store.close()

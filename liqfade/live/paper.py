@@ -108,6 +108,15 @@ class PaperTransport:
         self.oid += 1
         return self.oid
 
+    async def cancel_oid(self, coin: str, oid: int) -> None:
+        """Never reached: in a simulation nothing but this process places an order.
+
+        The kill cancels by oid only for an order the venue holds and the registry does
+        not, which on this transport cannot exist. Refusing loudly beats a no-op that would
+        let a caller believe something was cancelled.
+        """
+        raise KeyError(f"{coin} oid {oid} was never placed by the fill model")
+
     async def cancel(self, coin: str, cloid: str) -> None:
         self.cancelled.append((coin, cloid))
 

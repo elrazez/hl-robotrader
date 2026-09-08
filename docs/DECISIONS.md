@@ -2958,14 +2958,14 @@ venue trade id. `ts_ms` is the response's own `time`, so one address cannot hold
 different positions in the same coin at the same venue millisecond; a second such row is a
 re-flush. `_dedup_fields` gained a case rather than a rule.
 
-**Disk, estimated and to be measured.** At 200 addresses, five universe coins each and
-1440 polls a day, about 1.4 million rows a day, of the order of the `trades` table. The
-estimate's weak term is coins-per-address: the first probed account held five open
-positions but only three were in a plausible universe. **Measure the compacted partition
-after the first full day on the VPS (`du -sh /srv/liqfade/data/parquet/hl_positions`) and
-write the real number here beside this estimate.** Above 200 MB a day the follow-up is a
-changed-only write plus an hourly full snapshot, named in a `ponytail:` comment and not
-built now.
+**Disk: estimated 1.4M rows and 200 MB, measured 1.0M rows and 34 MB.** The estimate
+assumed five universe coins per address; the box says **3.54** (708 rows per poll of 200
+addresses, hour 14:00 UTC of 2026-09-08, 46 polls, 32,571 rows, 1,094,776 bytes). Scaled
+to 1440 polls: **about 1.02 million rows and 34 MB a day**, which is 17% of the 200 MB
+line, so the changed-only write that line would have triggered is **not needed** and the
+`ponytail:` comment naming it stays a comment. The figure is from hourly files; the
+nightly compaction folds a day into one and zstd does better across it, so 34 MB is an
+upper bound. Re-measure a compacted day once one exists.
 
 **Config reload does not reach the poller.** Coinalyze's does not either; a restart applies
 a change. Said in the config comment rather than fixed, because the recorder is restarted
@@ -3041,3 +3041,39 @@ Reserved for the first `liqfade drift` over the soak's own window, on the synced
 once the soak has a day on code carrying the refusals table and the config hash. Record
 every verdict, every `NOT_COMPARABLE` and why it was not comparable, and the command line
 that produced the report.
+## 2026-09-08 (05f: the settings write nobody announced)
+
+**A settings write the running loop did not take is posted to Telegram by the panel
+itself.** The `CONFIG RELOADED` message is a side effect of a reload that applied. When
+the control socket is down, when the loop refuses restart-only keys, or when the values
+were already live, the write existed only in `overrides.yaml` and `panel_audit.jsonl`,
+both of which need someone to go and look. CLAUDE.md's settings flow promises the owner
+hears about every change, and the change made while the loop is down is exactly the one
+that is easiest to forget was ever made.
+
+Two alternatives were rejected. The panel posting **every** write would put two messages
+on the phone for the write the loop did announce, for one event. The loop posting it on
+its **next** reload is minutes away at best and never if it is down, which is the case
+this exists for. So: the loop announces what it applied, the panel announces what the
+loop did not take, and there is exactly one message per write either way.
+
+The panel unit already loads the same `/srv/liqfade/.env` as the loops, so the token and
+the chat id are in its environment, and `send_alert` never raises into the request.
+Reverse if the panel is ever run somewhere that env is not available; the message would
+then have to come from a process that has it.
+
+**`rx_ms` is stamped per address, not per poll, and the first deploy got this wrong.**
+Found by verifying the first hour in the lake rather than by a test: `ts_ms - rx_ms` ran
+positive across every row, p50 1,593 ms and p100 6,539 ms, on a box whose clock is 5.6
+**microseconds** off NTP. The cause was not skew but the poller stamping one `rx_ms` at
+the start of a poll and reusing it for all 200 addresses, which are walked sequentially
+over those 6.5 seconds. That dates every row after the first *earlier* than it actually
+arrived, and a receive time preceding the receipt is lookahead, which CLAUDE.md rule 1
+does not tolerate. Fixed the same hour, on 46 minutes of data rather than 21 days of it,
+and the test that now guards it fails against the old stamping. The general lesson is the
+one the deploy checklist already encodes: the first hour in the lake gets read, not
+assumed.
+
+`ts_ms` genuinely leads `rx_ms` for a different and harmless reason: the response's `time`
+is the venue's, and it is the field research should join on, while `rx_ms` is what
+no-lookahead checks must use. Both are now honest per row.

@@ -781,3 +781,69 @@ async def test_the_config_hash_moves_when_a_setting_the_replay_reads_moves(
     finally:
         await one.aclose()
         await other.aclose()
+
+
+async def test_reload_reaches_the_strategy_that_decides_the_next_tick(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel's writable sections are mostly the strategy's own.
+
+    A reload that swaps the loop's settings and leaves the engine on the old object
+    announces a change on Telegram and applies none of it, which is the worst of both:
+    the owner believes the box is trading under the numbers the page shows.
+    """
+    from liqfade.control.protocol import now_ms
+
+    await _reload_env(loop, monkeypatch)
+    at = now_ms()
+    a_market(loop, 3000.0, at=at)
+    await loop.session.tick(at + 1_000)  # ETH gets a detector, built under the old settings
+    engine = loop.session.strategy
+    assert engine._detectors, "a detector to be left behind by the reload"
+
+    overrides = Path(loop.settings.paths.data_dir) / "overrides.yaml"
+    overrides.write_text(
+        "strategy:\n"
+        "  min_confluence: 1\n"
+        "  rules:\n"
+        "    min_cascade_notional:\n"
+        "      enabled: true\n"
+        "      required: false\n"
+    )
+
+    result = await PaperBackend(loop).reload_config()
+
+    assert result.error is None
+    assert "strategy.min_confluence" in result.changed
+    assert engine.settings is loop.settings, "the engine reads its settings on every tick"
+    assert engine.settings.strategy.min_confluence == 1
+    # The rules and the detectors are built once and would otherwise keep the config
+    # sections they were constructed with.
+    assert "min_cascade_notional" in [rule.name for rule in engine._rules]
+    assert all(d.settings is loop.settings for d in engine._detectors.values())
+
+
+async def test_reload_reaches_a_venue_session_the_same_way(tmp_path: Path) -> None:
+    """Testnet and mainnet run `VenueSession` behind the same reload, and the same panel."""
+    from liqfade.live.loop import apply_settings
+    from tests.test_live_venue import a_session
+
+    session, _venue = await a_session(tmp_path)
+    try:
+        fresh = paper_settings(
+            tmp_path,
+            **{
+                "strategy.min_confluence": 1,
+                "strategy.rules.min_cascade_notional.enabled": True,
+                "strategy.rules.min_cascade_notional.required": False,
+            },
+        )
+
+        apply_settings(session, fresh)
+
+        assert session.settings is fresh
+        assert session.risk.settings is fresh
+        assert session.strategy.settings is fresh
+        assert "min_cascade_notional" in [rule.name for rule in session.strategy._rules]
+    finally:
+        await session._store.close()

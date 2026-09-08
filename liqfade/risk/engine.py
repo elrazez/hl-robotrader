@@ -229,6 +229,24 @@ class RiskEngine:
             self.state.peak_equity = equity
             self._persist(now_ms)
 
+    def halt(self, reason: str, now_ms: int, *, until_ms: int | None = None) -> None:
+        """Latch a halt for something the gates cannot see for themselves.
+
+        Every other halt comes out of `check_entry`, because every other gate reads state
+        this engine holds. The address action budget does not live here and the venue's own
+        rate limit arrives as a refusal on an order, so the caller that met it says so. Same
+        reason string, same Telegram line, same row in docs/RUNBOOK.md.
+
+        Args:
+            reason: the halt reason, which is what the owner reads.
+            now_ms: decision time, for the persist.
+            until_ms: when it lifts by itself. None needs a manual `/resume`.
+        """
+        if self.state.halt_reason == reason:
+            return
+        self._halt(reason, until_ms)
+        self._persist(now_ms)
+
     def resume(self, now_ms: int) -> str | None:
         """Clear a halt. Returns the reason cleared, or None when nothing was halted.
 

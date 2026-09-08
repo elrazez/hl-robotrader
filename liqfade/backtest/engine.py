@@ -70,8 +70,9 @@ from liqfade.config.models import Settings
 from liqfade.execution.policy import EntryAction, entry_action
 from liqfade.features.grid import effective_ts
 from liqfade.log import get_logger
-from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
-from liqfade.sizing import LiquidityStats, size_intent
+from liqfade.risk.engine import RiskEngine
+from liqfade.risk.entry import gate_entry
+from liqfade.sizing import LiquidityStats
 from liqfade.strategy.engine import Rejection, StrategyEngine, rejection_of
 from liqfade.strategy.types import AssetMeta, FeatureRow, Intent
 
@@ -820,64 +821,47 @@ def _place_entry(
         return
 
     row = rows[intent.coin]
-    asset = meta[intent.coin]
-    decision = size_intent(
+    gated = gate_entry(
         intent,
+        now_ms=now_ms,
         equity=portfolio.equity(mids),
         stats=LiquidityStats(
             traded_usd_window=row.traded_usd_vol_window,
             depth_usd=row.depth(intent.side),
         ),
-        meta=asset,
+        meta=meta[intent.coin],
         settings=settings,
+        risk=risk,
         coin_exposure_usd=portfolio.coin_exposure(intent.coin, mids.get(intent.coin)),
         total_exposure_usd=portfolio.gross_exposure(mids),
-    )
-    if decision.reason is not None:
-        result.sizing_blocks[decision.reason] = result.sizing_blocks.get(decision.reason, 0) + 1
-        result.recent_blocks.append((now_ms, intent.coin, "sizing", decision.reason))
-        result.refused.append(
-            rejection_of(intent, ts_ms=now_ms, reason=decision.reason, stage="sizing")
-        )
-        return
-    if decision.depth_cap_applied:
-        result.depth_capped_entries += 1
-
-    request = EntryRequest(
-        coin=intent.coin,
-        side=intent.side,
-        notional_usd=decision.notional_usd,
-        now_ms=now_ms,
-    )
-    verdict = risk.check_entry(
-        request,
-        AccountView(
-            equity=portfolio.equity(mids),
-            open_sides=portfolio.open_sides(),
-            coin_last_data_ms={
-                coin: cs.last_data_ms for coin, cs in state.items() if cs.last_data_ms is not None
-            },
-            global_last_data_ms=max(
-                (cs.last_data_ms for cs in state.values() if cs.last_data_ms is not None),
-                default=None,
-            ),
+        open_sides=portfolio.open_sides(),
+        coin_last_data_ms={
+            coin: cs.last_data_ms for coin, cs in state.items() if cs.last_data_ms is not None
+        },
+        global_last_data_ms=max(
+            (cs.last_data_ms for cs in state.values() if cs.last_data_ms is not None),
+            default=None,
         ),
     )
-    if not verdict.allowed:
-        assert verdict.reason is not None
-        result.risk_blocks[verdict.reason] = result.risk_blocks.get(verdict.reason, 0) + 1
-        result.recent_blocks.append((now_ms, intent.coin, "risk", verdict.reason))
+    if gated.gate == "sizing":
+        assert gated.reason is not None
+        result.sizing_blocks[gated.reason] = result.sizing_blocks.get(gated.reason, 0) + 1
+        result.recent_blocks.append((now_ms, intent.coin, "sizing", gated.reason))
         result.refused.append(
-            rejection_of(intent, ts_ms=now_ms, reason=verdict.reason, stage="risk")
+            rejection_of(intent, ts_ms=now_ms, reason=gated.reason, stage="sizing")
         )
         return
+    if gated.depth_cap_applied:
+        result.depth_capped_entries += 1
+    if gated.reason is not None:
+        result.risk_blocks[gated.reason] = result.risk_blocks.get(gated.reason, 0) + 1
+        result.recent_blocks.append((now_ms, intent.coin, "risk", gated.reason))
+        result.refused.append(rejection_of(intent, ts_ms=now_ms, reason=gated.reason, stage="risk"))
+        return
 
-    risk.on_entry(request)
     coin_state.intent = intent
     coin_state.reprices = 0
-    coin_state.entry = _entry_order(
-        intent, float(decision.size), coin_state, now_ms, settings, cloid
-    )
+    coin_state.entry = _entry_order(intent, gated.size, coin_state, now_ms, settings, cloid)
     result.entries_placed += 1
 
 

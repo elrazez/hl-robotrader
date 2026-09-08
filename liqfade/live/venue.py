@@ -23,6 +23,7 @@ here weakens them, and nothing here asks for a signer.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from collections import deque
@@ -34,7 +35,13 @@ from liqfade.backtest.engine import _resolve_meta
 from liqfade.backtest.fills import BookState
 from liqfade.config.models import Settings
 from liqfade.control.protocol import OrderState, PositionState
-from liqfade.execution.hl import AccountSnapshot, InfoReader, VenuePosition
+from liqfade.execution.hl import (
+    AccountSnapshot,
+    InfoReader,
+    TriggerOrder,
+    VenueOrder,
+    VenuePosition,
+)
 from liqfade.execution.orders import (
     LIVE,
     OrderIntent,
@@ -43,12 +50,14 @@ from liqfade.execution.orders import (
     new_cloid,
 )
 from liqfade.execution.policy import EntryAction, entry_action, touch_price
+from liqfade.execution.ratelimit import HALT_REASON, rate_limited
 from liqfade.execution.tpsl import TpslLegs
 from liqfade.live.features import LiveFeatureEngine
 from liqfade.live.refusals import drain
 from liqfade.log import get_logger
-from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
-from liqfade.sizing import LiquidityStats, size_intent
+from liqfade.risk.engine import RiskEngine
+from liqfade.risk.entry import gate_entry
+from liqfade.sizing import LiquidityStats
 from liqfade.strategy.engine import Rejection, rejection_of
 from liqfade.strategy.types import Intent
 
@@ -57,6 +66,12 @@ log = get_logger(__name__)
 __all__ = ["VenueSession"]
 
 RECENT_BLOCKS = 256
+# The tags an order carries when it closes a position rather than opening one. A fill on
+# one of these is a round trip the risk engine has to hear about.
+EXIT_TAGS = frozenset({"target", "stop", "flat"})
+# The two legs of a bracket. They are resting orders like any other to the venue, and the
+# only thing that tells them apart from an entry the sweep should cancel is this tag.
+BRACKET_TAGS = frozenset({"target", "stop"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +156,13 @@ class VenueSession:
         # cloid -> how much of that entry has filled, so a bracket covers the whole
         # position rather than whichever partial arrived first.
         self.filled: dict[str, float] = {}
+        # coin -> (the wall clock the intent's time stop expires at, the signed size the
+        # entry filled). The size is kept because `positions` is a mirror that lags
+        # reconciliation, and a position opened since the last one is invisible in it.
+        self.time_stops: dict[str, tuple[int, float]] = {}
+        # What the last `venue_state` read saw: ref -> (coin, oid), so a cancel for an
+        # order the registry does not hold still has somewhere to send it.
+        self._venue_orders: dict[str, tuple[str, int]] = {}
         self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
@@ -226,6 +248,7 @@ class VenueSession:
         for coin in list(self.brackets):
             if coin not in self.positions:
                 self.brackets.pop(coin, None)
+                self.time_stops.pop(coin, None)
                 log.info("bracket_released", coin=coin, reason="position closed")
 
     def equity(self) -> float:
@@ -239,7 +262,7 @@ class VenueSession:
         return {coin: position.size for coin, position in self.positions.items()}
 
     async def venue_state(self) -> tuple[dict[str, float], list[str]]:
-        """What Hyperliquid holds right now: positions, and the cloids of every open order.
+        """What Hyperliquid holds right now: positions, and a handle on every open order.
 
         The kill switch's pass criterion and its work list. Read fresh from the venue
         rather than from the local mirror, because every failure this exists for was the
@@ -248,12 +271,25 @@ class VenueSession:
 
         Trigger orders are included. They live in `frontendOpenOrders` alone, so a sweep
         reading `openOrders` leaves a bracket resting behind a closed position.
+
+        The three reads go out together. In sequence they are three Tokyo round trips, and
+        this runs inside a kill whose whole budget is four seconds and which calls it again
+        on every retry.
         """
-        account = await self.reader.account(self.address)
-        orders = await self.reader.open_orders(self.address)
-        triggers = await self.reader.trigger_orders(self.address)
-        cloids = [o.cloid for o in orders if o.cloid] + [t.cloid for t in triggers if t.cloid]
-        return {coin: p.size for coin, p in account.positions.items()}, cloids
+        account, orders, triggers = await asyncio.gather(
+            self.reader.account(self.address),
+            self.reader.open_orders(self.address),
+            self.reader.trigger_orders(self.address),
+        )
+        # Every order, including the ones with no cloid. Filtering those out dropped them
+        # from the work list and from the pass criterion at once, so a kill could report
+        # VENUE FLAT over an order placed by hand on the web UI. `cancel` takes either
+        # handle, and `_venue_orders` is how it turns one back into a coin and an oid.
+        resting: list[VenueOrder | TriggerOrder] = [*orders, *triggers]
+        self._venue_orders = {
+            (order.cloid or f"oid:{order.oid}"): (order.coin, order.oid) for order in resting
+        }
+        return {coin: p.size for coin, p in account.positions.items()}, list(self._venue_orders)
 
     async def open_order_cloids(self) -> list[str]:
         return sorted(order.cloid for order in await self.orders.open_orders())
@@ -281,7 +317,13 @@ class VenueSession:
         return intents
 
     async def age_entries(self, now_ms: int) -> None:
-        """Run the entry policy over every resting entry. The same table the backtest runs."""
+        """Age everything on the book: positions against their time stop, then the entries.
+
+        The time stop rides here because this is the one pass the loop makes on every tick,
+        and a time stop that only ran when the strategy had something to say would not be a
+        time stop. The entry policy below is the same decision table the backtest runs.
+        """
+        await self.exit_expired_positions(now_ms)
         for order in await self.orders.open_orders():
             if order.intent.tag != "entry":
                 continue
@@ -305,6 +347,37 @@ class VenueSession:
                 continue  # no book to reprice onto; hold rather than invent a price
             await self.orders.reprice(order.cloid, touch)
 
+    async def exit_expired_positions(self, now_ms: int) -> list[str]:
+        """Close every position past its intent's time stop with a reduce-only Ioc.
+
+        `intent.time_stop_s` is the strategy's own answer to a fade that has not reverted,
+        and the backtest has exited on it since Phase 4. On this path nothing read it, so a
+        position was held until its target, its stop, or forever.
+
+        The bracket goes with the position, after the closing order and never before it:
+        the venue removes both legs itself once the position is gone, but only once it is.
+
+        Returns:
+            The coins it closed, in the order it closed them.
+        """
+        expired = [
+            coin for coin, (deadline, _size) in self.time_stops.items() if now_ms >= deadline
+        ]
+        closed = []
+        for coin in expired:
+            _deadline, filled = self.time_stops.pop(coin)
+            position = self.positions.get(coin)
+            size = position.size if position is not None else filled
+            if size == 0.0:
+                continue
+            log.warning("time_stop", coin=coin, size=size, now_ms=now_ms)
+            await self.close_position(coin, size)
+            closed.append(coin)
+            legs = self.brackets.pop(coin, None)
+            if legs is not None:
+                await self._cancel_legs(legs)
+        return closed
+
     async def place(self, intent: Intent, now_ms: int, row: Any = None) -> str | None:
         """Size an intent, gate it, and rest an `Alo` at the touch if it survives both.
 
@@ -325,6 +398,15 @@ class VenueSession:
             log.info("entry_skipped", coin=intent.coin, reason="entry already working")
             return None
 
+        remaining = self.orders.actions_remaining()
+        if remaining is not None and remaining <= 0:
+            # Halted rather than merely refused: the next tick would try again, and an
+            # address that spends its allowance on retries has none left for the cancels a
+            # kill needs. prompts/05_execution.md asks for this by name and
+            # docs/RUNBOOK.md has documented the reason since Phase 5.
+            self._halt_rate_limited(now_ms, intent, self._budget_frees_at())
+            return None
+
         if intent.coin not in self.orders.sz_decimals:
             # No rules for this coin means no order. `_resolve_meta` would answer 5 for
             # anything asked of it, and a guessed grid is refused by the venue with
@@ -334,54 +416,6 @@ class VenueSession:
         if intent.coin not in self.meta:
             self.meta = _resolve_meta(self.meta, [intent.coin], self.settings)
 
-        decision = size_intent(
-            intent,
-            equity=self.equity_usd,
-            stats=LiquidityStats(
-                traded_usd_window=getattr(row, "traded_usd_vol_window", 0.0) if row else 0.0,
-                depth_usd=row.depth(intent.side) if row else 0.0,
-            ),
-            meta=self.meta[intent.coin],
-            settings=self.settings,
-            coin_exposure_usd=abs(self._notional(intent.coin)),
-            total_exposure_usd=sum(abs(self._notional(c)) for c in self.positions),
-        )
-        if decision.reason is not None:
-            self.result.blocked(
-                now_ms=now_ms,
-                coin=intent.coin,
-                gate="sizing",
-                reason=decision.reason,
-                intent=intent,
-            )
-            return None
-
-        verdict = self.risk.check_entry(
-            EntryRequest(
-                coin=intent.coin,
-                side=intent.side,
-                notional_usd=decision.notional_usd,
-                now_ms=now_ms,
-            ),
-            AccountView(
-                equity=self.equity_usd,
-                open_sides={
-                    c: ("long" if p.size > 0 else "short") for c, p in self.positions.items()
-                },
-                coin_last_data_ms=self.coin_last_ms,
-                global_last_data_ms=self.global_last_ms,
-            ),
-        )
-        if not verdict.allowed:
-            self.result.blocked(
-                now_ms=now_ms,
-                coin=intent.coin,
-                gate="risk",
-                reason=verdict.reason or "refused",
-                intent=intent,
-            )
-            return None
-
         is_buy = intent.side == "long"
         # `Alo` at the touch, `Ioc` through it. strategy/types.py: only high urgency may
         # take liquidity, and an Ioc priced at its own side of the book cannot match
@@ -389,10 +423,42 @@ class VenueSession:
         # resting orders", which would have refused every urgent entry, meaning the loop
         # took the trades the strategy considers least urgent and refused the rest.
         crossing = intent.urgency == "high"
+        # Priced before the gate rather than after it, so an intent with no book to rest
+        # against never reaches `gate_entry`: the gate records the entry it allows, and
+        # recording one for an order that was then never sent would tighten the cluster
+        # cap on a trade that did not happen.
         px = self.touch(intent.coin, is_buy=not is_buy if crossing else is_buy)
         if px is None:
             log.warning("entry_unpriceable", coin=intent.coin)
             return None
+
+        gated = gate_entry(
+            intent,
+            now_ms=now_ms,
+            equity=self.equity_usd,
+            stats=LiquidityStats(
+                traded_usd_window=getattr(row, "traded_usd_vol_window", 0.0) if row else 0.0,
+                depth_usd=row.depth(intent.side) if row else 0.0,
+            ),
+            meta=self.meta[intent.coin],
+            settings=self.settings,
+            risk=self.risk,
+            coin_exposure_usd=abs(self._notional(intent.coin)),
+            total_exposure_usd=sum(abs(self._notional(c)) for c in self.positions),
+            open_sides={c: ("long" if p.size > 0 else "short") for c, p in self.positions.items()},
+            coin_last_data_ms=self.coin_last_ms,
+            global_last_data_ms=self.global_last_ms,
+        )
+        if gated.reason is not None:
+            self.result.blocked(
+                now_ms=now_ms,
+                coin=intent.coin,
+                gate=gated.gate or "risk",
+                reason=gated.reason,
+                intent=intent,
+            )
+            return None
+
         if crossing:
             bound = self.settings.execution.taker_slippage_bps / 1e4
             px = px * (1 + bound) if is_buy else px * (1 - bound)
@@ -410,7 +476,7 @@ class VenueSession:
                 coin=intent.coin,
                 is_buy=is_buy,
                 px=px,
-                size=float(decision.size),
+                size=gated.size,
                 # Alo at the touch, per docs/STRATEGY_AND_RISK.md section 3. A high
                 # urgency intent crosses instead: strategy/types.py says only high urgency
                 # may take liquidity, and the cascade it is fading does not wait.
@@ -420,8 +486,26 @@ class VenueSession:
         )
         if order.status is OrderStatus.REJECTED:
             self.entry_intents.pop(cloid, None)
+            if rate_limited(order.reject_reason or ""):
+                self._halt_rate_limited(now_ms, intent, self._budget_frees_at())
+            # Counted, because enough refusals in ten minutes is a reason to stop trying:
+            # "Insufficient margin" or "Order has invalid size" repeating is a sizing bug
+            # and every retry of it spends address budget the kill path may need.
+            self.risk.on_reject(now_ms)
             return None
         return cloid
+
+    def _budget_frees_at(self) -> int | None:
+        """When the action window next slides, or None when nothing is counted."""
+        return self.orders.budget.free_at_ms() if self.orders.budget is not None else None
+
+    def _halt_rate_limited(self, now_ms: int, intent: Intent, until_ms: int | None) -> None:
+        """Stop entering until the request window slides. Counted, so Telegram says so."""
+        log.error("rate_limit_halt", coin=intent.coin, until_ms=until_ms)
+        self.risk.halt(HALT_REASON, now_ms, until_ms=until_ms)
+        self.result.blocked(
+            now_ms=now_ms, coin=intent.coin, gate="risk", reason=HALT_REASON, intent=intent
+        )
 
     def _notional(self, coin: str) -> float:
         """Signed USD exposure in one coin, marked to the book we have.
@@ -454,25 +538,27 @@ class VenueSession:
         """
         intent = self.entry_intents.get(cloid)
         if intent is None:
-            return  # an exit leg, or an order from before this process
+            await self._on_exit_fill(cloid, ts_ms)
+            return
         self.fills.append((ts_ms, intent.coin, "entry", px, size))
         self.filled[cloid] = self.filled.get(cloid, 0.0) + size
         total = self.filled[cloid]
 
         previous = self.brackets.pop(intent.coin, None)
         if previous is not None:
-            for leg in (previous.tp_cloid, previous.sl_cloid):
-                with contextlib.suppress(KeyError):
-                    await self.orders.cancel(leg)
+            await self._cancel_legs(previous)
 
-        legs = await self.orders.submit_bracket(
-            coin=intent.coin,
-            is_long=intent.side == "long",
-            size=total,
-            tp_px=intent.target_px,
-            sl_px=intent.stop_px,
-        )
+        legs = await self._bracket(intent, total)
+        if legs is None:
+            await self._abandon_unbracketed(cloid, intent, total, ts_ms)
+            return
         self.brackets[intent.coin] = legs
+        # From the first fill, not from the last: the clock the strategy set runs from
+        # when the position was opened, and a partial that trickles in cannot extend it.
+        self.time_stops.setdefault(
+            intent.coin,
+            (ts_ms + int(intent.time_stop_s * 1000), total if intent.side == "long" else -total),
+        )
         log.info(
             "bracket_placed",
             coin=intent.coin,
@@ -484,16 +570,149 @@ class VenueSession:
             sl_cloid=legs.sl_cloid,
         )
 
+    async def _bracket(self, intent: Intent, size: float) -> TpslLegs | None:
+        """Ask the venue for the bracket, once and then once more. None if it will not.
+
+        One retry, because the two ways this fails are worth one more attempt each: a
+        refusal that came from a size or a price the venue disliked for a moment, and a
+        transport failure where the group may equally well have landed. A duplicate bracket
+        from the second case is reduce-only and dies with the position, which is the
+        cheaper of the two ways to be wrong.
+        """
+        for attempt in (0, 1):
+            try:
+                legs = await self.orders.submit_bracket(
+                    coin=intent.coin,
+                    is_long=intent.side == "long",
+                    size=size,
+                    tp_px=intent.target_px,
+                    sl_px=intent.stop_px,
+                )
+            except Exception as exc:
+                # Including `TransientTransportError`, which used to propagate into the
+                # user stream's fill hook and be logged there as a failed hook, leaving a
+                # position open with nothing on it and nothing said about it.
+                log.error(
+                    "bracket_attempt_failed",
+                    coin=intent.coin,
+                    attempt=attempt,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                continue
+            if legs is not None:
+                return legs
+            log.error("bracket_refused", coin=intent.coin, attempt=attempt, size=size)
+        return None
+
+    async def _abandon_unbracketed(
+        self, cloid: str, intent: Intent, size: float, ts_ms: int
+    ) -> None:
+        """Close a position the venue would not let us protect, and say why.
+
+        A position without a confirmed bracket is not held. The alternative is carrying an
+        unattended position with no stop through whatever the cascade does next, which is
+        the one thing Phase 6 running unattended cannot survive.
+
+        The rest of the entry is cancelled first: it would otherwise keep filling into a
+        coin we have just decided not to be in. The reason goes to the counters rather than
+        straight to Telegram because the loop is what drains them, and `report_risk_blocks`
+        posts `bracket_failed` like any other refusal.
+        """
+        log.error("position_unbracketed", coin=intent.coin, size=size)
+        self.result.blocked(
+            now_ms=ts_ms,
+            coin=intent.coin,
+            gate="risk",
+            reason="bracket_failed",
+            intent=intent,
+        )
+        with contextlib.suppress(KeyError):
+            await self.orders.cancel(cloid)
+        self.entry_intents.pop(cloid, None)
+        self.filled.pop(cloid, None)
+        await self.close_position(intent.coin, size if intent.side == "long" else -size)
+
+    async def _on_exit_fill(self, cloid: str, ts_ms: int) -> None:
+        """A bracket leg or a flattening order filled: one round trip is closed.
+
+        This is the only thing on the venue path that moves the day's realised PnL, the
+        losing streak and the per-coin cooldown, and until it existed none of those three
+        limits could fire on testnet or on mainnet however the day went.
+
+        A partial exit is not a round trip and is left alone, exactly as the backtest's
+        `_booked` leaves one: the position is still open and the venue has not finished
+        telling us what it earned.
+        """
+        try:
+            order = self.orders.get(cloid)
+        except KeyError:
+            return  # an order from before this process, or somebody else's
+        if order.intent.tag not in EXIT_TAGS or order.status is not OrderStatus.FILLED:
+            return
+        self.fills.append((ts_ms, order.coin, order.intent.tag, order.avg_px, order.filled))
+        self.portfolio.trades.append(
+            VenueTrade(coin=order.coin, net_pnl=order.closed_pnl, ts_ms=ts_ms)
+        )
+        self.time_stops.pop(order.coin, None)
+        self.risk.on_exit(order.coin, order.closed_pnl, ts_ms)
+        log.info(
+            "round_trip_closed",
+            coin=order.coin,
+            tag=order.intent.tag,
+            net_pnl=order.closed_pnl,
+            size=order.filled,
+        )
+
+    def on_reconnect(self, now_ms: int) -> None:
+        """A critical feed came back. Enough of them in ten minutes halts entries.
+
+        Sync, because the stream's own loop is what calls it through the loop's reconnect
+        handler, and counting a reconnect must not wait on anything.
+        """
+        self.risk.on_reconnect(now_ms)
+
     # --- what the kill switch and /flat call ---------------------------------
 
-    async def cancel(self, cloid: str) -> None:
-        await self.orders.cancel(cloid)
+    async def cancel(self, ref: str) -> None:
+        """Cancel one order, by cloid when we placed it and by oid when we did not.
+
+        `ref` is what `venue_state` handed out: a cloid for an order in the registry, and
+        `oid:<n>` for one that is not in it. An order the venue holds and the registry does
+        not used to raise KeyError here, which the kill counted as a failure and moved past,
+        leaving the order resting through a kill that reported cancelling everything.
+        """
+        with contextlib.suppress(KeyError):
+            await self.orders.cancel(ref)
+            return
+        coin, oid = self._venue_orders.get(ref, ("", 0))
+        if not coin or not oid:
+            log.error("cancel_unknown_ref", ref=ref)
+            raise KeyError(ref)
+        await self.orders.cancel_foreign(coin, oid=oid)
 
     async def cancel_all(self) -> int:
-        cloids = await self.open_order_cloids()
+        """Cancel every resting order except the brackets holding open positions.
+
+        A bracket leg rests at the venue like any other order, so a sweep over "everything
+        open" takes the stop off every position we hold: `close_out` on a deploy stripped
+        the protection it had just promised to leave in place, and `/flat BTC` cancelled
+        ETH's stop on its way past. A leg comes off with its own position and not before,
+        which is `_cancel_legs`.
+        """
+        cloids = [
+            order.cloid
+            for order in await self.orders.open_orders()
+            if order.intent.tag not in BRACKET_TAGS
+        ]
         for cloid in cloids:
             await self.orders.cancel(cloid)
         return len(cloids)
+
+    async def _cancel_legs(self, legs: TpslLegs) -> None:
+        """Take one bracket off, after the position it protected has been closed."""
+        for leg in (legs.tp_cloid, legs.sl_cloid):
+            with contextlib.suppress(KeyError):
+                await self.orders.cancel(leg)
 
     async def close_position(self, coin: str, size: float = 0.0) -> None:
         """Flatten one coin with a reduce-only `Ioc`. What `/flat` and the kill call.
@@ -551,6 +770,12 @@ class VenueSession:
             if name in self.positions:
                 await self.close_position(name)
                 closed.append(name)
+                # After the close and never before it: a bracket cancelled first leaves
+                # the position unprotected for as long as the closing Ioc takes, and an
+                # Ioc that cannot match is cancelled rather than filled.
+                legs = self.brackets.pop(name, None)
+                if legs is not None:
+                    await self._cancel_legs(legs)
         # Re-read rather than assume. The venue stays the truth, and without this the
         # mirror keeps a position we have just closed until the next reconcile, up to
         # execution.reconcile_s later, refusing every new entry in that coin meanwhile.
@@ -559,7 +784,7 @@ class VenueSession:
         return closed
 
     async def close_out(self, now_ms: int) -> None:
-        """Shutdown: cancel resting orders, leave positions to the bracket at the venue.
+        """Shutdown: cancel resting entries, leave positions to the bracket at the venue.
 
         Paper flattens on the way out because a simulated position across a restart would
         be marked against a book the new process has not seen. A real one is different: it

@@ -171,6 +171,10 @@ class Order:
     filled: float = 0.0
     avg_px: float = 0.0
     fees: float = 0.0
+    # What the venue said this order realised, summed over its fills. In memory only: it
+    # is read once, by whoever books the round trip, and the registry's job is which
+    # orders exist rather than what they earned.
+    closed_pnl: float = 0.0
     reject_reason: str | None = None
     submitted_ms: int = field(default_factory=now_ms)
     updated_ms: int = field(default_factory=now_ms)
@@ -219,6 +223,8 @@ class OrderTransport(Protocol):
     async def place(self, intent: OrderIntent) -> int: ...
 
     async def cancel(self, coin: str, cloid: str) -> None: ...
+
+    async def cancel_oid(self, coin: str, oid: int) -> None: ...
 
     async def modify(self, intent: OrderIntent) -> int: ...
 
@@ -715,9 +721,26 @@ class OrderManager:
         )
         return order
 
+    async def cancel_foreign(self, coin: str, *, oid: int) -> None:
+        """Cancel an order at the venue that the registry has never heard of.
+
+        The kill sweep works from what the venue says it is holding, not from the registry,
+        because the registry can be missing an order the account really has: one placed by
+        hand, or one left by a process that died before it persisted. `cancel` refuses
+        those outright with a `KeyError`, which the sweep counted as a failure and moved
+        on from, leaving the order resting through a kill.
+
+        Nothing is recorded here. There is no row to move to CANCELED, and inventing one
+        for an order we never placed is exactly what `record_fill` refuses to do for a fill
+        we did not expect: reconciliation is the thing that reasons about strangers.
+        """
+        self._spend(reducing=True)  # counted, never refused: see execution/ratelimit.py
+        await self.transport.cancel_oid(coin, oid)
+        log.warning("foreign_order_canceled", coin=coin, oid=oid)
+
     async def submit_bracket(
         self, *, coin: str, is_long: bool, size: float, tp_px: float, sl_px: float
-    ) -> TpslLegs:
+    ) -> TpslLegs | None:
         """Attach a take profit and a stop to a position as one `positionTpsl` group.
 
         Both legs are registered here before they are placed, and persisted, because a
@@ -730,9 +753,18 @@ class OrderManager:
         legs REJECTED rather than leaving one live.
 
         Returns:
-            The two cloids. `execution/tpsl.py` explains why they are the only handle:
-            the venue answers `waitingForTrigger` with no oid, and `isPositionTpsl` reads
-            false on both legs of the group that created them.
+            The two cloids of a bracket the venue took, or **None when it refused the
+            group**. None is the whole point of the return type: the caller records a
+            bracket from a confirmed placement and from nothing else, because a position
+            that reads as protected and is not is worse than one that reads as naked.
+            `execution/tpsl.py` explains why the cloids are the only handle: the venue
+            answers `waitingForTrigger` with no oid, and `isPositionTpsl` reads false on
+            both legs of the group that created them.
+
+        Raises:
+            TransientTransportError: the group may or may not have landed. Raised rather
+                than swallowed, same as `submit`, because the caller has to decide whether
+                to try again or to close the position it cannot protect.
         """
         legs = TpslLegs(tp_cloid=new_cloid(), sl_cloid=new_cloid())
         orders = []
@@ -775,7 +807,7 @@ class OrderManager:
                 await self._transition(
                     order, OrderStatus.REJECTED, "bracket_rejected", reason=str(exc)
                 )
-            return legs
+            return None
 
         for order in orders:
             await self._transition(order, OrderStatus.ACKED, "bracket_acked", statuses=statuses)
@@ -859,8 +891,14 @@ class OrderManager:
         ts_ms: int,
         fee: float = 0.0,
         maker: bool = False,
+        closed_pnl: float = 0.0,
     ) -> Order:
         """Apply one fill. Raises KeyError for a cloid we never placed.
+
+        `closed_pnl` is Hyperliquid's own `closedPnl` for this fill, zero on a fill that
+        opened rather than closed. It is kept because it is the only realised PnL the venue
+        path has: the exit price alone would need an entry price to be netted against, and
+        the venue already did that arithmetic against the lot it actually matched.
 
         An unknown cloid is never invented into an order: a fill for something we did not
         place is a reconciliation event and a halt, not a row in our book.
@@ -875,6 +913,7 @@ class OrderManager:
         order.avg_px = (order.avg_px * order.filled + px * size) / (order.filled + size)
         order.filled += size
         order.fees += fee
+        order.closed_pnl += closed_pnl
         await self.store.add_fill(cloid, ts_ms=ts_ms, px=px, size=size, fee=fee, maker=maker)
 
         complete = order.remaining <= 1e-12
@@ -886,6 +925,7 @@ class OrderManager:
             px=px,
             size=size,
             fee=fee,
+            closed_pnl=closed_pnl,
             maker=maker,
             filled=order.filled,
             remaining=order.remaining,

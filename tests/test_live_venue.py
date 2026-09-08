@@ -7,13 +7,22 @@ against these. Nothing here reaches the network and nothing here can sign.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from liqfade.execution.hl import AccountSnapshot, VenuePosition
-from liqfade.execution.orders import OrderIntent, OrderManager, OrderStatus, OrderStore
+from liqfade.execution.orders import (
+    OrderIntent,
+    OrderManager,
+    OrderStatus,
+    OrderStore,
+    RejectError,
+    TransientTransportError,
+)
+from liqfade.execution.ratelimit import ActionBudget
 from liqfade.live.venue import VenueSession
 from liqfade.strategy.types import Intent
 from tests.test_live_loop import paper_settings
@@ -65,13 +74,17 @@ class FakeReader:
         return self.snapshot
 
 
-async def a_session(tmp_path: Path, **dotted: Any) -> tuple[VenueSession, FakeVenue]:
+async def a_session(
+    tmp_path: Path, *, budget: ActionBudget | None = None, **dotted: Any
+) -> tuple[VenueSession, FakeVenue]:
     settings = paper_settings(tmp_path, **dotted)
     store = await OrderStore.open(tmp_path / "orders.sqlite")
     venue = FakeVenue()
     session = VenueSession(
         settings,
-        orders=OrderManager(store, venue, sz_decimals={COIN: 4}, killed=lambda: False),
+        orders=OrderManager(
+            store, venue, sz_decimals={COIN: 4}, killed=lambda: False, budget=budget
+        ),
         reader=FakeReader(),
         address="0xacc",
         meta={},
@@ -620,6 +633,309 @@ async def test_closing_a_short_reaches_through_the_ask(tmp_path: Path) -> None:
         await session._store.close()
 
 
+async def test_shutdown_leaves_the_bracket_that_holds_the_position(tmp_path: Path) -> None:
+    """The legs are live orders with no tag to the sweep, so a deploy stripped every stop.
+
+    `close_out` promises the position to its bracket. Cancelling the bracket on the way out
+    leaves a position at the venue with nothing behind it until the next process gets far
+    enough to notice, which on a deploy is the whole restart.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.cancelled.clear()
+
+        await session.close_out(START + 1_000)
+
+        cancelled = {c for _coin, c in venue.cancelled}
+        assert cloid in cancelled, "the part of the entry still resting"
+        assert legs.tp_cloid not in cancelled
+        assert legs.sl_cloid not in cancelled
+        assert session.brackets[COIN] is legs
+    finally:
+        await session._store.close()
+
+
+async def test_flattening_one_coin_leaves_another_coins_bracket_alone(tmp_path: Path) -> None:
+    """`/flat BTC` cancelled ETH's stop, because the sweep cancelled every resting order."""
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.orders.sz_decimals["BTC"] = 3
+        session.ingest(
+            "bbo",
+            "hyperliquid",
+            {
+                "coin": "BTC",
+                "ts_ms": START,
+                "rx_ms": START,
+                "bid_px": 59_999.0,
+                "bid_sz": 5.0,
+                "ask_px": 60_001.0,
+                "ask_sz": 5.0,
+            },
+        )
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={
+                    COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0),
+                    "BTC": VenuePosition(coin="BTC", size=0.001, entry_px=60_000.0),
+                },
+            )
+        )
+        # What the venue answers when `flatten` re-reads it afterwards: BTC gone, ETH not.
+        session.reader.snapshot = AccountSnapshot(
+            equity=1000.0,
+            margin_used=10.0,
+            withdrawable=990.0,
+            positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+        )
+        venue.cancelled.clear()
+
+        closed = await session.flatten(now_ms=START + 2_000, coin="BTC")
+
+        assert closed == ["BTC"]
+        assert venue.placed[-1].coin == "BTC", "BTC was closed reduce-only"
+        assert venue.placed[-1].reduce_only is True
+        cancelled = {c for _coin, c in venue.cancelled}
+        assert legs.tp_cloid not in cancelled, "ETH is still open and still needs its stop"
+        assert legs.sl_cloid not in cancelled
+        assert COIN in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_flattening_a_coin_cancels_that_coins_legs_after_the_close(
+    tmp_path: Path,
+) -> None:
+    """A bracket outliving the position it protected would close the next one.
+
+    The venue removes both legs when the position goes, but only once it has gone: the
+    cancel goes out after the closing order, never before it, so there is no window where
+    the position is open and unprotected.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.cancelled.clear()
+        venue.placed.clear()
+        order_of_events: list[str] = []
+        placing, cancelling = venue.place, venue.cancel
+
+        async def watch_place(intent: OrderIntent) -> int:
+            order_of_events.append(f"place:{intent.tag}")
+            return await placing(intent)
+
+        async def watch_cancel(coin: str, cloid: str) -> None:
+            order_of_events.append(f"cancel:{cloid}")
+            await cancelling(coin, cloid)
+
+        venue.place, venue.cancel = watch_place, watch_cancel
+
+        closed = await session.flatten(now_ms=START + 2_000, coin=COIN)
+
+        assert closed == [COIN]
+        assert f"cancel:{legs.tp_cloid}" in order_of_events
+        assert order_of_events.index("place:flat") < order_of_events.index(
+            f"cancel:{legs.sl_cloid}"
+        ), "the stop came off after the close, never before it"
+        assert COIN not in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_a_position_the_venue_would_not_bracket_is_not_held(tmp_path: Path) -> None:
+    """A refused group was recorded as a placed bracket, and the position stayed open.
+
+    `submit_bracket` answered with the two cloids whether or not the venue took the group,
+    so `brackets[coin]` read as protection and `bracket_placed` said so in the journal over
+    a position wearing nothing at all.
+    """
+    session, venue = await a_session(tmp_path)
+    attempts: list[int] = []
+
+    async def refuse(requests: list[dict[str, Any]]) -> list[str]:
+        attempts.append(1)
+        raise RejectError("Order must have minimum value of $10")
+
+    try:
+        venue.place_group = refuse  # type: ignore[assignment]
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+
+        assert len(attempts) == 2, "refused once, tried once more, then gave up"
+        assert COIN not in session.brackets
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.size == 0.01, "what the entry had actually filled"
+        assert session.orders.get(cloid).status is OrderStatus.CANCELED, "no more of it fills"
+        assert session.result.risk_blocks == {"bracket_failed": 1}, "and Telegram hears it"
+    finally:
+        await session._store.close()
+
+
+async def test_a_bracket_that_lost_its_response_is_placed_on_the_retry(tmp_path: Path) -> None:
+    """A transport failure used to escape into the user stream, which swallowed it."""
+    session, venue = await a_session(tmp_path)
+    attempts: list[int] = []
+    group = venue.place_group
+
+    async def fail_once(requests: list[dict[str, Any]]) -> list[str]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TransientTransportError("connection reset")
+        return await group(requests)
+
+    try:
+        venue.place_group = fail_once  # type: ignore[assignment]
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        before = len(venue.placed)
+
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+
+        assert len(attempts) == 2
+        assert COIN in session.brackets
+        assert len(venue.placed) == before, "the position is protected, not closed"
+        assert session.result.risk_blocks == {}
+    finally:
+        await session._store.close()
+
+
+async def test_a_position_past_its_time_stop_is_closed(tmp_path: Path) -> None:
+    """`intent.time_stop_s` was on every intent and read nowhere on the venue path.
+
+    The backtest exits on it, so a run's holding times and a run's PnL were both about a
+    rule the live loop did not have: a fade that never reverted was held until the stop or
+    forever, whichever came first.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        intent = an_intent("long")  # time_stop_s of 600
+        cloid = await session.place(intent, START, Row())
+        assert cloid is not None
+        filled_at = START + 10
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=filled_at)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.placed.clear()
+        venue.cancelled.clear()
+
+        await session.age_entries(filled_at + 599_000)
+        assert venue.placed == [], "still inside its time stop"
+
+        await session.age_entries(filled_at + 600_001)
+
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.is_buy is False, "a long is closed by selling"
+        cancelled = [c for _coin, c in venue.cancelled]
+        assert legs.tp_cloid in cancelled and legs.sl_cloid in cancelled
+        assert COIN not in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_a_time_stop_closes_what_the_venue_has_not_confirmed_yet(tmp_path: Path) -> None:
+    """The mirror lags reconciliation by up to `execution.reconcile_s`, so it is not asked.
+
+    A position opened since the last reconcile is invisible in `positions`, which is how a
+    kill once reported closing something and submitted nothing at all.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("short"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=3001.0, size=0.01, ts_ms=START)
+        assert session.positions == {}, "no reconcile has run"
+        venue.placed.clear()
+
+        await session.age_entries(START + 600_001)
+
+        closing = venue.placed[-1]
+        assert closing.tag == "flat" and closing.reduce_only is True
+        assert closing.is_buy is True, "a short is closed by buying"
+        assert closing.size == 0.01
+    finally:
+        await session._store.close()
+
+
+async def test_the_kills_venue_read_asks_for_all_three_at_once(tmp_path: Path) -> None:
+    """Three Tokyo round trips in sequence is most of a kill's budget spent queueing.
+
+    The barrier is the assertion: each read waits for the other two to have started, so a
+    `venue_state` that awaited them one after another never returns at all.
+    """
+    session, _venue = await a_session(tmp_path)
+    barrier = asyncio.Barrier(3)
+
+    class SlowReader(FakeReader):
+        async def account(self, address: str) -> AccountSnapshot:
+            await barrier.wait()
+            return self.snapshot
+
+        async def open_orders(self, address: str) -> list[Any]:
+            await barrier.wait()
+            return []
+
+        async def trigger_orders(self, address: str) -> list[Any]:
+            await barrier.wait()
+            return []
+
+    try:
+        session.reader = SlowReader()
+
+        positions, cloids = await asyncio.wait_for(session.venue_state(), timeout=2.0)
+
+        assert positions == {} and cloids == []
+    finally:
+        await session._store.close()
+
+
 async def test_a_refused_entry_is_kept_and_the_tick_writes_it_to_the_registry(
     tmp_path: Path,
 ) -> None:
@@ -660,5 +976,66 @@ async def test_a_paused_tick_still_drains_what_it_refused(tmp_path: Path) -> Non
 
         assert not session.result.refused
         assert len(await session.orders.store.refusals(0, START + 10_000)) == 1
+    finally:
+        await session._store.close()
+
+
+async def test_the_kill_can_cancel_an_order_the_registry_never_heard_of(
+    tmp_path: Path,
+) -> None:
+    """Every order the venue holds is on the kill's list, whatever placed it.
+
+    Two of these were invisible to a kill. One with a cloid the registry lacks raised
+    KeyError, which the sweep counted as a failure and moved past. One with no cloid at all
+    was dropped from the work list and from the pass criterion, so a kill could report
+    VENUE FLAT over an order the account was still holding.
+    """
+    from liqfade.execution.hl import TriggerOrder, VenueOrder
+
+    session, venue = await a_session(tmp_path)
+
+    class Reader(FakeReader):
+        async def open_orders(self, address: str) -> list[VenueOrder]:
+            return [
+                VenueOrder(oid=11, coin=COIN, is_buy=True, px=2999.0, size=0.01, ts_ms=START),
+                VenueOrder(
+                    oid=12,
+                    coin=COIN,
+                    is_buy=True,
+                    px=2998.0,
+                    size=0.01,
+                    ts_ms=START,
+                    cloid="0xnotinourregistry",
+                ),
+            ]
+
+        async def trigger_orders(self, address: str) -> list[TriggerOrder]:
+            return [
+                TriggerOrder(
+                    cloid=None,
+                    coin=COIN,
+                    oid=13,
+                    trigger_px=2900.0,
+                    is_stop=True,
+                    size=0.01,
+                    reduce_only=True,
+                )
+            ]
+
+    try:
+        session.reader = Reader()
+        cancelled_by_oid: list[tuple[str, int]] = []
+
+        async def cancel_oid(coin: str, oid: int) -> None:
+            cancelled_by_oid.append((coin, oid))
+
+        venue.cancel_oid = cancel_oid  # type: ignore[attr-defined]
+
+        _positions, refs = await session.venue_state()
+        assert len(refs) == 3, "every order the venue holds, counted"
+        for ref in refs:
+            await session.cancel(ref)
+
+        assert sorted(cancelled_by_oid) == [(COIN, 11), (COIN, 12), (COIN, 13)]
     finally:
         await session._store.close()

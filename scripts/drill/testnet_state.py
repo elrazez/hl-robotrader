@@ -65,6 +65,13 @@ def wait_for(address: str, predicate, *, timeout_s: float, what: str) -> bool:
     return False
 
 
+def cooldown_s(coin: str) -> float:
+    """Seconds of `coin_cooldown` left on this coin, from the loop's own risk state."""
+    status = asyncio.run(control("status"))
+    until = getattr(status, "risk", None) and status.risk.coin_cooldowns.get(coin)
+    return max((until - time.time() * 1000.0) / 1000.0, 0.0) if until else 0.0
+
+
 async def control(cmd: str, **args: object) -> object:
     from liqfade.control import ControlClient
 
@@ -115,6 +122,19 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print(line(address))
         return 1
+    # A coin the loop has just exited is on `risk.coin_cooldown_after_exit_min`, and 30
+    # minutes of it when the round trip lost. `build` flattens first, so the coin it then
+    # enters is always the coin it just closed: say so plainly rather than time out with an
+    # empty account, which is what the first re-drill after the risk hooks landed did.
+    cooling = cooldown_s(args.position_coin)
+    if cooling > 0:
+        print(
+            f"{args.position_coin} is in coin_cooldown for another {cooling:.0f}s. "
+            f"Wait it out, or pass --position-coin with a coin the loop has not just exited.",
+            file=sys.stderr,
+        )
+        return 1
+
     asyncio.run(control("resume"))
     asyncio.run(
         control(
@@ -135,9 +155,14 @@ def main(argv: list[str] | None = None) -> int:
         print(line(address))
         return 1
 
+    # Short, and the side matters: the cluster cap counts one side of the book inside
+    # `risk.cluster_window_s`, and the position above already fills it. A second long was
+    # refused with `cluster_exposure` the moment the venue path started recording its
+    # entries (2026-09-08), which is the gate working and left this drill with no resting
+    # order at all. A short is a different cluster and rests just the same.
     asyncio.run(
         control(
-            "inject_intent", coin=args.order_coin, side="long", target_bps=300.0, stop_bps=300.0
+            "inject_intent", coin=args.order_coin, side="short", target_bps=300.0, stop_bps=300.0
         )
     )
     wait_for(
