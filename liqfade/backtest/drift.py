@@ -20,7 +20,7 @@ missing half argues for changes nobody can check.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,6 +31,7 @@ from liqfade.backtest.costs import fee_for
 from liqfade.backtest.portfolio import Trade
 from liqfade.backtest.validate import bootstrap_mean_bps
 from liqfade.config.models import Settings
+from liqfade.execution.orders import Order, OrderStore
 
 __all__ = [
     "Dimension",
@@ -44,6 +45,7 @@ __all__ = [
     "Verdict",
     "compare",
     "match_intents",
+    "read_live",
 ]
 
 
@@ -591,3 +593,120 @@ def _holes_dimension(holes: Sequence[Hole], excluded: int) -> Dimension:
             ),
         ],
     )
+
+
+# --- the live side --------------------------------------------------------------------
+
+
+async def read_live(
+    store: OrderStore, start_ms: int, end_ms: int, *, config_hash: str | None = None
+) -> Side:
+    """What the running loop did over `[start_ms, end_ms)`, out of its own registry.
+
+    An entry attempt is an `orders` row tagged `entry` **plus** every `refusals` row: the
+    replay counts an intent the moment the strategy emits one, and the live side only has
+    an order for the ones that survived sizing and risk. Leaving the refusals out would
+    make every gate the loop fired look like an intent the live side never had.
+
+    Round trips are reconstructed by pairing each filled entry with the first filled
+    reduce-only order on the same coin at or after it. The engine holds at most one
+    position per coin, so that pairing is the one that happened. A resting bracket leg
+    that never filled closes nothing, which is why the pairing is on fills rather than on
+    submissions: both legs are submitted, one of them fills.
+
+    Args:
+        store: the order registry, already open. `liqfade sync` pulls the soak's copy.
+        start_ms: window start, inclusive. Orders are placed by submission time and
+            refusals by their own `ts_ms`.
+        end_ms: window end, exclusive.
+        config_hash: what the live run reported, when it reported one. None means the run
+            did not say, which the config dimension reports as not comparable rather than
+            as agreement.
+
+    Returns:
+        The live half of the comparison.
+    """
+    orders = [o for o in await store.all_orders() if start_ms <= o.submitted_ms < end_ms]
+    fills = await store.fills()
+    filled_at: dict[str, int] = {}
+    for row in fills:
+        cloid = row["cloid"]
+        filled_at[cloid] = max(filled_at.get(cloid, 0), int(row["ts_ms"]))
+
+    intents = [
+        IntentRef(
+            coin=order.coin,
+            side="long" if order.intent.is_buy else "short",
+            ts_ms=order.submitted_ms,
+            entry_px=order.avg_px if order.filled > 0 else None,
+        )
+        for order in orders
+        if order.intent.tag == "entry"
+    ]
+    refusals: dict[tuple[str, str], int] = {}
+    for row in await store.refusals(start_ms, end_ms):
+        key = (row["stage"], row["reason"])
+        refusals[key] = refusals.get(key, 0) + 1
+        intents.append(
+            IntentRef(
+                coin=row["coin"],
+                side=row["side"],
+                ts_ms=row["ts_ms"],
+                stage=row["stage"],
+                reason=row["reason"],
+            )
+        )
+    intents.sort(key=lambda i: (i.ts_ms, i.coin))
+    return Side(
+        intents=intents,
+        round_trips=_round_trips(orders, filled_at),
+        refusals=refusals,
+        config_hash=config_hash,
+    )
+
+
+def _round_trips(orders: Sequence[Order], filled_at: Mapping[str, int]) -> list[RoundTrip]:
+    """Pair each filled entry with the filled exit that closed it, per coin, in order."""
+    trips: list[RoundTrip] = []
+    by_coin: dict[str, list[Order]] = {}
+    for order in orders:
+        if order.filled > 0:
+            by_coin.setdefault(order.coin, []).append(order)
+    for coin, coin_orders in by_coin.items():
+        coin_orders.sort(key=lambda o: filled_at.get(o.cloid, o.submitted_ms))
+        exits = [o for o in coin_orders if o.intent.reduce_only]
+        used: set[str] = set()
+        for entry in (o for o in coin_orders if o.intent.tag == "entry"):
+            opened = filled_at.get(entry.cloid, entry.submitted_ms)
+            closer = next(
+                (
+                    o
+                    for o in exits
+                    if o.cloid not in used and filled_at.get(o.cloid, o.submitted_ms) >= opened
+                ),
+                None,
+            )
+            if closer is None:
+                continue
+            used.add(closer.cloid)
+            # The closed size is whichever leg filled less: a partial exit leaves the rest
+            # of the position open, and its PnL is not realised yet. Fees are prorated onto
+            # the closed part for the same reason.
+            size = min(entry.filled, closer.filled)
+            direction = 1.0 if entry.intent.is_buy else -1.0
+            gross = (closer.avg_px - entry.avg_px) * size * direction
+            fees = entry.fees * size / entry.filled + closer.fees * size / closer.filled
+            trips.append(
+                RoundTrip(
+                    coin=coin,
+                    side="long" if entry.intent.is_buy else "short",
+                    ts_ms=opened,
+                    exit_ms=filled_at.get(closer.cloid, closer.submitted_ms),
+                    exit_reason=closer.intent.tag,
+                    entry_px=entry.avg_px,
+                    exit_px=closer.avg_px,
+                    net_pnl=gross - fees,
+                    notional=entry.avg_px * size,
+                )
+            )
+    return sorted(trips, key=lambda t: (t.ts_ms, t.coin))
