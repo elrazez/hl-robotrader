@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from collections.abc import AsyncIterator
@@ -731,3 +732,24 @@ def test_paper_forces_env_paper_whatever_was_asked_for(
 
     assert seen == ["paper"]
     assert f"ignores --env {asked}" in capsys.readouterr().err
+
+
+def test_every_subcommand_can_actually_run() -> None:
+    """A subparser with no handler parses fine and dies with a KeyError on the box.
+
+    That is exactly what `liqfade testnet` did on 2026-09-08: the unit started, argparse
+    accepted the command, and `HANDLERS[args.command]` raised, four times a minute behind
+    Restart=always. Nothing in the suite noticed, because every test that ran a command
+    named one that existed.
+    """
+    from liqfade.cli import HANDLERS, NOT_YET, build_parser
+
+    parser = build_parser()
+    subparsers = [
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ]
+    assert subparsers, "the CLI should have subcommands"
+    commands = set(subparsers[0].choices)
+
+    unroutable = sorted(commands - set(HANDLERS) - set(NOT_YET))
+    assert not unroutable, f"these parse but cannot run: {unroutable}"

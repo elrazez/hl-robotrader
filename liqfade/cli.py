@@ -1194,6 +1194,7 @@ HANDLERS = {
     "panel": cmd_panel,
     "lab": cmd_lab,
     "paper": cmd_paper,
+    "testnet": cmd_testnet,
 }
 
 
