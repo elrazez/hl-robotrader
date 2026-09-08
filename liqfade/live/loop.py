@@ -727,6 +727,7 @@ class VenueLoop(PaperLoop):
             cancel_all=session.cancel,
             open_positions=session.open_positions,
             close_position=session.close_position,
+            venue_state=session.venue_state,
             alert=self.post,
             stop=stop,
             budget_s=settings.risk.kill_budget_s,

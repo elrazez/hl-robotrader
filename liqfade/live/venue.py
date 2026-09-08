@@ -233,6 +233,21 @@ class VenueSession:
         """Coin to signed size, for the kill switch and `/flat`."""
         return {coin: position.size for coin, position in self.positions.items()}
 
+    async def venue_state(self) -> tuple[dict[str, float], int]:
+        """What Hyperliquid holds right now: positions and an open order count.
+
+        The kill switch's pass criterion. Read fresh from the venue rather than from the
+        local mirror, because the whole failure this exists for was a kill trusting its
+        own bookkeeping over the account.
+        """
+        account = await self.reader.account(self.address)
+        orders = await self.reader.open_orders(self.address)
+        triggers = await self.reader.trigger_orders(self.address)
+        return (
+            {coin: p.size for coin, p in account.positions.items()},
+            len(orders) + len(triggers),
+        )
+
     async def open_order_cloids(self) -> list[str]:
         return sorted(order.cloid for order in await self.orders.open_orders())
 

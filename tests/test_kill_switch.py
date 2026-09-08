@@ -368,3 +368,125 @@ async def test_the_confirmation_names_a_few_abandoned_targets_and_counts_the_res
     assert posted
     assert len(posted[0]) < 400, f"confirmation is {len(posted[0])} characters"
     assert "0x" + "0" * 32 in posted[0]  # still names some of them
+
+
+# --- the venue decides whether a kill worked, not the counters --------------------
+
+
+class VenueBook:
+    """A venue that only really lets go of things when told to."""
+
+    def __init__(
+        self, *, positions: dict[str, float], orders: list[str], stubborn: int | None = 0
+    ) -> None:
+        self.positions = dict(positions)
+        self.orders = list(orders)
+        self.close_calls: list[str] = []
+        # How many close attempts to ignore before working. None never works, which is
+        # a venue that accepts every close and holds the position anyway.
+        self.stubborn = stubborn
+
+    async def open_orders(self) -> list[str]:
+        return list(self.orders)
+
+    async def cancel(self, cloid: str) -> None:
+        if cloid in self.orders:
+            self.orders.remove(cloid)
+
+    async def open_positions(self) -> dict[str, float]:
+        return dict(self.positions)
+
+    async def close(self, coin: str, size: float = 0.0) -> None:
+        self.close_calls.append(coin)
+        if self.stubborn is None:
+            return  # accepted and did nothing, forever
+        if self.stubborn > 0:
+            self.stubborn -= 1
+            return  # accepted and did nothing, which is what the refused Ioc did
+        self.positions.pop(coin, None)
+
+    async def venue_state(self) -> tuple[dict[str, float], int]:
+        return dict(self.positions), len(self.orders)
+
+
+async def test_a_kill_confirms_against_the_venue_not_its_own_counters(tmp_path: Path) -> None:
+    """Drilled on testnet: "cancelled 2, closed 1" while the venue held all of it.
+
+    The counters say what was attempted. Only a read of clearinghouseState and openOrders
+    says what is true, and that read is the pass criterion for every kill from here on.
+    """
+    venue = VenueBook(positions={"ETH": 0.064}, orders=["0xa", "0xb"])
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=venue.open_orders,
+        cancel_all=venue.cancel,
+        open_positions=venue.open_positions,
+        close_position=venue.close,
+        venue_state=venue.venue_state,
+        budget_s=2.0,
+    )
+
+    result = await switch.fire("drill")
+
+    assert result.venue_flat is True
+    assert result.venue_positions == {}
+    assert result.venue_orders == 0
+
+
+async def test_a_kill_that_cannot_flatten_says_so_and_retries(tmp_path: Path) -> None:
+    """A close the venue accepts and ignores must not read as done.
+
+    This is exactly what the refused reduce-only order looked like: accepted, counted,
+    and the position still there. The sweep retries within its budget and, if the venue
+    still holds something, the result says NOT flat and names what is left.
+    """
+    posted: list[str] = []
+
+    async def alert(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    venue = VenueBook(positions={"ETH": 0.064}, orders=[], stubborn=1)
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=venue.open_orders,
+        cancel_all=venue.cancel,
+        open_positions=venue.open_positions,
+        close_position=venue.close,
+        venue_state=venue.venue_state,
+        alert=alert,
+        budget_s=3.0,
+    )
+
+    result = await switch.fire("drill")
+
+    assert venue.close_calls[:2] == ["ETH", "ETH"], "it retried the close it could not confirm"
+    assert result.venue_flat is True
+    assert "flat" in posted[0].lower()
+
+
+async def test_a_kill_that_never_flattens_reports_what_is_left(tmp_path: Path) -> None:
+    posted: list[str] = []
+
+    async def alert(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    venue = VenueBook(positions={"ETH": 0.064}, orders=[], stubborn=None)
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=venue.open_orders,
+        cancel_all=venue.cancel,
+        open_positions=venue.open_positions,
+        close_position=venue.close,
+        venue_state=venue.venue_state,
+        alert=alert,
+        budget_s=1.0,
+    )
+
+    result = await switch.fire("drill")
+
+    assert result.venue_flat is False
+    assert result.venue_positions == {"ETH": 0.064}
+    assert "NOT flat" in posted[0] or "not flat" in posted[0].lower()
+    assert "ETH" in posted[0]

@@ -187,10 +187,20 @@ class FlatResult(Base):
 
 
 class KillResult(Base):
+    # What the venue said after the sweep, which is what decides whether a kill worked.
+    # None means it could not be checked: paper has no account to read, and "unverified"
+    # must never be reported as "flat".
     killed: bool
     canceled_orders: int = Field(0, ge=0)
     closed_positions: int = Field(0, ge=0)
     reason: str | None = None
+    venue_flat: bool | None = Field(
+        None, description="what the venue said after the sweep; None means it could not be read"
+    )
+    venue_positions: dict[str, float] = Field(
+        default_factory=dict, description="coin to signed size the venue still holds"
+    )
+    venue_orders: int = Field(0, ge=0, description="orders the venue still holds")
 
 
 class ReloadResult(Base):

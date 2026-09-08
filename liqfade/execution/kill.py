@@ -58,6 +58,7 @@ DEFAULT_BUDGET_S = 4.0
 # Abandoned targets named in the confirmation before it says "and N more". The count is
 # the number that matters at a glance; a few cloids are what make it actionable. The full
 # list goes in the log line, where a machine reads it.
+RETRY_PAUSE_S = 0.25  # between kill retries, so a sweep does not rate limit itself
 NAMED_IN_CONFIRMATION = 5
 
 
@@ -72,6 +73,7 @@ class KillSwitch:
         cancel_all: Callable[[str], Awaitable[None]],
         open_positions: Callable[[], Awaitable[Mapping[str, float]]],
         close_position: Callable[[str, float], Awaitable[None]],
+        venue_state: Callable[[], Awaitable[tuple[Mapping[str, float], int]]] | None = None,
         alert: Callable[[str], Awaitable[bool]] | None = None,
         stop: asyncio.Event | None = None,
         budget_s: float = DEFAULT_BUDGET_S,
@@ -83,6 +85,12 @@ class KillSwitch:
             cancel_all: cancel one cloid.
             open_positions: coin to signed size, positive long.
             close_position: close one coin's signed size with an IOC reduce-only order.
+            venue_state: reads the venue for (positions, open order count) and is what
+                decides whether the kill worked. The counters only say what was attempted:
+                on 2026-09-08 a kill reported "cancelled 2, closed 1" while Hyperliquid
+                still held the position, one order and a bracket leg, because its own
+                closing order had been refused by its own flag. None means unverifiable,
+                which paper is, and the result then says so rather than claiming flat.
             alert: Telegram. Optional, so the switch works with Telegram down.
             stop: the process shutdown event, set after the flattening, so the loop stops
                 only once there is nothing left for it to manage.
@@ -94,6 +102,7 @@ class KillSwitch:
         self._cancel = cancel_all
         self._open_positions = open_positions
         self._close = close_position
+        self._venue_state = venue_state
         self._alert = alert
         self._stop = stop
         self.budget_s = budget_s
@@ -129,10 +138,22 @@ class KillSwitch:
         )
         closed, close_failures, stuck_closes = await self._close_everything(started + self.budget_s)
 
+        # What the venue says, which is the only thing that decides whether this worked.
+        # Retry the close for as long as the budget allows: a close the venue accepts and
+        # ignores is exactly what the refused reduce-only order looked like, and counting
+        # it as done is how a kill reports success over an open position.
+        venue_positions, venue_orders, verified = await self._verify(started + self.budget_s)
+
         if self._stop is not None:
             self._stop.set()
 
         parts = [reason] if reason else []
+        if verified and not (not venue_positions and venue_orders == 0):
+            parts.append(
+                "VENUE NOT FLAT: still holding "
+                + ", ".join(f"{coin} {size:g}" for coin, size in sorted(venue_positions.items()))
+                + f", {venue_orders} order(s)"
+            )
         if cancel_failures:
             parts.append(f"{cancel_failures} cancel(s) failed")
         if stuck_cancels:
@@ -156,15 +177,68 @@ class KillSwitch:
             abandoned=[*stuck_cancels, *stuck_closes],
             elapsed_s=round(time.monotonic() - started, 3),
             budget_s=self.budget_s,
+            venue_flat=(not venue_positions and venue_orders == 0) if verified else None,
+            venue_positions=dict(venue_positions),
+            venue_orders=venue_orders,
         )
         result = KillResult(
             killed=written,
             canceled_orders=cancelled,
             closed_positions=closed,
             reason=detail,
+            venue_flat=(not venue_positions and venue_orders == 0) if verified else None,
+            venue_positions=dict(venue_positions),
+            venue_orders=venue_orders,
         )
         await self._confirm(result)
         return result
+
+    async def _verify(self, deadline: float) -> tuple[dict[str, float], int, bool]:
+        """Read the venue, and keep closing what it still holds until the budget runs out.
+
+        Returns the venue's last known positions, its open order count, and whether the
+        read succeeded at all. An unverified kill is reported as unverified: paper has no
+        venue to ask, and a read that timed out is not the same as a flat account.
+        """
+        if self._venue_state is None:
+            return {}, 0, False
+
+        positions: dict[str, float] = {}
+        orders = 0
+        verified = False
+        while True:
+            try:
+                venue_positions, orders = await _before(self._venue_state(), deadline)
+            except Exception as exc:
+                log.error("kill_verify_failed", error=f"{type(exc).__name__}: {exc}")
+                return positions, orders, verified
+            positions = dict(venue_positions)
+            verified = True
+
+            if not positions and orders == 0:
+                log.info("kill_verified_flat")
+                return positions, orders, True
+            if time.monotonic() + RETRY_PAUSE_S >= deadline:
+                # No time left to try again and confirm it, so report what is still there.
+                log.error("kill_venue_not_flat", positions=positions, orders=orders)
+                return positions, orders, True
+
+            log.warning("kill_retrying_close", positions=positions, orders=orders)
+            # A pause between attempts: hammering the venue inside a kill spends the
+            # address action budget on retries and can rate limit the very calls that
+            # would flatten the account.
+            await asyncio.sleep(RETRY_PAUSE_S)
+            for coin, size in list(positions.items()):
+                if time.monotonic() >= deadline:
+                    break
+                with contextlib.suppress(Exception):
+                    await _before(self._close(coin, size), deadline)
+            if orders and time.monotonic() < deadline:
+                with contextlib.suppress(Exception):
+                    for cloid in list(await _before(self._open_orders(), deadline)):
+                        if time.monotonic() >= deadline:
+                            break
+                        await _before(self._cancel(cloid), deadline)
 
     async def _cancel_everything(self, deadline: float) -> tuple[int, int, list[str]]:
         try:
@@ -206,8 +280,21 @@ class KillSwitch:
     async def _confirm(self, result: KillResult) -> None:
         if self._alert is None:
             return
+        # The venue's verdict leads, because the counters say what was attempted and
+        # that is what read as success over an open position on 2026-09-08.
+        if result.venue_flat is True:
+            verdict = "VENUE FLAT."
+        elif result.venue_flat is False:
+            held = ", ".join(f"{c} {s:g}" for c, s in sorted(result.venue_positions.items()))
+            verdict = (
+                f"VENUE NOT FLAT: still holding {held or 'nothing'}, "
+                f"{result.venue_orders} order(s). ACT BY HAND."
+            )
+        else:
+            verdict = "Venue not checked (no account to read)."
         text = (
-            f"KILL fired. Cancelled {result.canceled_orders} order(s), "
+            f"KILL fired. {verdict} "
+            f"Cancelled {result.canceled_orders} order(s), "
             f"closed {result.closed_positions} position(s). "
             f"{'Flag written.' if result.killed else 'FLAG NOT WRITTEN.'}"
         )

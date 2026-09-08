@@ -385,6 +385,12 @@ class InfoReader:
     async def open_orders(self, address: str) -> list[VenueOrder]:
         return parse_open_orders(await self.post({"type": "openOrders", "user": address}))
 
+    async def trigger_orders(self, address: str) -> list[TriggerOrder]:
+        """Resting trigger orders, which `openOrders` does not carry at all."""
+        return parse_trigger_orders(
+            await self.post({"type": "frontendOpenOrders", "user": address})
+        )
+
     async def user_fills(self, address: str) -> list[VenueFill]:
         return parse_user_fills(await self.post({"type": "userFills", "user": address}))
 
