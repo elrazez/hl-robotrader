@@ -49,13 +49,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 
 import aiosqlite
 
 from liqfade.control.protocol import OrderState, now_ms
 from liqfade.execution.ratelimit import ActionBudget, BudgetExhaustedError
 from liqfade.execution.rounding import RoundingError, round_price, round_size
+from liqfade.execution.tpsl import TpslLegs, tpsl_requests
 from liqfade.log import get_logger
 
 log = get_logger(__name__)
@@ -216,6 +217,8 @@ class OrderTransport(Protocol):
     async def cancel(self, coin: str, cloid: str) -> None: ...
 
     async def modify(self, intent: OrderIntent) -> int: ...
+
+    async def place_group(self, requests: list[dict[str, Any]]) -> list[str]: ...
 
 
 SCHEMA = """
@@ -643,6 +646,72 @@ class OrderManager:
             remaining=order.remaining,
         )
         return order
+
+    async def submit_bracket(
+        self, *, coin: str, is_long: bool, size: float, tp_px: float, sl_px: float
+    ) -> TpslLegs:
+        """Attach a take profit and a stop to a position as one `positionTpsl` group.
+
+        Both legs are registered here before they are placed, and persisted, because a
+        trigger order the venue holds and the registry does not is a stop nobody is
+        tracking: reconciliation would report it as a stranger's order for as long as it
+        rests, and a restart would not know to look for it.
+
+        The group is one action to us and one refusal if it fails. A group half accepted
+        would leave a position that looks protected and is not, so a refusal marks both
+        legs REJECTED rather than leaving one live.
+
+        Returns:
+            The two cloids. `execution/tpsl.py` explains why they are the only handle:
+            the venue answers `waitingForTrigger` with no oid, and `isPositionTpsl` reads
+            false on both legs of the group that created them.
+        """
+        legs = TpslLegs(tp_cloid=new_cloid(), sl_cloid=new_cloid())
+        orders = []
+        for cloid, px, tag in (
+            (legs.tp_cloid, tp_px, "target"),
+            (legs.sl_cloid, sl_px, "stop"),
+        ):
+            intent = OrderIntent(
+                cloid=cloid,
+                coin=coin,
+                is_buy=not is_long,
+                px=px,
+                size=size,
+                tif="Ioc",  # isMarket on the trigger: a gap must not leave a stop unfilled
+                reduce_only=True,
+                tag=tag,
+                trigger_px=px,
+                tpsl="tp" if tag == "target" else "sl",
+            )
+            order = Order(intent=self._rounded(intent), status=OrderStatus.NEW)
+            self._orders[cloid] = order
+            orders.append(order)
+            await self._persist(order, "bracket_leg_registered", tag=tag, px=px)
+
+        requests = tpsl_requests(
+            coin=coin,
+            is_long=is_long,
+            size=orders[0].intent.size,
+            tp_px=orders[0].intent.px,
+            sl_px=orders[1].intent.px,
+            tp_cloid=legs.tp_cloid,
+            sl_cloid=legs.sl_cloid,
+        )
+        try:
+            self._spend(reducing=True)  # a bracket reduces risk; never refused
+            statuses = await self.transport.place_group(requests)
+        except RejectError as exc:
+            for order in orders:
+                order.reject_reason = str(exc)
+                await self._transition(
+                    order, OrderStatus.REJECTED, "bracket_rejected", reason=str(exc)
+                )
+            return legs
+
+        for order in orders:
+            await self._transition(order, OrderStatus.ACKED, "bracket_acked", statuses=statuses)
+        return legs
 
     async def reprice(self, cloid: str, px: float) -> Order:
         """Move a resting order to `px`, keeping its cloid. The entry policy's one action.

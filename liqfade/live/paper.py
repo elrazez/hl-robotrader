@@ -60,6 +60,7 @@ from liqfade.execution.orders import (
     OrderManager,
     OrderStatus,
     OrderStore,
+    RejectError,
     new_cloid,
 )
 from liqfade.execution.ratelimit import ActionBudget
@@ -119,6 +120,16 @@ class PaperTransport:
         self.modified.append(intent)
         self.oid += 1
         return self.oid
+
+    async def place_group(self, requests: list[dict[str, Any]]) -> list[str]:
+        """Paper brackets its positions through the engine's own exit orders.
+
+        The engine already rests a target and checks a stop every tick, so a paper
+        bracket would be a second set of exits racing the first. This exists to satisfy
+        the transport protocol and refuses rather than pretending, because a silent no-op
+        here would look like a bracket the paper run does not have.
+        """
+        raise RejectError("paper brackets through the engine's exits, not positionTpsl")
 
 
 class _RecordingStrategy(StrategyEngine):

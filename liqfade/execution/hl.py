@@ -43,9 +43,11 @@ __all__ = [
     "VenueOrder",
     "VenuePosition",
     "as_transport_error",
+    "classify_group_response",
     "classify_order_response",
     "parse_clearinghouse_state",
     "parse_open_orders",
+    "parse_trigger_orders",
     "parse_user_fills",
 ]
 
@@ -150,6 +152,26 @@ def classify_order_response(response: Any) -> int:
     raise RejectError(f"unrecognised order status: {status!r}")
 
 
+def classify_group_response(response: Any) -> list[str]:
+    """The per-leg statuses, or the reason one of them was refused.
+
+    Raises:
+        RejectError: the group was refused, or any single leg was. One leg refused leaves
+            the position with half a bracket, which is worse than none because it looks
+            protected. The caller cancels the survivor and reports.
+    """
+    if not isinstance(response, dict) or response.get("status") != "ok":
+        raise RejectError(str((response or {}).get("response") or response))
+    data = response.get("response", {})
+    statuses = data.get("data", {}).get("statuses") if isinstance(data, dict) else None
+    if not statuses:
+        raise RejectError(f"tpsl group carried no status: {response!r}")
+    for status in statuses:
+        if isinstance(status, dict) and "error" in status:
+            raise RejectError(str(status["error"]))
+    return [str(status) for status in statuses]
+
+
 def as_transport_error(exc: BaseException) -> Exception:
     """Classify an exception the SDK raised. Transient only when it may not have landed."""
     if isinstance(exc, TRANSIENT_EXCEPTIONS):
@@ -199,6 +221,48 @@ def parse_open_orders(payload: Any) -> list[VenueOrder]:
                 size=_f(row.get("sz")),
                 ts_ms=int(row.get("timestamp", 0)),
                 cloid=row.get("cloid"),
+            )
+        )
+    return orders
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerOrder:
+    """One resting trigger order, from `frontendOpenOrders`.
+
+    Trigger orders do not appear in `openOrders` at all, so reconciliation that reads only
+    that endpoint sees a position with no protection on it.
+    """
+
+    cloid: str | None
+    coin: str
+    oid: int
+    trigger_px: float
+    is_stop: bool
+    size: float
+    reduce_only: bool
+
+
+def parse_trigger_orders(payload: Any) -> list[TriggerOrder]:
+    """The trigger orders in a `frontendOpenOrders` payload, plain limits skipped.
+
+    `orderType` is the discriminator, spelled "Stop Market" and "Take Profit Market" in
+    the measured payload. `isPositionTpsl` is deliberately not read: it is false on both
+    legs of a `positionTpsl` group, so filtering on it finds nothing.
+    """
+    orders = []
+    for row in payload or []:
+        if not row.get("isTrigger"):
+            continue
+        orders.append(
+            TriggerOrder(
+                cloid=row.get("cloid"),
+                coin=str(row.get("coin")),
+                oid=int(row.get("oid", 0)),
+                trigger_px=_f(row.get("triggerPx")),
+                is_stop="stop" in str(row.get("orderType", "")).lower(),
+                size=_f(row.get("sz")),
+                reduce_only=bool(row.get("reduceOnly")),
             )
         )
     return orders
@@ -309,6 +373,25 @@ class HyperliquidTransport:
         except Exception as exc:
             raise as_transport_error(exc) from exc
         return classify_order_response(response)
+
+    async def place_group(self, requests: list[dict[str, Any]]) -> list[str]:
+        """Place a `positionTpsl` group: the whole bracket, or nothing.
+
+        `grouping="positionTpsl"` is what ties the legs to the position rather than to
+        each other, which is what makes the venue cancel both when the position closes
+        (measured, docs/HYPERLIQUID.md probe 3). Without it the two are unrelated orders
+        and a closed position leaves both resting.
+        """
+        from hyperliquid.utils.types import Cloid
+
+        wire = [{**request, "cloid": Cloid.from_str(str(request["cloid"]))} for request in requests]
+        try:
+            response = await asyncio.to_thread(
+                self._exchange.bulk_orders, wire, grouping="positionTpsl"
+            )
+        except Exception as exc:
+            raise as_transport_error(exc) from exc
+        return classify_group_response(response)
 
     async def modify(self, intent: OrderIntent) -> int:
         """Move a resting order to a new price, addressed by its cloid.
