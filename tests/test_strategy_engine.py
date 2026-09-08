@@ -243,6 +243,32 @@ class TestRuleLayer:
         assert rejection.stage == "rule"
         assert rejection.explain["min_cascade_notional.cascade_notional_usd"] == 4_000_000.0
 
+    def test_a_rejection_carries_the_prices_the_intent_would_have_traded_at(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The refusal scorer needs a counterfactual, and a reason alone is not one.
+
+        Rules and filters both run after `_price`, so every rejection the engine records
+        was a fully priced intent. Keeping the prices is what lets `liqfade refusals` say
+        what the refusal was worth instead of only how often it fired.
+        """
+        settings = settings_factory(
+            **{
+                "strategy.rules.min_cascade_notional.enabled": True,
+                "strategy.rules.min_cascade_notional.min_notional_usd": 9_000_000.0,
+            }
+        )
+        engine = StrategyEngine(settings, META)
+        assert run_to_signal(engine) == []
+
+        (rejection,) = engine.take_rejections()
+        assert rejection.entry_px > 0
+        assert rejection.stop_px > 0
+        assert rejection.target_px > rejection.entry_px  # a long fade of a long liquidation
+        assert rejection.stop_px < rejection.entry_px
+        assert rejection.time_stop_s == settings.intent.time_stop_s
+        assert rejection.urgency in ("normal", "high")
+
     def test_a_passing_rule_leaves_the_intent_and_its_values_in_explain(
         self, settings_factory: SettingsFactory
     ) -> None:
