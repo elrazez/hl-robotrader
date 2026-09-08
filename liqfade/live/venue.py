@@ -59,6 +59,9 @@ RECENT_BLOCKS = 256
 # The tags an order carries when it closes a position rather than opening one. A fill on
 # one of these is a round trip the risk engine has to hear about.
 EXIT_TAGS = frozenset({"target", "stop", "flat"})
+# The two legs of a bracket. They are resting orders like any other to the venue, and the
+# only thing that tells them apart from an entry the sweep should cancel is this tag.
+BRACKET_TAGS = frozenset({"target", "stop"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,9 +446,7 @@ class VenueSession:
 
         previous = self.brackets.pop(intent.coin, None)
         if previous is not None:
-            for leg in (previous.tp_cloid, previous.sl_cloid):
-                with contextlib.suppress(KeyError):
-                    await self.orders.cancel(leg)
+            await self._cancel_legs(previous)
 
         legs = await self.orders.submit_bracket(
             coin=intent.coin,
@@ -510,10 +511,28 @@ class VenueSession:
         await self.orders.cancel(cloid)
 
     async def cancel_all(self) -> int:
-        cloids = await self.open_order_cloids()
+        """Cancel every resting order except the brackets holding open positions.
+
+        A bracket leg rests at the venue like any other order, so a sweep over "everything
+        open" takes the stop off every position we hold: `close_out` on a deploy stripped
+        the protection it had just promised to leave in place, and `/flat BTC` cancelled
+        ETH's stop on its way past. A leg comes off with its own position and not before,
+        which is `_cancel_legs`.
+        """
+        cloids = [
+            order.cloid
+            for order in await self.orders.open_orders()
+            if order.intent.tag not in BRACKET_TAGS
+        ]
         for cloid in cloids:
             await self.orders.cancel(cloid)
         return len(cloids)
+
+    async def _cancel_legs(self, legs: TpslLegs) -> None:
+        """Take one bracket off, after the position it protected has been closed."""
+        for leg in (legs.tp_cloid, legs.sl_cloid):
+            with contextlib.suppress(KeyError):
+                await self.orders.cancel(leg)
 
     async def close_position(self, coin: str, size: float = 0.0) -> None:
         """Flatten one coin with a reduce-only `Ioc`. What `/flat` and the kill call.
@@ -571,6 +590,12 @@ class VenueSession:
             if name in self.positions:
                 await self.close_position(name)
                 closed.append(name)
+                # After the close and never before it: a bracket cancelled first leaves
+                # the position unprotected for as long as the closing Ioc takes, and an
+                # Ioc that cannot match is cancelled rather than filled.
+                legs = self.brackets.pop(name, None)
+                if legs is not None:
+                    await self._cancel_legs(legs)
         # Re-read rather than assume. The venue stays the truth, and without this the
         # mirror keeps a position we have just closed until the next reconcile, up to
         # execution.reconcile_s later, refusing every new entry in that coin meanwhile.
@@ -579,7 +604,7 @@ class VenueSession:
         return closed
 
     async def close_out(self, now_ms: int) -> None:
-        """Shutdown: cancel resting orders, leave positions to the bracket at the venue.
+        """Shutdown: cancel resting entries, leave positions to the bracket at the venue.
 
         Paper flattens on the way out because a simulated position across a restart would
         be marked against a book the new process has not seen. A real one is different: it

@@ -618,3 +618,145 @@ async def test_closing_a_short_reaches_through_the_ask(tmp_path: Path) -> None:
         assert order.px > 3010.0
     finally:
         await session._store.close()
+
+
+async def test_shutdown_leaves_the_bracket_that_holds_the_position(tmp_path: Path) -> None:
+    """The legs are live orders with no tag to the sweep, so a deploy stripped every stop.
+
+    `close_out` promises the position to its bracket. Cancelling the bracket on the way out
+    leaves a position at the venue with nothing behind it until the next process gets far
+    enough to notice, which on a deploy is the whole restart.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.cancelled.clear()
+
+        await session.close_out(START + 1_000)
+
+        cancelled = {c for _coin, c in venue.cancelled}
+        assert cloid in cancelled, "the part of the entry still resting"
+        assert legs.tp_cloid not in cancelled
+        assert legs.sl_cloid not in cancelled
+        assert session.brackets[COIN] is legs
+    finally:
+        await session._store.close()
+
+
+async def test_flattening_one_coin_leaves_another_coins_bracket_alone(tmp_path: Path) -> None:
+    """`/flat BTC` cancelled ETH's stop, because the sweep cancelled every resting order."""
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.orders.sz_decimals["BTC"] = 3
+        session.ingest(
+            "bbo",
+            "hyperliquid",
+            {
+                "coin": "BTC",
+                "ts_ms": START,
+                "rx_ms": START,
+                "bid_px": 59_999.0,
+                "bid_sz": 5.0,
+                "ask_px": 60_001.0,
+                "ask_sz": 5.0,
+            },
+        )
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={
+                    COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0),
+                    "BTC": VenuePosition(coin="BTC", size=0.001, entry_px=60_000.0),
+                },
+            )
+        )
+        # What the venue answers when `flatten` re-reads it afterwards: BTC gone, ETH not.
+        session.reader.snapshot = AccountSnapshot(
+            equity=1000.0,
+            margin_used=10.0,
+            withdrawable=990.0,
+            positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+        )
+        venue.cancelled.clear()
+
+        closed = await session.flatten(now_ms=START + 2_000, coin="BTC")
+
+        assert closed == ["BTC"]
+        assert venue.placed[-1].coin == "BTC", "BTC was closed reduce-only"
+        assert venue.placed[-1].reduce_only is True
+        cancelled = {c for _coin, c in venue.cancelled}
+        assert legs.tp_cloid not in cancelled, "ETH is still open and still needs its stop"
+        assert legs.sl_cloid not in cancelled
+        assert COIN in session.brackets
+    finally:
+        await session._store.close()
+
+
+async def test_flattening_a_coin_cancels_that_coins_legs_after_the_close(
+    tmp_path: Path,
+) -> None:
+    """A bracket outliving the position it protected would close the next one.
+
+    The venue removes both legs when the position goes, but only once it has gone: the
+    cancel goes out after the closing order, never before it, so there is no window where
+    the position is open and unprotected.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        cloid = await session.place(an_intent("long"), START, Row())
+        assert cloid is not None
+        await session.on_fill(cloid, px=2999.0, size=0.01, ts_ms=START + 10)
+        legs = session.brackets[COIN]
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=2999.0)},
+            )
+        )
+        venue.cancelled.clear()
+        venue.placed.clear()
+        order_of_events: list[str] = []
+        placing, cancelling = venue.place, venue.cancel
+
+        async def watch_place(intent: OrderIntent) -> int:
+            order_of_events.append(f"place:{intent.tag}")
+            return await placing(intent)
+
+        async def watch_cancel(coin: str, cloid: str) -> None:
+            order_of_events.append(f"cancel:{cloid}")
+            await cancelling(coin, cloid)
+
+        venue.place, venue.cancel = watch_place, watch_cancel
+
+        closed = await session.flatten(now_ms=START + 2_000, coin=COIN)
+
+        assert closed == [COIN]
+        assert f"cancel:{legs.tp_cloid}" in order_of_events
+        assert order_of_events.index("place:flat") < order_of_events.index(
+            f"cancel:{legs.sl_cloid}"
+        ), "the stop came off after the close, never before it"
+        assert COIN not in session.brackets
+    finally:
+        await session._store.close()
