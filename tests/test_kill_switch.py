@@ -518,3 +518,21 @@ async def test_a_kill_closes_what_the_venue_holds_not_what_we_remember(tmp_path:
 
     assert sorted(venue.close_calls) == ["ETH", "SOL"]
     assert result.venue_flat is True
+
+
+def test_the_first_reason_survives_a_second_writer(tmp_path: Path) -> None:
+    """The reason in the flag belongs to whoever killed first.
+
+    Drilled on 2026-09-08: the watchdog wrote "paper loop is stale", the trading loop saw
+    the flag and rewrote it with "kill file at data/KILL", and the only record of why the
+    box died was gone before anyone read it.
+    """
+    from liqfade.control.backend import write_kill_file
+
+    flag = tmp_path / "KILL"
+    assert write_kill_file(flag, "watchdog: paper loop is stale") is True
+    first = flag.read_text()
+
+    assert write_kill_file(flag, "kill file at data/KILL") is True
+    assert flag.read_text() == first
+    assert "watchdog" in flag.read_text()

@@ -42,9 +42,18 @@ def write_kill_file(path: Path, reason: str | None = None) -> bool:
     A write failure is logged and returned rather than raised: the in-process half of the
     kill still has to run, but the caller has to report the failure instead of confirming
     a kill it did not get.
+
+    **An existing flag is left exactly as it is.** The reason in it is the first thing
+    anybody reads at 3am, and it belongs to whoever killed first. Drilled on 2026-09-08:
+    the watchdog wrote "paper loop is stale", the trading loop saw the flag and rewrote it
+    with "kill file at data/KILL", and the diagnosis was gone by the time anyone looked.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            # A file, specifically: a directory sitting where the flag must go is a write
+            # that will fail, not a kill that already happened.
+            return True
         stamp = f"killed_at: {datetime.now(UTC).isoformat()}\n"
         if reason:
             stamp += f"reason: {reason}\n"
