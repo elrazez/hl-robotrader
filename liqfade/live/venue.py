@@ -46,8 +46,9 @@ from liqfade.execution.policy import EntryAction, entry_action, touch_price
 from liqfade.execution.tpsl import TpslLegs
 from liqfade.live.features import LiveFeatureEngine
 from liqfade.log import get_logger
-from liqfade.risk.engine import AccountView, EntryRequest, RiskEngine
-from liqfade.sizing import LiquidityStats, size_intent
+from liqfade.risk.engine import RiskEngine
+from liqfade.risk.entry import gate_entry
+from liqfade.sizing import LiquidityStats
 from liqfade.strategy.types import Intent
 
 log = get_logger(__name__)
@@ -55,6 +56,9 @@ log = get_logger(__name__)
 __all__ = ["VenueSession"]
 
 RECENT_BLOCKS = 256
+# The tags an order carries when it closes a position rather than opening one. A fill on
+# one of these is a round trip the risk engine has to hear about.
+EXIT_TAGS = frozenset({"target", "stop", "flat"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,46 +331,6 @@ class VenueSession:
         if intent.coin not in self.meta:
             self.meta = _resolve_meta(self.meta, [intent.coin], self.settings)
 
-        decision = size_intent(
-            intent,
-            equity=self.equity_usd,
-            stats=LiquidityStats(
-                traded_usd_window=getattr(row, "traded_usd_vol_window", 0.0) if row else 0.0,
-                depth_usd=row.depth(intent.side) if row else 0.0,
-            ),
-            meta=self.meta[intent.coin],
-            settings=self.settings,
-            coin_exposure_usd=abs(self._notional(intent.coin)),
-            total_exposure_usd=sum(abs(self._notional(c)) for c in self.positions),
-        )
-        if decision.reason is not None:
-            self.result.blocked(
-                now_ms=now_ms, coin=intent.coin, gate="sizing", reason=decision.reason
-            )
-            return None
-
-        verdict = self.risk.check_entry(
-            EntryRequest(
-                coin=intent.coin,
-                side=intent.side,
-                notional_usd=decision.notional_usd,
-                now_ms=now_ms,
-            ),
-            AccountView(
-                equity=self.equity_usd,
-                open_sides={
-                    c: ("long" if p.size > 0 else "short") for c, p in self.positions.items()
-                },
-                coin_last_data_ms=self.coin_last_ms,
-                global_last_data_ms=self.global_last_ms,
-            ),
-        )
-        if not verdict.allowed:
-            self.result.blocked(
-                now_ms=now_ms, coin=intent.coin, gate="risk", reason=verdict.reason or "refused"
-            )
-            return None
-
         is_buy = intent.side == "long"
         # `Alo` at the touch, `Ioc` through it. strategy/types.py: only high urgency may
         # take liquidity, and an Ioc priced at its own side of the book cannot match
@@ -374,10 +338,38 @@ class VenueSession:
         # resting orders", which would have refused every urgent entry, meaning the loop
         # took the trades the strategy considers least urgent and refused the rest.
         crossing = intent.urgency == "high"
+        # Priced before the gate rather than after it, so an intent with no book to rest
+        # against never reaches `gate_entry`: the gate records the entry it allows, and
+        # recording one for an order that was then never sent would tighten the cluster
+        # cap on a trade that did not happen.
         px = self.touch(intent.coin, is_buy=not is_buy if crossing else is_buy)
         if px is None:
             log.warning("entry_unpriceable", coin=intent.coin)
             return None
+
+        gated = gate_entry(
+            intent,
+            now_ms=now_ms,
+            equity=self.equity_usd,
+            stats=LiquidityStats(
+                traded_usd_window=getattr(row, "traded_usd_vol_window", 0.0) if row else 0.0,
+                depth_usd=row.depth(intent.side) if row else 0.0,
+            ),
+            meta=self.meta[intent.coin],
+            settings=self.settings,
+            risk=self.risk,
+            coin_exposure_usd=abs(self._notional(intent.coin)),
+            total_exposure_usd=sum(abs(self._notional(c)) for c in self.positions),
+            open_sides={c: ("long" if p.size > 0 else "short") for c, p in self.positions.items()},
+            coin_last_data_ms=self.coin_last_ms,
+            global_last_data_ms=self.global_last_ms,
+        )
+        if gated.reason is not None:
+            self.result.blocked(
+                now_ms=now_ms, coin=intent.coin, gate=gated.gate or "risk", reason=gated.reason
+            )
+            return None
+
         if crossing:
             bound = self.settings.execution.taker_slippage_bps / 1e4
             px = px * (1 + bound) if is_buy else px * (1 - bound)
@@ -395,7 +387,7 @@ class VenueSession:
                 coin=intent.coin,
                 is_buy=is_buy,
                 px=px,
-                size=float(decision.size),
+                size=gated.size,
                 # Alo at the touch, per docs/STRATEGY_AND_RISK.md section 3. A high
                 # urgency intent crosses instead: strategy/types.py says only high urgency
                 # may take liquidity, and the cascade it is fading does not wait.
@@ -405,6 +397,10 @@ class VenueSession:
         )
         if order.status is OrderStatus.REJECTED:
             self.entry_intents.pop(cloid, None)
+            # Counted, because enough refusals in ten minutes is a reason to stop trying:
+            # "Insufficient margin" or "Order has invalid size" repeating is a sizing bug
+            # and every retry of it spends address budget the kill path may need.
+            self.risk.on_reject(now_ms)
             return None
         return cloid
 
@@ -439,7 +435,8 @@ class VenueSession:
         """
         intent = self.entry_intents.get(cloid)
         if intent is None:
-            return  # an exit leg, or an order from before this process
+            await self._on_exit_fill(cloid, ts_ms)
+            return
         self.fills.append((ts_ms, intent.coin, "entry", px, size))
         self.filled[cloid] = self.filled.get(cloid, 0.0) + size
         total = self.filled[cloid]
@@ -468,6 +465,44 @@ class VenueSession:
             tp_cloid=legs.tp_cloid,
             sl_cloid=legs.sl_cloid,
         )
+
+    async def _on_exit_fill(self, cloid: str, ts_ms: int) -> None:
+        """A bracket leg or a flattening order filled: one round trip is closed.
+
+        This is the only thing on the venue path that moves the day's realised PnL, the
+        losing streak and the per-coin cooldown, and until it existed none of those three
+        limits could fire on testnet or on mainnet however the day went.
+
+        A partial exit is not a round trip and is left alone, exactly as the backtest's
+        `_booked` leaves one: the position is still open and the venue has not finished
+        telling us what it earned.
+        """
+        try:
+            order = self.orders.get(cloid)
+        except KeyError:
+            return  # an order from before this process, or somebody else's
+        if order.intent.tag not in EXIT_TAGS or order.status is not OrderStatus.FILLED:
+            return
+        self.fills.append((ts_ms, order.coin, order.intent.tag, order.avg_px, order.filled))
+        self.portfolio.trades.append(
+            VenueTrade(coin=order.coin, net_pnl=order.closed_pnl, ts_ms=ts_ms)
+        )
+        self.risk.on_exit(order.coin, order.closed_pnl, ts_ms)
+        log.info(
+            "round_trip_closed",
+            coin=order.coin,
+            tag=order.intent.tag,
+            net_pnl=order.closed_pnl,
+            size=order.filled,
+        )
+
+    def on_reconnect(self, now_ms: int) -> None:
+        """A critical feed came back. Enough of them in ten minutes halts entries.
+
+        Sync, because the stream's own loop is what calls it through the loop's reconnect
+        handler, and counting a reconnect must not wait on anything.
+        """
+        self.risk.on_reconnect(now_ms)
 
     # --- what the kill switch and /flat call ---------------------------------
 

@@ -50,6 +50,7 @@ class UserEvent:
     fee: float = 0.0
     maker: bool = True
     ts_ms: int = 0
+    closed_pnl: float = 0.0  # the venue's `closedPnl`; non-zero only on a closing fill
 
 
 def subscribe_frames(address: str) -> list[dict[str, Any]]:
@@ -114,6 +115,7 @@ def parse_user_frame(message: Any) -> list[UserEvent]:
                     # `crossed` true means we took, so maker is its inverse.
                     maker=not bool(fill.get("crossed", True)),
                     ts_ms=int(fill.get("time") or 0),
+                    closed_pnl=_f(fill.get("closedPnl")),
                 )
             )
         return events
@@ -141,6 +143,7 @@ async def apply_event(manager: OrderManager, event: UserEvent) -> None:
                 fee=event.fee,
                 maker=event.maker,
                 ts_ms=event.ts_ms,
+                closed_pnl=event.closed_pnl,
             )
         elif event.kind == "canceled" and order.status in LIVE:
             if order.oid is not None and event.oid and event.oid != order.oid:

@@ -167,6 +167,10 @@ class Order:
     filled: float = 0.0
     avg_px: float = 0.0
     fees: float = 0.0
+    # What the venue said this order realised, summed over its fills. In memory only: it
+    # is read once, by whoever books the round trip, and the registry's job is which
+    # orders exist rather than what they earned.
+    closed_pnl: float = 0.0
     reject_reason: str | None = None
     submitted_ms: int = field(default_factory=now_ms)
     updated_ms: int = field(default_factory=now_ms)
@@ -798,8 +802,14 @@ class OrderManager:
         ts_ms: int,
         fee: float = 0.0,
         maker: bool = False,
+        closed_pnl: float = 0.0,
     ) -> Order:
         """Apply one fill. Raises KeyError for a cloid we never placed.
+
+        `closed_pnl` is Hyperliquid's own `closedPnl` for this fill, zero on a fill that
+        opened rather than closed. It is kept because it is the only realised PnL the venue
+        path has: the exit price alone would need an entry price to be netted against, and
+        the venue already did that arithmetic against the lot it actually matched.
 
         An unknown cloid is never invented into an order: a fill for something we did not
         place is a reconciliation event and a halt, not a row in our book.
@@ -814,6 +824,7 @@ class OrderManager:
         order.avg_px = (order.avg_px * order.filled + px * size) / (order.filled + size)
         order.filled += size
         order.fees += fee
+        order.closed_pnl += closed_pnl
         await self.store.add_fill(cloid, ts_ms=ts_ms, px=px, size=size, fee=fee, maker=maker)
 
         complete = order.remaining <= 1e-12
@@ -825,6 +836,7 @@ class OrderManager:
             px=px,
             size=size,
             fee=fee,
+            closed_pnl=closed_pnl,
             maker=maker,
             filled=order.filled,
             remaining=order.remaining,
