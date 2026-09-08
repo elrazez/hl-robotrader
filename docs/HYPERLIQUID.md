@@ -100,8 +100,15 @@ URL without "testnet" in it and reads no key itself; `execution/signer.py` does 
 | 8 | Reduce-only with and without a position | `reduce_only` | **not run: needs margin** |
 | 9 | Raw `clearinghouseState`, `openOrders`, `frontendOpenOrders`, `userFills` | `state_shape` | **run 2026-09-07, empty account** |
 
-**Read the "void" rows as not run.** The testnet account had `accountValue: 0.0` on
-2026-09-07. On a zero-equity account Hyperliquid answers an order with
+**Read the "void" rows as not run, and read the reason below as superseded.** The cause
+was found on 2026-09-08 and it was not funding: `HL_TESTNET_ACCOUNT_ADDRESS` held the agent
+wallet's own address rather than the master account it signs for, so every read was pointed
+somewhere the orders never went. `userRole` on the configured address returns
+`{"role": "agent", "data": {"user": "0x000000000000000000000000000000000000beef..."}}`, and `orderStatus` against that master
+returns the orders in full. **Run `userRole` before trusting any probe result.** What
+follows is what the symptoms looked like from the wrong address.
+
+The testnet account read `accountValue: 0.0` on 2026-09-07. On a zero-equity account Hyperliquid answers an order with
 `{"resting": {"oid": ...}}` and a real oid, and then books nothing: `openOrders`,
 `frontendOpenOrders` and `historicalOrders` all stay empty, `totalMarginUsed` stays 0.0,
 `orderUpdates` sends no frame, and `cancel_by_cloid` on the phantom returns

@@ -2576,3 +2576,54 @@ seven days of evidence on its own, and it is not the DoD.
 The alternative was to leave the loop stopped until the entry policy exists, which buys
 nothing: the plumbing evidence is only available by running, and the comparison days can
 start whenever the policy lands. Recorded so the week is not later read as more than it is.
+
+## 2026-09-08 (05c: the account address was the agent's own, and it faked every symptom)
+
+**Correcting the 2026-09-07 entry above.** That entry blamed an unfunded testnet account
+for orders that came back `resting` and were never booked. The funding was real and it was
+not the cause. `userRole` settles it:
+
+    {"role": "agent", "data": {"user": "0x000000000000000000000000000000000000beef"}}
+
+`HL_TESTNET_ACCOUNT_ADDRESS` held **the agent wallet's own address**, not the master
+account it signs for. CLAUDE.md Phase 0 item 3 states the rule this breaks in one line: the
+bot signs with the agent key but `account_address` is the main wallet address.
+
+**The orders were real the whole time.** `orderStatus` queried against the master returns
+the order in full, matching cloid and all:
+
+    {"status": "order", "order": {"order": {"coin": "ETH", "side": "B", "limitPx": "2451.7",
+     "sz": "0.0045", "oid": 59609609087, "cloid": "0x4dd5d294...", "tif": "Gtc"},
+     "status": "canceled", "statusTimestamp": 1788858434243}}
+
+Canceled 2.4 seconds after it was placed, which is when the probe's own `cancel_by_cloid`
+landed. Place, rest and cancel all worked. Every read was pointed at the wrong address.
+
+**Why this was so convincing as a funding problem.** An agent address is a real address
+that can hold its own balances, so every query against it answers politely with zeroes and
+empties instead of erroring. Orders signed by the agent execute on the master;
+`usdClassTransfer` signed by the agent moves **the agent's own** funds. That asymmetry is
+the trap: the 995 USDC the faucet supplied was transferred into the agent address's perps
+balance, where no order will ever see it, while the master that actually trades sits at
+`accountValue: 0.0` with 3 USDC in spot.
+
+**What this invalidates.** Everything in the 2026-09-07 entry that reasoned from "the
+account is unfunded" is wrong about the cause. The three answers that entry called
+trustworthy need re-reading with this in mind:
+
+- **`userFees`** was queried for the agent address, so 0.045% / 0.015% are the agent's
+  rates and not necessarily the master's. Re-run against the master before the cost model
+  cites it.
+- **`scheduleCancel`** was signed by the agent and therefore applied to the master, whose
+  traded volume genuinely is $0. The gate and its message stand.
+- **The `Alo` rejection string** is a pre-trade validation returned in the response body
+  and never depended on an address. It stands.
+- **`orderUpdates` sending nothing** was the subscription being pointed at the agent
+  address. Its frame shape is still unmeasured, but for a different reason than recorded.
+
+**The lesson, which is the same one twice now.** 05b's twelve-minute equivalence test and
+05c's zero-equity probes both produced confident results from a setup where the mechanism
+could not operate, and in both cases the failure presented as success rather than as an
+error. Here it went one worse: a wrong reading was written into this file as a finding.
+The check that would have caught it costs one call, `userRole`, and it is now the first
+thing any probe run should do.
