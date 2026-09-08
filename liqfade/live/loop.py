@@ -678,6 +678,8 @@ class VenueLoop(PaperLoop):
         )
         self.session = session
         await session.orders.load()
+        # Before anything can be sized: the venue's own szDecimals, not a default.
+        await session.load_asset_rules()
 
         self.streams = build_streams(
             settings,

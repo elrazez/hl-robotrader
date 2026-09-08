@@ -13,6 +13,7 @@ import pytest
 
 from liqfade.execution.hl import (
     classify_order_response,
+    parse_asset_meta,
     parse_clearinghouse_state,
     parse_open_orders,
     parse_user_fills,
@@ -323,3 +324,33 @@ def test_no_spot_payload_leaves_equity_as_the_perps_account_value() -> None:
         "assetPositions": [],
     }
     assert parse_clearinghouse_state(state).equity == 500.0
+
+
+def test_asset_meta_comes_from_the_venue_not_from_a_default() -> None:
+    """`szDecimals` decides whether an order is even accepted, so it cannot be guessed.
+
+    `_resolve_meta` answers 5 for every coin, which is a backtest fallback. The testnet
+    loop inherited it and sent ETH at 0.00435, five decimals against the four the venue
+    allows: "Order has invalid size." CLAUDE.md says a coin with no szDecimals is refused
+    rather than rounded on a guessed grid, and a wrong default is a guess that passes.
+    """
+    payload = {
+        "universe": [
+            {"name": "BTC", "szDecimals": 5, "maxLeverage": 40},
+            {"name": "ETH", "szDecimals": 4, "maxLeverage": 25},
+            {"name": "kPEPE", "szDecimals": 0, "maxLeverage": 10, "isDelisted": True},
+        ]
+    }
+
+    meta = parse_asset_meta(payload)
+
+    assert meta["ETH"].sz_decimals == 4
+    assert meta["BTC"].sz_decimals == 5
+    assert meta["ETH"].max_leverage == 25.0
+    assert "kPEPE" not in meta, "a delisted asset is not one to size an order for"
+
+
+def test_a_zero_decimal_asset_survives_the_parse() -> None:
+    """szDecimals 0 is a whole-unit asset, not a missing field."""
+    meta = parse_asset_meta({"universe": [{"name": "kBONK", "szDecimals": 0, "maxLeverage": 5}]})
+    assert meta["kBONK"].sz_decimals == 0

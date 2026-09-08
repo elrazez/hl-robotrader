@@ -51,6 +51,11 @@ class FakeVenue:
 
 
 class FakeReader:
+    async def asset_meta(self) -> dict[str, Any]:
+        from liqfade.execution.hl import AssetRules
+
+        return {COIN: AssetRules(coin=COIN, sz_decimals=4, max_leverage=25.0)}
+
     def __init__(self) -> None:
         self.snapshot = AccountSnapshot(
             equity=1000.0, margin_used=0.0, withdrawable=1000.0, positions={}
@@ -73,6 +78,7 @@ async def a_session(tmp_path: Path, **dotted: Any) -> tuple[VenueSession, FakeVe
         starting_equity=1000.0,
     )
     session._store = store  # for the fixture to close
+    await session.load_asset_rules()
     return session, venue
 
 
@@ -422,3 +428,18 @@ def test_only_one_loop_polls_telegram_for_commands() -> None:
     settings = load_settings("testnet", environ={"LIQFADE_TELEGRAM__COMMANDS": "0"})
     assert settings.telegram.commands is False
     assert load_settings("paper", environ={}).telegram.commands is True
+
+
+async def test_a_coin_the_venue_has_no_rules_for_is_not_ordered(tmp_path: Path) -> None:
+    """A guessed szDecimals is how an order gets filled at the wrong size."""
+    session, venue = await a_session(tmp_path)
+    try:
+        session.books["DOGE"] = session.books.get(COIN, None) or None
+        quote(session, START, 2999.0, 3001.0)
+        intent = an_intent("long")
+        object.__setattr__(intent, "coin", "DOGE")
+
+        assert await session.place(intent, START, Row()) is None
+        assert venue.placed == []
+    finally:
+        await session._store.close()

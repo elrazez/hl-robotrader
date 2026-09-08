@@ -132,6 +132,7 @@ class VenueSession:
         # cloid -> the intent that asked for it, so a fill can be bracketed with the
         # target and stop the strategy actually chose rather than a recomputed pair.
         self.entry_intents: dict[str, Intent] = {}
+        self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
 
@@ -189,6 +190,20 @@ class VenueSession:
         )
 
     # --- the account, from the venue -----------------------------------------
+
+    async def load_asset_rules(self) -> int:
+        """Read `szDecimals` and max leverage from the venue. Called before anything trades.
+
+        The rounding rules are the venue's, not ours and not the backtest's.
+        `_resolve_meta` answers 5 decimals and 3x for every coin, which is a replay's
+        fallback and is what the testnet loop inherited: it sent ETH with five decimals
+        against the four allowed and the venue answered "Order has invalid size".
+        """
+        rules = await self.reader.asset_meta()
+        self.orders.sz_decimals = {coin: rule.sz_decimals for coin, rule in rules.items()}
+        self.asset_rules = rules
+        log.info("asset_rules_loaded", assets=len(rules))
+        return len(rules)
 
     def sync_account(self, snapshot: AccountSnapshot) -> None:
         """Overwrite the local view with the venue's. The venue is the truth.
@@ -277,9 +292,14 @@ class VenueSession:
         ):
             return None
 
+        if intent.coin not in self.orders.sz_decimals:
+            # No rules for this coin means no order. `_resolve_meta` would answer 5 for
+            # anything asked of it, and a guessed grid is refused by the venue with
+            # "Order has invalid size" at best and filled at the wrong size at worst.
+            log.error("no_asset_rules", coin=intent.coin)
+            return None
         if intent.coin not in self.meta:
             self.meta = _resolve_meta(self.meta, [intent.coin], self.settings)
-            self.orders.sz_decimals = {c: m.sz_decimals for c, m in self.meta.items()}
 
         decision = size_intent(
             intent,

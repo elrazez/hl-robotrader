@@ -45,6 +45,7 @@ __all__ = [
     "as_transport_error",
     "classify_group_response",
     "classify_order_response",
+    "parse_asset_meta",
     "parse_clearinghouse_state",
     "parse_open_orders",
     "parse_trigger_orders",
@@ -228,6 +229,39 @@ def parse_clearinghouse_state(state: Any, *, spot: Any = None) -> AccountSnapsho
     )
 
 
+@dataclass(frozen=True, slots=True)
+class AssetRules:
+    """What the venue will accept for one asset. Read from `meta`, never assumed."""
+
+    coin: str
+    sz_decimals: int
+    max_leverage: float
+
+
+def parse_asset_meta(payload: Any) -> dict[str, AssetRules]:
+    """`meta.universe` into the rounding rules, delisted assets dropped.
+
+    `szDecimals` decides whether an order is accepted at all, so it comes from here and
+    not from a default. `backtest/engine.py`'s `_resolve_meta` answers 5 for every coin,
+    which is fine for a replay and wrong at a venue: ETH is 4, and an order with five
+    decimals is refused with "Order has invalid size".
+    """
+    rules: dict[str, AssetRules] = {}
+    for asset in (payload or {}).get("universe", []):
+        if asset.get("isDelisted"):
+            continue
+        name = str(asset.get("name"))
+        decimals = asset.get("szDecimals")
+        if not name or decimals is None:
+            continue
+        rules[name] = AssetRules(
+            coin=name,
+            sz_decimals=int(decimals),
+            max_leverage=_f(asset.get("maxLeverage"), 1.0),
+        )
+    return rules
+
+
 def parse_open_orders(payload: Any) -> list[VenueOrder]:
     """`openOrders`, parsed. `side` is "B" for a bid and "A" for an ask."""
     orders = []
@@ -341,6 +375,10 @@ class InfoReader:
             self.post({"type": "spotClearinghouseState", "user": address}),
         )
         return parse_clearinghouse_state(state, spot=spot)
+
+    async def asset_meta(self) -> dict[str, AssetRules]:
+        """The venue's own rounding rules for every listed perp."""
+        return parse_asset_meta(await self.post({"type": "meta"}))
 
     async def open_orders(self, address: str) -> list[VenueOrder]:
         return parse_open_orders(await self.post({"type": "openOrders", "user": address}))
