@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
@@ -11,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from liqfade.config import load_settings
 from liqfade.config.models import Settings
+from liqfade.control.backend import NoopBackend
 from liqfade.control.protocol import (
     LatencyState,
     OrderState,
@@ -19,11 +22,13 @@ from liqfade.control.protocol import (
     StateSnapshot,
     now_ms,
 )
+from liqfade.control.server import ControlServer
 from liqfade.control.state import write_state
 from liqfade.panel.app import (
     create_app,
     is_loopback,
     liquidations_by_venue,
+    live_socket_path,
     live_state_path,
     serve,
 )
@@ -1029,3 +1034,142 @@ class TestTheLiveLatencyEndpoint:
         assert body["ws_ping_p50"] == 3.0
         assert body["submit_ack_p50"] is None
         assert body["submit_ack_p95"] is None
+
+
+# --- controls -------------------------------------------------------------------
+
+
+class TestControls:
+    """Pause, resume and flat, through the loop's own control socket.
+
+    There is no kill button here on purpose: `/kill` stays Telegram and the flag file.
+    A kill is the one action that must work when the panel is what is broken, and a
+    button in a browser tab is the easiest thing in this system to click by accident.
+    """
+
+    @pytest.fixture
+    def settings(self, sock_dir: Path) -> Settings:
+        """data_dir on a short path: pytest's tmp_path blows the sockaddr_un limit."""
+        return load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(sock_dir)})
+
+    @pytest.fixture
+    def loop_socket(self, settings: Settings) -> Iterator[NoopBackend]:
+        """A real ControlServer on the path the panel expects, behind a NoopBackend.
+
+        Real socket, real wire format, real ControlClient: what is worth testing is that
+        the panel reaches the loop's socket and reports what came back, and a mocked
+        client would test neither. NoopBackend records every call and places nothing.
+
+        On its own thread and its own event loop, because TestClient's calls block the
+        caller: served from the test's loop, the blocking POST would starve the accept
+        and every request would time out against a socket that is listening.
+        """
+        backend = NoopBackend(env="paper", proc="paper")
+        server = ControlServer(backend, live_socket_path(settings))
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def run() -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.start())
+            loop.call_soon(ready.set)
+            loop.run_forever()
+
+        thread = threading.Thread(target=run, name="fake-control", daemon=True)
+        thread.start()
+        assert ready.wait(timeout=5.0), "the fake control server never came up"
+        try:
+            yield backend
+        finally:
+            asyncio.run_coroutine_threadsafe(server.stop(), loop).result(timeout=5.0)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+
+    def test_they_need_a_session(self, client: TestClient) -> None:
+        assert client.post("/api/live/pause", json={"confirm": True}).status_code == 401
+        assert client.post("/api/live/resume", json={"confirm": True}).status_code == 401
+        assert client.post("/api/live/flat", json={"confirm": True}).status_code == 401
+
+    def test_no_route_can_send_a_kill(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        """The rule is that no HTTP request reaches the loop's kill, not that one 404s.
+
+        The SPA catch-all answers unknown paths, so the status is 405 rather than 404;
+        what matters is the command the loop never received.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+
+        assert client.post("/api/live/kill", json={"confirm": True}).status_code >= 400
+
+        assert loop_socket.calls == []
+
+    def test_pause_reaches_the_loop_and_reports_what_came_back(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+
+        body = client.post("/api/live/pause", json={"confirm": True}).json()
+
+        assert body["ok"] is True
+        assert body["result"]["paused"] is True
+        assert [name for name, _ in loop_socket.calls] == ["pause"]
+        # Who asked, so the loop's own log says a human did this from the panel.
+        assert loop_socket.calls[0][1]["reason"] == "panel"
+
+    def test_resume_reaches_the_loop(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/resume", json={"confirm": True}).json()
+        assert body["result"]["paused"] is False
+        assert [name for name, _ in loop_socket.calls] == ["resume"]
+
+    def test_flat_closes_everything_when_no_coin_is_named(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/flat", json={"confirm": True}).json()
+        assert body["ok"] is True
+        assert loop_socket.calls == [("flat", {"coin": None})]
+
+    def test_flat_takes_one_coin(self, client: TestClient, loop_socket: NoopBackend) -> None:
+        client.post("/api/login", json={"password": PASSWORD})
+        body = client.post("/api/live/flat", json={"confirm": True, "coin": "btc"}).json()
+        assert body["result"]["closing"] == ["BTC"]  # upper cased on the way in
+        assert loop_socket.calls == [("flat", {"coin": "BTC"})]
+
+    def test_an_unconfirmed_action_is_refused_and_never_reaches_the_loop(
+        self, client: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        """The confirm step is enforced here, not only in the browser.
+
+        A page can be reloaded mid-dialog and a curl has no dialog at all. Flattening is
+        not something to do because a request arrived.
+        """
+        client.post("/api/login", json={"password": PASSWORD})
+
+        response = client.post("/api/live/flat", json={"confirm": False})
+
+        assert response.status_code == 400
+        assert "confirm" in response.json()["detail"]
+        assert loop_socket.calls == []
+
+    def test_no_loop_running_is_a_503_that_says_so(self, client: TestClient) -> None:
+        """Nothing is listening: the page has to say the loop is down, not "failed"."""
+        client.post("/api/login", json={"password": PASSWORD})
+        response = client.post("/api/live/pause", json={"confirm": True})
+        assert response.status_code == 503
+        assert "control socket" in response.json()["detail"]
+
+    def test_every_action_is_logged_with_its_result(
+        self, client: TestClient, loop_socket: NoopBackend, settings: Settings
+    ) -> None:
+        """The audit log is the record of who changed what, and it is what the page shows."""
+        client.post("/api/login", json={"password": PASSWORD})
+
+        client.post("/api/live/flat", json={"confirm": True, "coin": "ETH"})
+
+        entries = client.get("/api/audit").json()["entries"]
+        assert len(entries) == 1
+        assert entries[0]["action"] == "flat"
+        assert entries[0]["args"] == {"coin": "ETH"}
+        assert entries[0]["ok"] is True
+        assert entries[0]["result"]["closing"] == ["ETH"]
+        assert entries[0]["ts_ms"] > 0

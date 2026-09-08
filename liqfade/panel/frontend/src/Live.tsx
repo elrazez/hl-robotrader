@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchLiveLatency, fetchLiveState } from "./api";
 import type { StateResult } from "./api";
+import AuditLog from "./AuditLog";
+import Controls from "./Controls";
 import LatencyChart from "./LatencyChart";
 import type { Latency, OrderState, PositionState } from "./types";
 import { Banner, Row, Section, pnlTone, stamp, usd } from "./ui";
@@ -99,6 +101,8 @@ function Orders({ orders }: { orders: OrderState[] }) {
 export default function Live({ onUnauthorized }: { onUnauthorized: () => void }) {
   const [result, setResult] = useState<StateResult | null>(null);
   const [latency, setLatency] = useState<Latency | null>(null);
+  // Bumped after every control action, so the audit log reloads without polling it.
+  const [acted, setActed] = useState(0);
 
   const poll = useCallback(async () => {
     const next = await fetchLiveState();
@@ -141,6 +145,10 @@ export default function Live({ onUnauthorized }: { onUnauthorized: () => void })
           killed. The loop has fired its kill switch and will not resume without a restart.
         </Banner>
       )}
+
+      <div className="mb-4">
+        <Controls state={state} readOnly={readOnly} onDone={() => setActed(acted + 1)} />
+      </div>
 
       <div className="grid gap-4 md:grid-cols-3">
         <Section title="process">
@@ -210,6 +218,10 @@ export default function Live({ onUnauthorized }: { onUnauthorized: () => void })
           <Section title="open orders">
             <Orders orders={state?.orders ?? []} />
           </Section>
+        </div>
+
+        <div className="md:col-span-3">
+          <AuditLog refreshKey={acted} />
         </div>
 
         <div className="md:col-span-3">

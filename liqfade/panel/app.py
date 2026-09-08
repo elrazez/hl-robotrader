@@ -18,13 +18,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from liqfade.config import config_layers, flatten, resolve
 from liqfade.config.models import Settings
-from liqfade.control.protocol import LatencyState, now_ms
+from liqfade.control.client import ControlClient
+from liqfade.control.protocol import ControlError, LatencyState, now_ms
 from liqfade.control.state import read_state
 from liqfade.log import get_logger, setup_logging
+from liqfade.panel import audit
 from liqfade.panel.auth import COOKIE_NAME, LoginLimiter, SessionAuth
 
 log = get_logger(__name__)
@@ -33,6 +35,20 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 class LoginBody(BaseModel):
     password: str = Field(..., min_length=1, max_length=1024)
+
+
+class ControlBody(BaseModel):
+    """What a control action needs. `confirm` is enforced here, not only in the browser.
+
+    A page can be reloaded mid-dialog and a curl has no dialog at all, so the second
+    step of "click, then confirm" is a field on the request rather than a state in the
+    frontend. Flattening a book is not something to do because a request arrived.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool = False
+    coin: str | None = Field(None, max_length=32, description="flat only; all coins when None")
 
 
 def is_loopback(host: str) -> bool:
@@ -661,6 +677,67 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
             settings.panel.state_stale_s,
             absent=f"no state file at {path}: the trading loop is not running",
         )
+
+    async def _control(action: str, body: ControlBody, **args: Any) -> dict[str, Any]:
+        """Send one command to the loop, record what came back, and answer with both.
+
+        Every path through here writes an audit entry, including the refusals, because
+        an action the owner believes they took and that never happened is the failure
+        worth being able to read back afterwards.
+        """
+        if not body.confirm:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"{action} needs confirm=true: this is the second half of click and confirm",
+            )
+        socket = live_socket_path(settings)
+        client = ControlClient(
+            socket,
+            connect_timeout_s=settings.control.connect_timeout_s,
+            request_timeout_s=settings.control.request_timeout_s,
+        )
+        try:
+            result = await client.send(action, **args)  # type: ignore[arg-type]
+        except ControlError as exc:
+            log.warning("panel_control_failed", action=action, args=args, error=str(exc))
+            audit.record(
+                settings.paths.data_dir, action=action, args=args, ok=False, error=str(exc)
+            )
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"control socket at {socket} did not answer: {exc}",
+            ) from None
+        payload = result.model_dump(mode="json")
+        log.warning("panel_control", action=action, args=args, result=payload)
+        entry = audit.record(
+            settings.paths.data_dir, action=action, args=args, ok=True, result=payload
+        )
+        return {"ok": True, "result": payload, "entry": entry}
+
+    # No /live/kill, on purpose. The kill switch is Telegram and the data/KILL flag: it
+    # is the one control that has to work when the panel is the thing that is broken,
+    # and a button in a browser tab is the easiest thing here to click by accident.
+
+    @api.post("/live/pause", dependencies=[Depends(require_session)])
+    async def live_pause(body: ControlBody) -> dict[str, Any]:
+        """Block new entries. Open positions are left alone; use flat to close them."""
+        return await _control("pause", body, reason="panel")
+
+    @api.post("/live/resume", dependencies=[Depends(require_session)])
+    async def live_resume(body: ControlBody) -> dict[str, Any]:
+        """Lift a pause. The loop refuses while a halt reason or a kill still stands."""
+        return await _control("resume", body)
+
+    @api.post("/live/flat", dependencies=[Depends(require_session)])
+    async def live_flat(body: ControlBody) -> dict[str, Any]:
+        """Cancel and close, everything or one coin. The loop pauses itself afterwards."""
+        coin = body.coin.upper() if body.coin else None
+        return await _control("flat", body, coin=coin)
+
+    @api.get("/audit", dependencies=[Depends(require_session)])
+    def audit_log(limit: int = audit.DEFAULT_TAIL) -> dict[str, Any]:
+        """What the panel has done: control actions and settings writes, newest first."""
+        return {"entries": audit.tail(settings.paths.data_dir, limit)}
 
     @api.get("/live/fills", dependencies=[Depends(require_session)])
     def live_fills(

@@ -1,4 +1,5 @@
 import type {
+  AuditEntry,
   DiskStats,
   EquityCurve,
   FillsPage,
@@ -116,6 +117,52 @@ export async function fetchFills(query: string, offset = 0, limit = 100): Promis
 export async function fetchLiveEquity(query: string): Promise<EquityCurve | null> {
   const res = await fetch(`/api/live/equity?${query}`, { credentials: "same-origin" });
   return res.ok ? ((await res.json()) as EquityCurve) : null;
+}
+
+/** What one control action came back with, in the shape the page shows. */
+export interface ControlOutcome {
+  action: string;
+  ok: boolean;
+  detail: string;
+  ts_ms: number;
+}
+
+/**
+ * Pause, resume or flat, through the loop's control socket. `confirm` is sent because
+ * the endpoint requires it: the second half of click-and-confirm is enforced server
+ * side, so a page reloaded mid-dialog cannot half submit an action.
+ */
+export async function sendControl(
+  action: "pause" | "resume" | "flat",
+  coin?: string,
+): Promise<ControlOutcome> {
+  const res = await fetch(`/api/live/${action}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify({ confirm: true, coin: coin ?? null }),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    return {
+      action,
+      ok: false,
+      detail: body?.detail ?? res.statusText,
+      ts_ms: Date.now(),
+    };
+  }
+  return {
+    action,
+    ok: true,
+    detail: JSON.stringify(body.result),
+    ts_ms: body.entry?.ts_ms ?? Date.now(),
+  };
+}
+
+export async function fetchAudit(limit = 100): Promise<AuditEntry[]> {
+  const res = await fetch(`/api/audit?limit=${limit}`, { credentials: "same-origin" });
+  if (!res.ok) return [];
+  return ((await res.json()).entries ?? []) as AuditEntry[];
 }
 
 /** Backtest reports. All of these are session gated like everything else. */

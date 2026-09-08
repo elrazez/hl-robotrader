@@ -181,6 +181,18 @@ export interface EquityCurve {
   drawdown: number[];
 }
 
+/** GET /api/audit: what the panel did, appended one JSON object per line. */
+export interface AuditEntry {
+  ts_ms: number;
+  action: string;
+  args: Record<string, unknown>;
+  ok: boolean;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  /** Settings writes only: why the owner made the change. */
+  reason?: string;
+}
+
 /** GET /api/live/fills: one fill joined to the order it belongs to. */
 export interface FillRow {
   id: number;
