@@ -22,6 +22,7 @@ from liqfade.execution.orders import (
     RejectError,
     TransientTransportError,
 )
+from liqfade.execution.ratelimit import ActionBudget
 from liqfade.live.venue import VenueSession
 from liqfade.strategy.types import Intent
 from tests.test_live_loop import paper_settings
@@ -73,13 +74,17 @@ class FakeReader:
         return self.snapshot
 
 
-async def a_session(tmp_path: Path, **dotted: Any) -> tuple[VenueSession, FakeVenue]:
+async def a_session(
+    tmp_path: Path, *, budget: ActionBudget | None = None, **dotted: Any
+) -> tuple[VenueSession, FakeVenue]:
     settings = paper_settings(tmp_path, **dotted)
     store = await OrderStore.open(tmp_path / "orders.sqlite")
     venue = FakeVenue()
     session = VenueSession(
         settings,
-        orders=OrderManager(store, venue, sz_decimals={COIN: 4}, killed=lambda: False),
+        orders=OrderManager(
+            store, venue, sz_decimals={COIN: 4}, killed=lambda: False, budget=budget
+        ),
         reader=FakeReader(),
         address="0xacc",
         meta={},

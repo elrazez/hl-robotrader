@@ -50,6 +50,7 @@ from liqfade.execution.orders import (
     new_cloid,
 )
 from liqfade.execution.policy import EntryAction, entry_action, touch_price
+from liqfade.execution.ratelimit import HALT_REASON, rate_limited
 from liqfade.execution.tpsl import TpslLegs
 from liqfade.live.features import LiveFeatureEngine
 from liqfade.live.refusals import drain
@@ -397,6 +398,15 @@ class VenueSession:
             log.info("entry_skipped", coin=intent.coin, reason="entry already working")
             return None
 
+        remaining = self.orders.actions_remaining()
+        if remaining is not None and remaining <= 0:
+            # Halted rather than merely refused: the next tick would try again, and an
+            # address that spends its allowance on retries has none left for the cancels a
+            # kill needs. prompts/05_execution.md asks for this by name and
+            # docs/RUNBOOK.md has documented the reason since Phase 5.
+            self._halt_rate_limited(now_ms, intent, self._budget_frees_at())
+            return None
+
         if intent.coin not in self.orders.sz_decimals:
             # No rules for this coin means no order. `_resolve_meta` would answer 5 for
             # anything asked of it, and a guessed grid is refused by the venue with
@@ -476,12 +486,26 @@ class VenueSession:
         )
         if order.status is OrderStatus.REJECTED:
             self.entry_intents.pop(cloid, None)
+            if rate_limited(order.reject_reason or ""):
+                self._halt_rate_limited(now_ms, intent, self._budget_frees_at())
             # Counted, because enough refusals in ten minutes is a reason to stop trying:
             # "Insufficient margin" or "Order has invalid size" repeating is a sizing bug
             # and every retry of it spends address budget the kill path may need.
             self.risk.on_reject(now_ms)
             return None
         return cloid
+
+    def _budget_frees_at(self) -> int | None:
+        """When the action window next slides, or None when nothing is counted."""
+        return self.orders.budget.free_at_ms() if self.orders.budget is not None else None
+
+    def _halt_rate_limited(self, now_ms: int, intent: Intent, until_ms: int | None) -> None:
+        """Stop entering until the request window slides. Counted, so Telegram says so."""
+        log.error("rate_limit_halt", coin=intent.coin, until_ms=until_ms)
+        self.risk.halt(HALT_REASON, now_ms, until_ms=until_ms)
+        self.result.blocked(
+            now_ms=now_ms, coin=intent.coin, gate="risk", reason=HALT_REASON, intent=intent
+        )
 
     def _notional(self, coin: str) -> float:
         """Signed USD exposure in one coin, marked to the book we have.

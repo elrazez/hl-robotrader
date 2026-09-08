@@ -19,9 +19,22 @@ from __future__ import annotations
 
 from collections import deque
 
-__all__ = ["ActionBudget", "BudgetExhaustedError"]
+__all__ = ["HALT_REASON", "ActionBudget", "BudgetExhaustedError", "rate_limited"]
 
 HOUR_MS = 3_600_000
+# The halt both the local budget and the venue's own refusal produce. One reason string,
+# because docs/RUNBOOK.md has one row for it and an owner reading Telegram has one thing
+# to do about it either way: wait for the window to slide.
+HALT_REASON = "rate_limit"
+# docs/HYPERLIQUID.md: "Too many cumulative requests sent. Place taker orders to free up 1
+# request per USDC traded". Matched on the stable half of the sentence.
+VENUE_MARKER = "too many cumulative requests"
+
+
+def rate_limited(reason: str) -> bool:
+    """Whether a refusal means the address is out of requests, ours or the venue's."""
+    lowered = reason.lower()
+    return VENUE_MARKER in lowered or "action budget spent" in lowered
 
 
 class BudgetExhaustedError(RuntimeError):
@@ -44,6 +57,15 @@ class ActionBudget:
         cutoff = now_ms - HOUR_MS
         while self._taken and self._taken[0] <= cutoff:
             self._taken.popleft()
+
+    def free_at_ms(self) -> int | None:
+        """When the oldest action leaves the window, or None while nothing is counted.
+
+        What a `rate_limit` halt expires at. The window slides, so the halt has an end and
+        does not need a person to clear it: docs/RUNBOOK.md says wait, and this is the
+        instant there is something to wait for.
+        """
+        return self._taken[0] + HOUR_MS if self._taken else None
 
     def remaining(self, *, now_ms: int) -> int:
         """Actions left in the current window. What `RiskState.actions_remaining` shows."""

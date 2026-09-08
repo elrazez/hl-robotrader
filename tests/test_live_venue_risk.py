@@ -20,6 +20,7 @@ import pytest
 
 from liqfade.execution.hl import AccountSnapshot
 from liqfade.execution.orders import RejectError
+from liqfade.execution.ratelimit import ActionBudget
 from liqfade.live.venue import VenueSession
 from liqfade.strategy.types import Intent
 from tests.test_live_loop import paper_settings
@@ -249,5 +250,51 @@ async def test_a_reconnect_storm_halts_entries_on_the_venue_path(tmp_path: Path)
 
         assert blocked is None
         assert session.result.risk_blocks == {"reconnect_storm": 1}
+    finally:
+        await session._store.close()
+
+
+async def test_a_spent_action_budget_halts_entries_with_rate_limit(tmp_path: Path) -> None:
+    """prompts/05_execution.md: at zero, entries halt with reason `rate_limit`.
+
+    docs/RUNBOOK.md has had the row for it since Phase 5 and nothing could ever produce it.
+    The budget refused the order and said so in the journal, and the next tick tried again,
+    which is how an address spends what the kill path needs on retries.
+    """
+    session, _venue = await a_session(tmp_path, budget=ActionBudget(1))
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        first = await session.place(an_intent("long"), START, Row())
+        assert first is not None
+        await session.orders.cancel(first)  # a cancel is counted and never refused
+        assert session.orders.actions_remaining() == 0
+
+        blocked = await session.place(an_intent("long"), START + 10, Row())
+
+        assert blocked is None
+        assert session.result.risk_blocks == {"rate_limit": 1}
+        assert session.risk.state.halt_reason == "rate_limit"
+        assert session.risk.state.halt_until_ms is not None, "it clears when the window slides"
+    finally:
+        await session._store.close()
+
+
+async def test_the_venues_own_rate_limit_is_the_same_halt(tmp_path: Path) -> None:
+    """docs/HYPERLIQUID.md: the string the venue answers when the address is out of credit."""
+    session, venue = await a_session(tmp_path)
+    try:
+
+        async def refuse(intent: object) -> int:
+            raise RejectError(
+                "Too many cumulative requests sent. Place taker orders to free up 1 "
+                "request per USDC traded"
+            )
+
+        venue.place = refuse  # type: ignore[assignment]
+        quote(session, START, 2999.0, 3001.0)
+
+        assert await session.place(an_intent("long"), START, Row()) is None
+
+        assert session.risk.state.halt_reason == "rate_limit"
     finally:
         await session._store.close()
