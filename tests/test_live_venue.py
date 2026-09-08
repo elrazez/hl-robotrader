@@ -539,3 +539,32 @@ async def test_a_fill_that_beats_the_submit_return_still_brackets(tmp_path: Path
         assert len(venue.groups) == 1, "the fill must find its intent, however early it lands"
     finally:
         await session._store.close()
+
+
+async def test_flatten_refreshes_the_local_book_from_the_venue(tmp_path: Path) -> None:
+    """Otherwise the mirror holds a closed position until the next reconcile.
+
+    Up to `execution.reconcile_s` of refusing every new entry in that coin, silently. The
+    venue stays the truth; this just asks it again once the closing orders are away.
+    """
+    session, _venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        session.sync_account(
+            AccountSnapshot(
+                equity=1000.0,
+                margin_used=10.0,
+                withdrawable=990.0,
+                positions={COIN: VenuePosition(coin=COIN, size=0.01, entry_px=3000.0)},
+            )
+        )
+        # The venue is flat by the time we ask it again.
+        session.reader.snapshot = AccountSnapshot(
+            equity=1000.0, margin_used=0.0, withdrawable=1000.0, positions={}
+        )
+
+        await session.flatten(now_ms=START)
+
+        assert await session.open_positions() == {}, "the mirror follows the venue at once"
+    finally:
+        await session._store.close()

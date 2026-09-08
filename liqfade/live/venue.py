@@ -527,6 +527,11 @@ class VenueSession:
             if name in self.positions:
                 await self.close_position(name)
                 closed.append(name)
+        # Re-read rather than assume. The venue stays the truth, and without this the
+        # mirror keeps a position we have just closed until the next reconcile, up to
+        # execution.reconcile_s later, refusing every new entry in that coin meanwhile.
+        with contextlib.suppress(Exception):
+            self.sync_account(await self.reader.account(self.address))
         return closed
 
     async def close_out(self, now_ms: int) -> None:
