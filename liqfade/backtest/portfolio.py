@@ -44,6 +44,14 @@ class Position:
         fees_usd: fees paid so far on this position, entry side included.
         entry_slippage_bps: slippage on the entry fills, size weighted.
         no_book_entry: whether any entry fill used the degraded no-snapshot model.
+        closed_size: coin units exited so far. Equals the units ever opened at the close.
+        exit_px: volume weighted exit, mirroring `entry_px`.
+        realized_pnl: gross PnL booked by the exit fills so far, USD. Accumulated rather
+            than derived at the close, because an entry that scales in between two exit
+            partials moves `entry_px` after the first partial was already priced against
+            the old one; this is the number that went into cash.
+        exit_slippage_bps: slippage on the exit fills, size weighted.
+        no_book_exit: whether any exit fill used the degraded no-snapshot model.
     """
 
     coin: str
@@ -55,6 +63,11 @@ class Position:
     fees_usd: float = 0.0
     entry_slippage_bps: float = 0.0
     no_book_entry: bool = False
+    closed_size: float = 0.0
+    exit_px: float = 0.0
+    realized_pnl: float = 0.0
+    exit_slippage_bps: float = 0.0
+    no_book_exit: bool = False
 
     @property
     def is_long(self) -> bool:
@@ -200,7 +213,15 @@ class Portfolio:
         existing.no_book_entry = existing.no_book_entry or fill.no_book
 
     def apply_exit(self, fill: Fill, reason: str) -> Trade | None:
-        """Book an exit fill and, when it closes the position, produce the trade row."""
+        """Book an exit fill and, when it closes the position, produce the trade row.
+
+        Every partial is accumulated on the position, and the row the closing fill returns
+        is the whole round trip: the units opened, the size weighted exit price, the fees
+        of every leg and the realised PnL of every partial. Until 2026-09-08 the row was
+        built from the closing fill alone, so an exit that filled in two prints reported
+        the second print's size and PnL while the first print's PnL sat in cash and in no
+        row. The equity curve was right and the trade table did not sum to it.
+        """
         position = self.positions.get(fill.coin)
         if position is None:
             return None
@@ -214,6 +235,24 @@ class Portfolio:
         gross = direction * (fill.px - position.entry_px) * closed
         self.cash += gross
         position.size -= closed
+        # The first exit fill is assigned rather than averaged, the way the first entry
+        # fill is. Averaging it would round `px * closed / closed` back to a price a bit
+        # off `px` about one time in ten, and a single-print exit has to stay bit-identical
+        # or the reference digest in tests/test_backtest_streaming.py moves for no reason.
+        if position.closed_size == 0.0:
+            position.exit_px = fill.px
+            position.exit_slippage_bps = fill.slippage_bps
+        else:
+            total_closed = position.closed_size + closed
+            position.exit_px = (
+                position.exit_px * position.closed_size + fill.px * closed
+            ) / total_closed
+            position.exit_slippage_bps = (
+                position.exit_slippage_bps * position.closed_size + fill.slippage_bps * closed
+            ) / total_closed
+        position.closed_size += closed
+        position.realized_pnl += gross
+        position.no_book_exit = position.no_book_exit or fill.no_book
         if position.size > 1e-12:
             return None
 
@@ -230,20 +269,20 @@ class Portfolio:
         trade = Trade(
             coin=position.coin,
             side=position.side,
-            size=closed,
+            size=position.closed_size,
             entry_px=position.entry_px,
-            exit_px=fill.px,
+            exit_px=position.exit_px,
             entry_ms=position.opened_ms,
             exit_ms=fill.ts_ms,
             exit_reason=reason,
-            gross_pnl=gross,
+            gross_pnl=position.realized_pnl,
             fees_usd=position.fees_usd,
             funding_usd=funding,
-            net_pnl=gross - position.fees_usd - funding,
+            net_pnl=position.realized_pnl - position.fees_usd - funding,
             entry_slippage_bps=position.entry_slippage_bps,
-            exit_slippage_bps=fill.slippage_bps,
+            exit_slippage_bps=position.exit_slippage_bps,
             no_book_entry=position.no_book_entry,
-            no_book_exit=fill.no_book,
+            no_book_exit=position.no_book_exit,
             urgency=position.intent.urgency,
             cascade_notional_usd=position.intent.explain.get("cascade_notional_usd", 0.0),
             explain=dict(position.intent.explain),
