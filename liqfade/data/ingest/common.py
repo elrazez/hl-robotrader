@@ -23,6 +23,7 @@ run offline against a fake and no test can accidentally spend money.
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing
 import os
 import re
 import shutil
@@ -472,7 +473,16 @@ def parallel_pull(
                 finish(*_stage_object(client, bucket, key, size, str(stage_base), handler))
         else:
             factory = client_factory or s3_client
-            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            # spawn, not the Linux default fork. fork copies the parent's locks but
+            # not the threads holding them, and every handler writes Parquet through
+            # pyarrow, whose thread pool and allocator are exactly that kind of lock: a
+            # child can block on one no thread will ever release. It cost a CI run that
+            # hung for 20 minutes where macOS, which already defaults to spawn, was
+            # green. Pickling by reference is the contract the handlers were written to
+            # anyway, so nothing else changes.
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
                 futures = [
                     pool.submit(
                         _pull_one,
