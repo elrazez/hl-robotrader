@@ -11,7 +11,7 @@ import pytest
 
 from liqfade.execution.hl import VenueOrder, VenuePosition
 from liqfade.execution.orders import Order, OrderIntent, OrderStatus
-from liqfade.execution.reconcile import Severity, reconcile
+from liqfade.execution.reconcile import Reconciler, Severity, reconcile
 
 
 def our_order(
@@ -292,3 +292,53 @@ def _collect(sink: list[str]):
         return True
 
     return alert
+
+
+async def test_the_account_snapshot_is_handed_to_the_caller_before_the_comparison() -> None:
+    """The venue is the truth about positions, and the session has to be told.
+
+    The order matters: the local book is overwritten from `clearinghouseState` and only
+    then compared, so a reconcile reports what the loop believes *after* it has been
+    corrected. Comparing first would report a difference the same call was about to fix,
+    once every interval, forever.
+    """
+    from liqfade.execution.hl import AccountSnapshot, VenuePosition
+
+    snapshot = AccountSnapshot(
+        equity=990.0,
+        margin_used=10.0,
+        withdrawable=980.0,
+        positions={"ETH": VenuePosition(coin="ETH", size=0.01, entry_px=3000.0)},
+    )
+    seen: list[AccountSnapshot] = []
+    ours: dict[str, float] = {}
+
+    class Reader:
+        async def open_orders(self, address: str):
+            return []
+
+        async def account(self, address: str) -> AccountSnapshot:
+            return snapshot
+
+    def on_account(account: AccountSnapshot) -> None:
+        seen.append(account)
+        ours.clear()
+        ours.update({coin: p.size for coin, p in account.positions.items()})
+
+    reconciler = Reconciler(
+        reader=Reader(),
+        address="0xacc",
+        orders=lambda: _none(),
+        positions=lambda: dict(ours),
+        compare_positions=True,
+        on_account=on_account,
+    )
+
+    result = await reconciler.check("test")
+
+    assert seen == [snapshot]
+    assert result is not None and result.clean, "corrected first, then compared"
+
+
+async def _none():
+    return []

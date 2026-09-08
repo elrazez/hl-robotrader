@@ -246,6 +246,7 @@ class Reconciler:
         interval_s: float = 60.0,
         alert: Callable[[str], Awaitable[bool]] | None = None,
         compare_positions: bool = True,
+        on_account: Callable[[AccountSnapshot], None] | None = None,
     ) -> None:
         """
         Args:
@@ -256,6 +257,9 @@ class Reconciler:
             positions: our positions, coin to signed size.
             interval_s: seconds between checks, from `execution.reconcile_s`.
             alert: Telegram. Optional.
+            on_account: called with the `clearinghouseState` snapshot before the
+                comparison, so the caller's position book is the venue's. None in paper,
+                which has no account to read.
             compare_positions: False in paper, where there is no venue account and so no
                 second source for a position. Comparing against nothing would report every
                 open position as one the venue lost, which is a HALT, every interval. Not
@@ -268,6 +272,7 @@ class Reconciler:
         self.interval_s = interval_s
         self._alert = alert
         self.compare_positions = compare_positions
+        self._on_account = on_account
         self.runs = 0
         self.failures = 0
         self.differences = 0
@@ -287,6 +292,11 @@ class Reconciler:
                 failures=self.failures,
             )
             return None
+
+        if account is not None and self._on_account is not None:
+            # Correct the local book from the venue, then compare. The other order
+            # reports a difference this same call was about to fix, every interval.
+            self._on_account(account)
 
         result = reconcile(
             our_orders=await self._orders(),

@@ -24,7 +24,6 @@ from liqfade.config.models import Settings
 
 # Subcommands that later phases fill in. Value is the phase number in docs/ROADMAP.md.
 NOT_YET: dict[str, int] = {
-    "testnet": 5,
     "live": 6,
 }
 
@@ -882,6 +881,50 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_testnet(args: argparse.Namespace) -> int:
+    """Run the live loop against Hyperliquid testnet: real orders, real fills, no real money.
+
+    The same `VenueLoop` Phase 6 runs on mainnet, with a different env. That is the point:
+    a drill harness would prove the harness works. What keeps this off mainnet is not this
+    function but `execution/signer.py`, which needs env, `LIQFADE_LIVE_TRADING` and the
+    absence of the kill flag to sign a mainnet order at all.
+    """
+    from liqfade.live.loop import VenueLoop
+    from liqfade.log import setup_logging
+    from liqfade.runtime import run_main, shutdown_event
+
+    asked = getattr(args, "env", None)
+    args.env = "testnet"
+    settings = _settings(args)
+    setup_logging(proc="testnet", env=settings.env, level=settings.logging.level)
+    if asked and asked != "testnet":
+        print(f"testnet mode ignores --env {asked} and runs with env=testnet", file=sys.stderr)
+
+    if "testnet" not in settings.venues.hyperliquid.exchange_base:
+        # The URL that signs, not the one that reads. A loop pointed at a testnet /info
+        # and a mainnet /exchange is the exact mistake worth failing loudly on.
+        print(
+            f"refusing: exchange_base is {settings.venues.hyperliquid.exchange_base}, "
+            "which is not testnet.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    from liqfade.live.features import LiveFeatureEngine
+
+    unsupported = LiveFeatureEngine.unsupported(settings)
+    if unsupported:
+        print("testnet mode cannot run this config:", file=sys.stderr)
+        for reason in unsupported:
+            print(f"  - {reason}", file=sys.stderr)
+        print("Set LIQFADE_CASCADE__TRIGGER=crossvenue, or disable the rule.", file=sys.stderr)
+        return EXIT_ERROR
+
+    loop = VenueLoop(settings, starting_equity=args.equity, minutes=args.minutes)
+    run_main(lambda: loop.run(shutdown_event()))
+    return 0
+
+
 # --- placeholders --------------------------------------------------------------
 
 
@@ -1096,7 +1139,19 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument(
         "--minutes", type=float, default=None, help="stop after N minutes, for smoke tests"
     )
-    sub.add_parser("testnet", parents=[common], help="live loop against testnet (Phase 5)")
+    testnet = sub.add_parser(
+        "testnet", parents=[common], help="live loop against Hyperliquid testnet"
+    )
+    testnet.add_argument(
+        "--equity",
+        type=float,
+        default=0.0,
+        help="opening equity for reporting; 0 reads it from the venue",
+    )
+    testnet.add_argument(
+        "--minutes", type=float, default=None, help="stop after N minutes, for a drill"
+    )
+    testnet.set_defaults(func=cmd_testnet)
     sub.add_parser("live", parents=[common], help="live loop against mainnet (Phase 6)")
 
     panel = sub.add_parser("panel", parents=[common], help="serve the web panel on 127.0.0.1")

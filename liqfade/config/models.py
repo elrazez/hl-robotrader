@@ -522,6 +522,15 @@ class Backtest(Base):
 class Control(Base):
     socket_path: Path = Field(..., description="path under data_dir, created with mode 0600")
     state_file: Path = Field(..., description="path under data_dir for the state snapshot")
+    # Two trading loops can run on one box: paper soaking while testnet drills. Each
+    # publishes its own heartbeat and keeps its own risk state, or the watchdog cannot
+    # tell which loop stopped breathing and one loop's daily loss halts the other.
+    heartbeat_file: Path = Field(
+        Path("heartbeat"), description="path under data_dir the loop touches for the watchdog"
+    )
+    risk_state_file: Path = Field(
+        Path("risk_state.json"), description="path under data_dir for persisted risk state"
+    )
     state_interval_s: Pos = Field(..., description="seconds between state snapshots")
     connect_timeout_s: Pos = Field(..., description="seconds a client waits for the socket")
     request_timeout_s: Pos = Field(..., description="seconds a client waits for a response")
@@ -633,11 +642,11 @@ class Settings(Base):
 
     @property
     def heartbeat_path(self) -> Path:
-        return self.paths.data_dir / "heartbeat"
+        return self.paths.data_dir / self.control.heartbeat_file
 
     @property
     def risk_state_path(self) -> Path:
-        return self.paths.data_dir / "risk_state.json"
+        return self.paths.data_dir / self.control.risk_state_file
 
     @property
     def order_db_path(self) -> Path:

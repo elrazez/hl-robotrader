@@ -44,6 +44,7 @@ def test_every_unit_exists() -> None:
     assert {p.name for p in UNITS} == {
         "liqfade-recorder.service",
         "liqfade-paper.service",
+        "liqfade-testnet.service",
         "liqfade-live.service",
         "liqfade-watchdog.service",
         "liqfade-panel.service",

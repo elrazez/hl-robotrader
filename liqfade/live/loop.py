@@ -60,6 +60,7 @@ from liqfade.execution.orders import OrderStore
 from liqfade.execution.reconcile import Reconciler
 from liqfade.execution.watchdog import write_heartbeat_atomic
 from liqfade.live.paper import PaperSession
+from liqfade.live.venue import VenueSession
 from liqfade.log import get_logger
 from liqfade.recorder.backend import LatencyTracker
 from liqfade.recorder.main import apply_universe, build_streams
@@ -205,6 +206,11 @@ class PaperBackend:
         # An injected order is placed outside a tick, and the fill model can take it before
         # the next one. Sync now, or a drill's entry never reaches the registry at all.
         await self.loop.session.sync_orders(now_ms())
+        drain = getattr(self.loop.session, "drain_injections", None)
+        if drain is not None:
+            # The venue session queues an injected intent rather than placing it from
+            # a sync call. Nothing to drain in paper, where the engine took it already.
+            await drain()
         await self.loop.post(
             f"[{self.loop.settings.env}] INTENT INJECTED {coin} {side} "
             f"entry {intent.entry_px:g} target {intent.target_px:g} stop {intent.stop_px:g}",
@@ -230,7 +236,7 @@ class PaperLoop:
         self.paused = False
         self.latency = LatencyTracker()
         self.store: OrderStore | None = None
-        self.session: PaperSession
+        self.session: PaperSession | VenueSession
         self.streams: list[WSStream] = []
         self.universe = UniverseManager(
             settings.universe,
@@ -465,6 +471,10 @@ class PaperLoop:
             log.warning("risk_halt_cleared")
             await self.post(f"[{self.settings.env}] halt cleared, entries allowed again")
 
+    def extra_jobs(self, stop: asyncio.Event) -> list[tuple[str, Any]]:
+        """Tasks a subclass runs beside the shared ones. Paper has none."""
+        return []
+
     async def heartbeat_loop(self, stop: asyncio.Event) -> None:
         """Beat on a thread of its own, every `risk.heartbeat_s`. The watchdog reads nothing else.
 
@@ -560,6 +570,7 @@ class PaperLoop:
             ("reconcile", lambda: self.reconciler.run(stop, reconnected=self.reconnected)),
             ("kill_watch", lambda: KillWatcher(self.kill).run(stop)),
             ("telegram", lambda: bot.run(stop)),
+            *self.extra_jobs(stop),
         ]
         tasks = [
             asyncio.create_task(self._supervise(name, factory, stop), name=name)
@@ -602,3 +613,114 @@ class PaperLoop:
         if self.store is not None:
             await self.store.close()
             self.store = None
+
+
+class VenueLoop(PaperLoop):
+    """`liqfade testnet` and `liqfade live`: the same loop, against a real venue.
+
+    Everything the paper loop wires stays wired and is not re-implemented here: the feeds,
+    the feature engine, the control socket, Telegram, the kill switch, the heartbeat and
+    the supervisor. Four things change, and each is a consequence of there being a real
+    account on the other side:
+
+    - the session is `VenueSession`, so orders go to Hyperliquid and fills come back from
+      it rather than from a fill model;
+    - reconciliation reads `clearinghouseState` and `openOrders` and **compares positions**,
+      which paper switches off because it has no second source for one;
+    - the user stream is a task, so a fill is known when it happens;
+    - the account snapshot feeds the session on every reconcile, because the venue is the
+      truth about what is held.
+
+    Phase 6 runs this with `env=mainnet`, so this is the real thing rather than a drill
+    harness. The three gates in `execution/signer.py` are untouched and are what decide
+    whether a mainnet order may be signed at all.
+    """
+
+    def __init__(
+        self, settings: Settings, *, starting_equity: float = 0.0, minutes: float | None = None
+    ) -> None:
+        super().__init__(settings, starting_equity=starting_equity, minutes=minutes)
+        self.reader: Any = None
+        self.user_stream: Any = None
+
+    async def setup(self, stop: asyncio.Event | None = None) -> None:
+        from liqfade.execution.hl import HyperliquidTransport, InfoReader
+        from liqfade.execution.orders import OrderManager
+        from liqfade.execution.ratelimit import ActionBudget
+        from liqfade.execution.signer import load_signer
+        from liqfade.execution.userstream import UserStream
+        from liqfade.live.venue import VenueSession
+
+        settings = self.settings
+        await asyncio.to_thread(Path(settings.paths.data_dir).mkdir, parents=True, exist_ok=True)
+        store = await OrderStore.open(settings.order_db_path)
+        self.store = store
+
+        # The one place a key is read. `load_signer` refuses on a missing key, a
+        # placeholder address, and while the kill flag is present.
+        signer = load_signer(settings)
+        self.reader = InfoReader(settings.venues.hyperliquid.info_base)
+        session = VenueSession(
+            settings,
+            orders=OrderManager(
+                store,
+                HyperliquidTransport(signer),
+                sz_decimals={},
+                killed=lambda: settings.kill_switch_present,
+                retries=settings.execution.transient_retries,
+                budget=ActionBudget(settings.execution.action_budget_per_hour),
+            ),
+            reader=self.reader,
+            address=signer.account_address,
+            meta={},
+            starting_equity=self.starting_equity,
+            risk_state_path=settings.risk_state_path,
+        )
+        self.session = session
+        await session.orders.load()
+
+        self.streams = build_streams(
+            settings,
+            self.sink,
+            on_rtt_ms=self.latency.add_ws_ping,
+            on_reconnect=self._on_reconnect,
+        )
+        self.user_stream = UserStream(
+            url=settings.venues.hyperliquid.ws_url,
+            address=signer.account_address,
+            manager=session.orders,
+            cfg=settings.recorder,
+            on_reconnect=self._on_reconnect,
+            on_fill=lambda event: session.on_fill(
+                event.cloid, px=event.px, size=event.size, ts_ms=event.ts_ms
+            ),
+        )
+        self.reconciler = Reconciler(
+            reader=self.reader,
+            address=signer.account_address,
+            orders=store.open_orders,
+            positions=lambda: {c: p.size for c, p in session.positions.items()},
+            interval_s=settings.execution.reconcile_s,
+            alert=self.post,
+            compare_positions=True,
+            on_account=session.sync_account,
+        )
+        self.kill = KillSwitch(
+            kill_file=settings.kill_file,
+            open_orders=session.open_order_cloids,
+            cancel_all=session.cancel,
+            open_positions=session.open_positions,
+            close_position=session.close_position,
+            alert=self.post,
+            stop=stop,
+            budget_s=settings.risk.kill_budget_s,
+        )
+
+    def extra_jobs(self, stop: asyncio.Event) -> list[tuple[str, Any]]:
+        """The user stream, on top of everything the paper loop runs."""
+        return [("user_stream", lambda: self.user_stream.run(stop))]
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        if self.reader is not None:
+            await self.reader.close()

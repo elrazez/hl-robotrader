@@ -1,0 +1,56 @@
+[Unit]
+Description=liqfade testnet trading loop
+Documentation=file:/srv/liqfade/app/docs/HYPERLIQUID.md
+# After= only. Like the paper unit, this loop opens its own feeds and reads neither the
+# recorder's process nor its Parquet. Requires= would make every recorder restart restart
+# a loop that may be holding a position at the venue.
+After=network-online.target chrony.service liqfade-recorder.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The kill switch wins over systemd. One data/KILL stops paper and testnet alike, which is
+# the point of it being one flag: an owner who kills does not want to learn there was a
+# second loop still trading.
+ExecStartPre=/usr/bin/test ! -e /srv/liqfade/data/KILL
+ExecStart=/srv/liqfade/app/.venv/bin/liqfade testnet
+User=liqfade
+Group=liqfade
+EnvironmentFile=/srv/liqfade/.env
+# Its own socket, state file, order registry, heartbeat and risk state. The paper loop and
+# the recorder run on the same box: the control server takes an exclusive flock per socket,
+# two loops sharing one heartbeat would leave the watchdog unable to say which stopped, and
+# a shared risk_state.json would let one loop's daily loss halt the other.
+Environment=LIQFADE_ENV=testnet
+Environment=LIQFADE_CASCADE__TRIGGER=crossvenue
+Environment=LIQFADE_CONTROL__SOCKET_PATH=control-testnet.sock
+Environment=LIQFADE_CONTROL__STATE_FILE=state-testnet.json
+Environment=LIQFADE_CONTROL__HEARTBEAT_FILE=heartbeat-testnet
+Environment=LIQFADE_CONTROL__RISK_STATE_FILE=risk_state-testnet.json
+Environment=LIQFADE_EXECUTION__ORDER_DB=orders-testnet.sqlite
+# LIQFADE_LIVE_TRADING is deliberately absent and must stay absent here. It is one of the
+# three gates in execution/signer.py, and this unit signs with the testnet agent key only.
+WorkingDirectory=/srv/liqfade/app
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Hardening, identical to the paper unit. The code directory stays read only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ReadWritePaths=/srv/liqfade/data /srv/liqfade/logs
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

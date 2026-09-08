@@ -368,6 +368,8 @@ backtest:
 control:
   socket_path: control.sock  # under data_dir, created with mode 0600
   state_file: state.json  # under data_dir, atomically rewritten every state_interval_s
+  heartbeat_file: heartbeat  # under data_dir, touched every risk.heartbeat_s; the watchdog reads it
+  risk_state_file: risk_state.json  # under data_dir, so a restart does not reset the limits
   state_interval_s: 1.0  # seconds between state snapshots
   connect_timeout_s: 2.0  # seconds a client waits for the socket
   request_timeout_s: 5.0  # seconds a client waits for a response

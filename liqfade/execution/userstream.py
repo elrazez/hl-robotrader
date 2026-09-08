@@ -22,7 +22,7 @@ every reconnect, which is CLAUDE.md rule 4, and this only makes it usually find 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -174,8 +174,17 @@ class UserStream:
         manager: OrderManager,
         cfg: Any,
         on_reconnect: Callable[[str], None] | None = None,
+        on_fill: Callable[[UserEvent], Awaitable[None]] | None = None,
     ) -> None:
+        """
+        Args:
+            on_fill: called after a fill has been written to the registry, so the session
+                can bracket the position it opened. After, not before: a bracket placed
+                against a fill the registry has not recorded would be a stop for a
+                position that a restart does not know about.
+        """
         self.manager = manager
+        self._on_fill = on_fill
         self.queue: asyncio.Queue[UserEvent] = asyncio.Queue()
         self.applied = 0
         self.stream = WSStream(
@@ -207,6 +216,11 @@ class UserStream:
                 continue
             await apply_event(self.manager, event)
             self.applied += 1
+            if event.kind == "fill" and self._on_fill is not None:
+                try:
+                    await self._on_fill(event)
+                except Exception:
+                    log.exception("user_fill_hook_failed", cloid=event.cloid)
 
     async def run(self, stop: asyncio.Event) -> None:
         """The socket and the drain together, until stopped."""
