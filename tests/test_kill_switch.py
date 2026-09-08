@@ -490,3 +490,31 @@ async def test_a_kill_that_never_flattens_reports_what_is_left(tmp_path: Path) -
     assert result.venue_positions == {"ETH": 0.064}
     assert "NOT flat" in posted[0] or "not flat" in posted[0].lower()
     assert "ETH" in posted[0]
+
+
+async def test_a_kill_closes_what_the_venue_holds_not_what_we_remember(tmp_path: Path) -> None:
+    """Drilled: "closed 0" while Hyperliquid held two positions.
+
+    The local book is refreshed on reconciliation, so it lags by up to
+    `execution.reconcile_s`, and a position opened since the last one is invisible to it.
+    A kill that closes only what it remembers leaves the rest on.
+    """
+    venue = VenueBook(positions={"ETH": 0.018, "SOL": 0.37}, orders=[])
+
+    async def stale_mirror() -> dict[str, float]:
+        return {}  # what the loop believed
+
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=venue.open_orders,
+        cancel_all=venue.cancel,
+        open_positions=stale_mirror,
+        close_position=venue.close,
+        venue_state=venue.venue_state,
+        budget_s=2.0,
+    )
+
+    result = await switch.fire("drill")
+
+    assert sorted(venue.close_calls) == ["ETH", "SOL"]
+    assert result.venue_flat is True

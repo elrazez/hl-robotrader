@@ -259,9 +259,22 @@ class KillSwitch:
         )
         return _count(outcomes, "kill_cancel_failed", cloids)
 
+    async def _positions_now(self, deadline: float) -> Mapping[str, float]:
+        """The venue's positions when it can be asked, ours when it cannot.
+
+        The local book is a mirror refreshed on reconciliation, so it can be a whole
+        `execution.reconcile_s` behind. Drilled on 2026-09-08: the kill read the mirror,
+        found nothing, reported "closed 0", and the venue was holding two positions opened
+        since the last reconcile. A kill asks the venue.
+        """
+        if self._venue_state is not None:
+            positions, _orders = await _before(self._venue_state(), deadline)
+            return positions
+        return await _before(self._open_positions(), deadline)
+
     async def _close_everything(self, deadline: float) -> tuple[int, int, list[str]]:
         try:
-            positions = dict(await _before(self._open_positions(), deadline))
+            positions = dict(await self._positions_now(deadline))
         except TimeoutError:
             log.error("kill_open_positions_timed_out")
             return 0, 1, ["clearinghouseState"]
