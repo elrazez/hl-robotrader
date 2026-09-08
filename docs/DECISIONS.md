@@ -3204,3 +3204,40 @@ definition that coverage is what counts. Counters for the window up to this depl
 clean reconciliations and **zero** differences, 8 reconnects, 19 process starts, 11 kills
 (yesterday's Telegram drill and today's), no halt, no trade, equity 10,000.00 with a peak of
 10,000.03. Latency: WS ping p50 2.1ms and p95 9.6ms, REST p50 44.7ms and p95 71.8ms.
+
+## 2026-09-08 (05i: the watchdog watches every loop, drilled)
+
+Found by the 05e re-drill: the single watchdog unit read `data/heartbeat`, the paper
+loop's, so a frozen testnet loop produced nothing. Harmless on testnet, not before
+`liqfade-live`. Fix (a3c6940, dd9dfe0): `risk.watchdog_heartbeats` in `config/default.yaml`
+maps a label to a heartbeat file under `data_dir` (`paper loop` to `heartbeat`, `testnet
+loop` to `heartbeat-testnet`), `build_watchdogs` returns one `Watchdog` per entry and the one
+process gathers them. One instance per loop rather than one over many files because healthy,
+the post-clear grace and "did this process write the flag" are already per loop. They share
+`data/KILL`; `write_kill_file` keeps the first reason, so the flag names the loop that
+stalled. The unit lost `Environment=LIQFADE_WATCH_LABEL`; the list is config. Four tests at
+the `build_watchdogs` seam, including the grace per file.
+
+Deployed 16:33:28 to 16:33:32 UTC, `LIQFADE_BRANCH=main` into `/srv/liqfade/paper`, all
+three units named; only the watchdog unit file changed so `deploy.sh` restarted it alone,
+paper and testnet restarted by hand at 16:33:56. `paper_started` now shows `config_hash`
+44dfa80bda53d587 (moved from c9cc76a1 because `risk.watchdog_heartbeats` is inside the hashed
+config, no other reason); testnet 2d0adcc0909b7367. The paper acceptance clock stands at
+2026-09-07 17:51:34 UTC; the drill cost the paper loop 53 s.
+
+Drill, UTC: 16:34:47.078 SIGSTOP on the testnet loop; 16:34:58.637 `watchdog_stale`
+"testnet loop", "heartbeat is 11.6s old, over the 10s limit", flag written (+11.56 s, the
+10 s limit plus one 2 s poll); 16:34:58.753 the paper loop saw the shared flag and killed
+itself (+116 ms); 22 `ExecStartPre` refusals while the flag was up; 16:35:19.188 SIGCONT,
+testnet `kill_fired` 119 ms later, `venue_flat` true; 16:35:49.331 flag cleared, two
+`watchdog_grace_started` 358 ms apart, one per file; both loops back 2.4 s after the clear,
+no re-arm, flag absent since. The paper loop's watchdog never alerted: its heartbeat aged
+only while the flag was up, which the flag path suppresses.
+
+Two edges recorded, neither a defect in the fix:
+
+- **Stopping a loop unit by hand now writes the flag ten seconds later.** A stopped loop and
+  a wedged one look identical from outside. Runbook note added under "Restart a service".
+- **Two alerts for one outage on the resume path.** SIGCONT let the loop write one heartbeat
+  before it killed itself, which read as recovered, and the next silence read as stale again.
+  The flag existed, nothing was rewritten, the first reason survived. Not worth code today.

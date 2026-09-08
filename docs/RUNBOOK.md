@@ -62,6 +62,12 @@ First deploy on a new box needs the repo URL:
     systemctl status  liqfade-recorder
     journalctl -u liqfade-recorder -f -n 100
 
+A trading loop (`liqfade-paper`, `liqfade-testnet`, `liqfade-live`) is watched: if you
+`systemctl stop` one and leave it stopped, the watchdog writes `data/KILL` about ten seconds
+later, because a stopped loop and a wedged one look the same from outside. A `restart` is
+inside the limit and is fine. To keep a loop down on purpose, stop `liqfade-watchdog` first,
+or expect to clear the flag (see "Stop trading right now") when you bring it back.
+
 Logs are one JSON object per line. To read them:
 
     journalctl -u liqfade-live -n 500 -o cat | jq 'select(.event=="order_reject")'
