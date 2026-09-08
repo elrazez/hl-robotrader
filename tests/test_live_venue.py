@@ -7,6 +7,7 @@ against these. Nothing here reaches the network and nothing here can sign.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -894,5 +895,37 @@ async def test_a_time_stop_closes_what_the_venue_has_not_confirmed_yet(tmp_path:
         assert closing.tag == "flat" and closing.reduce_only is True
         assert closing.is_buy is True, "a short is closed by buying"
         assert closing.size == 0.01
+    finally:
+        await session._store.close()
+
+
+async def test_the_kills_venue_read_asks_for_all_three_at_once(tmp_path: Path) -> None:
+    """Three Tokyo round trips in sequence is most of a kill's budget spent queueing.
+
+    The barrier is the assertion: each read waits for the other two to have started, so a
+    `venue_state` that awaited them one after another never returns at all.
+    """
+    session, _venue = await a_session(tmp_path)
+    barrier = asyncio.Barrier(3)
+
+    class SlowReader(FakeReader):
+        async def account(self, address: str) -> AccountSnapshot:
+            await barrier.wait()
+            return self.snapshot
+
+        async def open_orders(self, address: str) -> list[Any]:
+            await barrier.wait()
+            return []
+
+        async def trigger_orders(self, address: str) -> list[Any]:
+            await barrier.wait()
+            return []
+
+    try:
+        session.reader = SlowReader()
+
+        positions, cloids = await asyncio.wait_for(session.venue_state(), timeout=2.0)
+
+        assert positions == {} and cloids == []
     finally:
         await session._store.close()

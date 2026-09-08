@@ -23,6 +23,7 @@ here weakens them, and nothing here asks for a signer.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 from collections import deque
@@ -255,10 +256,16 @@ class VenueSession:
 
         Trigger orders are included. They live in `frontendOpenOrders` alone, so a sweep
         reading `openOrders` leaves a bracket resting behind a closed position.
+
+        The three reads go out together. In sequence they are three Tokyo round trips, and
+        this runs inside a kill whose whole budget is four seconds and which calls it again
+        on every retry.
         """
-        account = await self.reader.account(self.address)
-        orders = await self.reader.open_orders(self.address)
-        triggers = await self.reader.trigger_orders(self.address)
+        account, orders, triggers = await asyncio.gather(
+            self.reader.account(self.address),
+            self.reader.open_orders(self.address),
+            self.reader.trigger_orders(self.address),
+        )
         cloids = [o.cloid for o in orders if o.cloid] + [t.cloid for t in triggers if t.cloid]
         return {coin: p.size for coin, p in account.positions.items()}, cloids
 

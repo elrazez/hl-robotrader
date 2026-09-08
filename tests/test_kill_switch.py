@@ -536,3 +536,55 @@ def test_the_first_reason_survives_a_second_writer(tmp_path: Path) -> None:
     assert write_kill_file(flag, "kill file at data/KILL") is True
     assert flag.read_text() == first
     assert "watchdog" in flag.read_text()
+
+
+async def test_a_kill_whose_venue_read_timed_out_says_unverified(tmp_path: Path) -> None:
+    """A venue that accepted and never answered is not paper, and must not read as paper.
+
+    "Venue not checked (no account to read)" is the paper sentence: there is no account.
+    Sending it after a read that ran out of budget tells an owner the kill was as good as
+    it gets on this loop, when in fact nobody knows what the account holds.
+    """
+    posted: list[str] = []
+
+    async def never_answers() -> tuple[dict[str, float], list[str]]:
+        await asyncio.sleep(5.0)
+        return {"ETH": 0.01}, []
+
+    async def slow_close(coin: str, size: float) -> None:
+        await asyncio.sleep(5.0)
+
+    async def alert(text: str) -> bool:
+        posted.append(text)
+        return True
+
+    switch = KillSwitch(
+        kill_file=tmp_path / "KILL",
+        open_orders=lambda: asyncio.sleep(0, result=[]),
+        cancel_all=lambda cloid: asyncio.sleep(0),
+        open_positions=lambda: asyncio.sleep(0, result={"ETH": 0.01}),
+        close_position=slow_close,
+        venue_state=never_answers,
+        alert=alert,
+        budget_s=0.4,
+    )
+
+    result = await switch.fire(reason="drill")
+
+    assert result.venue_flat is None, "unknown, which is neither flat nor not flat"
+    assert "no account to read" not in posted[0]
+    assert "VENUE UNVERIFIED" in posted[0]
+    assert "ETH 0.01" in posted[0], "and what was last known, so the owner knows where to look"
+
+
+async def test_a_kill_with_no_account_to_read_still_says_so(tmp_path: Path) -> None:
+    """Paper. There is no venue behind it, and that is a different sentence."""
+    posted: list[str] = []
+    executor = FakeExecutor(orders=["0xa"], positions={"ETH": 1.0})
+    switch = a_switch(tmp_path, executor, posted)
+
+    result = await switch.fire(reason="drill")
+
+    assert result.venue_flat is None
+    assert "no account to read" in posted[0]
+    assert "UNVERIFIED" not in posted[0]
