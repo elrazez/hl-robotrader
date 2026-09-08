@@ -36,7 +36,7 @@ export function filterQuery(filters: FillFilters): string {
 function FillTable({ fills }: { fills: FillRow[] }) {
   if (fills.length === 0) return <p className="text-sm text-neutral-500">no fills match</p>;
   return (
-    <table className="w-full text-sm">
+    <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
       <thead className="text-left text-xs uppercase text-neutral-500">
         <tr>
           <th className="pb-1 font-medium">time (UTC)</th>
@@ -178,15 +178,12 @@ export default function Fills() {
           <Row label="fees on this page" value={usd(fees, 4)} />
         </Section>
         <div className="md:col-span-2">
-          <Section title="realized cash, cumulative">
-            <Row
-              label="net of fees"
-              value={usd(realized)}
-              tone={pnlTone(realized)}
-            />
+          <Section title="realized pnl, cumulative">
+            <Row label="net of fees" value={usd(realized)} tone={pnlTone(realized)} />
             <p className="mt-1 text-xs text-neutral-500">
-              A buy pays out, a sell takes in, fees come off both. An open position shows as
-              the cash it is out; the curve returns to realized PnL when the book is flat.
+              Running average cost per coin: a fill that reduces a position realizes the move
+              against that average, an entry costs only its fee. Open positions are not in
+              this number; the live page has their unrealized.
             </p>
           </Section>
         </div>

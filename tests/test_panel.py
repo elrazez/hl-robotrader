@@ -915,11 +915,13 @@ class TestFillsHistory:
 
 
 class TestTheRealizedEquityCurve:
-    """Cumulative realized cash flow across the fills, which is what these rows can say.
+    """Realized PnL over the fills, on running average cost per coin.
 
-    A fill row is a cash movement: a buy pays out, a sell takes in, and the fee comes off
-    either way. The registry stores no per-trade PnL, so this is the honest curve rather
-    than a round trip attribution that would have to guess how legs pair up.
+    The first version of this plotted cumulative cash, which is what a fill row literally
+    is. It made a useless chart: every entry dropped the line by the whole notional and
+    every exit put it back, so a 2,400 dollar swing drew over a 30 dollar edge. Average
+    cost realization needs no guess about which entry an exit belongs to and answers the
+    question the page exists for.
     """
 
     @pytest.fixture
@@ -937,15 +939,104 @@ class TestTheRealizedEquityCurve:
             "drawdown": [],
         }
 
-    def test_a_buy_pays_out_and_a_sell_takes_in_net_of_fees(self, filled: TestClient) -> None:
+    def test_an_entry_realizes_only_its_fee_and_an_exit_realizes_the_move(
+        self, filled: TestClient
+    ) -> None:
         body = filled.get("/api/live/equity").json()
 
-        # BTC: bought 0.03 at 79000 (-2370.00 - 1.06), sold at 79400 (+2382.00 - 1.07).
-        assert body["equity"][0] == pytest.approx(-2371.06)
+        # BTC long: the entry costs its fee and nothing else, because nothing closed.
+        assert body["equity"][0] == pytest.approx(-1.06)
+        # Sold 0.03 at 79400 against a 79000 average: 12.00 realized, less the 1.07 fee.
         assert body["equity"][1] == pytest.approx(9.87)
-        # ETH: sold 1 at 3100 (+3100.00 - 0.46), bought back at 3080 (-3080.00 - 1.38).
-        assert body["equity"][2] == pytest.approx(3109.41)
+        # ETH short: the entry is again its fee alone.
+        assert body["equity"][2] == pytest.approx(9.41)
+        # Bought 1.0 back at 3080 against a 3100 average short: 20.00 realized, less 1.38.
         assert body["equity"][3] == pytest.approx(28.03)
+
+    def test_a_short_realizes_when_price_falls(self, filled: TestClient) -> None:
+        """A sell then a cheaper buy is a profit, which a signed cash total also says
+        but only after both legs. The point of the curve is that it says so at the exit."""
+        body = filled.get("/api/live/equity?coin=ETH").json()
+        assert body["equity"] == [pytest.approx(-0.46), pytest.approx(18.16)]
+
+    def test_a_partial_close_realizes_only_the_part_that_closed(
+        self, client: TestClient, settings: Settings, tmp_path: Path
+    ) -> None:
+        """Half an exit is half the PnL, and the rest stays open at the same average."""
+        import sqlite3
+
+        from liqfade.execution.orders import SCHEMA
+
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(settings.order_db_path)
+        connection.executescript(SCHEMA)
+        for cloid, is_buy, px, size, ts in [
+            ("0xa", 1, 100.0, 2.0, 1_000),
+            ("0xb", 0, 110.0, 1.0, 2_000),
+            ("0xc", 0, 120.0, 1.0, 3_000),
+        ]:
+            connection.execute(
+                """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only,
+                                       tag, status, submitted_ms, updated_ms)
+                   VALUES (?,'BTC',?,?,?,'Gtc',0,'entry','FILLED',?,?)""",
+                (cloid, is_buy, px, size, ts, ts),
+            )
+            connection.execute(
+                "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,0,0)",
+                (cloid, ts, px, size),
+            )
+        connection.commit()
+        connection.close()
+        client.post("/api/login", json={"password": PASSWORD})
+
+        equity = client.get("/api/live/equity").json()["equity"]
+
+        assert equity == [0.0, pytest.approx(10.0), pytest.approx(30.0)]
+
+    def test_a_position_that_flips_realizes_the_old_side_and_opens_the_new(
+        self, client: TestClient, settings: Settings
+    ) -> None:
+        """One order can close a long and open a short. Only the closed part realizes;
+        treating the whole size as a close would book PnL on a position never held."""
+        import sqlite3
+
+        from liqfade.execution.orders import SCHEMA
+
+        settings.order_db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(settings.order_db_path)
+        connection.executescript(SCHEMA)
+        for cloid, is_buy, px, size, ts in [
+            ("0xa", 1, 100.0, 1.0, 1_000),  # long 1 at 100
+            ("0xb", 0, 110.0, 3.0, 2_000),  # closes the long, opens 2 short at 110
+            ("0xc", 1, 100.0, 2.0, 3_000),  # closes the short at 100
+        ]:
+            connection.execute(
+                """INSERT INTO orders (cloid, coin, is_buy, px, size, tif, reduce_only,
+                                       tag, status, submitted_ms, updated_ms)
+                   VALUES (?,'BTC',?,?,?,'Gtc',0,'entry','FILLED',?,?)""",
+                (cloid, is_buy, px, size, ts, ts),
+            )
+            connection.execute(
+                "INSERT INTO fills (cloid, ts_ms, px, size, fee, maker) VALUES (?,?,?,?,0,0)",
+                (cloid, ts, px, size),
+            )
+        connection.commit()
+        connection.close()
+        client.post("/api/login", json={"password": PASSWORD})
+
+        equity = client.get("/api/live/equity").json()["equity"]
+
+        # 10 from the long, then 20 from the 2 short at 110 bought back at 100.
+        assert equity == [0.0, pytest.approx(10.0), pytest.approx(30.0)]
+
+    def test_it_agrees_with_the_cash_total_once_every_book_is_flat(
+        self, filled: TestClient
+    ) -> None:
+        """The check on the whole method: when nothing is open, realized PnL is exactly
+        the cash that came in less the cash that went out."""
+        body = filled.get("/api/live/equity").json()
+        cash = -2370.0 - 1.06 + 2382.0 - 1.07 + 3100.0 - 0.46 - 3080.0 - 1.38
+        assert body["equity"][-1] == pytest.approx(cash)
 
     def test_the_curve_is_in_time_order_even_though_the_table_is_not(
         self, filled: TestClient
@@ -957,14 +1048,14 @@ class TestTheRealizedEquityCurve:
     def test_drawdown_is_the_distance_below_the_running_peak(self, filled: TestClient) -> None:
         body = filled.get("/api/live/equity").json()
         assert body["drawdown"][0] == pytest.approx(0.0)  # the first point is its own peak
-        assert body["drawdown"][1] == pytest.approx(9.87 - 9.87)
+        assert body["drawdown"][1] == pytest.approx(0.0)  # a new high
         assert all(value <= 0 for value in body["drawdown"])
 
     def test_it_honours_the_same_filters_as_the_table(self, filled: TestClient) -> None:
         """The chart under the table has to be the same rows the table is showing."""
         body = filled.get("/api/live/equity?coin=ETH").json()
         assert len(body["ts_ms"]) == 2
-        assert body["equity"][0] == pytest.approx(3099.54)
+        assert body["equity"][0] == pytest.approx(-0.46)
 
 
 # --- submit to ack latency ------------------------------------------------------

@@ -266,14 +266,23 @@ def realized_curve(
     start_ms: int | None = None,
     end_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Cumulative realized cash flow across the fills, uplot shaped, with its drawdown.
+    """Realized PnL across the fills, uplot shaped, with its drawdown.
 
-    A fill is a cash movement: a buy pays out `px * size`, a sell takes it in, and the
-    fee comes off either way. That is all these rows can honestly say. The registry
-    stores no per-trade PnL and pairing entry legs to exit legs would be a guess, so the
-    curve is cash rather than an attribution that could be wrong without looking wrong.
-    A flat account's curve therefore returns to its realized PnL; an open position shows
-    as the cash it is currently out.
+    Running average cost per coin: a fill that adds to a position moves its average, a
+    fill that reduces one realizes the difference between the fill price and that
+    average over the part it closed, and a fill that flips the sign does both. Fees come
+    off whatever the fill did. Nothing here needs to know which entry an exit belongs to,
+    which is what makes it exact rather than an attribution that could be quietly wrong.
+
+    This used to plot cumulative cash, which is what a fill row literally is, and it made
+    a useless chart: every entry dropped the line by the whole notional and every exit
+    put it back, so a 2,400 dollar swing drew over a 30 dollar edge. The two agree
+    wherever every book is flat, which is the check on the method.
+
+    A filter that cuts a coin's history in half leaves that coin's position opening
+    mid-flight, and its first reducing fill then realizes against a shorter average. The
+    filters exist to look at a window, and the window's own PnL is what the chart of it
+    should show.
     """
     connection = _open_registry(db_path)
     if connection is None:
@@ -281,7 +290,7 @@ def realized_curve(
     where, args = _fill_filter(coin, side, start_ms, end_ms)
     try:
         rows = connection.execute(
-            f"""SELECT f.ts_ms, f.px, f.size, f.fee, o.is_buy
+            f"""SELECT f.ts_ms, f.px, f.size, f.fee, o.is_buy, o.coin
                 FROM fills f JOIN orders o USING (cloid)
                 WHERE {where} ORDER BY f.ts_ms, f.id LIMIT ?""",  # noqa: S608
             [*args, MAX_CURVE_POINTS],
@@ -289,10 +298,34 @@ def realized_curve(
     finally:
         connection.close()
 
-    stamps, equity, drawdown = [], [], []
+    stamps: list[int] = []
+    equity: list[float] = []
+    drawdown: list[float] = []
+    # coin -> (signed size held, average cost of that size)
+    book: dict[str, tuple[float, float]] = {}
     running, peak = 0.0, float("-inf")
     for row in rows:
-        running += (-1.0 if row["is_buy"] else 1.0) * row["px"] * row["size"] - row["fee"]
+        held, average = book.get(row["coin"], (0.0, 0.0))
+        signed = row["size"] if row["is_buy"] else -row["size"]
+        running -= row["fee"]
+
+        if held == 0.0 or (held > 0) == (signed > 0):
+            # Adding to a position, or opening one. Nothing closes, so nothing realizes.
+            total = held + signed
+            average = (abs(held) * average + abs(signed) * row["px"]) / abs(total)
+            held = total
+        else:
+            closed = min(abs(held), abs(signed))
+            # Long closes at a profit above its average, short below it.
+            running += closed * (row["px"] - average) * (1.0 if held > 0 else -1.0)
+            held += signed
+            if abs(signed) > closed:
+                # The fill was bigger than the position: the rest opens the other way.
+                average = row["px"]
+            elif held == 0.0:
+                average = 0.0
+        book[row["coin"]] = (held, average)
+
         peak = max(peak, running)
         stamps.append(row["ts_ms"])
         equity.append(running)
