@@ -24,8 +24,8 @@ two are Phase 5 engineering. None of them is a strategy change.
 problem we are actually stuck on.**
 
 Every Hyperliquid position is public. `clearinghouseState` for any address returns, per
-position, `coin`, `szi`, `entryPx`, `leverage`, `marginUsed`, `positionValue` and — the field
-that matters — **`liquidationPx`**, the venue's own computed liquidation price. Verified
+position, `coin`, `szi`, `entryPx`, `leverage`, `marginUsed`, `positionValue` and, the field
+that matters, **`liquidationPx`**, the venue's own computed liquidation price. Verified
 against <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals.md>,
 read 2026-09-08. No auth, no key, no paid tier.
 
@@ -41,7 +41,7 @@ asked whether the live bot can *observe* Hyperliquid liquidations in real time a
 no: the tape carries no liquidation flag, the S3 archive is a day late, and the only complete
 source is a 128 GB node at $100/month. `features/proxy.py` was the workaround and it reached
 precision 0.01, which is why `cascade.trigger` fell back to cross-venue Bybit. The map asks a
-different question — not *what just liquidated* but *what is about to*, and then, one poll
+different question, not *what just liquidated* but *what is about to*, and then, one poll
 later, *what is gone*. Positions that held a `liquidationPx` inside the range price just
 traversed, and are absent from the next snapshot, liquidated. That is an estimate of
 Hyperliquid's own forced flow derived from the accounts themselves rather than from the shape
@@ -59,7 +59,7 @@ the clearest line to a config change (`exhaustion.mode`), and it is testable aga
 `fixed_delay` baseline we already have.
 
 **1c. Targets and stops.** A dense cluster below the entry is a bad place to hide a stop, and
-the far edge of a cleared band is a natural mean-reversion target. Third in line — do not
+the far edge of a cleared band is a natural mean-reversion target. Third in line, do not
 build this until 1a or 1b pays.
 
 ### Where the addresses come from
@@ -70,7 +70,7 @@ most of the notional and misses the retail tail. Two free harvests, both of whic
 have the data for:
 
 - **Live, from a feed we already consume.** The public `trades` WS payload carries
-  `users: [buyer, seller]` — documented, and already quoted in
+  `users: [buyer, seller]`, documented, and already quoted in
   `docs/research/hl_realtime_liquidations.md`. **We currently discard it**: `TRADES` in
   `data/schemas.py` stops at `tid`. Every large HL fill names its counterparties and we throw
   the names away. Note that `TRADES` is in `MULTI_VENUE_TABLES`, shared with Bybit, OKX and
@@ -82,7 +82,7 @@ have the data for:
 
 Both moondev and wilsontiger dodge this problem rather than solving it: moondev buys the
 positions from a keyed third-party API, and wilsontiger hardcodes thirteen wallet addresses
-in `config.yaml`. Neither is acceptable here — one adds a paid dependency and a data source
+in `config.yaml`. Neither is acceptable here, one adds a paid dependency and a data source
 we cannot audit, the other rots the moment a whale closes an account.
 
 ### Rate budget
@@ -91,7 +91,7 @@ we cannot audit, the other rots the moment a whale closes an account.
 at weight 2, so 600 calls/min is the ceiling and the recorder's existing info traffic comes
 out of the same budget. A few hundred addresses per minute is comfortable; the whole HL
 account set is not. The poller belongs next to `recorder/streams/coinalyze.py`, which is
-already a REST poller writing canonical rows on an interval rather than a stream — the shape
+already a REST poller writing canonical rows on an interval rather than a stream, the shape
 exists, this is one more of them plus one schema.
 
 ### What could kill it
@@ -114,7 +114,7 @@ Written down first, so the research question is not graded on a curve:
 ### How to start, and how it gets graded
 
 **Prospectively, and only prospectively.** Historical `clearinghouseState` cannot be
-reconstructed — the endpoint answers for now, not for a past block — so there is no way to
+reconstructed, the endpoint answers for now, not for a past block, so there is no way to
 backtest this against the year in the lake. braindeadpt reached the same wall and its Phase 2
 reaction analysis honestly reports "no evidence yet". Which makes the first step small and
 the second step patient:
@@ -142,7 +142,7 @@ per order**, so every wallet's resting stop-loss and take-profit levels are publ
 what it exposes about *other* people.
 
 Stops are forced flow that is not a liquidation, and they cluster at round numbers and under
-swing lows — where `features/levels.py` already draws its zones. Same address set, same
+swing lows, where `features/levels.py` already draws its zones. Same address set, same
 poller, one more call per address. Strictly an extension of §1 and only worth building after
 §1 has paid; noted here so that when someone asks "can we see stops", the answer and its
 source are already written down.
@@ -158,7 +158,7 @@ live and backtest have silently drifted apart, which is the failure mode that in
 every backtest number at once.
 
 `CLAUDE.md` calls backtest/live parity the single most important design constraint of this
-project, and we test around it rather than at it — `test_backtest_golden.py` pins the
+project, and we test around it rather than at it, `test_backtest_golden.py` pins the
 backtest against itself, `test_strategy_cascade_consistency.py` holds the online detector to
 the vectorized one. Neither takes a real run and replays it.
 
@@ -185,7 +185,7 @@ through recorded candles and reports what it would have made.
 
 We are half of the way there already: `live/loop.py` logs every refusal with its gate and
 reason, rate-limits the Telegram post per reason, and the backtest report prices what each
-filter cost over a run. What is missing is the live half — after a week of paper, "what did
+filter cost over a run. What is missing is the live half, after a week of paper, "what did
 `spread_too_wide` cost me" is answerable from the backtest and not from the run that just
 happened. The pieces exist (`backtest/fills.py`, `backtest/costs.py`, the refusal log, the
 lake); the lazy version is a CLI that joins them, not new machinery.
@@ -209,7 +209,7 @@ Lowest priority of the four. It is observability, not edge.
   with evidence.
 - **Weighted signal voting** (wilsontiger's `signal_aggregator.py`: funding 0.35, OI 0.30,
   liquidation 0.35, blended into a confidence score, threshold 0.6). The weights are asserted,
-  not fitted, and a blended scalar cannot be attributed — when it underperforms you cannot
+  not fitted, and a blended scalar cannot be attributed, when it underperforms you cannot
   tell which input did it. Our `strategy/rules.py` confluence rules are named, individually
   priced by the backtest report, and individually switchable. Strictly better; do not trade it
   for a weighted sum.
@@ -219,7 +219,7 @@ Lowest priority of the four. It is observability, not edge.
 - **The 27-strategy ensemble** (braindeadpt's `strategies/`, plus a 4,631-line `engine.py`, an
   `ensemble.py` and a `checklist_meta.py` that scores strategies against each other). This is
   the architecture our `CLAUDE.md` was written to prevent.
-- **moondev's trading rules** — momentum confirmed by whether the last 1h candle closed higher
+- **moondev's trading rules**, momentum confirmed by whether the last 1h candle closed higher
   than the one before, fixed $15 notional, fixed 3x leverage, one position at a time, 2-hour
   hard exit. Every one of these is beneath `sizing/`, `risk/` and `strategy/` as they stand.
   The 1h-close momentum check is genuinely worse than nothing at our horizon: our hold is 1 to
@@ -228,7 +228,7 @@ Lowest priority of the four. It is observability, not edge.
   cascade you then trade, calling it "ethically gray"). No. Separately, it is arithmetic: our
   size cannot move a liquid HL perp into a cluster, so it would be paying taker fees to
   achieve nothing even if we wanted it.
-- **A trend or ADX filter** (braindeadpt's liquidation catcher blocks entries above ADX 40 —
+- **A trend or ADX filter** (braindeadpt's liquidation catcher blocks entries above ADX 40 ,
   do not fade a strong trend). Not rejected on merit; rejected as a *build*. It is a research
   question, and the lab can answer it against the year in the lake whenever there is a reason
   to ask. It is not one of the four things above.
