@@ -40,6 +40,16 @@ class Universe(Base):
     exclude: tuple[str, ...] = Field((), description="HL symbols never traded")
 
 
+class HlPositions(Base):
+    """The public liquidation map poller. Read-only `/info`, no key, no account."""
+
+    enabled: bool
+    poll_s: Pos = Field(..., description="seconds between polls of the tracked addresses")
+    max_addresses: int = Field(
+        ..., gt=0, description="count: addresses per poll, ranked by cumulative notional"
+    )
+
+
 class HyperliquidVenue(Base):
     enabled: bool
     api_url: str = Field(..., description="url: base for /info and /exchange unless split")
@@ -55,6 +65,7 @@ class HyperliquidVenue(Base):
     )
     liq_weight: NonNeg = Field(..., description="weight in aggregated liquidation notional")
     complete: bool = Field(..., description="true when the venue publishes every liquidation")
+    positions: HlPositions
 
     @property
     def info_base(self) -> str:
