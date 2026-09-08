@@ -175,9 +175,16 @@ FLAT_STATE: dict[str, Any] = {
 class FakeInfo:
     """Answers `clearinghouseState` per address and records the order it was asked in."""
 
-    def __init__(self, states: dict[str, Any], *, failing: set[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        states: dict[str, Any],
+        *,
+        failing: frozenset[str] = frozenset(),
+        delay_s: float = 0.0,
+    ) -> None:
         self.states = states
         self.failing = failing
+        self.delay_s = delay_s
         self.asked: list[str] = []
         self.events: list[tuple[str, str]] = []
 
@@ -189,7 +196,9 @@ class FakeInfo:
         address = body["user"]
         self.asked.append(address)
         self.events.append(("start", address))
-        await asyncio.sleep(0)  # a gathered poll would interleave two starts here
+        # A gathered poll would interleave two starts here; a delay also makes the wall
+        # clock move between answers, which is what the rx_ms stamping test needs.
+        await asyncio.sleep(self.delay_s)
         self.events.append(("end", address))
         if address in self.failing:
             return httpx.Response(500, text="nope")
@@ -319,6 +328,24 @@ async def test_the_addresses_are_asked_one_after_another_and_never_gathered() ->
     ]
 
 
+async def test_each_address_is_stamped_when_its_own_answer_arrived() -> None:
+    """`rx_ms` is local receive time, and 200 addresses are walked one after another.
+
+    Measured on the box 2026-09-08: a full poll spans 6.5 seconds, so stamping every row
+    with the poll's start time dated the later ones up to that much *earlier* than they
+    actually arrived. A receive time that precedes the receipt is lookahead, which is the
+    one thing CLAUDE.md rule 1 does not tolerate, and the whole point of `hl_positions`
+    is to be research input.
+    """
+    slow = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE}, delay_s=0.05)
+    poller, rows = _poller(slow, ["BTC"])
+    async with slow.client() as client:
+        await poller.poll_once(client)
+
+    by_address = {row["address"]: row["rx_ms"] for row in rows}
+    assert by_address[ISOLATED] > by_address[WHALE], "the second answer arrived later"
+
+
 async def test_the_poll_counts_as_one_message_however_many_rows_it_returned() -> None:
     fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE})
     poller, rows = _poller(fake, ["BTC", "ETH", "HYPE"])
@@ -330,7 +357,7 @@ async def test_the_poll_counts_as_one_message_however_many_rows_it_returned() ->
 
 
 async def test_an_address_that_fails_is_skipped_counted_and_does_not_stop_the_poll() -> None:
-    fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE}, failing={WHALE})
+    fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE}, failing=frozenset({WHALE}))
     poller, rows = _poller(fake, ["BTC"])
     poller.stats[STREAM].connected = True  # as `run` leaves it after a good poll
     async with fake.client() as client:
@@ -343,7 +370,7 @@ async def test_an_address_that_fails_is_skipped_counted_and_does_not_stop_the_po
 
 
 async def test_a_poll_where_every_address_failed_is_a_disconnected_feed() -> None:
-    fake = FakeInfo({WHALE: WHALE_STATE}, failing={WHALE})
+    fake = FakeInfo({WHALE: WHALE_STATE}, failing=frozenset({WHALE}))
     poller, _ = _poller(fake, ["BTC"])
     poller.stats[STREAM].connected = True
     async with fake.client() as client:
