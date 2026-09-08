@@ -198,6 +198,8 @@ it argues for removing filters.
 
 Lowest priority of the four. It is observability, not edge.
 
+Built 2026-09-08 on branch `05d-refusals`: refusals are persisted from both live sessions into `data/orders.sqlite`, and `liqfade refusals` scores them. Both fill rules above were taken.
+
 ---
 
 ## Rejected, with reasons
