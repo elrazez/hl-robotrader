@@ -6,7 +6,7 @@ import asyncio
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1530,6 +1530,59 @@ class TestSettingsWrites:
 
         assert [name for name, _ in loop_socket.calls] == ["reload_config"]
         assert body["reload"]["error"] is None
+
+    def test_a_write_the_loop_never_took_is_announced_on_telegram(
+        self, signed_in: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is listening, so nothing posted `CONFIG RELOADED`, so the panel does.
+
+        The owner hears about every settings write within a minute of it, whether or not
+        the loop is up. A write that only exists in the overrides file and the audit log
+        is the one an owner is most likely to forget was ever made.
+        """
+        posted: list[str] = []
+
+        async def capture(text: str, **_: Any) -> bool:
+            posted.append(text)
+            return True
+
+        monkeypatch.setattr("liqfade.panel.app.send_alert", capture)
+
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert "control socket" in body["reload"]["error"]
+        assert len(posted) == 1
+        assert "intent.k_target" in posted[0]
+        assert "0.8 -> 1.4" in posted[0]
+        assert "wider" in posted[0]
+        assert "control socket" in posted[0], "and why the running loop has not got it"
+
+    def test_a_write_the_loop_applied_is_left_for_the_loop_to_announce(
+        self, signed_in: TestClient, loop_socket: NoopBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One message per write. The loop posts what it reloaded; two would be noise."""
+        from liqfade.control.protocol import ReloadResult
+
+        posted: list[str] = []
+
+        async def capture(text: str, **_: Any) -> bool:
+            posted.append(text)
+            return True
+
+        async def applied(_self: NoopBackend) -> ReloadResult:
+            return ReloadResult(changed=["intent.k_target"])
+
+        monkeypatch.setattr("liqfade.panel.app.send_alert", capture)
+        monkeypatch.setattr(NoopBackend, "reload_config", applied)
+
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert body["reload"]["changed"] == ["intent.k_target"]
+        assert posted == []
 
     def test_a_loop_that_refuses_the_reload_does_not_undo_the_write(
         self, signed_in: TestClient, settings: Settings
