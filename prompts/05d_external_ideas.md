@@ -33,9 +33,11 @@ scan doc already lists what could kill the map; the grill is for what the scan m
 
 ## Prompt A: the liquidation map recorder
 
-ROUTING: NEW chat. Runs concurrently with prompt B. Branch `07a-liqmap-recorder` off `main`.
-When done, send the final report (prompt name, branch, tip hash, what was deployed and what
-the first hour on the VPS showed) to the control chat `hl-robotrader-38` with `SendMessage`.
+ROUTING: NEW chat. Runs concurrently with prompt B. Branch `07a-liqmap-recorder` off `main`,
+in its own worktree: `git worktree add ../hl-robotrader-liqmap -b 07a-liqmap-recorder main`,
+then `uv sync --all-extras` there. When done, send the final report (prompt name, branch, tip
+hash, what was deployed and what the first hour on the VPS showed) to the control chat
+`hl-robotrader-38` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -219,7 +221,8 @@ trial anything else against it):
     ssh liqfade-vps 'systemctl restart liqfade-recorder'
 
 `deploy.sh` restarts only a unit whose file changed, so the second line is the restart, on
-purpose. Then, in this order, and report each as seen rather than assumed:
+purpose. It deploys `main`, which by now also carries Panel v3 and the 05c testnet loop;
+that is intended, `/srv/liqfade/app` should be on `main`. Then, in this order, and report each as seen rather than assumed:
 
 1. `systemctl status liqfade-paper` is unchanged and its heartbeat file is fresh: the soak
    was not restarted.
@@ -238,9 +241,16 @@ from this machine), print the checklist and stop; never simulate having done it.
 
 ## Prompt B: the refusals the live loop throws away
 
-ROUTING: NEW chat. Runs concurrently with prompt A. Branch `05d-refusals` off `main`. When
-done, send the final report (prompt name, branch, tip hash) to the control chat
-`hl-robotrader-38` with `SendMessage`.
+ROUTING: NEW chat. Runs concurrently with prompt A. Branch `05d-refusals` off `main`, in its
+own worktree: `git worktree add ../hl-robotrader-refusals -b 05d-refusals main`, then
+`uv sync --all-extras` there. When done, send the final report (prompt name, branch, tip
+hash) to the control chat `hl-robotrader-38` with `SendMessage`.
+
+Since this prompt was written, 05c landed on `main`: `liqfade/live/venue.py` holds
+`VenueSession`, the session that runs against a real account (testnet now, mainnet in Phase
+6), beside `PaperSession`; `OrderStore` gained a migration step for new columns; and
+`execution/policy.py` owns the entry policy. Read `liqfade/live/venue.py` with the files
+below, and read the current code rather than the line references here.
 
 /mattpocock-skills:tdd
 
@@ -295,8 +305,9 @@ Print a short plan (files, seams, slice order) and wait for an OK before writing
    (in-memory `RunInputs`, as `tests/test_backtest_engine.py` builds them).
 3. `OrderStore.add_refusals(...)` and `OrderStore.refusals(start_ms, end_ms)` round trip
    through a temp sqlite file.
-4. `PaperSession.tick`: after a tick, `strategy._rejections` is empty and the refusals of
-   that tick are in the store; a session with `store=None` drains and discards.
+4. `PaperSession.tick` and `VenueSession.tick`: after a tick, `strategy._rejections` is
+   empty and the refusals of that tick are in the store; a session with `store=None` drains
+   and discards. One drain, shared by both sessions, not two copies.
 5. `liqfade/backtest/shadow.py::score_refusal(refusal, prints, settings) -> Outcome`, pure,
    on hand-built prints: target hit; stop hit; both in one second resolves as stop; time
    stop; a print before `ts_ms + latency_ms` cannot fill.
@@ -325,7 +336,9 @@ filter rejections drained at the end); the report is not changed in this session
              time_stop_s REAL NOT NULL, urgency TEXT NOT NULL, explain_json TEXT NOT NULL)
 
 with an index on `ts_ms`. `explain_json` is `orjson` of the mapping (CLAUDE.md: orjson for
-all JSON; `tests/test_conventions.py` enforces it).
+all JSON; `tests/test_conventions.py` enforces it). The table is created through the same
+migration path 05c added for new columns, so an existing `orders.sqlite` on the box gains it
+on the next start.
 
 **The drain.** At the end of `PaperSession.tick`, after `_on_tick`: collect
 `self.strategy.take_rejections()` plus everything in `self.result.refused` (then clear it),
