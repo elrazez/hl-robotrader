@@ -18,6 +18,12 @@ Each difference carries a `Severity`, which is a recommendation and not an actio
   one whose size or side does not match is a difference in the thing that carries the
   risk, and no automatic action on it is safe.
 
+**Two queries make one venue book.** `openOrders` does not carry trigger orders at all,
+so a bracket read from it alone is two legs the venue appears to have lost, reported on
+every run for as long as the position is open. `frontendOpenOrders` is where they rest and
+is read beside it; the two are compared as one book, because a resting order is a resting
+order whichever query answers for it.
+
 Sizes are signed, positive long and negative short, so a side flip is a size difference
 rather than a special case: the two books disagreeing about direction is the same finding
 as disagreeing about magnitude, and the worst one there is.
@@ -32,7 +38,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Protocol
 
-from liqfade.execution.hl import AccountSnapshot, VenueOrder, VenuePosition
+from liqfade.execution.hl import AccountSnapshot, TriggerOrder, VenueOrder, VenuePosition
 from liqfade.execution.orders import LIVE, Order
 from liqfade.log import get_logger
 
@@ -51,6 +57,10 @@ class BookReader(Protocol):
     async def account(self, address: str) -> AccountSnapshot: ...
 
     async def open_orders(self, address: str) -> Sequence[VenueOrder]: ...
+
+    # Trigger orders are not in `openOrders` at all, so a bracket read from that query
+    # alone is two orders the venue appears to have lost, every interval.
+    async def trigger_orders(self, address: str) -> Sequence[TriggerOrder]: ...
 
 
 # Positions are compared with a tolerance: szDecimals rounding, and the venue's own
@@ -111,6 +121,7 @@ def reconcile(
     venue_orders: Sequence[VenueOrder],
     our_positions: Mapping[str, float],
     venue_positions: Mapping[str, VenuePosition],
+    venue_triggers: Sequence[TriggerOrder] = (),
 ) -> Reconciliation:
     """Compare the two books and report every disagreement.
 
@@ -119,15 +130,21 @@ def reconcile(
         venue_orders: `openOrders`, parsed.
         our_positions: coin to signed size, positive long, from our own fills.
         venue_positions: `clearinghouseState`, parsed.
+        venue_triggers: `frontendOpenOrders`, parsed. The bracket legs live only here,
+            and a comparison without them reports both of them missing on every run of
+            every bracketed position.
 
     Returns:
         A `Reconciliation`. `clean` is true when the two books agree.
     """
     differences: list[Difference] = []
     ours_live = {order.cloid: order for order in our_orders if order.status in LIVE}
-    theirs_by_cloid = {order.cloid: order for order in venue_orders if order.cloid}
+    # One book out of the two queries: a resting order is in `openOrders` or, if it is a
+    # trigger, in `frontendOpenOrders`, and either way it is an order we placed.
+    theirs: list[VenueOrder | TriggerOrder] = [*venue_orders, *venue_triggers]
+    theirs_by_cloid = {order.cloid: order for order in theirs if order.cloid}
 
-    for venue_order in venue_orders:
+    for venue_order in theirs:
         if venue_order.cloid and venue_order.cloid in ours_live:
             continue
         differences.append(
@@ -147,8 +164,8 @@ def reconcile(
         )
 
     for cloid, order in ours_live.items():
-        theirs = theirs_by_cloid.get(cloid)
-        if theirs is None:
+        at_venue = theirs_by_cloid.get(cloid)
+        if at_venue is None:
             differences.append(
                 Difference(
                     kind="missing_order",
@@ -164,7 +181,7 @@ def reconcile(
                 )
             )
             continue
-        if abs(theirs.size - order.remaining) > SIZE_TOLERANCE:
+        if abs(at_venue.size - order.remaining) > SIZE_TOLERANCE:
             differences.append(
                 Difference(
                     kind="order_size",
@@ -173,10 +190,10 @@ def reconcile(
                     cloid=cloid,
                     oid=order.oid,
                     ours=order.remaining,
-                    theirs=theirs.size,
+                    theirs=at_venue.size,
                     detail=(
                         f"{order.coin} {cloid} has {order.remaining} left for us and "
-                        f"{theirs.size} at the venue, which is a fill we did not see"
+                        f"{at_venue.size} at the venue, which is a fill we did not see"
                     ),
                 )
             )
@@ -217,7 +234,7 @@ def reconcile(
 
     return Reconciliation(
         differences=differences,
-        checked_orders=len(ours_live) + len(venue_orders),
+        checked_orders=len(ours_live) + len(theirs),
         checked_positions=len(coins),
     )
 
@@ -282,6 +299,7 @@ class Reconciler:
         """One comparison. Returns None when the venue could not be read."""
         try:
             venue_orders = await self.reader.open_orders(self.address)
+            venue_triggers = await self.reader.trigger_orders(self.address)
             account = await self.reader.account(self.address) if self.compare_positions else None
         except Exception as exc:
             self.failures += 1
@@ -301,6 +319,7 @@ class Reconciler:
         result = reconcile(
             our_orders=await self._orders(),
             venue_orders=venue_orders,
+            venue_triggers=venue_triggers,
             our_positions=self._positions() if account is not None else {},
             venue_positions=account.positions if account is not None else {},
         )

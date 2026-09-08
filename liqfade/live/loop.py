@@ -55,7 +55,7 @@ from liqfade.control.protocol import (
     StateSnapshot,
     now_ms,
 )
-from liqfade.execution.hl import AccountSnapshot, VenueOrder
+from liqfade.execution.hl import AccountSnapshot, TriggerOrder, VenueOrder
 from liqfade.execution.kill import KillSwitch, KillWatcher
 from liqfade.execution.orders import OrderStore
 from liqfade.execution.reconcile import Reconciler
@@ -109,6 +109,15 @@ class PaperBooks:
 
     async def account(self, address: str) -> AccountSnapshot:  # pragma: no cover - never called
         raise NotImplementedError("paper has no venue account; compare_positions must be False")
+
+    async def trigger_orders(self, address: str) -> list[TriggerOrder]:
+        """None: the simulator has no separate trigger book.
+
+        A paper exit, stop or target included, is a working order and comes back from
+        `open_orders` with everything else. The venue keeps its triggers in a query of
+        their own, which is what the reconciler reads this for.
+        """
+        return []
 
     async def open_orders(self, address: str) -> list[VenueOrder]:
         orders = []
