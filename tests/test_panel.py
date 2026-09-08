@@ -223,6 +223,28 @@ def test_config_endpoint_reports_sources_and_the_live_trading_gate(client: TestC
     assert keys["sizing.risk_frac"]["source"] == "default.yaml"
 
 
+def test_the_config_endpoint_serves_what_the_process_runs_not_the_raw_merge(
+    client: TestClient,
+) -> None:
+    """The page has to show the config the loop is on, and that is the validated model.
+
+    The merge is what the YAML layers and the env spell; the model is what the loop
+    reads. Every field a layer leaves out is a value the process still has and the page
+    did not show at all.
+    """
+    from liqfade.config import flatten, load_settings
+
+    client.post("/api/login", json={"password": PASSWORD})
+    body = client.get("/api/config").json()
+
+    served = {row["key"]: row["value"] for row in body["values"]}
+    assert served == flatten(load_settings("paper").model_dump(mode="json"))
+    sources = {row["key"]: row["source"] for row in body["values"]}
+    assert sources["sizing.risk_frac"] == "default.yaml"
+    # A field no layer sets is the model's, and says so rather than reading as unset.
+    assert sources["venues.hyperliquid.info_url"] == "model default"
+
+
 def test_the_built_bundle_is_served(client: TestClient) -> None:
     response = client.get("/")
     assert response.status_code == 200

@@ -21,7 +21,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from liqfade.alerts.telegram import send_alert
-from liqfade.config import config_layers, flatten, overrides_file, resolve
+from liqfade.config import (
+    ConfigError,
+    config_layers,
+    flatten,
+    load_settings,
+    overrides_file,
+    resolve,
+)
 from liqfade.config.models import Settings
 from liqfade.control.client import ControlClient
 from liqfade.control.protocol import ControlError, LatencyState, now_ms
@@ -950,14 +957,24 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
         `writable_sections` is served rather than kept in the frontend, so the form and
         the endpoint cannot disagree about what may be changed.
         """
-        merged, sources = resolve(settings.env)
-        flat = flatten(merged)
+        _merged, sources = resolve(settings.env)
+        # The validated model, not the raw merge: the merge is what the layers spell and
+        # the model is what the loop reads. Every field no layer sets is a value the
+        # process is running on and the page did not show at all, which is exactly the
+        # half a settings page exists to make visible.
+        try:
+            flat = flatten(load_settings(settings.env).model_dump(mode="json"))
+        except ConfigError as exc:
+            # Only a hand edit gets here: the panel validates before it writes. Said out
+            # loud, because this page is where an owner would come to fix it.
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from None
         return {
             "env": settings.env,
             "live_trading_enabled": settings.live_trading_enabled,
             "live_trading_block_reason": settings.live_trading_block_reason(),
             "values": [
-                {"key": k, "value": flat[k], "source": sources.get(k)} for k in sorted(flat)
+                {"key": k, "value": flat[k], "source": sources.get(k) or "model default"}
+                for k in sorted(flat)
             ],
             "layers": [
                 {
