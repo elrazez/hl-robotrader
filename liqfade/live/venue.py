@@ -163,6 +163,9 @@ class VenueSession:
         # What the last `venue_state` read saw: ref -> (coin, oid), so a cancel for an
         # order the registry does not hold still has somewhere to send it.
         self._venue_orders: dict[str, tuple[str, int]] = {}
+        # Bracket legs whose position has closed at the venue, waiting to be written off
+        # in the registry. `sync_account` finds them and the next tick records them.
+        self._released_legs: list[str] = []
         self.asset_rules: dict[str, Any] = {}
         self.coin_last_ms: dict[str, int] = {}
         self.global_last_ms: int | None = None
@@ -247,8 +250,14 @@ class VenueSession:
         self.positions = dict(snapshot.positions)
         for coin in list(self.brackets):
             if coin not in self.positions:
-                self.brackets.pop(coin, None)
+                legs = self.brackets.pop(coin)
                 self.time_stops.pop(coin, None)
+                # The registry has to hear that they are gone, or reconciliation reports
+                # each one as an order the venue lost, at INVESTIGATE, on every run for the
+                # life of the process: measured on testnet 2026-09-08 after a kill closed
+                # two bracketed positions. Queued rather than done here because this is
+                # called from the reconciler and writing sqlite is not synchronous.
+                self._released_legs.extend((legs.tp_cloid, legs.sl_cloid))
                 log.info("bracket_released", coin=coin, reason="position closed")
 
     def equity(self) -> float:
@@ -324,6 +333,7 @@ class VenueSession:
         time stop. The entry policy below is the same decision table the backtest runs.
         """
         await self.exit_expired_positions(now_ms)
+        await self._write_off_released_legs()
         for order in await self.orders.open_orders():
             if order.intent.tag != "entry":
                 continue
@@ -377,6 +387,20 @@ class VenueSession:
             if legs is not None:
                 await self._cancel_legs(legs)
         return closed
+
+    async def _write_off_released_legs(self) -> None:
+        """Record the legs the venue removed with their position. No cancel is sent.
+
+        `execution/tpsl.py` measured both legs disappearing within two seconds of the
+        position closing, with no cancel of ours, so sending one spends an action from the
+        budget to be told the order is gone. What was missing was the registry entry: an
+        ACKED row for an order the venue does not have is a reconciliation difference
+        forever.
+        """
+        while self._released_legs:
+            cloid = self._released_legs.pop(0)
+            with contextlib.suppress(KeyError):
+                await self.orders.record_cancel(cloid, reason="position closed at the venue")
 
     async def place(self, intent: Intent, now_ms: int, row: Any = None) -> str | None:
         """Size an intent, gate it, and rest an `Alo` at the touch if it survives both.
