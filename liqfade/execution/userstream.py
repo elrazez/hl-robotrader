@@ -143,6 +143,14 @@ async def apply_event(manager: OrderManager, event: UserEvent) -> None:
                 ts_ms=event.ts_ms,
             )
         elif event.kind == "canceled" and order.status in LIVE:
+            if order.oid is not None and event.oid and event.oid != order.oid:
+                # A reprice is a cancel-and-replace at the venue: it retires the old oid
+                # and rests a new one under the same cloid. The retirement frame arrives
+                # after we already hold the new oid, and taking it at face value marked a
+                # live order dead. Drilled on 2026-09-08: a repriced entry survived a kill
+                # because the registry believed it was already gone.
+                log.debug("stale_cancel_ignored", cloid=event.cloid, oid=event.oid)
+                return
             await manager.record_cancel(event.cloid, reason="venue")
         elif event.kind == "rejected" and order.status in LIVE:
             await manager.record_reject(event.cloid, reason="venue")

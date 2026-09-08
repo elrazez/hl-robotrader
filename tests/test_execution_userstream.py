@@ -273,7 +273,9 @@ async def test_a_frame_off_the_socket_reaches_the_registry(tmp_path: Path) -> No
             cfg=load_settings("paper", environ={}).recorder,
         )
 
-        for table, row in stream._parse(orjson.dumps(an_order_update(cloid, "canceled")), 0):
+        oid = manager.get(cloid).oid or 0
+        frame = an_order_update(cloid, "canceled", oid=oid)
+        for table, row in stream._parse(orjson.dumps(frame), 0):
             stream._sink(table, "hyperliquid_user", row)
 
         stop = asyncio.Event()
@@ -323,5 +325,44 @@ async def test_an_open_frame_never_resurrects_a_filled_order(tmp_path: Path) -> 
 
         assert manager.get(cloid).status is OrderStatus.FILLED, "a fill is terminal"
         assert await manager.open_orders() == []
+    finally:
+        await store.close()
+
+
+async def test_the_cancel_half_of_a_reprice_does_not_kill_the_live_order(tmp_path: Path) -> None:
+    """A reprice retires one oid and rests another under the same cloid.
+
+    The retirement frame arrives after we already hold the new oid. Taking it at face
+    value marked a live order dead in the registry, so the entry policy stopped managing
+    it and the kill skipped it: drilled on 2026-09-08, a repriced entry survived a kill
+    and was still resting at Hyperliquid afterwards.
+    """
+    from liqfade.execution.userstream import apply_event
+
+    class Transport:
+        async def place(self, intent: OrderIntent) -> int:
+            return 100
+
+        async def cancel(self, coin: str, cloid: str) -> None: ...
+        async def modify(self, intent: OrderIntent) -> int:
+            return 200
+
+    store = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = OrderManager(store, Transport(), sz_decimals={"ETH": 4}, killed=lambda: False)
+        cloid = new_cloid()
+        await manager.submit(
+            OrderIntent(cloid=cloid, coin="ETH", is_buy=True, px=2000.0, size=0.01, tif="Alo")
+        )
+        await manager.reprice(cloid, 2010.0)
+        assert manager.get(cloid).oid == 200
+
+        # The venue retires the oid the reprice replaced.
+        await apply_event(manager, UserEvent(kind="canceled", cloid=cloid, oid=100, coin="ETH"))
+        assert manager.get(cloid).status is OrderStatus.ACKED, "the replacement is still live"
+
+        # A cancel of the oid we actually hold is real.
+        await apply_event(manager, UserEvent(kind="canceled", cloid=cloid, oid=200, coin="ETH"))
+        assert manager.get(cloid).status is OrderStatus.CANCELED
     finally:
         await store.close()
