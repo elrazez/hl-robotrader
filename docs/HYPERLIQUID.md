@@ -59,6 +59,43 @@ WebSocket: max 100 connections, 1000 subscriptions, 10 unique users in user-spec
 - Prefer `modify` over cancel plus place when queue position does not matter.
 - Log the exact error string when it happens (`Too many cumulative requests sent ... Place taker orders to free up 1 request per USDC traded`) and halt new entries until volume catches up.
 
+## `clearinghouseState` is public for every address
+
+Probed 2026-09-08 with `scripts/probe/hl_positions.py`, keyless, against two addresses
+taken off the public trades tape. **Every Hyperliquid position is readable by anyone.**
+Post `{"type": "clearinghouseState", "user": "0x..."}` to `/info` for any wallet and each
+open position comes back as
+
+    {"type": "oneWay", "position": {"coin": "BTC", "szi": "0.99782",
+      "leverage": {"type": "cross", "value": 40}, "entryPx": "78072.5",
+      "positionValue": "77654.34368", "unrealizedPnl": "-248.03624",
+      "liquidationPx": null, "marginUsed": "1941.358592", "maxLeverage": 40,
+      "cumFunding": {...}}}
+
+with the response carrying its own `time`. `liquidationPx` is the venue's own computed
+liquidation level and it is what `hl_positions` exists to record.
+
+Four things the shape teaches, all measured rather than assumed:
+
+- **`liquidationPx` is often null.** Three of the first probed account's five open cross
+  positions had none. It is nullable in the schema and stays null in the lake: a zero
+  would put a cluster at price zero and every map built from the table would be wrong
+  there.
+- **An isolated position carries an extra `leverage.rawUsd`**, and its `leverage.value`
+  is the position's own leverage while `maxLeverage` is the asset's cap. The second
+  probed account held BTC isolated at 15 against a `maxLeverage` of 40, so the two
+  columns are genuinely different numbers.
+- **A flat coin stays in `assetPositions` with `szi: "0.0"`**, the same fact
+  `execution/hl.py::parse_clearinghouse_state` already drops. It is not a position and it
+  is not a row.
+- **There is no history.** The endpoint answers for now and not for a past block, so the
+  liquidation map can only be recorded forward. That is why the recorder started before
+  there was anything to grade.
+
+Weight 2 (see rate limits above), so the recorder's default of 200 addresses a minute
+costs 400 of the 1200 per-IP budget. `docs/research/external_bots_scan.md` section 1 has
+the full argument, including what could kill the idea.
+
 ## Liquidation mechanics (relevant to the thesis)
 
 - Liquidations trigger on **mark price**, which blends the oracle (CEX medians) with HL book state, not on last trade. Wicks on HL alone cannot liquidate; cross-venue moves can.

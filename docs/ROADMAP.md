@@ -107,4 +107,4 @@ Scaling rule of thumb: increase `risk_frac` or deposit only after a full week wh
 
 ## Phase 7: Iterate
 
-Candidates, each as its own research question first: cross-venue liquidation weights, funding and OI regime filters, book-imbalance timing, coin-tier specific parameters, trailing exits, HL paid liquidation feed if budget grows, partial-liquidation rhythm exploitation, momentum variant for market-wide sweeps.
+Candidates, each as its own research question first: cross-venue liquidation weights, funding and OI regime filters, book-imbalance timing, coin-tier specific parameters, trailing exits, HL paid liquidation feed if budget grows, partial-liquidation rhythm exploitation, momentum variant for market-wide sweeps, liquidation map from public positions (recorder since 2026-09-08, graded by Q9).

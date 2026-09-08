@@ -128,6 +128,8 @@ the second step patient:
   and it is exact); and does fuel-remaining at cascade start separate the episodes that revert
   from the episodes that keep going, measured against the `fixed_delay` baseline?
 
+**Step one built 2026-09-08**, branch `07a-liqmap-recorder`: the `hl_positions` table, the `AddressBook` harvested from the `users` field of the public trades feed, and `HlPositionsPoller` on the recorder. Recorder only, as scoped. Step two is Q9.
+
 Nothing enters `strategy/` before step two answers. If step two says the coverage is not
 there, the poller is deleted and this document is the record of why.
 

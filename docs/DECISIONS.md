@@ -2880,3 +2880,61 @@ the one field that answers the question, and three existing tests failed because
 changed behaviour they correctly asserted. Reverted. Reading the flag before theorising
 would have cost one command; this is the third time in this branch that the answer was one
 direct question away.
+
+## 2026-09-08 (the liquidation map, step one: recorder only)
+
+**`hl_positions`, a new table of public Hyperliquid positions polled from
+`clearinghouseState`.** `docs/research/external_bots_scan.md` section 1 kept this idea out
+of a scan of four public liquidation bots: every HL position is readable by anyone, and
+each one carries `liquidationPx`, the venue's own computed liquidation level. Polling the
+addresses the tape names gives a forward-looking map of what is queued to be force-closed
+at each price, which is worth more to a fader than to the cascade-chasers those bots are.
+Recorder only: no feature, no strategy wiring, nothing under `strategy/` or `features/`.
+Reverse by deleting the poller if Q9 says the map measures nothing, which is the
+preregistered stop rule.
+
+**Why it had to start now and small.** `clearinghouseState` answers for now and never for
+a past block, so there is no way to backtest this over the year already in the lake. The
+only way to have data is to have been recording, which makes step one small and step two
+patient. Nothing grades it until 21 days exist.
+
+**The addresses come from the tape, not from a list.** The public `trades` payload carries
+`users: [buyer, seller]` and the lake was throwing it away, because `trades` is in
+`MULTI_VENUE_TABLES` and Bybit, OKX and Binance rows have no such field. So the parser
+gained an optional `on_users` callback and the addresses go to an in-memory `AddressBook`
+persisted as `data/hl_addresses.json`, ranked by cumulative traded notional, bounded at
+5,000. The two public bots that solve this differently both rot: one buys the positions
+from a keyed third-party API, the other hardcodes thirteen wallets in its config.
+
+**Cumulative and never decayed.** A whale who opened a position a week ago and has not
+traded since is exactly who the map is for, so the ranking must not forget them. The
+ceiling (a permanently dormant address holds its rank forever) is named in a `ponytail:`
+comment with its upgrade.
+
+**Rate budget: 400 of 1200 per minute.** `clearinghouseState` weighs 2 against the 1200
+weight/min per-IP limit, so the default 200 addresses at 60s is 400, one third, and the
+hourly universe refresh is the recorder's only other info traffic. The addresses are asked
+sequentially and never gathered, so a slow venue stretches a poll rather than bursting the
+whole minute's budget into one instant.
+
+**Dedup key `(address, coin, ts_ms)`.** The first table in the lake whose identity is not a
+venue trade id. `ts_ms` is the response's own `time`, so one address cannot hold two
+different positions in the same coin at the same venue millisecond; a second such row is a
+re-flush. `_dedup_fields` gained a case rather than a rule.
+
+**Disk, estimated and to be measured.** At 200 addresses, five universe coins each and
+1440 polls a day, about 1.4 million rows a day, of the order of the `trades` table. The
+estimate's weak term is coins-per-address: the first probed account held five open
+positions but only three were in a plausible universe. **Measure the compacted partition
+after the first full day on the VPS (`du -sh /srv/liqfade/data/parquet/hl_positions`) and
+write the real number here beside this estimate.** Above 200 MB a day the follow-up is a
+changed-only write plus an hourly full snapshot, named in a `ponytail:` comment and not
+built now.
+
+**Config reload does not reach the poller.** Coinalyze's does not either; a restart applies
+a change. Said in the config comment rather than fixed, because the recorder is restarted
+by every deploy anyway.
+
+**Not in `CONTINUOUS_STREAMS`.** A poll is sparse by nature, so only its connection is
+monitored, exactly like `coinalyze.xchg_ctx`. A declared-but-idle stream pages Telegram
+every ten minutes, which is why the poller declares no stream at all when it is disabled.
