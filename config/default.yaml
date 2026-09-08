@@ -330,6 +330,12 @@ risk:
   max_rejects_10min: 5  # exchange rejects before entries halt
   heartbeat_s: 1.0  # seconds between touches of data/heartbeat by the live loop
   watchdog_stale_s: 10.0  # seconds of heartbeat staleness before the watchdog cancels all
+  # Every loop the single watchdog process watches, label -> file under data_dir. The label
+  # is what the KILL flag names, so an owner reading the flag knows which loop stopped.
+  # Phase 6: the live loop needs its own file here, since it writes `heartbeat` like paper.
+  watchdog_heartbeats:
+    paper loop: heartbeat
+    testnet loop: heartbeat-testnet
   kill_deadline_s: 5.0  # seconds within which /kill must have cancelled and flattened
   kill_budget_s: 4.0  # seconds the kill's venue calls get; the rest of the deadline is the report
 

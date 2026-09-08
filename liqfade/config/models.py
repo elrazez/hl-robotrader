@@ -447,6 +447,13 @@ class Risk(Base):
     max_reconnects_10min: int = Field(..., gt=0, description="count before entries halt")
     max_rejects_10min: int = Field(..., gt=0, description="count before entries halt")
     heartbeat_s: Pos = Field(..., description="seconds between heartbeat file touches")
+    # Every loop the one watchdog process watches, label -> file under data_dir. It read
+    # `data/heartbeat` alone until 2026-09-08, which is the paper loop's: 25s of SIGSTOP on
+    # the testnet loop produced nothing, because nothing read `heartbeat-testnet`. The
+    # label is what the KILL flag says stalled, so it names the loop, not the file.
+    watchdog_heartbeats: dict[str, Path] = Field(
+        ..., min_length=1, description="label -> heartbeat file under data_dir, per loop"
+    )
     watchdog_stale_s: Pos = Field(
         ..., description="seconds of heartbeat staleness before cancel all"
     )

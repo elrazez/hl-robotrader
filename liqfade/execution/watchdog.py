@@ -1,12 +1,16 @@
-"""The watchdog: a separate process that notices when the trading loop stops breathing.
+"""The watchdog: a separate process that notices when a trading loop stops breathing.
 
 `scripts/systemd/liqfade-watchdog.service` runs `python -m liqfade.execution.watchdog`
 and is deliberately independent of `liqfade-live` and `liqfade-paper`. A watchdog that
 dies with the process it watches is not a watchdog, which is why it shares no code path
 with the loop and reads only two things off the filesystem:
 
-1. **`data/heartbeat`**, which the loop rewrites every `risk.heartbeat_s`. Its age is
-   the whole signal. A missing or unparseable file is *not* a young heartbeat: absence
+1. **One heartbeat file per loop**, each rewritten every `risk.heartbeat_s` by the loop
+   that owns it. `risk.watchdog_heartbeats` names them, and this single process watches
+   all of them: two loops run on the box, and until 2026-09-08 the unit read the paper
+   loop's file alone, so 25s of `SIGSTOP` on the testnet loop produced nothing at all.
+   The age of the file is the whole signal. A missing or unparseable one is *not* a young
+   heartbeat: absence
    reads as stale, because "I cannot tell" and "everything is fine" being the same answer
    is the exact failure this process exists to catch. That reading only holds because the
    loop writes through `write_heartbeat_atomic`: while the write was a plain truncate, a
@@ -55,7 +59,7 @@ log = get_logger(__name__)
 
 __all__ = [
     "Watchdog",
-    "build_watchdog",
+    "build_watchdogs",
     "heartbeat_age_s",
     "read_heartbeat",
     "write_heartbeat_atomic",
@@ -219,25 +223,37 @@ class Watchdog:
                 await asyncio.wait_for(stop.wait(), timeout=self.poll_s)
 
 
-def build_watchdog(settings: Settings) -> Watchdog:
-    """The watchdog the unit runs, from the same config the loop it watches reads.
+def build_watchdogs(
+    settings: Settings, *, alert: Callable[[str], Awaitable[bool]] | None = None
+) -> list[Watchdog]:
+    """One watchdog per loop in `risk.watchdog_heartbeats`, all in the one process.
 
     The threshold is `risk.watchdog_stale_s` and nothing else. It used to come from
     `LIQFADE_WATCH_STALE_S`, which meant the number the loop is judged by lived in a
     systemd unit while a validated field of the same name sat in the config being ignored.
-    The path and the label stay environment overrides: which loop this watchdog watches is
-    a property of the unit, not of the config.
-    """
-    from liqfade.alerts.telegram import send_alert
+    Which loops are watched went the same way on 2026-09-08: it was one heartbeat path in
+    one unit's environment, so the second loop on the box was watched by nobody.
 
-    heartbeat = Path(os.environ.get("LIQFADE_WATCH_HEARTBEAT") or settings.heartbeat_path)
-    return Watchdog(
-        heartbeat=heartbeat,
-        kill_file=settings.kill_file,
-        alert=send_alert,
-        stale_s=settings.risk.watchdog_stale_s,
-        label=os.environ.get("LIQFADE_WATCH_LABEL") or "trading loop",
-    )
+    Each loop gets its own instance because every piece of state here is per loop: which
+    of them is healthy, which is inside its grace after a cleared flag, and which one this
+    process killed. They share the kill file, which is right: one flag stops the box, and
+    `write_kill_file` leaves the first reason in place, so the flag names the loop that
+    actually stalled rather than the last one to notice.
+    """
+    if alert is None:
+        from liqfade.alerts.telegram import send_alert
+
+        alert = send_alert
+    return [
+        Watchdog(
+            heartbeat=settings.paths.data_dir / path,
+            kill_file=settings.kill_file,
+            alert=alert,
+            stale_s=settings.risk.watchdog_stale_s,
+            label=label,
+        )
+        for label, path in settings.risk.watchdog_heartbeats.items()
+    ]
 
 
 def main() -> int:
@@ -248,14 +264,21 @@ def main() -> int:
 
     settings = load_settings()
     setup_logging(proc="watchdog", env=settings.env, level=settings.logging.level)
-    dog = build_watchdog(settings)
-    log.info(
-        "watchdog_started",
-        heartbeat=str(dog.heartbeat),
-        stale_s=dog.stale_s,
-        kill_file=str(dog.kill_file),
-    )
-    run_main(lambda: dog.run(shutdown_event()))
+    dogs = build_watchdogs(settings)
+    for dog in dogs:
+        log.info(
+            "watchdog_started",
+            label=dog.label,
+            heartbeat=str(dog.heartbeat),
+            stale_s=dog.stale_s,
+            kill_file=str(dog.kill_file),
+        )
+
+    async def watch_all() -> None:
+        stop = shutdown_event()
+        await asyncio.gather(*(dog.run(stop) for dog in dogs))
+
+    run_main(watch_all)
     return 0
 
 
