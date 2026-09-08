@@ -429,6 +429,7 @@ class OrderManager:
         retries: int = 3,
         backoff_s: float = 0.25,
         budget: ActionBudget | None = None,
+        on_ack_ms: Callable[[float], None] | None = None,
     ) -> None:
         """
         Args:
@@ -446,6 +447,8 @@ class OrderManager:
             backoff_s: base delay; each retry waits `backoff_s * 2**attempt` times a
                 random factor in [0.5, 1.5). Jittered because two coins rejected by the
                 same rate limit would otherwise retry in lockstep forever.
+            on_ack_ms: called with each order's submit-to-ack milliseconds. The panel
+                plots the series; `submit_ack_p50` and `p95` were fields nothing fed.
             budget: the address action budget from `execution.action_budget_per_hour`.
                 None counts nothing, which is what the backtest and the paper fill model
                 want: neither sends an action to an address.
@@ -457,6 +460,7 @@ class OrderManager:
         self.retries = retries
         self.backoff_s = backoff_s
         self.budget = budget
+        self._on_ack_ms = on_ack_ms
         self._orders: dict[str, Order] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -613,13 +617,10 @@ class OrderManager:
                     await asyncio.sleep(self._delay(attempt))
                 continue
             order.oid = oid
-            await self._transition(
-                order,
-                OrderStatus.ACKED,
-                "order_acked",
-                oid=oid,
-                ack_ms=now_ms() - order.submitted_ms,
-            )
+            ack_ms = now_ms() - order.submitted_ms
+            if self._on_ack_ms is not None:
+                self._on_ack_ms(float(ack_ms))
+            await self._transition(order, OrderStatus.ACKED, "order_acked", oid=oid, ack_ms=ack_ms)
             return order
 
         assert last is not None

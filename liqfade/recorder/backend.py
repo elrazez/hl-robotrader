@@ -61,6 +61,9 @@ class LatencyTracker:
         self.window = window
         self.ws_ping: list[tuple[int, float]] = []
         self.rest: list[tuple[int, float]] = []
+        # Submit to ack, which only a loop with a venue produces. Empty in the
+        # recorder and in paper, where nothing is submitted to an exchange.
+        self.submit_ack: list[tuple[int, float]] = []
 
     def _add(self, series: list[tuple[int, float]], value: float, at_ms: int | None) -> None:
         series.append((now_ms() if at_ms is None else at_ms, round(value, 3)))
@@ -73,17 +76,25 @@ class LatencyTracker:
     def add_rest(self, ms: float, at_ms: int | None = None) -> None:
         self._add(self.rest, ms, at_ms)
 
+    def add_submit_ack(self, ms: float, at_ms: int | None = None) -> None:
+        """One order's submit to ack, in ms. Fed by the order manager, not by a probe."""
+        self._add(self.submit_ack, ms, at_ms)
+
     def state(self) -> LatencyState:
         ws_ping = [ms for _, ms in self.ws_ping]
         rest = [ms for _, ms in self.rest]
+        submit_ack = [ms for _, ms in self.submit_ack]
         return LatencyState(
             ws_ping_p50=_percentile(ws_ping, 0.5),
             ws_ping_p95=_percentile(ws_ping, 0.95),
             rest_p50=_percentile(rest, 0.5),
             rest_p95=_percentile(rest, 0.95),
-            samples=len(ws_ping) + len(rest),
+            submit_ack_p50=_percentile(submit_ack, 0.5),
+            submit_ack_p95=_percentile(submit_ack, 0.95),
+            samples=len(ws_ping) + len(rest) + len(submit_ack),
             ws_ping_samples=list(self.ws_ping),
             rest_samples=list(self.rest),
+            submit_ack_samples=list(self.submit_ack),
         )
 
 

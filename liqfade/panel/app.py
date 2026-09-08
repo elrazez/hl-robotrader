@@ -348,6 +348,7 @@ def latency_payload(state_path: Path) -> dict[str, Any]:
     return {
         "ws_ping": [list(sample) for sample in latency.ws_ping_samples],
         "rest": [list(sample) for sample in latency.rest_samples],
+        "submit_ack": [list(sample) for sample in latency.submit_ack_samples],
         "ws_ping_p50": latency.ws_ping_p50,
         "ws_ping_p95": latency.ws_ping_p95,
         "rest_p50": latency.rest_p50,

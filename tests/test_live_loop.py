@@ -18,7 +18,7 @@ from liqfade.config import resolve
 from liqfade.config.models import Settings
 from liqfade.control import ControlClient, ControlServer
 from liqfade.control.protocol import InjectResult
-from liqfade.live.loop import PaperLoop
+from liqfade.live.loop import PaperBackend, PaperLoop
 
 COIN = "ETH"
 START = 1_700_000_000_000
@@ -662,3 +662,84 @@ async def test_the_heartbeat_keeps_beating_through_a_long_tick(tmp_path: Path) -
 
     assert before is not None and after is not None
     assert after - before >= 200, "the heartbeat stopped while the event loop was busy"
+
+
+async def test_pause_resume_and_flat_reach_telegram(loop: PaperLoop) -> None:
+    """A pause from the panel must look like a pause from Telegram to whoever is watching.
+
+    These commands arrive from Telegram, the panel and the CLI alike, and they only wrote
+    a log line. A state change nobody is told about is how two people end up disagreeing
+    about whether the bot is trading.
+    """
+    posted: list[str] = []
+
+    async def capture(text: str, **_: Any) -> None:
+        posted.append(text)
+
+    loop.post = capture  # type: ignore[assignment,method-assign]
+    backend = PaperBackend(loop)
+
+    await backend.pause("panel")
+    await backend.resume()
+    await backend.flat()
+
+    assert any("PAUSED" in p and "panel" in p for p in posted)
+    assert any("RESUMED" in p for p in posted)
+    assert any("FLAT" in p for p in posted)
+
+
+async def _reload_env(loop: PaperLoop, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `load_settings` resolve the same base the fixture built in memory.
+
+    The unit does this with `Environment=` lines, so production is already consistent;
+    the fixture constructs settings directly and has to say the same thing out loud.
+    """
+    monkeypatch.setenv("LIQFADE_PATHS__DATA_DIR", str(loop.settings.paths.data_dir))
+    monkeypatch.setenv("LIQFADE_CASCADE__TRIGGER", loop.settings.cascade.trigger)
+
+
+async def test_reload_applies_a_risk_limit_and_says_what_moved(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The panel writes overrides.yaml and calls this; the loop has to actually apply it."""
+    await _reload_env(loop, monkeypatch)
+    posted: list[str] = []
+
+    async def capture(text: str, **_: Any) -> None:
+        posted.append(text)
+
+    loop.post = capture  # type: ignore[assignment,method-assign]
+    before = loop.settings.sizing.risk_frac
+    overrides = Path(loop.settings.paths.data_dir) / "overrides.yaml"
+    overrides.write_text(f"sizing:\n  risk_frac: {before / 2}\n")
+
+    result = await PaperBackend(loop).reload_config()
+
+    assert result.error is None
+    assert "sizing.risk_frac" in result.changed
+    assert loop.settings.sizing.risk_frac == before / 2
+    assert loop.session.settings.sizing.risk_frac == before / 2, "the session reads it too"
+    assert any("CONFIG RELOADED" in p for p in posted)
+
+
+async def test_reload_refuses_what_the_feature_buffers_were_built_around(
+    loop: PaperLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-reloaded engine has windows that no longer describe the data in its buffers.
+
+    05a refused every reload for this reason. Naming the keys is the answer, not refusing
+    the command: the panel's settings page changes sizing and risk limits, which are read
+    fresh on the tick that uses them.
+    """
+    await _reload_env(loop, monkeypatch)
+    before = loop.settings.features.z_lookback_h
+    overrides = Path(loop.settings.paths.data_dir) / "overrides.yaml"
+    overrides.write_text("features:\n  z_lookback_h: 999\n")
+
+    result = await PaperBackend(loop).reload_config()
+
+    assert result.changed == []
+    assert result.error is not None
+    assert "features.z_lookback_h" in result.error
+    assert "restart" in result.error
+    assert loop.settings.features.z_lookback_h == before

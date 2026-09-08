@@ -269,7 +269,10 @@ async def test_clearing_the_flag_gives_the_loop_time_to_start_beating(tmp_path: 
     started. Clearing the flag starts a grace period of one stale limit.
     """
     posted: list[str] = []
-    dog = _a_watchdog(tmp_path, posted, stale_s=1.0)
+    # A long grace on purpose: the test asserts the grace is *in force*, and a one second
+    # window can expire between two checks on a loaded machine, which would make this pass
+    # or fail on how busy the box is rather than on the behaviour.
+    dog = _a_watchdog(tmp_path, posted, stale_s=30.0)
     kill = tmp_path / "KILL"
     kill.write_text("killed_at: deliberately\n")
     write_heartbeat(tmp_path / "heartbeat", _now() - 300_000)

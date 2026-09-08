@@ -93,13 +93,14 @@ export interface DiskStats {
 
 /**
  * GET /api/recorder/latency and /api/live/latency: the retained round trip samples as
- * [ts_ms, ms] pairs, plus every percentile that process measured. submit_ack is null on
- * the recorder, which places no orders, and there is no sample series behind it, so it
- * renders as two numbers beside the two drawn series.
+ * [ts_ms, ms] pairs, plus every percentile that process measured. submit_ack is empty on
+ * the recorder and in paper, neither of which submits an order to an exchange; the
+ * testnet and live loops fill it, one pair per order acked.
  */
 export interface Latency {
   ws_ping: [number, number][];
   rest: [number, number][];
+  submit_ack: [number, number][];
   ws_ping_p50: number | null;
   ws_ping_p95: number | null;
   rest_p50: number | null;

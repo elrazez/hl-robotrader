@@ -147,6 +147,10 @@ class LatencyState(Base):
     rest_samples: list[tuple[int, float]] = Field(
         default_factory=list, description="(ts_ms, ms) REST round trips, oldest first"
     )
+    submit_ack_samples: list[tuple[int, float]] = Field(
+        default_factory=list,
+        description="(ts_ms, ms) order submit to venue ack, oldest first",
+    )
 
 
 class StateSnapshot(Base):

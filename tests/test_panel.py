@@ -433,6 +433,7 @@ def test_latency_without_a_recorder_running_is_an_empty_chart_not_an_error(
     assert body == {
         "ws_ping": [],
         "rest": [],
+        "submit_ack": [],
         "ws_ping_p50": None,
         "ws_ping_p95": None,
         "rest_p50": None,
@@ -628,7 +629,10 @@ class TestTheFrontendTypesMirrorTheProtocol:
     # which are the only large thing in the snapshot, and `/api/recorder/latency` serves
     # them in a shape of their own because the page polls state every second and the
     # chart every thirty. See liqfade/panel/app.py.
-    STRIPPED: ClassVar[dict[str, set[str]]] = {"LatencyState": {"ws_ping_samples", "rest_samples"}}
+    STRIPPED: ClassVar[dict[str, set[str]]] = {
+        # /api/state strips the sample series; the latency endpoints serve them.
+        "LatencyState": {"ws_ping_samples", "rest_samples", "submit_ack_samples"}
+    }
     # And what the endpoint adds on top of the model: `/api/state` stamps how old the
     # snapshot is, because the page greys itself out when nothing is writing state.json.
     ADDED: ClassVar[dict[str, set[str]]] = {"StateSnapshot": {"age_s"}}

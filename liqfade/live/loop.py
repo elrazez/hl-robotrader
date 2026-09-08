@@ -87,6 +87,11 @@ __all__ = ["PaperBackend", "PaperLoop"]
 # Seconds before the same risk reason is posted again. Every refusal is logged; a gate
 # that refuses every 250ms tick is one thing to say, not two thousand.
 RISK_BLOCK_ALERT_S = 300.0
+# Config keys that cannot change under a running loop. The feature engine's ring buffers
+# were filled under these, so swapping them leaves windows that no longer describe the data
+# in them, and the universe decides which streams are even subscribed.
+RESTART_ONLY = ("features.", "cascade.", "universe.", "paths.", "control.", "venues.")
+
 DEFAULT_PAPER_EQUITY = 10_000.0  # USD, overridden by --equity. Never a hardcoded live number.
 
 
@@ -164,8 +169,16 @@ class PaperBackend:
         )
 
     async def pause(self, reason: str | None = None) -> PauseResult:
+        # Posted, not only logged. These commands arrive from Telegram, the panel and the
+        # CLI alike, and an owner who paused from the panel should see the same message an
+        # owner who paused from their phone sees. A state change nobody is told about is
+        # how two people disagree about whether the bot is trading.
         self.loop.paused = True
         log.warning("paper_paused", reason=reason)
+        await self.loop.post(
+            f"[{self.loop.settings.env}] PAUSED" + (f": {reason}" if reason else ""),
+            dedupe=False,
+        )
         return PauseResult(paused=True, reason=reason)
 
     async def resume(self) -> ResumeResult:
@@ -173,6 +186,7 @@ class PaperBackend:
             return ResumeResult(paused=True, halt_cleared=False, reason="killed, restart required")
         self.loop.paused = False
         log.warning("paper_resumed")
+        await self.loop.post(f"[{self.loop.settings.env}] RESUMED, entries allowed", dedupe=False)
         return ResumeResult(paused=False, halt_cleared=True)
 
     async def flat(self, coin: str | None = None) -> FlatResult:
@@ -180,16 +194,33 @@ class PaperBackend:
         closed = await self.loop.session.flatten(now_ms=now_ms(), coin=coin)
         self.loop.paused = True
         log.warning("paper_flat", coin=coin, closed=closed, cancelled=cancelled)
+        await self.loop.post(
+            f"[{self.loop.settings.env}] FLAT {coin or 'all'}: closed {len(closed)} "
+            f"position(s), cancelled {cancelled} order(s). Entries paused.",
+            dedupe=False,
+        )
         return FlatResult(closing=closed, canceled_orders=cancelled)
 
     async def kill(self, reason: str | None = None) -> KillResult:
         return await self.loop.kill.fire(reason=reason)
 
     async def reload_config(self) -> ReloadResult:
-        # Deliberately not implemented in 05a. Reloading mid-session would swap the
-        # windows the feature engine's buffers were filled under, and a half-reloaded
-        # engine is worse than one that says no.
-        return ReloadResult(changed=[], error="reload_config is not supported by the paper loop")
+        """Re-resolve config and apply what is safe to change while running.
+
+        The panel writes `overrides.yaml` and calls this. What it wants to change is
+        sizing, risk limits and trigger thresholds, and those are all read fresh on the
+        tick that uses them, so applying them between ticks is safe.
+
+        **What is refused is anything the feature engine was built around.** The ring
+        buffers were filled under `features.*`, `cascade.*` and the universe, and swapping
+        those under a running engine gives a half-reloaded one whose windows no longer
+        mean what its buffers hold. That is worse than saying no, which is why 05a said no
+        to everything; the answer is to name the keys rather than refuse the command.
+
+        Applied between ticks, never mid-order: this runs on the control task, and the
+        session reads `self.settings` at the top of each tick.
+        """
+        return await self.loop.reload_config()
 
     async def get_metrics(self) -> MetricsResult:
         return MetricsResult(
@@ -485,6 +516,42 @@ class PaperLoop:
             log.warning("risk_halt_cleared")
             await self.post(f"[{self.settings.env}] halt cleared, entries allowed again")
 
+    async def reload_config(self) -> ReloadResult:
+        """Re-resolve settings and swap in the keys that are safe to change live."""
+        from liqfade.config import ConfigError, flatten, load_settings
+
+        try:
+            fresh = load_settings(self.settings.env)
+        except ConfigError as exc:
+            log.error("reload_failed", error=str(exc))
+            return ReloadResult(changed=[], error=str(exc))
+
+        before, after = flatten(self.settings.model_dump()), flatten(fresh.model_dump())
+        changed = sorted(k for k in after if before.get(k) != after.get(k))
+        if not changed:
+            return ReloadResult(changed=[])
+
+        blocked = sorted(k for k in changed if k.startswith(RESTART_ONLY))
+        if blocked:
+            reason = (
+                "these need a restart, because the feature engine's buffers were filled "
+                f"under them: {', '.join(blocked)}"
+            )
+            log.warning("reload_refused", blocked=blocked)
+            return ReloadResult(changed=[], error=reason)
+
+        for key in changed:
+            log.warning("config_changed", key=key, before=before.get(key), after=after.get(key))
+        self.settings = fresh
+        self.session.settings = fresh
+        self.session.risk.settings = fresh
+        await self.post(
+            f"[{fresh.env}] CONFIG RELOADED, {len(changed)} change(s):\n"
+            + "\n".join(f"{k}: {before.get(k)} -> {after.get(k)}" for k in changed[:10]),
+            dedupe=False,
+        )
+        return ReloadResult(changed=changed)
+
     def extra_jobs(self, stop: asyncio.Event) -> list[tuple[str, Any]]:
         """Tasks a subclass runs beside the shared ones. Paper has none."""
         return []
@@ -683,6 +750,7 @@ class VenueLoop(PaperLoop):
                 killed=lambda: settings.kill_switch_present,
                 retries=settings.execution.transient_retries,
                 budget=ActionBudget(settings.execution.action_budget_per_hour),
+                on_ack_ms=self.latency.add_submit_ack,
             ),
             reader=self.reader,
             address=signer.account_address,
