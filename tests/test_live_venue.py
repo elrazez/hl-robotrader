@@ -618,3 +618,47 @@ async def test_closing_a_short_reaches_through_the_ask(tmp_path: Path) -> None:
         assert order.px > 3010.0
     finally:
         await session._store.close()
+
+
+async def test_a_refused_entry_is_kept_and_the_tick_writes_it_to_the_registry(
+    tmp_path: Path,
+) -> None:
+    """The venue session refuses through `VenueCounters`, which now keeps the intent.
+
+    `recent_blocks` is unchanged and still four fields, because `report_risk_blocks`
+    unpacks it. The refusal beside it is what `liqfade refusals` prices.
+    """
+    session, venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        # No row means no traded volume and no depth, so `vol_cap` binds and sizing refuses.
+        assert await session.place(an_intent("long"), START, None) is None
+        assert not venue.placed
+
+        (refusal,) = session.result.refused
+        assert refusal.stage == "sizing"
+        assert refusal.entry_px == 3000.0
+        assert session.result.recent_blocks, "the counter Telegram reads is untouched"
+
+        await session.tick(START + 1_000)
+
+        assert not session.result.refused
+        rows = await session.orders.store.refusals(0, START + 10_000)
+        assert [(row["stage"], row["coin"]) for row in rows] == [("sizing", COIN)]
+    finally:
+        await session._store.close()
+
+
+async def test_a_paused_tick_still_drains_what_it_refused(tmp_path: Path) -> None:
+    """A pause stops entries, not bookkeeping: the list still has to be bounded."""
+    session, _venue = await a_session(tmp_path)
+    try:
+        quote(session, START, 2999.0, 3001.0)
+        await session.place(an_intent("long"), START, None)
+
+        assert await session.tick(START + 1_000, allow_entries=False) == []
+
+        assert not session.result.refused
+        assert len(await session.orders.store.refusals(0, START + 10_000)) == 1
+    finally:
+        await session._store.close()
