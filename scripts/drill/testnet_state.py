@@ -135,9 +135,14 @@ def main(argv: list[str] | None = None) -> int:
         print(line(address))
         return 1
 
+    # Short, and the side matters: the cluster cap counts one side of the book inside
+    # `risk.cluster_window_s`, and the position above already fills it. A second long was
+    # refused with `cluster_exposure` the moment the venue path started recording its
+    # entries (2026-09-08), which is the gate working and left this drill with no resting
+    # order at all. A short is a different cluster and rests just the same.
     asyncio.run(
         control(
-            "inject_intent", coin=args.order_coin, side="long", target_bps=300.0, stop_bps=300.0
+            "inject_intent", coin=args.order_coin, side="short", target_bps=300.0, stop_bps=300.0
         )
     )
     wait_for(
