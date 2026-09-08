@@ -31,6 +31,7 @@ import orjson
 from liqfade.execution.orders import LIVE, OrderManager
 from liqfade.log import get_logger
 from liqfade.recorder.streams.base import WSStream
+from liqfade.recorder.streams.hl import PING_FRAME
 
 log = get_logger(__name__)
 
@@ -189,11 +190,20 @@ class UserStream:
         address: str,
         manager: OrderManager,
         cfg: Any,
+        ping_s: float | None = None,
         on_reconnect: Callable[[str], None] | None = None,
         on_fill: Callable[[UserEvent], Awaitable[None]] | None = None,
     ) -> None:
         """
         Args:
+            ping_s: seconds between `{"method": "ping"}` frames, from
+                `venues.hyperliquid.ws_ping_s`. **Hyperliquid closes a connection that has
+                not pinged for 60 seconds**, and this socket carries no traffic of its own
+                on a quiet account, so without it the venue closed it on the minute, every
+                minute: measured on testnet 2026-09-08 at 60.4s intervals for as long as
+                the loop ran. Each close costs the fills that land in the gap, and it feeds
+                the reconnect counter `risk.max_reconnects_10min` halts entries on.
+                None means no ping, which is for a test that never connects.
             on_fill: called after a fill has been written to the registry, so the session
                 can bracket the position it opened. After, not before: a bracket placed
                 against a fill the registry has not recorded would be a stop for a
@@ -211,6 +221,8 @@ class UserStream:
             cfg=cfg,
             on_connect=lambda _symbols: subscribe_frames(address),
             on_reconnect=on_reconnect,
+            ping_s=ping_s,
+            ping_frame=PING_FRAME,
         )
 
     def _parse(self, raw: bytes, rx_ms: int) -> list[tuple[str, dict[str, Any] | None]]:

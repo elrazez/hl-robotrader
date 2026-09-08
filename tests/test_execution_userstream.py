@@ -18,6 +18,7 @@ from liqfade.execution.orders import (
     new_cloid,
 )
 from liqfade.execution.userstream import UserEvent, parse_user_frame, subscribe_frames
+from tests.test_live_loop import paper_settings
 
 ADDRESS = "0x000000000000000000000000000000000000beef"
 
@@ -364,5 +365,36 @@ async def test_the_cancel_half_of_a_reprice_does_not_kill_the_live_order(tmp_pat
         # A cancel of the oid we actually hold is real.
         await apply_event(manager, UserEvent(kind="canceled", cloid=cloid, oid=200, coin="ETH"))
         assert manager.get(cloid).status is OrderStatus.CANCELED
+    finally:
+        await store.close()
+
+
+async def test_the_account_socket_pings_or_the_venue_closes_it_every_minute(
+    tmp_path: Path,
+) -> None:
+    """Measured on testnet 2026-09-08: `stream_closed` every 60.4s, forever.
+
+    config/default.yaml says it in the comment beside the interval: "server closes idle
+    connections after 60s". The recorder's market streams have always pinged; this one was
+    built without one, so Hyperliquid closed it on the minute, every minute. It reconnected
+    each time, which cost the fills that landed inside the gap and, once the reconnect
+    counter was wired to the risk engine, halted entries with `reconnect_storm`.
+    """
+    from liqfade.execution.userstream import UserStream
+    from liqfade.recorder.streams.hl import PING_FRAME
+
+    store = await OrderStore.open(tmp_path / "orders.sqlite")
+    try:
+        manager = OrderManager(store, None, sz_decimals={}, killed=lambda: False)  # type: ignore[arg-type]
+        stream = UserStream(
+            url="wss://api.hyperliquid-testnet.xyz/ws",
+            address="0xacc",
+            manager=manager,
+            cfg=paper_settings(tmp_path).recorder,
+            ping_s=20.0,
+        )
+
+        assert stream.stream.ping_s == 20.0
+        assert stream.stream.ping_frame == PING_FRAME
     finally:
         await store.close()
