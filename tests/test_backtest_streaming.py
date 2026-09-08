@@ -317,6 +317,18 @@ class TestACascadeThatStraddlesMidnight:
 #
 # The funnel of the re-pin run shows no `kill_switch` block (the backtest no longer reads
 # the flag at all since 76dbf36). Control chat, 2026-09-07.
+#
+# **Not re-pinned on 2026-09-08, and the lake drive was not mounted to find out.** Branch
+# 05j-partial-exit-rows made a trade row the whole round trip rather than the closing
+# print, so a multi-print exit now reports the units opened, a size weighted exit price and
+# the realised PnL of every partial. A row whose exit filled in one print is unchanged bit
+# for bit: the first exit fill is assigned, not averaged, precisely so that it is. So this
+# digest moves if and only if one of the three reference trades exited in more than one
+# print, and the golden fixture cannot say which, because a partial maker fill needs a
+# print exactly at the resting price and that fixture's prices are continuous. If the run
+# below fails, compare `sum(net_pnl)` against the equity curve first: before this change a
+# partially exited row subtracted the whole position's fees from one partial's gross, so
+# the old total was wrong by the partials it dropped and the new total is the cash.
 REFERENCE = {
     "start": "2025-10-09",
     "end": "2025-10-11",

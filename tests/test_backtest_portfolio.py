@@ -185,6 +185,51 @@ class TestPartialExit:
         assert "BTC" not in book.positions
         assert len(book.trades) == 1
 
+    def test_the_row_is_the_whole_round_trip_not_the_closing_print(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """10 units out as 4 at 101 then 6 at 103 is one row of 10, summing to the cash.
+
+        The closing print used to be the whole row: 6 units of size, 6 units of gross, an
+        exit price of 103 and the first partial's realised PnL sitting in cash and in no
+        row at all. A trade table that does not sum to the account it traded is not a
+        trade table. Found 2026-09-08 by the paper fill-price chat.
+        """
+        settings = settings_factory()
+        book = Portfolio(settings, starting_equity=EQUITY)
+        book.apply_entry(fill(size=10.0), intent())
+        book.apply_exit(fill(size=4.0, px=101.0, is_buy=False), "target")
+        trade = book.apply_exit(fill(size=6.0, px=103.0, is_buy=False), "target")
+
+        assert trade is not None
+        maker = settings.backtest.maker_fee_frac
+        assert trade.size == pytest.approx(10.0)
+        assert trade.size * trade.entry_px == pytest.approx(1_000.0)
+        assert trade.exit_px == pytest.approx((4 * 101.0 + 6 * 103.0) / 10)
+        assert trade.gross_pnl == pytest.approx(4 * 1.0 + 6 * 3.0)
+        assert trade.fees_usd == pytest.approx(maker * (10 * 100.0 + 4 * 101.0 + 6 * 103.0))
+        assert trade.net_pnl == pytest.approx(book.cash - EQUITY)
+
+    def test_exit_slippage_is_size_weighted_and_one_degraded_print_marks_the_exit(
+        self, settings_factory: SettingsFactory
+    ) -> None:
+        """The exit side gets the treatment the entry side already had.
+
+        Reporting the closing print's slippage would let a clean last fill hide a costly
+        first one, and `metrics.stop_slippage_bps` reads this field.
+        """
+        book = Portfolio(settings_factory(), starting_equity=EQUITY)
+        book.apply_entry(fill(size=10.0), intent())
+        book.apply_exit(
+            fill(size=4.0, px=102.0, is_buy=False, slippage_bps=20.0, no_book=True), "stop"
+        )
+        trade = book.apply_exit(
+            fill(size=6.0, px=102.0, is_buy=False, slippage_bps=0.0, no_book=False), "stop"
+        )
+        assert trade is not None
+        assert trade.exit_slippage_bps == pytest.approx(8.0)
+        assert trade.no_book_exit is True
+
     def test_an_exit_with_no_position_is_ignored(self, settings_factory: SettingsFactory) -> None:
         book = Portfolio(settings_factory(), starting_equity=EQUITY)
         assert book.apply_exit(fill(is_buy=False), "target") is None
