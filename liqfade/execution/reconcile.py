@@ -294,6 +294,9 @@ class Reconciler:
         self.failures = 0
         self.differences = 0
         self.last: Reconciliation | None = None
+        # Set after every completed comparison, so a caller can wait for one instead of
+        # guessing how long it takes. Nothing in the process waits on it; the tests do.
+        self.ran = asyncio.Event()
 
     async def check(self, trigger: str) -> Reconciliation | None:
         """One comparison. Returns None when the venue could not be read."""
@@ -326,6 +329,7 @@ class Reconciler:
         self.runs += 1
         self.differences += len(result.differences)
         self.last = result
+        self.ran.set()
 
         if result.clean:
             log.info(

@@ -8,7 +8,8 @@ the session, and that a kill flag already on disk stops the loop before it trade
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from liqfade.config import resolve
 from liqfade.config.models import Settings
 from liqfade.control import ControlClient, ControlServer
 from liqfade.control.protocol import InjectResult
+from liqfade.execution.reconcile import Reconciler
 from liqfade.live.loop import PaperBackend, PaperLoop
 
 COIN = "ETH"
@@ -79,6 +81,33 @@ def a_market(loop: PaperLoop, px: float = 3000.0, at: int = START) -> None:
     )
 
 
+async def eventually(what: str, condition: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    """Wait for a background loop to get there, rather than guessing how long it takes.
+
+    A fixed sleep is a bet on the scheduler: on a loaded machine the task under test has
+    not run yet when the assertion fires, and the test fails on a run that was only late.
+    Waiting on the condition itself is slow only when the code is wrong.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out after {timeout_s}s waiting for {what}")
+        await asyncio.sleep(0.001)
+
+
+async def reconciles(reconciler: Reconciler, n: int, timeout_s: float = 5.0) -> None:
+    """Wait for the reconciler's own signal that it has finished `n` comparisons."""
+    try:
+        async with asyncio.timeout(timeout_s):
+            while reconciler.runs < n:
+                await reconciler.ran.wait()
+                reconciler.ran.clear()
+    except TimeoutError:
+        raise AssertionError(
+            f"the reconciler ran {reconciler.runs} times in {timeout_s}s, wanted {n}"
+        ) from None
+
+
 async def test_status_reports_paper_and_never_live_trading(loop: PaperLoop) -> None:
     from liqfade.live.loop import PaperBackend
 
@@ -105,7 +134,7 @@ async def test_pause_drops_new_intents_and_still_ticks(loop: PaperLoop) -> None:
 
     stop = asyncio.Event()
     task = asyncio.create_task(loop.tick_loop(stop))
-    await asyncio.sleep(0.05)
+    await eventually("a tick", lambda: loop.ticks > 0)
     stop.set()
     await task
 
@@ -149,7 +178,7 @@ async def test_pause_does_not_abandon_the_stop_on_a_position_already_open(
 
         stop = asyncio.Event()
         task = asyncio.create_task(paper.tick_loop(stop))
-        await asyncio.sleep(0.05)
+        await eventually("the stop to fire", lambda: COIN not in paper.session.portfolio.positions)
         stop.set()
         await task
 
@@ -295,11 +324,11 @@ async def test_a_stream_reconnect_reconciles_without_waiting_for_the_interval(
     stop = asyncio.Event()
     task = asyncio.create_task(loop.reconciler.run(stop, reconnected=loop.reconnected))
     try:
-        await asyncio.sleep(0.02)
+        await reconciles(loop.reconciler, 1)
         assert loop.reconciler.runs == 1  # startup
 
         loop.streams[0].on_reconnect("hyperliquid")  # what WSStream.run calls on the way back
-        await asyncio.sleep(0.02)
+        await reconciles(loop.reconciler, 2)
 
         assert loop.reconciler.runs == 2
     finally:
@@ -310,7 +339,7 @@ async def test_a_stream_reconnect_reconciles_without_waiting_for_the_interval(
 async def test_the_heartbeat_file_is_written(loop: PaperLoop) -> None:
     stop = asyncio.Event()
     task = asyncio.create_task(loop.heartbeat_loop(stop))
-    await asyncio.sleep(0.05)
+    await eventually("the first beat", loop.settings.heartbeat_path.exists)
     stop.set()
     await task
 
@@ -469,7 +498,10 @@ async def test_a_stream_reconnect_is_posted(
     await paper.setup()
     try:
         paper._on_reconnect("hyperliquid")
-        await asyncio.sleep(0.01)
+        await eventually(
+            "the reconnect post",
+            lambda: any("RECONNECT" in text and "hyperliquid" in text for text, _ in sent),
+        )
 
         assert any("RECONNECT" in text and "hyperliquid" in text for text, _ in sent)
     finally:
@@ -491,7 +523,10 @@ async def test_a_tick_that_raises_is_posted(
         monkeypatch.setattr(paper.session, "tick", boom)
         stop = asyncio.Event()
         task = asyncio.create_task(paper.tick_loop(stop))
-        await asyncio.sleep(0.05)
+        await eventually(
+            "the error post",
+            lambda: any("ERROR" in text and "the book fell over" in text for text, _ in sent),
+        )
         stop.set()
         await task
 
@@ -651,7 +686,9 @@ async def test_the_heartbeat_keeps_beating_through_a_long_tick(tmp_path: Path) -
     stop = asyncio.Event()
     task = asyncio.create_task(paper.heartbeat_loop(stop))
     try:
-        await asyncio.sleep(0.05)
+        await eventually(
+            "the first beat", lambda: read_heartbeat(paper.settings.heartbeat_path) is not None
+        )
         before = read_heartbeat(paper.settings.heartbeat_path)
         # Blocking the event loop is the whole point: this is what a long tick does.
         wall.sleep(0.3)  # noqa: ASYNC251 - fifteen heartbeat intervals of a busy loop
