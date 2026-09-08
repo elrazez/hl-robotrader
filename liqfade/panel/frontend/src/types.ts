@@ -181,6 +181,52 @@ export interface EquityCurve {
   drawdown: number[];
 }
 
+/** One resolved config key with the layer that won it. */
+export interface ConfigValue {
+  key: string;
+  value: unknown;
+  source: string | null;
+}
+
+/** One layer of the config, and only what that layer itself set. */
+export interface ConfigLayer {
+  name: string;
+  path: string | null;
+  exists: boolean;
+  values: Record<string, unknown>;
+}
+
+/** GET /api/config. `writable_sections` is served so the form cannot drift from the
+ * endpoint's allowlist, and `confirm_sections` says which fields need a typed name. */
+export interface ConfigView {
+  env: string;
+  live_trading_enabled: boolean;
+  live_trading_block_reason: string | null;
+  values: ConfigValue[];
+  layers: ConfigLayer[];
+  writable: boolean;
+  overrides_path: string;
+  writable_sections: string[];
+  confirm_sections: string[];
+}
+
+/** One row of the settings diff: what it is now, what it would become, who set it. */
+export interface DiffRow {
+  key: string;
+  before: unknown;
+  after: unknown;
+  source: string | null;
+}
+
+/** What POST /api/config came back with, in the shape the page shows. */
+export interface WriteResult {
+  ok: boolean;
+  diff: DiffRow[];
+  written: boolean;
+  reload: { changed: string[]; error: string | null } | null;
+  detail: string;
+}
+
 /** GET /api/audit: what the panel did, appended one JSON object per line. */
 export interface AuditEntry {
   ts_ms: number;

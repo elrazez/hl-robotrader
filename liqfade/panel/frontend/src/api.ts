@@ -1,5 +1,6 @@
 import type {
   AuditEntry,
+  ConfigView,
   DiskStats,
   EquityCurve,
   FillsPage,
@@ -7,6 +8,7 @@ import type {
   Liquidations,
   ReportDetail,
   ReportRow,
+  WriteResult,
   StateSnapshot,
   TradeWindow,
   TradesPage,
@@ -163,6 +165,41 @@ export async function fetchAudit(limit = 100): Promise<AuditEntry[]> {
   const res = await fetch(`/api/audit?limit=${limit}`, { credentials: "same-origin" });
   if (!res.ok) return [];
   return ((await res.json()).entries ?? []) as AuditEntry[];
+}
+
+export async function fetchConfig(): Promise<ConfigView | null> {
+  const res = await fetch("/api/config", { credentials: "same-origin" });
+  return res.ok ? ((await res.json()) as ConfigView) : null;
+}
+
+/**
+ * Write settings, or preview them. `dry_run` runs every check the write runs and
+ * returns the same diff without touching the file, so the preview cannot promise
+ * something the write then refuses.
+ */
+export async function writeConfig(body: {
+  changes: Record<string, unknown>;
+  reason: string;
+  confirm: Record<string, string>;
+  dry_run: boolean;
+}): Promise<WriteResult> {
+  const res = await fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: JSON.stringify(body),
+  });
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    return {
+      ok: false,
+      diff: [],
+      written: false,
+      reload: null,
+      detail: payload?.detail ?? res.statusText,
+    };
+  }
+  return { ...payload, detail: "" } as WriteResult;
 }
 
 /** Backtest reports. All of these are session gated like everything else. */

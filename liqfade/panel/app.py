@@ -20,13 +20,13 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from liqfade.config import config_layers, flatten, resolve
+from liqfade.config import config_layers, flatten, overrides_file, resolve
 from liqfade.config.models import Settings
 from liqfade.control.client import ControlClient
 from liqfade.control.protocol import ControlError, LatencyState, now_ms
 from liqfade.control.state import read_state
 from liqfade.log import get_logger, setup_logging
-from liqfade.panel import audit
+from liqfade.panel import audit, overrides
 from liqfade.panel.auth import COOKIE_NAME, LoginLimiter, SessionAuth
 
 log = get_logger(__name__)
@@ -49,6 +49,23 @@ class ControlBody(BaseModel):
 
     confirm: bool = False
     coin: str | None = Field(None, max_length=32, description="flat only; all coins when None")
+
+
+class SettingsBody(BaseModel):
+    """One settings write. `reason` is required: the audit log's value is the why.
+
+    `confirm` maps a risk field to the owner's typed confirmation of its own name, which
+    is the second pair of eyes CLAUDE.md asks for on anything that decides how much is at
+    risk. `dry_run` runs every check and returns the diff without writing, so the preview
+    the page shows is the write minus the write.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    changes: dict[str, Any] = Field(..., description="dotted key to new value")
+    reason: str = Field(..., min_length=1, max_length=500)
+    confirm: dict[str, str] = Field(default_factory=dict)
+    dry_run: bool = False
 
 
 def is_loopback(host: str) -> bool:
@@ -861,13 +878,16 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
 
     @api.get("/config", dependencies=[Depends(require_session)])
     def config() -> dict[str, Any]:
-        """Read only for now. Phase 5 adds validated writes to config/overrides.yaml.
+        """The resolved config, what each layer set, and what the panel may write.
 
         Both views are returned. `values` is the resolved config with the label of the
         layer that won each key, which is what the page displays. `layers` is what each
         layer set, in merge order, which is what a settings page needs before it offers to
         change a number: the flattened resolution alone cannot say what a value is being
         changed from or what removing an override would go back to.
+
+        `writable_sections` is served rather than kept in the frontend, so the form and
+        the endpoint cannot disagree about what may be changed.
         """
         merged, sources = resolve(settings.env)
         flat = flatten(merged)
@@ -887,8 +907,82 @@ def create_app(settings: Settings, auth: SessionAuth) -> FastAPI:
                 }
                 for layer in config_layers(settings.env)
             ],
-            "writable": False,
+            "writable": True,
+            "overrides_path": str(overrides_file({"paths": {"data_dir": settings.paths.data_dir}})),
+            "writable_sections": sorted(overrides.WRITABLE_SECTIONS),
+            "confirm_sections": sorted(overrides.CONFIRM_SECTIONS),
         }
+
+    @api.post("/config", dependencies=[Depends(require_session)])
+    async def write_config(body: SettingsBody) -> dict[str, Any]:
+        """Validate a settings change, write it, reload the loop and audit all of it.
+
+        The order matters. Everything that can refuse the change runs before anything is
+        written, so a refusal leaves the file exactly as it was. The reload runs after
+        the write and cannot undo it: an override that vanished because the loop happened
+        to be down would be worse than one the running process has not picked up yet, and
+        the page says which of those it is.
+        """
+        merged, flat, sources = overrides.current(settings.env)
+        rows = overrides.diff(body.changes, flat, sources)
+
+        def refuse(message: str) -> HTTPException:
+            audit.record(
+                settings.paths.data_dir,
+                action="settings",
+                args={"changed": body.changes, "diff": rows},
+                ok=False,
+                error=message,
+                reason=body.reason,
+            )
+            log.warning("panel_settings_refused", changes=body.changes, error=message)
+            return HTTPException(status.HTTP_400_BAD_REQUEST, message)
+
+        try:
+            overrides.check(body.changes, body.confirm, sources)
+            overrides.validate(settings.env, body.changes, merged)
+        except overrides.OverridesError as exc:
+            raise refuse(str(exc)) from None
+
+        if body.dry_run:
+            return {"ok": True, "diff": rows, "written": False, "reload": None}
+
+        path = overrides_file({"paths": {"data_dir": settings.paths.data_dir}})
+        try:
+            overrides.write(path, body.changes, body.reason)
+        except (overrides.OverridesError, OSError) as exc:
+            raise refuse(f"could not write {path}: {exc}") from None
+
+        # The loop is told after the file is on disk, so a reload always reads the change
+        # that is actually there. A loop that is down or that refuses is reported, not
+        # rolled back.
+        reload: dict[str, Any] = {"changed": [], "error": None}
+        client = ControlClient(
+            live_socket_path(settings),
+            connect_timeout_s=settings.control.connect_timeout_s,
+            request_timeout_s=settings.control.request_timeout_s,
+        )
+        try:
+            reload = (await client.reload_config()).model_dump(mode="json")
+        except ControlError as exc:
+            reload = {"changed": [], "error": f"control socket: {exc}"}
+
+        log.warning(
+            "panel_settings_written",
+            changes=body.changes,
+            reason=body.reason,
+            path=str(path),
+            reload_error=reload.get("error"),
+        )
+        entry = audit.record(
+            settings.paths.data_dir,
+            action="settings",
+            args={"changed": body.changes, "diff": rows},
+            ok=True,
+            result={"path": str(path), "reload": reload},
+            reason=body.reason,
+        )
+        return {"ok": True, "diff": rows, "written": True, "reload": reload, "entry": entry}
 
     app.include_router(api)
 

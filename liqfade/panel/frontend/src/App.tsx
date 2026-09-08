@@ -6,6 +6,7 @@ import LiquidationChart from "./LiquidationChart";
 import Live from "./Live";
 import Login from "./Login";
 import Reports from "./Reports";
+import SettingsPage from "./Settings";
 import type { DiskStats, FeedState, Latency, Liquidations, StateSnapshot } from "./types";
 import { Banner, Row, Section, ms } from "./ui";
 
@@ -76,7 +77,7 @@ function Feeds({ feeds }: { feeds: FeedState[] }) {
   );
 }
 
-type Tab = "live" | "fills" | "recorder" | "reports";
+type Tab = "live" | "fills" | "recorder" | "reports" | "settings";
 
 function TabButton({
   tab,
@@ -169,6 +170,7 @@ export default function App() {
           <TabButton tab="fills" current={tab} onPick={setTab} label="fills" />
           <TabButton tab="recorder" current={tab} onPick={setTab} label="recorder" />
           <TabButton tab="reports" current={tab} onPick={setTab} label="reports" />
+          <TabButton tab="settings" current={tab} onPick={setTab} label="settings" />
           <button
             onClick={() => logout().then(() => setAuthed(false))}
             className="ml-4 text-sm text-neutral-500 hover:text-neutral-300"
@@ -181,6 +183,7 @@ export default function App() {
       {tab === "live" ? <Live onUnauthorized={() => setAuthed(false)} /> : null}
       {tab === "fills" ? <Fills /> : null}
       {tab === "reports" ? <Reports /> : null}
+      {tab === "settings" ? <SettingsPage /> : null}
 
       {tab === "recorder" && problem && <Banner kind="warn">stale: {problem}</Banner>}
 

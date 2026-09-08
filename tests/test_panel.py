@@ -212,10 +212,11 @@ def test_state_returns_503_on_a_corrupt_file(client: TestClient, settings: Setti
     assert "unreadable" in response.json()["detail"]
 
 
-def test_config_endpoint_is_read_only_and_reports_sources(client: TestClient) -> None:
+def test_config_endpoint_reports_sources_and_the_live_trading_gate(client: TestClient) -> None:
     client.post("/api/login", json={"password": PASSWORD})
     body = client.get("/api/config").json()
-    assert body["writable"] is False
+    # Writable since the settings page landed; TestSettingsWrites owns what that means.
+    assert body["writable"] is True
     assert body["live_trading_enabled"] is False
     keys = {row["key"]: row for row in body["values"]}
     assert keys["sizing.risk_frac"]["value"] == 0.005
@@ -1039,6 +1040,42 @@ class TestTheLiveLatencyEndpoint:
 # --- controls -------------------------------------------------------------------
 
 
+@pytest.fixture
+def loop_socket(settings: Settings) -> Iterator[NoopBackend]:
+    """A real ControlServer on the path the panel expects, behind a NoopBackend.
+
+    Real socket, real wire format, real ControlClient: what is worth testing is that the
+    panel reaches the loop's socket and reports what came back, and a mocked client would
+    test neither. NoopBackend records every call and places nothing.
+
+    On its own thread and its own event loop, because TestClient's calls block the
+    caller: served from the test's loop, the blocking POST would starve the accept and
+    every request would time out against a socket that is listening. The `settings` it
+    resolves is whichever one is in scope, so a class that needs a short data_dir gets
+    its socket there.
+    """
+    backend = NoopBackend(env="paper", proc="paper")
+    server = ControlServer(backend, live_socket_path(settings))
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(server.start())
+        loop.call_soon(ready.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run, name="fake-control", daemon=True)
+    thread.start()
+    assert ready.wait(timeout=5.0), "the fake control server never came up"
+    try:
+        yield backend
+    finally:
+        asyncio.run_coroutine_threadsafe(server.stop(), loop).result(timeout=5.0)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+
+
 class TestControls:
     """Pause, resume and flat, through the loop's own control socket.
 
@@ -1051,39 +1088,6 @@ class TestControls:
     def settings(self, sock_dir: Path) -> Settings:
         """data_dir on a short path: pytest's tmp_path blows the sockaddr_un limit."""
         return load_settings("paper", environ={"LIQFADE_PATHS__DATA_DIR": str(sock_dir)})
-
-    @pytest.fixture
-    def loop_socket(self, settings: Settings) -> Iterator[NoopBackend]:
-        """A real ControlServer on the path the panel expects, behind a NoopBackend.
-
-        Real socket, real wire format, real ControlClient: what is worth testing is that
-        the panel reaches the loop's socket and reports what came back, and a mocked
-        client would test neither. NoopBackend records every call and places nothing.
-
-        On its own thread and its own event loop, because TestClient's calls block the
-        caller: served from the test's loop, the blocking POST would starve the accept
-        and every request would time out against a socket that is listening.
-        """
-        backend = NoopBackend(env="paper", proc="paper")
-        server = ControlServer(backend, live_socket_path(settings))
-        loop = asyncio.new_event_loop()
-        ready = threading.Event()
-
-        def run() -> None:
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(server.start())
-            loop.call_soon(ready.set)
-            loop.run_forever()
-
-        thread = threading.Thread(target=run, name="fake-control", daemon=True)
-        thread.start()
-        assert ready.wait(timeout=5.0), "the fake control server never came up"
-        try:
-            yield backend
-        finally:
-            asyncio.run_coroutine_threadsafe(server.stop(), loop).result(timeout=5.0)
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=5.0)
 
     def test_they_need_a_session(self, client: TestClient) -> None:
         assert client.post("/api/live/pause", json={"confirm": True}).status_code == 401
@@ -1173,3 +1177,300 @@ class TestControls:
         assert entries[0]["ok"] is True
         assert entries[0]["result"]["closing"] == ["ETH"]
         assert entries[0]["ts_ms"] > 0
+
+
+# --- settings writes ------------------------------------------------------------
+
+
+class TestSettingsWrites:
+    """The only thing in this system that changes a running config from a browser.
+
+    Four rules, each enforced here rather than in the frontend, because a page can be
+    reloaded mid-flow and a curl has no frontend at all: an allowlist of writable
+    sections, a typed confirmation for anything that decides how much money is at risk,
+    a validation pass through the same model the YAML goes through, and an audit entry
+    whatever the outcome.
+    """
+
+    @pytest.fixture
+    def settings(self, sock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+        """data_dir on a short path, set in the environment rather than passed in.
+
+        The endpoint resolves the config from the process environment, the way the real
+        panel does, so a data_dir the test knows about and the process does not would
+        have the two looking at different overrides files.
+        """
+        monkeypatch.setenv("LIQFADE_PATHS__DATA_DIR", str(sock_dir))
+        return load_settings("paper")
+
+    @pytest.fixture
+    def signed_in(self, client: TestClient) -> TestClient:
+        client.post("/api/login", json={"password": PASSWORD})
+        return client
+
+    def test_it_needs_a_session(self, client: TestClient) -> None:
+        assert client.post("/api/config", json={"changes": {}}).status_code == 401
+
+    def test_the_config_endpoint_now_says_it_is_writable_and_where(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        body = signed_in.get("/api/config").json()
+        assert body["writable"] is True
+        assert body["overrides_path"] == str(settings.paths.data_dir / "overrides.yaml")
+        # The sections a settings page may touch, so the form is built from the answer
+        # rather than from a list the frontend keeps its own copy of.
+        assert set(body["writable_sections"]) == {
+            "cascade",
+            "exhaustion",
+            "filters",
+            "intent",
+            "risk",
+            "sizing",
+            "strategy",
+            "universe",
+        }
+
+    def test_a_dry_run_returns_the_diff_and_writes_nothing(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """The preview is the write, minus the write, so they cannot disagree."""
+        body = signed_in.post(
+            "/api/config",
+            json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets", "dry_run": True},
+        ).json()
+
+        assert body["ok"] is True
+        assert body["diff"] == [
+            {"key": "intent.k_target", "before": 0.8, "after": 1.4, "source": "default.yaml"}
+        ]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_a_write_lands_in_the_overrides_file_with_its_timestamp_and_reason(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        import yaml
+
+        response = signed_in.post(
+            "/api/config",
+            json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets"},
+        )
+
+        assert response.status_code == 200
+        path = settings.paths.data_dir / "overrides.yaml"
+        written = yaml.safe_load(path.read_text())
+        assert written["intent"]["k_target"] == 1.4
+        header = path.read_text().splitlines()[0]
+        assert "wider targets" in path.read_text()
+        assert header.startswith("#")  # the timestamp and reason are a comment, not config
+
+    def test_a_second_write_keeps_the_first(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Two changes on different days are two overrides, not the second one only."""
+        import yaml
+
+        signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "a"})
+        signed_in.post("/api/config", json={"changes": {"intent.k_stop": 0.9}, "reason": "b"})
+
+        written = yaml.safe_load((settings.paths.data_dir / "overrides.yaml").read_text())
+        assert written["intent"] == {"k_target": 1.4, "k_stop": 0.9}
+
+    def test_the_written_config_still_loads(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """What the panel writes has to be a config the next process start can read."""
+        signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"sizing.risk_frac": 0.004},
+                "reason": "r",
+                "confirm": {"sizing.risk_frac": "sizing.risk_frac"},
+            },
+        )
+
+        reloaded = load_settings(
+            "paper", environ={"LIQFADE_PATHS__DATA_DIR": str(settings.paths.data_dir)}
+        )
+
+        assert reloaded.sizing.risk_frac == 0.004
+
+    # --- what it refuses ---------------------------------------------------------
+
+    def test_a_value_the_model_refuses_is_refused_before_it_is_written(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Validated through the same model as the YAML, so the page cannot write a
+        config that only fails at the next process start."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"sizing.risk_frac": 5.0}, "reason": "oops"}
+        )
+
+        assert response.status_code == 400
+        assert "risk_frac" in response.json()["detail"]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_a_cross_field_rule_is_refused_too(self, signed_in: TestClient) -> None:
+        """One field at a time is valid; the pair is not. Only whole-model validation
+        catches that, which is why the check is a load and not a field lookup."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"risk.kill_budget_s": 30.0}, "reason": "oops"}
+        )
+        assert response.status_code == 400
+        assert "kill_budget_s" in response.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "env",
+            "execution.entry_tif",
+            "panel.allow_non_loopback",
+            "paths.data_dir",
+            "venues.hyperliquid.info_base",
+            "telegram.enabled",
+        ],
+    )
+    def test_only_the_allowlisted_sections_may_be_written(
+        self, signed_in: TestClient, key: str
+    ) -> None:
+        """An allowlist, not a blocklist. Nothing on this page can enable live trading,
+        and the way to be sure of that is that it cannot write anything it was not
+        named for, rather than that someone remembered every key that would do it."""
+        response = signed_in.post("/api/config", json={"changes": {key: "x"}, "reason": "no"})
+
+        assert response.status_code == 400
+        assert "not writable" in response.json()["detail"]
+
+    def test_a_risk_field_needs_its_own_name_typed_back(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        response = signed_in.post(
+            "/api/config",
+            json={"changes": {"risk.max_daily_loss_frac": 0.05}, "reason": "tighter"},
+        )
+
+        assert response.status_code == 400
+        assert "risk.max_daily_loss_frac" in response.json()["detail"]
+        assert not (settings.paths.data_dir / "overrides.yaml").exists()
+
+    def test_the_typed_confirmation_has_to_be_the_right_name(self, signed_in: TestClient) -> None:
+        response = signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"risk.max_daily_loss_frac": 0.05},
+                "reason": "tighter",
+                "confirm": {"risk.max_daily_loss_frac": "risk.max_dd_frac"},
+            },
+        )
+        assert response.status_code == 400
+
+    def test_a_confirmed_risk_field_is_written(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        import yaml
+
+        response = signed_in.post(
+            "/api/config",
+            json={
+                "changes": {"risk.max_daily_loss_frac": 0.05},
+                "reason": "tighter after the drawdown",
+                "confirm": {"risk.max_daily_loss_frac": "risk.max_daily_loss_frac"},
+            },
+        )
+
+        assert response.status_code == 200
+        written = yaml.safe_load((settings.paths.data_dir / "overrides.yaml").read_text())
+        assert written["risk"]["max_daily_loss_frac"] == 0.05
+
+    def test_sizing_counts_as_a_risk_field(self, signed_in: TestClient) -> None:
+        """Sizing decides how much is at risk, so it gets the same typed confirmation."""
+        response = signed_in.post(
+            "/api/config", json={"changes": {"sizing.risk_frac": 0.004}, "reason": "smaller"}
+        )
+        assert response.status_code == 400
+        assert "sizing.risk_frac" in response.json()["detail"]
+
+    def test_a_key_an_env_var_already_wins_is_refused(
+        self, sock_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An override under an env var is a change the owner would watch do nothing.
+
+        The env layer merges last, so writing the file would leave the page showing a
+        value the process never adopts. Better to say so than to write it.
+        """
+        settings = load_settings(
+            "paper",
+            environ={
+                "LIQFADE_PATHS__DATA_DIR": str(sock_dir),
+                "LIQFADE_INTENT__K_TARGET": "1.9",
+            },
+        )
+        monkeypatch.setenv("LIQFADE_INTENT__K_TARGET", "1.9")
+        auth = SessionAuth(password_hash=hash_password(PASSWORD), secret="s", ttl_s=60)
+        with TestClient(create_app(settings, auth)) as client:
+            client.post("/api/login", json={"password": PASSWORD})
+            response = client.post(
+                "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "no"}
+            )
+
+        assert response.status_code == 400
+        assert "env var" in response.json()["detail"]
+
+    def test_a_write_with_no_reason_is_refused(self, signed_in: TestClient) -> None:
+        """The audit log's whole value is the why; a blank one makes it a diff."""
+        response = signed_in.post("/api/config", json={"changes": {"intent.k_target": 1.4}})
+        assert response.status_code == 422
+
+    def test_an_empty_change_set_is_refused(self, signed_in: TestClient) -> None:
+        response = signed_in.post("/api/config", json={"changes": {}, "reason": "nothing"})
+        assert response.status_code == 400
+
+    # --- the reload and the audit trail ------------------------------------------
+
+    def test_a_write_reloads_the_loop_and_reports_what_it_said(
+        self, signed_in: TestClient, loop_socket: NoopBackend
+    ) -> None:
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert [name for name, _ in loop_socket.calls] == ["reload_config"]
+        assert body["reload"]["error"] is None
+
+    def test_a_loop_that_refuses_the_reload_does_not_undo_the_write(
+        self, signed_in: TestClient, settings: Settings
+    ) -> None:
+        """Nothing is listening, or the loop says it cannot reload. Either way the file
+        is written and the page says the running process has not picked it up: an
+        override that vanishes because the loop was down would be worse than a stale one.
+        """
+        body = signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider"}
+        ).json()
+
+        assert body["ok"] is True
+        assert (settings.paths.data_dir / "overrides.yaml").exists()
+        assert "control socket" in body["reload"]["error"]
+
+    def test_every_write_is_audited_with_its_before_and_after(self, signed_in: TestClient) -> None:
+        signed_in.post(
+            "/api/config", json={"changes": {"intent.k_target": 1.4}, "reason": "wider targets"}
+        )
+
+        entry = signed_in.get("/api/audit").json()["entries"][0]
+
+        assert entry["action"] == "settings"
+        assert entry["reason"] == "wider targets"
+        assert entry["args"]["changed"] == {"intent.k_target": 1.4}
+        assert entry["args"]["diff"] == [
+            {"key": "intent.k_target", "before": 0.8, "after": 1.4, "source": "default.yaml"}
+        ]
+
+    def test_a_refused_write_is_audited_too(self, signed_in: TestClient) -> None:
+        """What the owner tried is as worth reading back as what they managed."""
+        signed_in.post("/api/config", json={"changes": {"env": "mainnet"}, "reason": "no"})
+
+        entry = signed_in.get("/api/audit").json()["entries"][0]
+
+        assert entry["action"] == "settings"
+        assert entry["ok"] is False
+        assert "not writable" in entry["error"]

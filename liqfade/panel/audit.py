@@ -38,19 +38,24 @@ def record(
     ok: bool,
     result: dict[str, Any] | None = None,
     error: str | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Append one entry and return it, so a route can log and answer with one object.
+
+    `reason` is the why the owner gave, which is the field this log exists for and so is
+    its own column rather than something to dig out of `args`.
 
     A failure to write is not a failure of the action: the action already happened, and
     raising here would tell the caller it did not. The entry comes back either way.
     """
-    entry = {
+    entry: dict[str, Any] = {
         "ts_ms": now_ms(),
         "action": action,
         "args": args or {},
         "ok": ok,
         "result": result,
         "error": error,
+        "reason": reason,
     }
     path = audit_path(data_dir)
     try:
