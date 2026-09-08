@@ -71,6 +71,12 @@ export async function logout(): Promise<void> {
   await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
 }
 
+/** Unauthenticated, so the header can name the environment before anyone logs in. */
+export async function fetchHealth(): Promise<{ ok: boolean; env: string } | null> {
+  const res = await fetch("/api/health", { credentials: "same-origin" });
+  return res.ok ? await res.json() : null;
+}
+
 export async function hasSession(): Promise<boolean> {
   const res = await fetch("/api/session", { credentials: "same-origin" });
   if (!res.ok) return false;

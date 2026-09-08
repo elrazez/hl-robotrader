@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchDisk, fetchLatency, fetchLiquidations, fetchState, hasSession, logout } from "./api";
+import {
+  fetchDisk,
+  fetchHealth,
+  fetchLatency,
+  fetchLiquidations,
+  fetchState,
+  hasSession,
+  logout,
+} from "./api";
 import Fills from "./Fills";
 import LatencyChart from "./LatencyChart";
 import LiquidationChart from "./LiquidationChart";
@@ -22,7 +30,7 @@ function gb(bytes: number) {
 function Feeds({ feeds }: { feeds: FeedState[] }) {
   if (feeds.length === 0) return <p className="text-sm text-neutral-500">no feeds registered</p>;
   return (
-    <table className="w-full text-sm">
+    <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
       <thead className="text-left text-xs uppercase text-neutral-500">
         <tr>
           <th className="pb-1 font-medium">stream</th>
@@ -112,9 +120,14 @@ export default function App() {
   const [disk, setDisk] = useState<DiskStats | null>(null);
   const [liquidations, setLiquidations] = useState<Liquidations | null>(null);
   const [latency, setLatency] = useState<Latency | null>(null);
+  // The env this panel is serving, which every tab shows and no tab's poll owns. It
+  // used to come from the recorder's snapshot, which only the recorder tab polls, so
+  // the header read "? / ?" everywhere else.
+  const [env, setEnv] = useState<string | null>(null);
 
   useEffect(() => {
     hasSession().then(setAuthed);
+    fetchHealth().then((health) => setEnv(health?.env ?? null));
   }, []);
 
   const poll = useCallback(async () => {
@@ -161,9 +174,7 @@ export default function App() {
       <header className="mb-4 flex items-baseline justify-between">
         <h1 className="text-lg font-semibold">
           liqfade{" "}
-          <span className="text-sm font-normal text-neutral-500">
-            {state?.env ?? "?"} / {state?.proc ?? "?"}
-          </span>
+          <span className="text-sm font-normal text-neutral-500">{env ?? "connecting"}</span>
         </h1>
         <div className="flex items-center gap-2">
           <TabButton tab="live" current={tab} onPick={setTab} label="live" />

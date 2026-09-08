@@ -40,7 +40,7 @@ export default function AuditLog({ refreshKey }: { refreshKey: number }) {
       {entries.length === 0 ? (
         <p className="text-sm text-neutral-500">nothing yet</p>
       ) : (
-        <table className="w-full text-sm">
+        <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
           <thead className="text-left text-xs uppercase text-neutral-500">
             <tr>
               <th className="pb-1 font-medium">time (UTC)</th>

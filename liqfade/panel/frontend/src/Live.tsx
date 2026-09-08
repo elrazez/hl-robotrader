@@ -15,7 +15,7 @@ const LATENCY_POLL_MS = 30_000;
 function Positions({ positions }: { positions: PositionState[] }) {
   if (positions.length === 0) return <p className="text-sm text-neutral-500">flat</p>;
   return (
-    <table className="w-full text-sm">
+    <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
       <thead className="text-left text-xs uppercase text-neutral-500">
         <tr>
           <th className="pb-1 font-medium">coin</th>
@@ -53,7 +53,7 @@ function Positions({ positions }: { positions: PositionState[] }) {
 function Orders({ orders }: { orders: OrderState[] }) {
   if (orders.length === 0) return <p className="text-sm text-neutral-500">no resting orders</p>;
   return (
-    <table className="w-full text-sm">
+    <table className="w-full text-sm [&_td:not(:first-child)]:pl-4 [&_th:not(:first-child)]:pl-4">
       <thead className="text-left text-xs uppercase text-neutral-500">
         <tr>
           <th className="pb-1 font-medium">coin</th>
