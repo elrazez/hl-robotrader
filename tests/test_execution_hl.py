@@ -382,3 +382,40 @@ async def test_signed_actions_never_share_a_millisecond() -> None:
 
     assert len(set(stamps)) == len(stamps), f"two actions shared a millisecond: {stamps}"
     assert stamps == sorted(stamps), "and they must be issued in order"
+
+
+def test_equity_in_all_three_account_layouts() -> None:
+    """Measured on testnet 2026-09-08; see the equity table in docs/HYPERLIQUID.md.
+
+    Sizing multiplies equity by `sizing.risk_frac`, so the wrong field is either no trades
+    or oversized ones. The sum is right in each layout rather than right by luck.
+    """
+
+    def state(account_value: str) -> dict:
+        return {
+            "marginSummary": {
+                "accountValue": account_value,
+                "totalNtlPos": "0.0",
+                "totalRawUsd": "0.0",
+                "totalMarginUsed": "0.0",
+            },
+            "crossMaintenanceMarginUsed": "0.0",
+            "withdrawable": "0.0",
+            "assetPositions": [],
+        }
+
+    def spot(total: str) -> dict:
+        return {"balances": [{"coin": "USDC", "total": total}]}
+
+    # Spot collateralised, which is this testnet account: accountValue is 0 while flat.
+    assert parse_clearinghouse_state(state("0.0"), spot=spot("995.65")).equity == pytest.approx(
+        995.65
+    )
+    # Perps funded, which is where a mainnet deposit lands.
+    assert parse_clearinghouse_state(state("1000.0"), spot=spot("0.0")).equity == pytest.approx(
+        1000.0
+    )
+    # Mixed: each half counted once.
+    assert parse_clearinghouse_state(state("400.0"), spot=spot("600.0")).equity == pytest.approx(
+        1000.0
+    )

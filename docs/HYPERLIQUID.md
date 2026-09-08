@@ -241,3 +241,43 @@ What does matter: **an agent address holding a balance is a balance no order wil
 use**, because orders execute on the master. Funds sent to the agent address by mistake
 are recoverable with the agent key through `spot_transfer`, which acts on the agent's own
 address, and that is the only reason the split above needs to be understood at all.
+
+## Which balance is equity, measured 2026-09-08
+
+Sizing multiplies equity by `sizing.risk_frac`, so reading the wrong field is either no
+trades at all or trades several times the intended size. This is what the venue actually
+did, on one account, across one round trip of about $15 of ETH.
+
+| | `accountValue` | `totalRawUsd` | `totalMarginUsed` | `withdrawable` | spot USDC |
+| --- | --- | --- | --- | --- | --- |
+| flat | 0.0 | 0.0 | 0.0 | 0.0 | 995.648036 |
+| holding 0.006 ETH | 1.507194 | **-13.564747** | 0.753597 | 0.0 | 995.641315 |
+| closed again | 0.0 | 0.0 | 0.0 | 0.0 | 995.633862 |
+
+**The perps ledger is not where the money is.** Spot USDC fell by 0.0067 opening and
+0.0075 closing, which is the taker fee and nothing else: the margin was never moved out of
+spot. Opening the position instead drove the perps raw USD *negative*, to -13.56, against a
+position marked at +15.07. `accountValue` is the sum of those two, so it reports the
+position's net equity inside the perps sub-ledger and reads **0.0 whenever the account is
+flat**, however much collateral stands behind it.
+
+**So equity is `marginSummary.accountValue` plus the spot USDC balance**, and that is what
+`parse_clearinghouse_state` returns and what `sizing` reads. The sum is right in all three
+layouts rather than by luck:
+
+- **spot-collateralised** (this testnet account): 995.65 + 0.0 = 995.65, the tradeable
+  capital. Reading `accountValue` alone gives 0 and refuses every entry for `risk_budget`,
+  which is what happened before this was measured.
+- **perps-funded** (a mainnet deposit, which lands in perps): 0 + 1000 = 1000. Reading the
+  spot balance alone would give 0 and refuse everything.
+- **mixed**: both halves counted once.
+
+While a position is open the perps half carries its unrealized PnL, which belongs in
+equity, so the sum tracks the account rather than the deposit.
+
+**Do not read `withdrawable` as equity.** It was 0.0 with a position open *and* 0.0 while
+flat with 995 USDC available, so it answers a different question entirely.
+
+**The check worth keeping:** `accountValue: 0.0` is not an empty account. Read the spot
+balance before concluding anything, and `userRole` before concluding anything at all
+(see `docs/DECISIONS.md` 2026-09-08).
