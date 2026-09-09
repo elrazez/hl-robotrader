@@ -3352,24 +3352,31 @@ than against that arithmetic. Reverse upward only after the gauge and a real mai
 have run side by side for a day.
 
 **Measured after the deploy, same code both sides.** Hour 09 UTC on 2026-09-09 is the
-last full hour of the old poller; the post-deploy window is the new one. Deduplicated to
-the latest row per address and coin, joined to `asset_ctx` marks.
+last full hour of the old poller and hour 11 the first clean hour of the new one, both
+deduplicated to the latest row per address and coin and joined to `asset_ctx` marks.
 
-| | before, 200 addresses | after, 400 addresses |
+| | before, hour 09 | after, hour 11 |
 | --- | --- | --- |
-| distinct addresses seen | 195 | 3,277 |
-| open positions | 862 across 18 coins | 8,667 across 18 coins |
-| notional tracked | $1,593M | $4,084M |
-| positions with no `liquidation_px` | 293 of 862 | 2,796 of 8,667 |
-| notional within 2% of mark | $83M | $117M |
-| notional within 5% of mark | $167M | $266M |
-| notional within 20% of mark | $461M | $986M |
-| cross margin share | $1,549M of $1,593M | $3,852M of $4,084M |
+| distinct addresses seen | 195 | 3,740 |
+| open positions | 862 across 18 coins | 9,769 across 18 coins |
+| notional tracked | $1,593M | $5,075M |
+| positions with no `liquidation_px` | 293 of 862 | 2,993 of 9,769 |
+| notional within 2% of mark | $83M | $83M |
+| notional within 5% of mark | $167M | $271M |
+| notional within 20% of mark | $461M | $1,017M |
+| cross margin share | $1,549M of $1,593M | $4,820M of $5,075M |
 
-The rows that matter are 2% and 5%, the fuel the map can actually see: up 41% and 59%.
-They rise by less than the 2.6x rise in total notional, which is the sweep doing its job:
-it discovers addresses indiscriminately and the priority tier is what keeps the near-price
-ones in the poll afterwards. `weight_per_min` measured 800 to 810 over twelve cycles.
+**The 2% bucket did not move, and that is the honest headline.** Within 5% is up 62% and
+within 20% is up 121%, but the narrowest band, which is the fuel that can actually burn
+this hour, read $83M before and $83M after. A 42-minute window between the two deploys
+read $117M, so across three windows the number is 83, 117, 83: this bucket is small,
+dominated by a handful of large positions, and noise-dominated at one-hour resolution.
+Doubling the poll clearly bought reach; whether it bought *near-price* reach cannot be
+settled by one hour a side and should be re-measured over a full day once Q9's clock has
+run. What can be said is that the top-200-by-notional ranking was already catching most of
+the biggest near-price positions, which is the one thing the old ranking was good at.
+
+`weight_per_min` measured 800 to 810 over twelve cycles.
 
 **The asks are paced across the interval, not merely un-gathered.** The first deploy
 measured `weight_per_min` at 1022 of the 1200 per-IP budget against an average of 800,
