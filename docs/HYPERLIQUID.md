@@ -83,6 +83,13 @@ That leaves 800 for the poller, 100 reserved for a future mainnet loop, and abou
 spare. The poller logs `weight_per_min` (`StreamStats.weight_per_min`) every cycle, so
 the number in the config is checked against a measurement rather than against this table.
 
+**An average under the limit is not enough; the peak is what the venue meters.** The first
+deploy of the 400-address poller averaged exactly 800 and peaked at **1022**, because 400
+sequential asks finish in 7 to 10 seconds and a sliding 60s window can then contain one
+whole cycle plus the tail of the one before it. The asks are now paced across 90% of
+`poll_s` (`hl_positions.PACE_FRAC`), which makes the peak equal the average. Any future
+poller on this box has the same trap: spread the weight, do not merely refuse to gather.
+
 **Round trip to `api.hyperliquid.xyz` from the VPS: 52 to 63 ms, measured 2026-09-09.**
 A sequential sweep of 400 addresses is therefore about 23s and of 600 about 33s, inside
 a 60s `poll_s` either way. The clock is not the binding constraint; the weight budget is.

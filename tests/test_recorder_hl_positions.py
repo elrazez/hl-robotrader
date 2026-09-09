@@ -18,12 +18,18 @@ from typing import Any
 
 import httpx
 import orjson
+import pytest
 
 from liqfade.config import load_settings
 from liqfade.config.models import HlPositions, HyperliquidVenue
 from liqfade.data.schemas import SOURCE_RECORDER, rows_to_table, validate_table
 from liqfade.recorder.addresses import AddressBook
-from liqfade.recorder.streams.hl_positions import STREAM, HlPositionsPoller, select_addresses
+from liqfade.recorder.streams.hl_positions import (
+    PACE_FRAC,
+    STREAM,
+    HlPositionsPoller,
+    select_addresses,
+)
 
 VENUE_CFG: HyperliquidVenue = load_settings("paper", environ={}).venues.hyperliquid
 CFG = VENUE_CFG.positions
@@ -206,6 +212,10 @@ class FakeInfo:
         return httpx.Response(200, json=self.states.get(address, {"assetPositions": []}))
 
 
+async def _no_sleep(_seconds: float) -> None:
+    """The pace between asks, skipped, so the unit tests stay under 30s."""
+
+
 def _poller(
     fake: FakeInfo,
     coins: list[str],
@@ -213,6 +223,7 @@ def _poller(
     addresses: list[str] | None = None,
     cfg: Any = CFG,
     book_path: Path | None = None,
+    sleep: Any = None,
 ) -> tuple[HlPositionsPoller, list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     book = AddressBook()
@@ -224,6 +235,7 @@ def _poller(
         book,
         INFO_BASE,
         book_path=book_path,
+        sleep=sleep or _no_sleep,
     )
     poller.set_universe(coins)
     return poller, rows
@@ -565,3 +577,25 @@ async def test_the_weight_gauge_counts_two_per_address_actually_asked() -> None:
         await poller.poll_once(client)
     assert fake.asked == [WHALE, ISOLATED]
     assert poller.stats[STREAM].weight_per_min() == 2 * len(fake.asked)
+
+
+async def test_the_poll_paces_its_asks_across_the_interval_rather_than_bursting() -> None:
+    """800 weight spent in seven seconds and then fifty idle is not 800 a minute to the
+    venue: a sliding 60s window can hold one whole burst plus the tail of the one before
+    it, which read 1022 of the 1200 per IP on the box on 2026-09-09. Spread across the
+    interval, the peak is the average, and the trading loop keeps its reconcile budget.
+    """
+    slept: list[float] = []
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+
+    fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE})
+    poller, _ = _poller(
+        fake, ["BTC"], cfg=_cfg(priority_addresses=0, sweep_addresses=2), sleep=record
+    )
+    async with fake.client() as client:
+        await poller.poll_once(client)
+    assert len(slept) == len(fake.asked) == 2
+    assert slept[0] == pytest.approx(slept[1], rel=0.05)
+    assert sum(slept) == pytest.approx(CFG.poll_s * PACE_FRAC, rel=0.05)
