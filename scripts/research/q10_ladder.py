@@ -646,22 +646,36 @@ def banded(args: object, settings: object, episodes: pl.DataFrame) -> pl.DataFra
         measured = bands_of(levels, oi, cfg, ladder, measured=True)
         if bands.is_empty():
             continue
-        # Asked as of the cascade start, so a band the cascade itself created is invisible,
-        # exactly as Q7 asks its zone question.
-        queries = month.select("key", "coin", "start_ts", pl.col("anchor_px").alias("px")).rename(
-            {"start_ts": "ts_ms"}
-        )
+        # Two queries per episode, exactly as Q7 asks its zone question. Q10b is about
+        # where the cascade *ended*, so it asks at the extreme; Q10c is about the flow the
+        # cascade still had to burn through, so it asks at the start. Both are timed at the
+        # cascade start, so no band the cascade itself created is ever visible.
+        asked = month.select("key", "coin", pl.col("start_ts").alias("ts_ms"))
+        at_extreme = asked.with_columns(month["extreme_px"].alias("px"))
+        at_start = asked.with_columns(month["anchor_px"].alias("px"))
         found = map_features(
             bands,
-            queries,
+            at_extreme,
             band_width_bps=cfg.band_width_bps,
             fuel_window_bps=cfg.fuel_window_bps,
+        ).select(
+            "key",
+            "dist_to_band_below_bps",
+            "dist_to_band_above_bps",
+            "band_leverage",
+            "bands_stacked",
         )
+        fuel_at_start = map_features(
+            bands,
+            at_start,
+            band_width_bps=cfg.band_width_bps,
+            fuel_window_bps=cfg.fuel_window_bps,
+        ).select("key", "fuel_below_usd", "fuel_above_usd")
         # Distances and the stacked count do not depend on weights at all, so only the fuel
         # columns are recomputed for the secondary scheme.
         secondary = map_features(
             measured,
-            queries,
+            at_start,
             band_width_bps=cfg.band_width_bps,
             fuel_window_bps=cfg.fuel_window_bps,
         ).select(
@@ -670,19 +684,9 @@ def banded(args: object, settings: object, episodes: pl.DataFrame) -> pl.DataFra
             pl.col("fuel_above_usd").alias("_measured_above"),
         )
         parts.append(
-            month.join(
-                found.select(
-                    "key",
-                    "dist_to_band_below_bps",
-                    "dist_to_band_above_bps",
-                    "band_leverage",
-                    "bands_stacked",
-                    "fuel_below_usd",
-                    "fuel_above_usd",
-                ),
-                on="key",
-                how="left",
-            ).join(secondary, on="key", how="left")
+            month.join(found, on="key", how="left")
+            .join(fuel_at_start, on="key", how="left")
+            .join(secondary, on="key", how="left")
         )
     if not parts:
         return pl.DataFrame()
@@ -875,8 +879,11 @@ def main() -> None:
         reaction_verdict(reaction_results),
         "## Q10b, cascade confluence",
         "",
-        "Q7's question with projected bands in place of raw levels, on Q7's own episodes, "
-        "asked as of the cascade start so a band the cascade itself created is invisible.",
+        "Q7's question with projected bands in place of raw levels, on Q7's own episodes. "
+        "Asked at the cascade **extreme**, which is where the cascade ended and what Q7 "
+        "measured, but timed at the cascade start so no band the cascade itself created is "
+        "visible. Q10c's fuel below is asked at the start price instead, because that is "
+        "the flow the cascade still had ahead of it.",
         "",
         confluence,
         "",
