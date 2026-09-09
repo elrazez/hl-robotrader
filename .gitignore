@@ -19,6 +19,7 @@ cache/features/
 !/reports/research/
 /reports/research/*
 !/reports/research/PREREGISTRATION.md
+!/reports/research/PREREGISTRATION_Q10.md
 !/reports/research/SUMMARY.md
 /logs/
 *.sqlite
