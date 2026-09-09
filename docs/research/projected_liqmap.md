@@ -113,8 +113,10 @@ script read the lake.
 
 ## Verdicts
 
-_Pending the run. `scripts/research/q10_ladder.py` writes `reports/research/q10_ladder.md`;
-the four verdicts and their sample sizes are transcribed here when it has run over the year._
+_Pending the run, which is the owner's to make. `scripts/research/q10_ladder.py` carries
+the exact command in its docstring and writes `reports/research/q10_ladder.md`. The four
+verdicts, their sample sizes and their bootstrap intervals are transcribed here once it has
+run over the year._
 
 ## Relationship to the real map
 

@@ -19,8 +19,15 @@ cascades ending within 15 bps of a raw swing level reverted +36.1 bps net-stress
 +146.3 for cascades ending nowhere near one. Q7's row is printed beside every row of
 Q10b's table so the two are always read together.
 
-    uv run python scripts/research/q10_ladder.py --start 2025-09-01 --end 2026-08-31 \
-        --data-dir /Volumes/<drive>/liqfade
+The window is Q7's, so the episodes are Q7's: 2025-09-01 to 2026-08-30, 2722 qualifying.
+`build_episodes` caches to `<out-dir>/episodes.parquet` keyed by that window, so dropping
+Q7's cache there makes this reuse the same episodes rather than rebuilding them.
+
+    uv run python scripts/research/q10_ladder.py --start 2025-09-01 --end 2026-08-30 \
+        --data-dir "/Volumes/<drive>/liqfade-data" --out-dir reports/research
+
+One job at a time on the lake: `pgrep -f liqfade` first. Peak RSS was 1.2 GB over the
+first two months of a trial run, inside the 2 GB budget.
 """
 
 from __future__ import annotations
