@@ -59,6 +59,34 @@ WebSocket: max 100 connections, 1000 subscriptions, 10 unique users in user-spec
 - Prefer `modify` over cancel plus place when queue position does not matter.
 - Log the exact error string when it happens (`Too many cumulative requests sent ... Place taker orders to free up 1 request per USDC traded`) and halt new entries until volume catches up.
 
+### How the per-IP budget is split across the processes on the box
+
+Enumerated from the code 2026-09-09, because the VPS runs the recorder, the paper loop
+and the testnet loop behind one address and the limit is per IP, not per process.
+
+| Process | Mainnet `/info` calls | Interval | Weight/min |
+| --- | --- | --- | --- |
+| recorder, positions poller | `clearinghouseState` x `max_addresses`, weight 2 | `poll_s` 60s | 800 at 400 addresses |
+| recorder, universe | `metaAndAssetCtxs`, weight 20 | `universe.refresh_min` 60 | 0.3 |
+| paper loop | none | | **0** |
+| testnet loop | `openOrders` 2 + `frontendOpenOrders` 20 + `clearinghouseState` 2 + `spotClearinghouseState` 20 | `execution.reconcile_s` 60s | 44, **against a different host** |
+| a future mainnet loop | the same four | 60s | 44, plus one reconcile per reconnect |
+
+Two of those rows are easy to get wrong. The **paper loop spends nothing**: its
+reconciler is built on `live/loop.py::PaperBooks`, which answers `open_orders` and
+`trigger_orders` out of the simulator and never calls `account`, and its feeds are all
+WebSocket. The **testnet loop talks to `api.hyperliquid-testnet.xyz`**, a separate
+deployment with its own limiter, so its 44/min is not in the mainnet bucket; it is
+budgeted as if it were, because being wrong about that in the safe direction costs 44.
+
+That leaves 800 for the poller, 100 reserved for a future mainnet loop, and about 250
+spare. The poller logs `weight_per_min` (`StreamStats.weight_per_min`) every cycle, so
+the number in the config is checked against a measurement rather than against this table.
+
+**Round trip to `api.hyperliquid.xyz` from the VPS: 52 to 63 ms, measured 2026-09-09.**
+A sequential sweep of 400 addresses is therefore about 23s and of 600 about 33s, inside
+a 60s `poll_s` either way. The clock is not the binding constraint; the weight budget is.
+
 ## `clearinghouseState` is public for every address
 
 Probed 2026-09-08 with `scripts/probe/hl_positions.py`, keyless, against two addresses
@@ -92,8 +120,8 @@ Four things the shape teaches, all measured rather than assumed:
   liquidation map can only be recorded forward. That is why the recorder started before
   there was anything to grade.
 
-Weight 2 (see rate limits above), so the recorder's default of 200 addresses a minute
-costs 400 of the 1200 per-IP budget. `docs/research/external_bots_scan.md` section 1 has
+Weight 2 (see rate limits above), so the recorder's default of 400 addresses a minute
+costs 800 of the 1200 per-IP budget. `docs/research/external_bots_scan.md` section 1 has
 the full argument, including what could kill the idea.
 
 ## Liquidation mechanics (relevant to the thesis)

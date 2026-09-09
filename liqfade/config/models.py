@@ -46,8 +46,25 @@ class HlPositions(Base):
     enabled: bool
     poll_s: Pos = Field(..., description="seconds between polls of the tracked addresses")
     max_addresses: int = Field(
-        ..., gt=0, description="count: addresses per poll, ranked by cumulative notional"
+        ..., gt=0, description="count: hard ceiling on the addresses asked in one poll"
     )
+    priority_addresses: int = Field(
+        ..., ge=0, description="count: addresses per poll whose liquidation level is near mark"
+    )
+    sweep_addresses: int = Field(
+        ..., ge=0, description="count: addresses per poll from the rotating whole-book sweep"
+    )
+    priority_pct: Pct = Field(
+        ..., description="percent of mark: how near a liquidation level must be to earn priority"
+    )
+
+    @model_validator(mode="after")
+    def _tiers_within_ceiling(self) -> HlPositions:
+        """The two tiers are the poll, and the poll is a share of a budget the whole box
+        shares. Overspending here is the trading loop failing to reconcile."""
+        if self.priority_addresses + self.sweep_addresses > self.max_addresses:
+            raise ValueError("priority_addresses + sweep_addresses must not exceed max_addresses")
+        return self
 
 
 class HyperliquidVenue(Base):

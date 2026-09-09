@@ -425,3 +425,19 @@ class TestTheOverridesLayerIsUnderDataDir:
         assert layers["overrides.yaml"].path == str(data / "overrides.yaml")
         assert layers["overrides.yaml"].exists is False
         assert layers["overrides.yaml"].values == {}
+
+
+def test_the_two_address_tiers_may_not_exceed_the_poll_ceiling(tmp_path: Path) -> None:
+    """`max_addresses` is the shared per-IP weight budget written in addresses. A sum
+    above it spends the trading loop's reconcile budget on the recorder, and the trading
+    loop is the one that cannot be allowed to fail to reconcile."""
+    extra = tmp_path / "greedy.yaml"
+    extra.write_text(
+        "venues:\n"
+        "  hyperliquid:\n"
+        "    positions:\n"
+        "      priority_addresses: 400\n"
+        "      sweep_addresses: 400\n"
+    )
+    with pytest.raises(ConfigError, match="max_addresses"):
+        load_settings("paper", extra_files=[extra], environ={})

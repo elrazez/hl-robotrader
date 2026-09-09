@@ -6,6 +6,15 @@ liquidation level. Poll the addresses the tape names (`AddressBook`, fed from th
 `users` field of the public trades feed) and the `hl_positions` table becomes a
 forward-looking map of what is queued to be force-closed at each price, by side.
 
+Every cycle asks two tiers, both drawn by `select_addresses`. The *priority* set is the
+addresses whose last snapshot held a liquidation level within `priority_pct` of that
+coin's mark, biggest position first: the ones whose forced flow can actually arrive soon.
+The *sweep* is a rotating cursor over the whole book, so every harvested address comes
+round on a fixed period and can be promoted. Ranking on cumulative traded notional alone
+spent the budget on positions nowhere near their liquidation price, which cannot be this
+hour's cascade fuel: on 2026-09-09 only $143M of $1,561M tracked notional sat within 5%
+of mark. See docs/DECISIONS.md, 2026-09-09.
+
 Shaped like `CoinalyzePoller`, which is the recorder's other REST poller: one stream
 declared only when it will actually poll, `set_universe`, `poll_once(client)` and `run`.
 
@@ -13,7 +22,10 @@ Three things this deliberately does not do:
 
 - **It does not gather.** The addresses are asked one after another, so a slow venue
   stretches a poll rather than bursting the whole minute's rate budget into one instant.
-  At the defaults that is 200 calls of weight 2 per minute, 400 of the 1200 per IP.
+  At the defaults that is 400 calls of weight 2 per minute, 800 of the 1200 per IP.
+  What it really spends is measured, not asserted: `StreamStats.weight_per_min` is
+  logged every cycle and the config is sized off that. docs/HYPERLIQUID.md carries the
+  split of the shared budget across the processes on the box.
 - **It is not in `CONTINUOUS_STREAMS`.** A poll is sparse by nature; only the connection
   is monitored, exactly as for `coinalyze.xchg_ctx`.
 - **It records nothing but positions.** No feature, no strategy wiring. Whether the map
@@ -26,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +56,91 @@ VENUE = "hyperliquid"
 TABLES = ("hl_positions",)
 STREAM = f"{VENUE}.positions"
 TIMEOUT_S = 10.0
+# `clearinghouseState` costs 2 of the 1200 weight per minute the whole box shares.
+WEIGHT_PER_ADDRESS = 2
+
+
+def select_addresses(
+    book: AddressBook,
+    last_snapshot: Sequence[Mapping[str, Any]],
+    marks: Mapping[str, float],
+    cfg: HlPositions,
+    *,
+    cursor: int = 0,
+) -> tuple[list[str], int]:
+    """The addresses to ask this cycle, in order, and where the sweep resumes next time.
+
+    Args:
+        book: the ranked address book.
+        last_snapshot: the rows the previous cycle sank, which is what priority is built
+            from. An empty one yields a pure sweep, which is what a restart gets.
+        marks: coin -> last mark price, USD.
+        cfg: the poller config.
+        cursor: index into the ranked book where the sweep resumes.
+
+    Returns:
+        The addresses, priority first, and the next cursor.
+    """
+    total = min(cfg.max_addresses, cfg.priority_addresses + cfg.sweep_addresses)
+    picked = _priority(last_snapshot, marks, cfg)[: cfg.priority_addresses]
+    asked = set(picked)
+    # A priority set short of its cap hands the slack to the sweep rather than under-
+    # spending the budget: on a restart the priority set is empty and the whole cycle is
+    # sweep, which is how the poller heals itself.
+    ranked = book.top(len(book.entries))
+    if ranked:
+        index = cursor % len(ranked)
+        for _ in range(len(ranked)):
+            if len(picked) >= total:
+                break
+            address = ranked[index]
+            index = (index + 1) % len(ranked)
+            if address in asked:
+                continue
+            picked.append(address)
+            asked.add(address)
+        cursor = index
+    return picked, cursor
+
+
+def _marks(rows: Sequence[Mapping[str, Any]]) -> dict[str, float]:
+    """coin -> mark price, USD, read back out of the rows themselves.
+
+    `positionValue` is the venue's own `abs(szi) * markPx`, so a poll that saw any
+    position in a coin already knows that coin's mark to within its own rounding and the
+    poller needs no second feed to judge how near a liquidation level is. Up to `poll_s`
+    stale, which a band as wide as `priority_pct` absorbs.
+    """
+    marks: dict[str, float] = {}
+    for row in rows:
+        size = abs(float(row.get("szi") or 0.0))
+        value = float(row.get("position_value_usd") or 0.0)
+        if size and value:
+            marks[str(row["coin"])] = value / size
+    return marks
+
+
+def _priority(
+    last_snapshot: Sequence[Mapping[str, Any]],
+    marks: Mapping[str, float],
+    cfg: HlPositions,
+) -> list[str]:
+    """Addresses holding a position whose liquidation level is within `priority_pct` of
+    that coin's mark, biggest position first. These are the ones whose forced flow can
+    actually arrive soon; a position 60% away cannot be this hour's cascade fuel."""
+    near: dict[str, float] = {}
+    for row in last_snapshot:
+        liquidation_px = row.get("liquidation_px")
+        mark = marks.get(str(row.get("coin")))
+        # A null liquidation level is a fact about the account, not a level at price zero.
+        if liquidation_px is None or not mark:
+            continue
+        if abs(float(liquidation_px) - mark) / mark * 100.0 > cfg.priority_pct:
+            continue
+        address = str(row.get("address"))
+        value = float(row.get("position_value_usd") or 0.0)
+        near[address] = max(near.get(address, 0.0), value)
+    return [address for address, _ in sorted(near.items(), key=lambda item: (-item[1], item[0]))]
 
 
 def _f(value: Any) -> float | None:
@@ -72,6 +170,11 @@ class HlPositionsPoller:
         self.coins: list[str] = []
         # A poller that will never poll declares no stream: a declared-but-idle stream
         # reads as disconnected to the health check and pages Telegram every ten minutes.
+        # Rebuilt from the last poll and never persisted: a restart simply has no priority
+        # set, fills its first cycles from the sweep and heals itself within one sweep period.
+        self.last_rows: list[dict[str, Any]] = []
+        self.sweep_cursor = 0
+        self.asked = 0  # addresses the last cycle asked about. Logged, not acted on.
         self.active = bool(cfg.enabled)
         self.stats = {STREAM: StreamStats(name=STREAM)} if self.active else {}
 
@@ -95,12 +198,22 @@ class HlPositionsPoller:
         *every* address failed is, and sets `connected` false. An empty book is neither:
         on day one there is nothing to ask and that is not a failure.
         """
-        addresses = self.book.top(self.cfg.max_addresses)
+        addresses, self.sweep_cursor = select_addresses(
+            self.book,
+            self.last_rows,
+            _marks(self.last_rows),
+            self.cfg,
+            cursor=self.sweep_cursor,
+        )
+        self.asked = len(addresses)
         wanted = set(self.coins)
         started_ms = int(time.time() * 1000)
+        fresh: list[dict[str, Any]] = []
         rows = 0
         failed = 0
         for address in addresses:
+            # Recorded before the ask: a request the venue rejects has still been paid for.
+            self._stat.record_weight(WEIGHT_PER_ADDRESS)
             try:
                 state = await self._state(client, address)
             except Exception as exc:
@@ -117,8 +230,14 @@ class HlPositionsPoller:
             # seconds (6.5s measured on the box 2026-09-08): one rx_ms for the whole poll
             # dated every row after the first up to that much *earlier* than it actually
             # arrived, which is lookahead, and CLAUDE.md rule 1 has no tolerance for it.
-            rows += self._sink_positions(address, state, wanted, int(time.time() * 1000))
+            written = self._sink_positions(address, state, wanted, int(time.time() * 1000))
+            fresh.extend(written)
+            rows += len(written)
 
+        # What the next cycle ranks its priority set from. Replaced rather than merged: a
+        # position closed since the last poll must stop counting as fuel, and an address the
+        # sweep did not reach this cycle keeps no stale row to be picked on.
+        self.last_rows = fresh
         # One poll is one message, whatever it returned, timed from when it began.
         self._stat.record_message(started_ms)
         if addresses and failed == len(addresses):
@@ -136,10 +255,10 @@ class HlPositionsPoller:
 
     def _sink_positions(
         self, address: str, state: dict[str, Any], wanted: set[str], rx_ms: int
-    ) -> int:
-        """One row per open position in the universe. Returns how many were written."""
+    ) -> list[dict[str, Any]]:
+        """One row per open position in the universe. Returns the rows written."""
         ts_ms = int(state.get("time") or rx_ms)
-        written = 0
+        written: list[dict[str, Any]] = []
         for entry in state.get("assetPositions") or []:
             position = entry.get("position") or {}
             coin = str(position.get("coin"))
@@ -149,27 +268,24 @@ class HlPositionsPoller:
             if coin not in wanted or not size:
                 continue
             leverage = position.get("leverage") or {}
-            self.sink(
-                "hl_positions",
-                VENUE,
-                {
-                    "coin": coin,
-                    "ts_ms": ts_ms,
-                    "rx_ms": rx_ms,
-                    "address": address,
-                    "szi": size,
-                    "entry_px": _f(position.get("entryPx")),
-                    # Null stays null. A position with no liquidation level is a fact
-                    # about the account; a zero would put a cluster at price zero.
-                    "liquidation_px": _f(position.get("liquidationPx")),
-                    "position_value_usd": _f(position.get("positionValue")),
-                    "margin_used_usd": _f(position.get("marginUsed")),
-                    "leverage": _f(leverage.get("value")),
-                    "leverage_type": leverage.get("type"),
-                    "max_leverage": position.get("maxLeverage"),
-                },
-            )
-            written += 1
+            row = {
+                "coin": coin,
+                "ts_ms": ts_ms,
+                "rx_ms": rx_ms,
+                "address": address,
+                "szi": size,
+                "entry_px": _f(position.get("entryPx")),
+                # Null stays null. A position with no liquidation level is a fact
+                # about the account; a zero would put a cluster at price zero.
+                "liquidation_px": _f(position.get("liquidationPx")),
+                "position_value_usd": _f(position.get("positionValue")),
+                "margin_used_usd": _f(position.get("marginUsed")),
+                "leverage": _f(leverage.get("value")),
+                "leverage_type": leverage.get("type"),
+                "max_leverage": position.get("maxLeverage"),
+            }
+            self.sink("hl_positions", VENUE, row)
+            written.append(row)
         return written
 
     # --- the loop ------------------------------------------------------------
@@ -187,7 +303,14 @@ class HlPositionsPoller:
                 try:
                     rows = await self.poll_once(client)
                     self._stat.connected = True
-                    log.info("hl_positions_poll", rows=rows, addresses=len(self.book.entries))
+                    log.info(
+                        "hl_positions_poll",
+                        rows=rows,
+                        book=len(self.book.entries),
+                        asked=self.asked,
+                        weight_per_min=self._stat.weight_per_min(),
+                        cycle_s=round(time.monotonic() - started, 2),
+                    )
                 except Exception as exc:
                     self._stat.connected = False
                     log.warning("hl_positions_poll_failed", error=f"{type(exc).__name__}: {exc}")

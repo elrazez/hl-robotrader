@@ -20,10 +20,10 @@ import httpx
 import orjson
 
 from liqfade.config import load_settings
-from liqfade.config.models import HyperliquidVenue
+from liqfade.config.models import HlPositions, HyperliquidVenue
 from liqfade.data.schemas import SOURCE_RECORDER, rows_to_table, validate_table
 from liqfade.recorder.addresses import AddressBook
-from liqfade.recorder.streams.hl_positions import STREAM, HlPositionsPoller
+from liqfade.recorder.streams.hl_positions import STREAM, HlPositionsPoller, select_addresses
 
 VENUE_CFG: HyperliquidVenue = load_settings("paper", environ={}).venues.hyperliquid
 CFG = VENUE_CFG.positions
@@ -413,7 +413,155 @@ async def test_a_poller_that_will_not_poll_declares_no_stream() -> None:
 
 
 def test_the_config_carries_the_rate_budget_it_was_sized_against() -> None:
-    """clearinghouseState weighs 2 of 1200/min per IP, so 200 a minute is one third."""
+    """clearinghouseState weighs 2 of the 1200/min per IP the whole box shares.
+
+    Enumerated 2026-09-09: the paper loop spends nothing on `/info` (its reconciler reads
+    the simulator through `PaperBooks` and never calls `account`), the testnet loop's
+    44/min goes to a different host, and the recorder's only other call is one
+    `metaAndAssetCtxs` an hour. 800 reserves 100 for a future mainnet loop and leaves
+    ~300 spare. See docs/HYPERLIQUID.md.
+    """
     assert CFG.enabled is True
     assert CFG.poll_s == 60
-    assert CFG.max_addresses * 2 * (60 / CFG.poll_s) <= 1200 / 3
+    assert CFG.max_addresses * 2 * (60 / CFG.poll_s) <= 800
+    assert CFG.priority_addresses + CFG.sweep_addresses <= CFG.max_addresses
+
+
+# --- which addresses get asked ---------------------------------------------------
+
+
+def _cfg(**over: Any) -> HlPositions:
+    """The shipped positions config with the tiers overridden, unvalidated."""
+    return CFG.model_copy(update=over)
+
+
+def _snap(
+    address: str, coin: str, liquidation_px: float | None, value_usd: float
+) -> dict[str, Any]:
+    """One `hl_positions` row, carrying only the fields the selection reads."""
+    return {
+        "coin": coin,
+        "address": address,
+        "szi": 1.0,
+        "liquidation_px": liquidation_px,
+        "position_value_usd": value_usd,
+    }
+
+
+def test_a_near_price_liquidation_outranks_a_bigger_position_with_none() -> None:
+    """Priority is about reachability, not size. A position that cannot be liquidated
+    at any price this hour is not cascade fuel, however large it is."""
+    book = AddressBook()
+    book.note(WHALE, 10_000_000.0, 1)  # the bigger address by traded notional
+    book.note(ISOLATED, 1.0, 1)
+    snapshot = [
+        _snap(WHALE, "BTC", None, 50_000_000.0),
+        _snap(ISOLATED, "BTC", 98_000.0, 1_000.0),
+    ]
+    picked, _ = select_addresses(
+        book, snapshot, {"BTC": 100_000.0}, _cfg(priority_addresses=1, sweep_addresses=0)
+    )
+    assert picked == [ISOLATED]
+
+
+def _book(*addresses: str) -> AddressBook:
+    """A book ranked in the order given, biggest traded notional first."""
+    book = AddressBook()
+    for rank, address in enumerate(addresses):
+        book.note(address, float(len(addresses) - rank) * 1_000.0, 1)
+    return book
+
+
+def test_an_empty_snapshot_spends_the_whole_budget_on_the_sweep() -> None:
+    """A restart has no priority set. It must still spend its full budget, and the
+    sweep is what rebuilds the priority set for the next cycle."""
+    book = _book("0x01", "0x02", "0x03", "0x04", "0x05")
+    picked, _ = select_addresses(book, [], {}, _cfg(priority_addresses=2, sweep_addresses=2))
+    assert picked == ["0x01", "0x02", "0x03", "0x04"]
+
+
+def test_the_sweep_cursor_advances_and_wraps() -> None:
+    """The sweep is what discovers the positions the priority rule cannot know about
+    yet, so every harvested address must come round again on a fixed period."""
+    book = _book("0x01", "0x02", "0x03")
+    cfg = _cfg(priority_addresses=0, sweep_addresses=2)
+    first, cursor = select_addresses(book, [], {}, cfg)
+    second, cursor = select_addresses(book, [], {}, cfg, cursor=cursor)
+    third, cursor = select_addresses(book, [], {}, cfg, cursor=cursor)
+    assert [first, second, third] == [
+        ["0x01", "0x02"],
+        ["0x03", "0x01"],
+        ["0x02", "0x03"],
+    ]
+
+
+def test_an_address_in_the_priority_set_is_not_asked_twice() -> None:
+    """Asking the same wallet twice in one cycle is weight spent on a row we already
+    have, and the sweep must step over it rather than stall on it."""
+    book = _book("0x01", "0x02", "0x03")
+    snapshot = [_snap("0x02", "BTC", 99_000.0, 5_000.0)]
+    picked, _ = select_addresses(
+        book, snapshot, {"BTC": 100_000.0}, _cfg(priority_addresses=1, sweep_addresses=2)
+    )
+    assert picked == ["0x02", "0x01", "0x03"]
+
+
+def test_a_null_liquidation_level_never_earns_priority() -> None:
+    """271 of 873 tracked positions carried no liquidation level at all on 2026-09-09.
+    A null is a fact about the account, not a level at price zero."""
+    snapshot = [_snap("0x01", "BTC", None, 10_000_000.0)]
+    picked, _ = select_addresses(
+        AddressBook(), snapshot, {"BTC": 100_000.0}, _cfg(priority_addresses=5, sweep_addresses=0)
+    )
+    assert picked == []  # an empty book has no sweep, so priority is the only source
+
+
+def test_a_level_further_out_than_priority_pct_waits_for_the_sweep() -> None:
+    snapshot = [_snap("0x01", "BTC", 70_000.0, 1_000_000.0), _snap("0x02", "BTC", 80_000.0, 1.0)]
+    picked, _ = select_addresses(
+        AddressBook(),
+        snapshot,
+        {"BTC": 100_000.0},
+        _cfg(priority_addresses=5, sweep_addresses=0, priority_pct=25.0),
+    )
+    assert picked == ["0x02"]  # 30% out is out of band however big it is; 20% is in
+
+
+def test_the_ceiling_caps_the_two_tiers_together() -> None:
+    """max_addresses is the weight budget written in addresses, so nothing may pass it."""
+    book = _book(*[f"0x{n:02d}" for n in range(1, 11)])
+    picked, _ = select_addresses(
+        book, [], {}, _cfg(max_addresses=3, priority_addresses=5, sweep_addresses=5)
+    )
+    assert len(picked) == 3
+
+
+async def test_the_next_poll_asks_the_near_price_address_before_the_bigger_one() -> None:
+    """The whale trades far more notional and is asked first on a cold start, but not one
+    of its levels is reachable: BTC, ETH and HYPE carry no liquidation price at all. The
+    isolated account's sits 3.4% from mark. From the second cycle on the budget goes there.
+    """
+    fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE})
+    poller, _ = _poller(
+        fake,
+        ["BTC"],
+        addresses=[WHALE, ISOLATED],
+        cfg=_cfg(priority_addresses=1, sweep_addresses=1),
+    )
+    async with fake.client() as client:
+        await poller.poll_once(client)
+        assert fake.asked == [WHALE, ISOLATED]  # cold start: rank order, a pure sweep
+        fake.asked.clear()
+        await poller.poll_once(client)
+    assert fake.asked[0] == ISOLATED
+
+
+async def test_the_weight_gauge_counts_two_per_address_actually_asked() -> None:
+    """The counts are sized off this gauge rather than off arithmetic in a prompt, and a
+    request the venue rejected still spent its weight, so it still counts."""
+    fake = FakeInfo({WHALE: WHALE_STATE, ISOLATED: ISOLATED_STATE}, failing=frozenset({ISOLATED}))
+    poller, _ = _poller(fake, ["BTC"], cfg=_cfg(priority_addresses=0, sweep_addresses=2))
+    async with fake.client() as client:
+        await poller.poll_once(client)
+    assert fake.asked == [WHALE, ISOLATED]
+    assert poller.stats[STREAM].weight_per_min() == 2 * len(fake.asked)

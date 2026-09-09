@@ -49,7 +49,14 @@ venues:
     positions:
       enabled: true
       poll_s: 60  # seconds between polls of the tracked addresses
-      max_addresses: 200  # addresses per poll, ranked by cumulative traded notional
+      # Every poll asks a priority set plus a slice of a rotating sweep. Ranking purely by
+      # cumulative traded notional spent the budget on positions nowhere near their
+      # liquidation price, which cannot become cascade fuel this hour: measured on the VPS
+      # 2026-09-09, only $143M of $1,561M tracked notional sat within 5% of mark.
+      max_addresses: 400  # count: hard ceiling on priority + sweep, 2 weight each = 800 of 1200
+      priority_addresses: 150  # count: liquidation level within priority_pct of mark, biggest first
+      sweep_addresses: 250  # count: rotating slice of the book, so 5,000 are re-checked in <=20 min
+      priority_pct: 25  # percent of mark: wide, because 20% away in a quiet hour is 5% after a move
   binance:
     enabled: true
     ws_url: wss://fstream.binance.com/ws/!forceOrder@arr
