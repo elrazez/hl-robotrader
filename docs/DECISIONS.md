@@ -3383,3 +3383,54 @@ poll ever needs to finish early for a reason the recorder does not have today.
 its first cycles from the sweep and is correct again within one sweep period. A file to
 persist it would be a third thing that can be stale or corrupt on disk, for 20 minutes of
 warm-up. Reverse never.
+
+## 2026-09-09 (Q10, the projected liquidation map)
+
+**A public indicator's hardcoded dollar offsets are the exchange leverage menu.** "Tomo's
+Flat Fibs" draws lines 600 to 4800 dollars from the last pivot, written for Bitcoin at
+$40,000 in April 2022. Read as percentages through `L = 1 / (d + m)` at a 0.5% maintenance
+margin they are 50x down to 8x. It is not drawing Fibonacci levels, it is drawing the
+liquidation ladder of everyone who entered at the swing extreme, in dollars, which is why
+it only works on one coin at one price era. `features/liqmap.py` stores it as percentages.
+`docs/research/projected_liqmap.md` has the decode. Reverse never; the arithmetic is the
+arithmetic.
+
+**`features.liqmap.max_dist_bps` is its own key at 1200, not `features.levels.max_dist_bps`
+at 200.** The levels key is sized for a zone a cascade can end in; a ladder whose 10x rung
+sits 950 bps out needs a cap five times wider, and 1200 bps is 12%, which is exactly the
+furthest line the source indicator draws. Changing the levels key instead would have
+silently moved Q7's published result. Reverse never.
+
+**Uniform rung weights are the primary result.** Q10b needs no weights at all, and Q10c runs
+uniform first with the open-interest-scaled, histogram-weighted version reported once beside
+it and carrying no DECISION. A weighting scheme tuned until a table passes is the failure
+mode the preregistration exists to prevent, so the scheme is fixed before the run and the
+clever version has to beat the dumb one in public. Reverse never.
+
+**The leverage histogram is measured off `hl_positions` because nothing else publishes one.**
+Binance, Bybit and OKX publish open interest and funding and never leverage. 194 addresses
+and $1,561M of tracked notional on 2026-09-09 give: under 3x 5.2%, 3 to 5x 7.2%, 5 to 10x
+22.3%, 10 to 20x 32.1%, 20 to 25x 17.5%, 25 to 40x 15.8%, 40x and up 0%. One day, one venue.
+Recompute it as `hl_positions` days accumulate; the config comment says where it came from.
+
+**Q10a prices its band touches from 1m candles, entering at the touching bar's close.**
+Written into `PREREGISTRATION_Q10.md` before any script read the lake, not amended after. A
+year of band touches is hundreds of thousands of events and pricing every one at the
+preregistered one-second delay means re-reading the year's tape, which the research machine
+cannot do in one pass. The bar close is up to 60 seconds later, so on a reverting move it
+captures less: the substitution biases against Q10a's own hypothesis, which is the only
+acceptable direction for a shortcut like this. Q10b and Q10c are episode questions and keep
+the one-second entry through `_lib.attach_outcomes` unchanged. Reverse if the 1s grid ever
+becomes cheap enough to sweep the year for this question too.
+
+**`map_features` reads an optional `touched_from` column as an upper bound on a band's
+validity.** "Untouched extremes only" is a rule about time, not a filter over a chunk:
+computing it as of the chunk end would exclude anchors from queries that happened before
+the touch, which is lookahead used to exclude. The first touch per anchor is computed once
+and compared per query, so a later touch can never change what an earlier query saw. The
+column is optional in the same way `levels._with_touches` treats its own. Reverse never.
+
+**The smoke test's discovery glob took one digit.** `q[0-9]_*.py` does not match
+`q10_ladder.py`, so a tenth question would have shipped without a smoke test while the count
+assertion still passed. Now `q[0-9]*_*.py` and nine. The fixture lake gained eight public
+positions a minute so Q10d's path is exercised rather than skipped.
