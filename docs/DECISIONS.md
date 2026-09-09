@@ -3351,6 +3351,14 @@ spare. Sizing is checked against `StreamStats.weight_per_min`, logged every cycl
 than against that arithmetic. Reverse upward only after the gauge and a real mainnet loop
 have run side by side for a day.
 
+**The asks are paced across the interval, not merely un-gathered.** The first deploy
+measured `weight_per_min` at 1022 of the 1200 per-IP budget against an average of 800,
+because 400 sequential asks finish in 7 to 10 seconds and the venue's sliding minute then
+holds one whole cycle plus the tail of the previous one. Not gathering is not the same as
+not bursting. Each ask now waits out its share of `poll_s` less its own duration, which
+makes the peak equal the average and self-corrects when the venue is slow. Reverse if a
+poll ever needs to finish early for a reason the recorder does not have today.
+
 **Priority state is in memory and never persisted.** A restart has no priority set, fills
 its first cycles from the sweep and is correct again within one sweep period. A file to
 persist it would be a third thing that can be stale or corrupt on disk, for 20 minutes of

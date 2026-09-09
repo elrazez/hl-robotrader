@@ -20,9 +20,12 @@ declared only when it will actually poll, `set_universe`, `poll_once(client)` an
 
 Three things this deliberately does not do:
 
-- **It does not gather.** The addresses are asked one after another, so a slow venue
-  stretches a poll rather than bursting the whole minute's rate budget into one instant.
-  At the defaults that is 400 calls of weight 2 per minute, 800 of the 1200 per IP.
+- **It does not gather, and it does not burst.** The addresses are asked one after
+  another and paced across `poll_s`, so the weight leaves the box at a steady rate rather
+  than in one lump. At the defaults that is 400 calls of weight 2 per minute, 800 of the
+  1200 per IP. Sequential alone was not enough: the first deploy finished its 400 asks in
+  7 to 10 seconds and the venue's own sliding minute then held one whole cycle plus the
+  tail of the last one, 1022 of the 1200. See PACE_FRAC.
   What it really spends is measured, not asserted: `StreamStats.weight_per_min` is
   logged every cycle and the config is sized off that. docs/HYPERLIQUID.md carries the
   split of the shared budget across the processes on the box.
@@ -38,7 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +59,12 @@ VENUE = "hyperliquid"
 TABLES = ("hl_positions",)
 STREAM = f"{VENUE}.positions"
 TIMEOUT_S = 10.0
+# Fraction of `poll_s` the asks are spread over. 400 sequential asks finish in 7 to 10
+# seconds and then the poller idles for fifty, so the venue's own sliding 60s window can
+# hold one whole cycle plus the tail of the last one: measured 1022 of the 1200 per-IP
+# weight on the box 2026-09-09, against an average of 800. Paced, the peak is the average.
+# The remaining tenth is slack for a poll that runs long; a poll already behind never waits.
+PACE_FRAC = 0.9
 # `clearinghouseState` costs 2 of the 1200 weight per minute the whole box shares.
 WEIGHT_PER_ADDRESS = 2
 
@@ -161,12 +170,14 @@ class HlPositionsPoller:
         info_base: str,
         *,
         book_path: Path | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.cfg = cfg
         self.sink = sink
         self.book = book
         self.info_base = info_base.rstrip("/")
         self.book_path = book_path
+        self.sleep = sleep
         self.coins: list[str] = []
         # A poller that will never poll declares no stream: a declared-but-idle stream
         # reads as disconnected to the health check and pages Telegram every ten minutes.
@@ -206,12 +217,14 @@ class HlPositionsPoller:
             cursor=self.sweep_cursor,
         )
         self.asked = len(addresses)
+        pace = self.cfg.poll_s * PACE_FRAC / max(1, len(addresses))
         wanted = set(self.coins)
         started_ms = int(time.time() * 1000)
         fresh: list[dict[str, Any]] = []
         rows = 0
         failed = 0
         for address in addresses:
+            asked_at = time.monotonic()
             # Recorded before the ask: a request the venue rejects has still been paid for.
             self._stat.record_weight(WEIGHT_PER_ADDRESS)
             try:
@@ -224,6 +237,7 @@ class HlPositionsPoller:
                     address=address,
                     error=f"{type(exc).__name__}: {exc}",
                 )
+                await self._pace(pace, asked_at)
                 continue
             # Stamped per address, after its response arrives, and not once for the poll.
             # The addresses are walked sequentially, so a poll of 200 spans several
@@ -233,6 +247,7 @@ class HlPositionsPoller:
             written = self._sink_positions(address, state, wanted, int(time.time() * 1000))
             fresh.extend(written)
             rows += len(written)
+            await self._pace(pace, asked_at)
 
         # What the next cycle ranks its priority set from. Replaced rather than merged: a
         # position closed since the last poll must stop counting as fuel, and an address the
@@ -245,6 +260,10 @@ class HlPositionsPoller:
         if self.book_path is not None:
             self.book.save(self.book_path)
         return rows
+
+    async def _pace(self, pace: float, asked_at: float) -> None:
+        """Wait out this address's share of the interval, less what its ask already took."""
+        await self.sleep(max(0.0, pace - (time.monotonic() - asked_at)))
 
     async def _state(self, client: httpx.AsyncClient, address: str) -> dict[str, Any]:
         response = await client.post(
