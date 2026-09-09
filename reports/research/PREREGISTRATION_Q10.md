@@ -52,6 +52,14 @@ here may be labelled exploratory on that ground.
 - **Every number is net-stress**: 0.09% round trip, entry one second after the signal, one
   effective spread per side. Reported in the same three-column form Q7 uses: gross,
   net-9bps, net-stress. The DECISION reads net-stress and nothing else.
+- **Q10a's entry is the close of the bar that touched the band**, not one second after it.
+  Q10b and Q10c are episode questions and inherit the one-second delayed entry through
+  `_lib.attach_outcomes` unchanged. Q10a is not: a year of band touches is hundreds of
+  thousands of events and pricing every one at second resolution means re-reading the
+  year's tape, which the research machine cannot do in one pass. The touching bar's close
+  is up to 60 seconds later than the preregistered entry, so on a reverting move it
+  captures **less**, and the substitution therefore biases against Q10a's own hypothesis.
+  Written here before any script read the lake, not amended after.
 - **Cluster bootstrap on every interval.** A cluster is every episode on the same side whose
   start falls within a 5-minute window, across all coins. The per-episode bootstrap is
   banned.

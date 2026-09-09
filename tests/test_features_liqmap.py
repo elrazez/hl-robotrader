@@ -286,3 +286,34 @@ def test_a_band_confirmed_in_the_very_millisecond_of_the_query_is_visible() -> N
         bands, _query(100.0, ts_ms=KNOWN_FROM), band_width_bps=15.0, fuel_window_bps=600.0
     ).row(0, named=True)
     assert found["dist_to_band_below_bps"] == pytest.approx(100.0)
+
+
+def test_an_anchor_price_has_traded_back_through_stops_projecting() -> None:
+    """Anchors are untouched extremes only: a price the market has already revisited is one
+    whose trapped positions were resolved there, so its ladder is stale. `touched_from` is
+    an upper bound on validity and is optional, exactly as levels.py treats its touch
+    columns. Computed once per anchor and compared per query, so a touch that happens later
+    can never change what an earlier query saw."""
+    bands = pl.DataFrame([_band(99.0, weight_usd=1_000.0) | {"touched_from": KNOWN_FROM + 100}])
+    seen = map_features(
+        bands, _query(100.0, ts_ms=KNOWN_FROM + 99), band_width_bps=15.0, fuel_window_bps=600.0
+    ).row(0, named=True)
+    gone = map_features(
+        bands, _query(100.0, ts_ms=KNOWN_FROM + 100), band_width_bps=15.0, fuel_window_bps=600.0
+    ).row(0, named=True)
+    assert seen["dist_to_band_below_bps"] == pytest.approx(100.0)
+    assert gone["dist_to_band_below_bps"] is None
+    assert gone["fuel_below_usd"] == 0.0
+
+
+def test_an_anchor_never_touched_carries_a_null_bound_and_still_projects() -> None:
+    """A null `touched_from` means nothing has traded through it yet, which is the case the
+    whole feature is about. It must not be read as "valid until never"."""
+    bands = pl.DataFrame(
+        [_band(99.0, weight_usd=1_000.0) | {"touched_from": None}],
+        schema_overrides={"touched_from": pl.Int64},
+    )
+    found = map_features(
+        bands, _query(100.0, ts_ms=KNOWN_FROM + 500), band_width_bps=15.0, fuel_window_bps=600.0
+    ).row(0, named=True)
+    assert found["dist_to_band_below_bps"] == pytest.approx(100.0)

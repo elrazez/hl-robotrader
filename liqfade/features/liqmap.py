@@ -210,6 +210,12 @@ def map_features(
         **Only bands with `known_from <= ts_ms` are considered.** A band whose anchor was
         not yet confirmed at the query is invisible, which is the whole no-lookahead
         contract this module inherits from `levels.py`.
+
+        A `touched_from` column on `bands`, if present, is the other end of that window:
+        the first moment price traded back through the anchor, after which its ladder is
+        stale because the positions trapped there were resolved at the anchor itself. A
+        null means nothing has touched it yet. Optional, the way `levels._with_touches`
+        treats its own columns, so a caller that does not care about freshness omits it.
     """
     blank = queries.with_columns(
         pl.lit(None, dtype=pl.Float64).alias("dist_to_band_below_bps"),
@@ -224,22 +230,28 @@ def map_features(
         return blank
     age_min = (pl.col("ts_ms") - pl.col("known_from")) / MINUTE_MS
     signed = 1e4 * (pl.col("_band_px") - pl.col("px")) / pl.col("px")
+    fresh = "touched_from" in bands.columns
+    carried = [
+        "coin",
+        pl.col("px").alias("_band_px"),
+        "ts_ms",
+        "known_from",
+        "anchor_px",
+        "leverage",
+        "weight_usd",
+        "half_life_min",
+        *(["touched_from"] if fresh else []),
+    ]
+    still_fresh = (
+        pl.col("touched_from").is_null() | (pl.col("ts_ms") < pl.col("touched_from"))
+        if fresh
+        else pl.lit(True)
+    )
     seen = (
         queries.select("key", "coin", "ts_ms", "px")
-        .join(
-            bands.select(
-                "coin",
-                pl.col("px").alias("_band_px"),
-                "ts_ms",
-                "known_from",
-                "anchor_px",
-                "leverage",
-                "weight_usd",
-                "half_life_min",
-            ).rename({"ts_ms": "_anchor_ts"}),
-            on="coin",
-        )
+        .join(bands.select(carried).rename({"ts_ms": "_anchor_ts"}), on="coin")
         .filter(pl.col("known_from") <= pl.col("ts_ms"))
+        .filter(still_fresh)
         .with_columns(signed.alias("_signed"))
         .with_columns(
             pl.col("_signed").abs().alias("_dist"),

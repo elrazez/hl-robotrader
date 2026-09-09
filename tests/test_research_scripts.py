@@ -20,8 +20,10 @@ SCRIPTS = Path(__file__).parents[1] / "scripts" / "research"
 LAKE_START = "2026-03-01"
 LAKE_END = "2026-03-01"
 
-# Discovered rather than listed, so a ninth question cannot be added without a smoke test.
-QUESTIONS = {path.stem: f"{path.stem}.md" for path in sorted(SCRIPTS.glob("q[0-9]_*.py"))}
+# Discovered rather than listed, so a tenth question cannot be added without a smoke test.
+# The glob takes two digits: q10 is a question, not a typo, and the one-digit form silently
+# skipped it.
+QUESTIONS = {path.stem: f"{path.stem}.md" for path in sorted(SCRIPTS.glob("q[0-9]*_*.py"))}
 
 
 def run(name: str, tmp_path: Path, lake: Path) -> None:
@@ -48,9 +50,9 @@ def run(name: str, tmp_path: Path, lake: Path) -> None:
         sys.argv = old
 
 
-def test_all_eight_question_scripts_exist() -> None:
-    """The phase's deliverable is eight questions, one script each."""
-    assert len(QUESTIONS) == 8, f"expected eight question scripts, found {sorted(QUESTIONS)}"
+def test_every_question_script_exists() -> None:
+    """Phase 3's deliverable was eight questions; Q9 and Q10 are the Phase 7 additions."""
+    assert len(QUESTIONS) == 9, f"expected nine question scripts, found {sorted(QUESTIONS)}"
 
 
 @pytest.mark.parametrize("name,report", sorted(QUESTIONS.items()))
@@ -65,3 +67,15 @@ def test_the_script_runs_on_the_fixture_lake_and_writes_a_report_with_a_decision
     # basis its DECISION is read from.
     if name != "q5_rhythm":
         assert "net-stress" in text, f"{report} never states the cost basis its DECISION reads"
+
+
+def test_q10_answers_inconclusive_on_every_one_of_its_decisions(
+    tmp_path: Path, research_lake: Path
+) -> None:
+    """Q10 writes three DECISION lines rather than one, and four synthetic hours cannot
+    clear a 40-episode floor on any of them. A `yes` here would mean the bar is not wired
+    up, not that a made up tape discovered something."""
+    run("q10_ladder", tmp_path, research_lake)
+    text = (tmp_path / "q10_ladder.md").read_text()
+    verdicts = re.findall(r"^## DECISION: (yes|no|inconclusive)$", text, re.MULTILINE)
+    assert verdicts == ["inconclusive", "inconclusive", "inconclusive"], text
