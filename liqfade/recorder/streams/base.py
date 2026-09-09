@@ -158,6 +158,9 @@ class StreamStats:
     _coin_msg_ms: dict[str, int] = field(default_factory=dict)
     _coin_gap_open: set[str] = field(default_factory=set)
     _intervals: deque[int] = field(default_factory=lambda: deque(maxlen=CADENCE_SAMPLES))
+    # Venue rate-limit weight spent, in the same per-second buckets as the message count.
+    # Only a poller spends any: a subscription costs weight once, at subscribe.
+    _weights: deque[list[float]] = field(default_factory=lambda: deque(maxlen=120))
     # coin -> its recent rx_ms minus ts_ms. Populated only for PER_COIN_STREAMS, and only
     # from rows that carry both timestamps.
     _coin_lags: dict[str, deque[int]] = field(default_factory=dict)
@@ -205,6 +208,26 @@ class StreamStats:
             self._buckets[-1][1] += 1
         else:
             self._buckets.append([second, 1.0])
+
+    def record_weight(self, weight: int, now: float | None = None) -> None:
+        """Rate-limit weight this stream just spent at the venue.
+
+        The per-IP budget is shared by every process on the box, so the poller's real
+        cost has to be a measurement rather than an arithmetic claim in a config comment.
+        A request the venue rejected spent its weight too, so it is recorded when the
+        request is made, not when it succeeds.
+        """
+        now = time.monotonic() if now is None else now
+        second = float(int(now))
+        if self._weights and self._weights[-1][0] == second:
+            self._weights[-1][1] += weight
+        else:
+            self._weights.append([second, float(weight)])
+
+    def weight_per_min(self, now: float | None = None) -> int:
+        """Venue rate-limit weight spent by this stream in the trailing minute."""
+        now = time.monotonic() if now is None else now
+        return int(sum(weight for second, weight in self._weights if now - second < 60.0))
 
     def forget_coin(self, coin: str) -> None:
         """Stop measuring a coin, because the universe no longer subscribes it.

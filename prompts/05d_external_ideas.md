@@ -17,7 +17,7 @@ gated on D saying yes.
 | A | `hl_positions` table, the address book, the positions poller, deployed to the recorder | `07a-liqmap-recorder` | NEW | concurrently with B | none |
 | B | refusals persisted from the live loop, `liqfade refusals` scorer | `05d-refusals` | NEW | concurrently with A | none |
 | C | `liqfade drift`, live paper versus replay of the same days | `05e-drift-check` | NEW | after B is merged **and** the entry policy is in `live/` | see the 2026-09-07 05c entry in `docs/DECISIONS.md` |
-| D | Q9, the preregistered research question on A's data | `07b-q9-liqmap` | NEW | after A has run 21 days on the VPS and the days are synced | data precondition inside the prompt |
+| D | Q9, the preregistered research question on A's data | `07b-q9-liqmap` | NEW | after 21 days of the **post-F** poller, so 2026-10-01 at the earliest, and the days are synced | data precondition inside the prompt |
 | E | `hl_triggers` table from `frontendOpenOrders` | `07c-trigger-map` | NEW | only after D's report says yes | D |
 
 Each prompt's first line is its routing line. Each chat sends its final report to the control
@@ -530,8 +530,13 @@ Print a short plan and wait for an OK before writing anything.
 ### Data precondition (stop and say so if it fails; no workaround)
 
 - At least 21 complete UTC days of `hl_positions` at 60s cadence or better, synced to the
-  local lake with `liqfade sync`. Count them with a duckdb query over the partitions and
-  print the count and the median poll interval per day.
+  local lake with `liqfade sync`, **and all 21 from 2026-09-10 or later**. Prompt F in
+  `prompts/05e_projected_liqmap.md` changed which addresses each cycle asks about, deployed
+  2026-09-09, which changes the instrument mid-experiment: days recorded before that are a
+  different sample and are not counted. 2026-09-10 through 2026-09-30 is the earliest
+  qualifying run, so the earliest date this gate can be met is 2026-10-01. Count the days
+  with a duckdb query over the partitions and print the count and the median poll interval
+  per day.
 - `fills_full` and `liquidations` with `source = hl_s3` for **the same days**, pulled with
   `liqfade backfill s3-fills --start --end`. About 1 GB a day at $0.09/GB, so 21 days is
   about $2; the job prints its estimate and refuses over $5 without `--yes`, and this is
@@ -628,8 +633,10 @@ Print a short plan and wait for an OK before writing anything.
 
 - **Budget first.** `frontendOpenOrders` weighs 20, ten times `clearinghouseState`
   (<https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/rate-limits-and-user-limits.md>,
-  read 2026-09-08). Defaults `poll_s: 60`, `max_addresses: 20` → 400 weight a minute, which
-  with the positions poller's 400 is two thirds of the IP budget. The config comment
+  read 2026-09-08). Defaults `poll_s: 60`, `max_addresses: 20` → 400 weight a minute. The
+  positions poller now spends 800 rather than 400 (prompt F, 2026-09-09), so 400 more is
+  the entire 1200 per-IP budget and this poller must be re-sized against
+  `StreamStats.weight_per_min` and the split in `docs/HYPERLIQUID.md` before it ships. The config comment
   carries that arithmetic. The two pollers share the address book and take the top of the
   same ranking.
 - **The table.** `hl_triggers`: `coin, ts_ms, rx_ms, source, address, oid, side,

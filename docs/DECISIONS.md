@@ -3318,3 +3318,40 @@ ranks entries; the backtests price them.
 it down, which would mean the exhaustion rule cannot see the end of the flow at the 250 ms
 cadence and the strategy needs the liquidation map (Q9) or a paid HL feed before the
 entry problem is solved.
+
+## 2026-09-09 (positions poller coverage)
+
+**The positions poll is two tiers: a priority set near price, and a rotating sweep.**
+Ranking purely by cumulative traded notional spent the budget on positions that cannot be
+this hour's cascade fuel. Measured on the VPS 2026-09-09 over the most recent hourly
+partition of `hl_positions`, deduplicated to the latest row per address and coin and
+joined to `asset_ctx` marks: 5,000 addresses harvested, 200 polled per cycle, 873 open
+positions across 18 coins, $1,561M notional tracked, 271 of 873 positions with no
+`liquidation_px` at all, and of that notional only $54M within 2% of mark, $143M within
+5% and $413M within 20%. $1,529M of $1,561M is cross margin. So we were polling 4% of the
+addresses we hold, and spending most of that on positions 20% or further from being
+forced. Priority is now the addresses whose last snapshot held a liquidation level within
+`priority_pct` of mark, biggest position first; the sweep is a rotating cursor over the
+whole book so everything is re-checked inside 20 minutes and can be promoted. Reverse if
+the sweep turns out to discover nothing the priority rule would not have found anyway, in
+which case the whole budget goes to priority.
+
+**The poller reads its own marks out of its own rows.** `positionValue` is the venue's
+`abs(szi) * markPx`, so the previous cycle's rows already carry every mark the selection
+needs. No second feed, no extra call, no new dependency. Up to `poll_s` stale, which a
+25% band absorbs. Reverse if `priority_pct` is ever tightened below a few percent, where
+a 60-second-old mark starts to matter.
+
+**400 addresses, not 600.** The per-IP budget is 1200 weight per minute shared by every
+process on the box, and the enumeration in `docs/HYPERLIQUID.md` says the recorder is
+very nearly alone in it: the paper loop spends nothing on `/info` because its reconciler
+reads the simulator, and the testnet loop's 44/min goes to a different host. 400
+addresses is 800 weight, leaving 100 reserved for a future mainnet loop and about 250
+spare. Sizing is checked against `StreamStats.weight_per_min`, logged every cycle, rather
+than against that arithmetic. Reverse upward only after the gauge and a real mainnet loop
+have run side by side for a day.
+
+**Priority state is in memory and never persisted.** A restart has no priority set, fills
+its first cycles from the sweep and is correct again within one sweep period. A file to
+persist it would be a third thing that can be stale or corrupt on disk, for 20 minutes of
+warm-up. Reverse never.
