@@ -44,6 +44,7 @@ HORIZONS_MIN = (5, 15, 30)
 # Under 40 in a cell is `inconclusive`, never a result. The preregistration's floor.
 MIN_CELL = 40
 MINUTE_MS = 60_000
+DAY_MS = 86_400_000
 # Q8's winning cell, from reports/research/q8_path.md. Q10c reads its stop-out rate.
 K_STOP, K_TARGET = 1.0, 0.8
 
@@ -75,20 +76,71 @@ def anchors(candles: pl.DataFrame, cfg: object) -> pl.DataFrame:
     )
     if levels.is_empty():
         return levels
-    first_touch = (
-        levels.join(
-            candles.select("coin", pl.col("ts_ms").alias("_bar"), "h", "l"),
-            on="coin",
-        )
-        .filter(
-            (pl.col("_bar") >= pl.col("known_from"))
-            & (pl.col("l") <= pl.col("px"))
-            & (pl.col("h") >= pl.col("px"))
-        )
-        .group_by("coin", "ts_ms", "px", "kind")
-        .agg(pl.col("_bar").min().alias("touched_from"))
+    keyed = levels.with_columns(
+        pl.concat_str(
+            ["coin", "kind", pl.col("ts_ms").cast(pl.String), pl.col("px").cast(pl.String)],
+            separator="/",
+        ).alias("key")
     )
-    return levels.join(first_touch, on=["coin", "ts_ms", "px", "kind"], how="left")
+    touched = first_touch(keyed, candles).rename({"touch_ts": "touched_from"})
+    return keyed.join(touched, on="key", how="left").drop("key")
+
+
+def first_touch(targets: pl.DataFrame, candles: pl.DataFrame) -> pl.DataFrame:
+    """The first bar at or after `known_from` whose range contains each target's `px`.
+
+    Args:
+        targets: `key`, `coin`, `px`, `known_from`. A level, or a projected band.
+        candles: 1m bars over the same window.
+
+    Returns:
+        `key` and `touch_ts`, for the targets price actually reached. A target never
+        reached is absent, which a left join turns into the null its callers want.
+
+    Walks days rather than joining every target to every bar. A month holds roughly 13,000
+    bands and 43,000 bars per coin, so the direct join is billions of rows per coin and the
+    research machine has 8 GB. Each day is prefiltered by that day's own high and low per
+    coin, so only the targets price came near are ever joined to bars, and a target leaves
+    the pool the moment it is touched.
+    """
+    empty = targets.head(0).select("key", pl.lit(None, dtype=pl.Int64).alias("touch_ts"))
+    if targets.is_empty() or candles.is_empty():
+        return empty
+    bars = candles.select("coin", "ts_ms", "h", "l").with_columns(
+        (pl.col("ts_ms") // DAY_MS).alias("_day")
+    )
+    found = []
+    pool = targets.select("key", "coin", "px", "known_from")
+    for day in sorted(bars["_day"].unique().to_list()):
+        if pool.is_empty():
+            break
+        day_bars = bars.filter(pl.col("_day") == day).drop("_day")
+        span = day_bars.group_by("coin").agg(
+            pl.col("h").max().alias("_hi"), pl.col("l").min().alias("_lo")
+        )
+        candidates = (
+            pool.filter(pl.col("known_from") < (day + 1) * DAY_MS)
+            .join(span, on="coin")
+            .filter((pl.col("px") >= pl.col("_lo")) & (pl.col("px") <= pl.col("_hi")))
+            .select("key", "coin", "px", "known_from")
+        )
+        if candidates.is_empty():
+            continue
+        hit = (
+            candidates.join(day_bars, on="coin")
+            .filter(
+                (pl.col("ts_ms") >= pl.col("known_from"))
+                & (pl.col("l") <= pl.col("px"))
+                & (pl.col("h") >= pl.col("px"))
+            )
+            .group_by("key")
+            .agg(pl.col("ts_ms").min().alias("touch_ts"))
+        )
+        if hit.is_empty():
+            continue
+        found.append(hit)
+        pool = pool.join(hit.select("key"), on="key", how="anti")
+    return pl.concat(found) if found else empty
 
 
 def shifted_ladder(ladder: list[float], mm_frac: float) -> list[float]:
@@ -187,16 +239,25 @@ def touches(bands: pl.DataFrame, candles: pl.DataFrame, ctx: pl.DataFrame) -> pl
     if bands.is_empty() or candles.is_empty():
         return pl.DataFrame()
     bars = candles.select("coin", pl.col("ts_ms").alias("bar_ts"), "h", "l", "c", "o")
+    keyed = bands.with_columns(
+        pl.concat_str(
+            [
+                "coin",
+                "side",
+                pl.col("ts_ms").cast(pl.String),
+                pl.col("leverage").cast(pl.String),
+                pl.col("px").cast(pl.String),
+            ],
+            separator="/",
+        ).alias("_band")
+    )
+    hit = first_touch(keyed.rename({"_band": "key"}), candles).rename({"key": "_band"})
     reached = (
-        bands.join(bars, on="coin")
-        .filter(
-            (pl.col("bar_ts") >= pl.col("known_from"))
-            & (pl.col("touched_from").is_null() | (pl.col("bar_ts") < pl.col("touched_from")))
-            & (pl.col("l") <= pl.col("px"))
-            & (pl.col("h") >= pl.col("px"))
-        )
-        .group_by("coin", "ts_ms", "anchor_px", "leverage", "px", "side", "weight_usd")
-        .agg(pl.col("bar_ts").min().alias("touch_ts"))
+        keyed.join(hit, on="_band")
+        # The anchor's own ladder goes stale the moment price trades back through it, so a
+        # band reached after that is not the trap this question is about.
+        .filter(pl.col("touched_from").is_null() | (pl.col("touch_ts") < pl.col("touched_from")))
+        .drop("_band")
     )
     if reached.is_empty():
         return pl.DataFrame()
