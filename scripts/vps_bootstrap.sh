@@ -14,6 +14,13 @@
 # known_hosts. Stage 8 of scripts/wizard_phase1_recorder.sh creates both.
 set -euo pipefail
 
+# Retired 2026-09-25: the owner hand-tunes the box, and a run of this script would overwrite
+# that work. Only the owner runs it, by hand, with LIQFADE_OWNER_RUN=1 (CLAUDE.md section 6).
+if [ "${LIQFADE_OWNER_RUN:-}" != "1" ]; then
+  echo "refused: the owner manages the VPS by hand. Owner only: rerun with LIQFADE_OWNER_RUN=1." >&2
+  exit 1
+fi
+
 SSH_PORT="${1:-2222}"
 SERVICE_USER="liqfade"
 APP_ROOT="/srv/liqfade"

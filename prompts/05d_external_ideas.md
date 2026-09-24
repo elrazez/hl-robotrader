@@ -214,16 +214,17 @@ failed now passing with `make lint test` green.
 ### Deploy and verify
 
 After the branch is merged to `main` by the control chat (report first, then wait for the
-merge notice), deploy from the laptop with the only ssh path that exists for this box,
-the `liqfade-vps` alias (`docs/RUNBOOK.md`; the box bans after four failed tries, never
-trial anything else against it):
+merge notice), the owner deploys by hand: the box has been theirs since 2026-09-25 (CLAUDE.md
+section 6), and `deploy.sh` refuses to run without their flag. Put these two lines in the
+owner checklist, warn that `deploy.sh` resets `/srv/liqfade/app` to `main` and overwrites
+any unit file that differs from the repo, and wait for their word:
 
-    ssh liqfade-vps 'bash -s' < scripts/deploy.sh
+    ssh liqfade-vps 'LIQFADE_OWNER_RUN=1 bash -s' < scripts/deploy.sh
     ssh liqfade-vps 'systemctl restart liqfade-recorder'
 
-`deploy.sh` restarts only a unit whose file changed, so the second line is the restart, on
-purpose. It deploys `main`, which by now also carries Panel v3 and the 05c testnet loop;
-that is intended, `/srv/liqfade/app` should be on `main`. Then, in this order, and report each as seen rather than assumed:
+Then check read-only over the `liqfade-vps` alias (`docs/RUNBOOK.md`; the box bans after
+four failed tries, never trial anything else against it), in this order, and report each
+as seen rather than assumed:
 
 1. `systemctl status liqfade-paper` is unchanged and its heartbeat file is fresh: the soak
    was not restarted.

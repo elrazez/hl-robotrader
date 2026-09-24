@@ -97,6 +97,13 @@ if [ -n "${LIQFADE_PLAN_ONLY:-}" ]; then
   exit 0
 fi
 
+# Retired 2026-09-25: the owner hand-tunes the box, and a run of this script would overwrite
+# that work. Only the owner runs it, by hand, with LIQFADE_OWNER_RUN=1 (CLAUDE.md section 6).
+if [ "${LIQFADE_OWNER_RUN:-}" != "1" ]; then
+  echo "refused: the owner manages the VPS by hand. Owner only: rerun with LIQFADE_OWNER_RUN=1." >&2
+  exit 1
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "run as root" >&2
   exit 1
