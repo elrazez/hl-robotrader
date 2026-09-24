@@ -40,8 +40,8 @@ Ordering rules from the roadmap:
 
 Rules for whoever runs these prompts (human or agent):
 
-1. The agent must read `CLAUDE.md` in full first, then the docs named at the top of the
-   prompt. Every prompt repeats this because it is that important.
+1. The agent reads the docs named at the top of the prompt before planning. `CLAUDE.md`
+   needs no instruction: Claude Code loads it into every session started in the repo.
 2. Each prompt starts with the agent printing a short plan and waiting for an OK.
 3. The prompts pre-answer design questions in a "Decisions already made" section. The
    agent follows those instead of asking. If something is genuinely not covered, the

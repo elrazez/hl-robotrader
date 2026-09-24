@@ -8,7 +8,7 @@ flip the live switch.
 
 ---
 
-You are working in the liqfade repo. Read `CLAUDE.md` in full, then `docs/ROADMAP.md`
+You are working in the liqfade repo. Read `docs/ROADMAP.md`
 Phase 6, `docs/RUNBOOK.md`, and `docs/HYPERLIQUID.md` (fees and rate limit sections
 again). The agent NEVER runs `liqfade live`, never edits `.env`, and never modifies
 `config/mainnet.yaml` risk limits unless this prompt's owner explicitly typed new

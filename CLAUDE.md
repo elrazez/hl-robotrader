@@ -2,21 +2,23 @@
 
 Project: **liqfade** (working name). An autonomous crypto perps trading bot on Hyperliquid that fades liquidation cascades on scalp to short-intraday horizons, with Telegram alerts and a hard kill switch.
 
-Read this file fully before doing anything. Then read the reference doc for the area you are touching:
+Before touching an area, read its reference doc:
 
 - `docs/DATA_SOURCES.md` before any data ingestion, recorder or backtest-data work
 - `docs/HYPERLIQUID.md` before any execution, order, account or rate-limit work
 - `docs/STRATEGY_AND_RISK.md` before any signal, sizing, risk or backtest-logic work
 - `docs/ROADMAP.md` for the phase you are in and its definition of done
 
-Think before coding. State assumptions. Ask if ambiguous.
+State assumptions. Ask only when two readings of a task lead to materially different
+work; otherwise pick the simplest option, say which in a sentence, and keep going.
 Simplest code that works. No speculative abstractions.
 Surgical edits only. Do not “improve” adjacent code.
 Define done in a way a test or command can check.
 
 ## Context7
 Before writing code that uses a third-party library or API, call Context7
-(resolve-library-id → query-docs) using the version in package.json.
+(resolve-library-id → query-docs) using the version pinned in `uv.lock`
+(`liqfade/panel/frontend/package.json` for the panel frontend).
 Do this without being asked. Skip for this repo’s own code.
 
 ## 1. Owner context and decisions already made
@@ -62,6 +64,7 @@ liqfade/
   risk/          pre-trade checks, exposure caps, daily loss, drawdown halt, cooldowns, stale-data guard
   execution/     Hyperliquid client wrapper, order manager, cloid registry, reconciliation, signer
   backtest/      event-driven replay engine, fill model, cost model, metrics, walk-forward
+  lab/           the terminal workbench: configs, runs, results (`docs/LAB.md`)
   live/          the trading loop: wires recorder feeds -> features -> strategy -> sizing -> risk -> execution
   alerts/        Telegram bot: outbound alerts, inbound commands (/status /pause /resume /flat /kill)
   control/       local control plane: Unix-socket JSON-RPC server inside the live/recorder processes, typed
@@ -71,11 +74,11 @@ liqfade/
                  Reads: control socket, data/orders.sqlite, Parquet via duckdb, reports/. Writes: only
                  config/overrides.yaml through validated endpoints, then sends reload_config.
   config/        pydantic-settings models, YAML defaults, env overrides, overrides.yaml (panel-managed)
-  cli.py         `liqfade record|backfill|backtest|paper|testnet|live|panel|status|sync`
+  cli.py         the `liqfade` entry point; `uv run liqfade --help` lists every subcommand
 tests/           mirrors package layout; `tests/integration/` needs testnet keys and is skipped by default
 notebooks/       research only; never imported by package code
 docs/            the reference docs listed above plus decision log
-scripts/         VPS bootstrap, systemd units, cron for parquet compaction
+scripts/         VPS bootstrap, deploy, systemd units, `probe/` (testnet probes), `research/`
 data/            gitignored. parquet/{source}/{stream}/date=YYYY-MM-DD/*.parquet, plus KILL flag file
 ```
 
@@ -102,7 +105,7 @@ Framework decision: we build a lightweight custom engine on top of the official 
 - Style: small modules, explicit names, docstrings on public functions stating units and edge cases. No clever metaprogramming.
 - Git: `main` is always runnable in paper mode. Feature branches. Conventional commit messages (`feat:`, `fix:`, `data:`, `research:`).
 
-Commands (target state; create the Makefile in Phase 0):
+Commands:
 
 ```
 make setup        # uv sync, pre-commit install
@@ -141,17 +144,8 @@ make sync         # rsync data/parquet, data/orders.sqlite and reports/ from the
 - Keep this file under control: if a section grows beyond a screen, move detail into `docs/` and leave a pointer.
 - The `mattpocock-skills` plugin is installed. Use its skills whenever one fits, and when handing the owner a prompt for a new chat, put the skill invocation at the top of it: `/mattpocock-skills:code-review <commit>` at every phase boundary and after any batch of agent commits; `/grill-me` before a phase's design is pasted; `/mattpocock-skills:wizard` for anything only the owner can do by hand (VPS, keys, dashboards); `/mattpocock-skills:diagnosing-bugs` for a hard bug or a performance regression; `/mattpocock-skills:handoff` when a chat must continue elsewhere. Do not reach for the ticket, triage or architecture-scan skills mid-phase; they invite refactors CLAUDE.md forbids.
 
-## 7. Owner's manual tasks (Phase 0 checklist)
+## 7. Owner's manual tasks
 
-Owner does these; Claude prepares scripts and instructions.
-
-1. GitHub repo (private), push the scaffold.
-2. VPS in Tokyo: 2 vCPU, 4 GB RAM, 80 GB disk, Ubuntu 24.04. Vultr Tokyo or AWS Lightsail Tokyo both fit the budget (roughly $12 to $24/month). Add your SSH public key at creation; the bootstrap script disables password login.
-2b. Tailscale (free tier) on both the VPS and your local machine, so the panel and rsync go over a private network and the VPS exposes nothing but SSH. Optional: a VPN firewall on the laptop blocks tailnet traffic, and the wizard then uses the public address with the same key-only SSH.
-2c. Local machine: install `uv` and `git`. Backtests and research run here; expect 20 to 60 GB of Parquet over time, so pick a disk with room.
-3. Hyperliquid mainnet account via `app.hyperliquid.xyz`, fund with USDC on Arbitrum. Generate an **API wallet** (agent key) at `app.hyperliquid.xyz/API`. Note: the bot signs with the agent key but `account_address` is the main wallet address.
-4. Hyperliquid **testnet** account at `app.hyperliquid-testnet.xyz`, claim faucet USDC, generate a separate testnet agent key.
-5. Telegram bot via BotFather, get bot token, get your chat id.
-6. Coinalyze account and API key (free).
-7. AWS account with an IAM user that has `s3:GetObject` and `s3:ListBucket` on `hyperliquid-archive` and `hl-mainnet-node-data`, for requester-pays historical pulls. Set a billing alarm at $10.
-8. Fill `.env` from `.env.example` on the VPS only. Never paste keys into chat.
+The one-time setup (VPS, Hyperliquid mainnet and testnet accounts with their API wallets,
+Telegram bot, Coinalyze key, Tailscale, `.env`) is `docs/DEPLOY_VPS.md`; the S3 IAM policy
+is in `docs/DATA_SOURCES.md`. Keys go into `.env` on the VPS only; never paste them into chat.

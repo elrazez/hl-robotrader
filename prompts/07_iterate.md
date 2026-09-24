@@ -6,8 +6,8 @@ the "This iteration" block at the bottom and paste the whole thing to the agent.
 
 ---
 
-You are working in the liqfade repo. Read `CLAUDE.md` in
-full, then `docs/DECISIONS.md` and the latest `reports/live/weekly/` report. The
+You are working in the liqfade repo. Read
+`docs/DECISIONS.md` and the latest `reports/live/weekly/` report. The
 discipline below overrides any instinct to just tweak a number.
 
 ## The iteration law

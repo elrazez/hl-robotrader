@@ -21,9 +21,10 @@ gated on D saying yes.
 | E | `hl_triggers` table from `frontendOpenOrders` | `07c-trigger-map` | NEW | only after D's report says yes | D |
 
 Each prompt's first line is its routing line. Each chat sends its final report to the control
-chat by `SendMessage` (session `hl-robotrader-38` at the time of writing; the name changes when the
-session restarts, so ask the owner if it is gone rather than guessing from `ListAgents`). The control chat
-merges. Paste only the part below each `---`.
+chat by `SendMessage`. Its name changes when its session restarts, so the routing lines say
+`hl-robotrader-<N>` and the control chat writes its current name in when it hands a prompt
+over; a chat that finds the name gone asks the owner rather than guessing from `ListAgents`.
+The control chat merges. Paste only the part below each `---`.
 
 Before pasting A, optionally paste this whole file into a chat with
 `/mattpocock-skills:grilling` on top and let it argue with the design for ten minutes. The
@@ -37,7 +38,7 @@ ROUTING: NEW chat. Runs concurrently with prompt B. Branch `07a-liqmap-recorder`
 in its own worktree: `git worktree add ../hl-robotrader-liqmap -b 07a-liqmap-recorder main`,
 then `uv sync --all-extras` there. When done, send the final report (prompt name, branch, tip
 hash, what was deployed and what the first hour on the VPS showed) to the control chat
-`hl-robotrader-38` with `SendMessage`.
+`hl-robotrader-<N>` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -244,7 +245,7 @@ from this machine), print the checklist and stop; never simulate having done it.
 ROUTING: NEW chat. Runs concurrently with prompt A. Branch `05d-refusals` off `main`, in its
 own worktree: `git worktree add ../hl-robotrader-refusals -b 05d-refusals main`, then
 `uv sync --all-extras` there. When done, send the final report (prompt name, branch, tip
-hash) to the control chat `hl-robotrader-38` with `SendMessage`.
+hash) to the control chat `hl-robotrader-<N>` with `SendMessage`.
 
 Since this prompt was written, 05c landed on `main`: `liqfade/live/venue.py` holds
 `VenueSession`, the session that runs against a real account (testnet now, mainnet in Phase
@@ -385,7 +386,7 @@ these are true: prompt B is merged to
 by the live path — the qualification in `docs/DECISIONS.md`, 2026-09-07 "05c: the seven day
 paper acceptance run", has been lifted by a later entry. If either is false, say so and
 stop. Branch `05e-drift-check` off `main`. When done, send the final report to the control
-chat `hl-robotrader-38` with `SendMessage`.
+chat `hl-robotrader-<N>` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
@@ -505,12 +506,12 @@ end-to-end (MATCH, then perturb, then DRIFT). 6. Run it on the soak's synced win
 ## Prompt D: Q9, does the map measure anything
 
 ROUTING: NEW chat. Start only when the data precondition below holds. Branch
-`07b-q9-liqmap` off `main`. When done, send the final report (the DECISION lines verbatim)
-to the control chat `hl-robotrader-38` with `SendMessage`.
+`07b-q9-liqmap` off `main`. When done, send the final report (the run line and the offline
+test results) to the control chat `hl-robotrader-<N>` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
-You are working in the liqfade repo. Read `CLAUDE.md` in full, then
+You are working in the liqfade repo. Read
 `reports/research/PREREGISTRATION.md` end to end (ground rules, the DECISION format, the
 stop rules), `reports/research/SUMMARY.md`, `reports/research/q3_proxy.md`,
 `docs/research/external_bots_scan.md` section 1, `docs/STRATEGY_AND_RISK.md` section 7, and
@@ -600,12 +601,14 @@ style, grilled first. Q9b yes and Q9a no: the next prompt is an exhaustion featu
 
 ### Deliverables
 
-`scripts/research/q9_liqmap.py` with the run line in its docstring;
-`reports/research/q9_liqmap.md` with the three-column net tables, the three DECISION lines,
-episode and cluster counts, and the bootstrap intervals; a Q9 row in
-`reports/research/SUMMARY.md`; a dated `docs/DECISIONS.md` entry; and one line under "How
-to start" in section 1 of `docs/research/external_bots_scan.md`: step two run, date, the
-three verdicts.
+`scripts/research/q9_liqmap.py` with the run line in its docstring, tested offline over
+`research_lake`. The owner runs it over the real lake; this chat does not, and reports the
+work as complete except the run. That run writes `reports/research/q9_liqmap.md` with the
+three-column net tables, the three DECISION lines, episode and cluster counts, and the
+bootstrap intervals. The Q9 row in `reports/research/SUMMARY.md`, the dated
+`docs/DECISIONS.md` entry and the line under "How to start" in section 1 of
+`docs/research/external_bots_scan.md` (step two run, date, the three verdicts) are
+written once that report exists.
 
 ---
 
@@ -613,11 +616,11 @@ three verdicts.
 
 ROUTING: NEW chat. Start only if Q9's report says yes on Q9a or Q9b; otherwise this prompt
 is never run. Branch `07c-trigger-map` off `main`. When done, send the final report to the
-control chat `hl-robotrader-38` with `SendMessage`.
+control chat `hl-robotrader-<N>` with `SendMessage`.
 
 /mattpocock-skills:tdd
 
-You are working in the liqfade repo. Read `CLAUDE.md` in full, then
+You are working in the liqfade repo. Read
 `docs/research/external_bots_scan.md` section 2, the rate limits section of
 `docs/HYPERLIQUID.md`, `liqfade/recorder/streams/hl_positions.py` and its tests (prompt A's
 work, which this extends), and `liqfade/recorder/addresses.py`.
