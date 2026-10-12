@@ -224,3 +224,18 @@ the trading parts:
    ```
 
 This box can never place an order. There is no key on it to sign one with.
+
+## Rebuilding after the October 2026 retirement
+
+The first box was deleted in October 2026 after recording 38 days (`docs/RECORDED_DATA.md`);
+its data was not kept. Three things it knew that the repo does not do on its own:
+
+1. Its `.env` carried two lines that are not in `.env.example`. Add them again, or the
+   recorder holds a Binance socket that never speaks and Coinalyze dies at its first 429:
+
+       LIQFADE_VENUES__BINANCE__ENABLED=false   # geo-blocked from Tokyo, 2026-09-05
+       LIQFADE_VENUES__COINALYZE__ENABLED=false # no 429 backoff yet, prompts/02g item 29
+
+2. The journal keeps about a day. Anything worth keeping goes to the lake or to a file.
+3. A loop unit left enabled while `data/KILL` exists retries every 3 s forever, and nothing
+   alerts. The first box did that for a month. Disable the units you are not running.

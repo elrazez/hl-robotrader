@@ -3390,3 +3390,36 @@ poll ever needs to finish early for a reason the recorder does not have today.
 its first cycles from the sweep and is correct again within one sweep period. A file to
 persist it would be a third thing that can be stale or corrupt on disk, for 20 minutes of
 warm-up. Reverse never.
+
+## 2026-10-13 (the VPS is retired, and what its month held)
+
+**The owner is deleting the VPS after 38 days of recording.** Before deletion the box was
+read end to end, read-only, and everything it knew that the repo did not went into
+`docs/RECORDED_DATA.md`: the lake's tables and per-day counts, the silences and their
+causes, and the findings below. **The lake itself was not kept**: the owner chose to delete
+the box without copying it, and a download of the irreplaceable tables was stopped part
+way. Two traps found on the way, for the next recorder: `liqfade sync` writes into the
+working directory rather than the data dir, and `liqfade backfill s3-fills` over a recorded
+day deletes every Hyperliquid trade that did not come from S3, the recorder's `rx_ms` with
+it (`docs/DATA_SOURCES.md`, "Counting a trade once").
+
+**Two decisions made on the box on 2026-09-05 were recorded only in its `.env` and are
+written down here.** Binance liquidations were switched off because Tokyo is geo-blocked
+(connected four hours, no message), so the recorded lake has no Binance rows. Coinalyze was
+switched off because it died at its first 429, and the code still has no backoff (prompts/02g
+item 29 is open), so there is no `xchg_ctx`. The cross-venue trigger therefore saw Bybit
+notional and OKX counts only.
+
+**What the month showed, in one line each.** The recorder was clean: no day missing, one
+restart by hand. The Phase 5 paper run placed nothing in four and a half days on
+`crossvenue`, and the watchdog stopped it on 2026-09-12 during a stall that hit the whole box.
+The `KILL` flag then stayed up for a month, with 621,241 refused restarts per loop unit and no
+alert. The journal held one day; the month's feed-health figures were read from a leftover
+`/tmp/watch.sh` log before the box went. Hyperliquid's websockets go quiet for about two minutes on weekend
+mornings while its REST API answers.
+
+**What it does to the plan.** Q9's 21-day gate was met (32 days from 2026-09-10) and Q9 was
+never run; `hl_positions` has no history to re-pull, so Q9 starts from zero on any future
+recorder, as do Q4's 60 recorder days and the Q3 re-cut's live `asset_ctx`. The edge itself
+stands where Phase 3 and the 2026-09-08 entry left it: real on exact S3 liquidations,
+unproven on anything a live bot can see.

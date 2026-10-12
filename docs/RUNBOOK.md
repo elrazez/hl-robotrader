@@ -223,6 +223,13 @@ From the laptop, not the VPS:
 macOS ships openrsync, which does not support `--info=progress2`. Install GNU rsync
 (`brew install rsync`) or drop that flag from `sync.rsync_flags` in your local config.
 
+**`liqfade sync` writes into `./data/` under the directory it runs from, not into
+`LIQFADE_DATA_DIR`.** Run from the repo, it fills the laptop's own disk beside the real lake
+on the external drive. Pull straight into the lake instead. `-rt` rather than `-a`, because
+the drive cannot take the box's owners and modes:
+
+    rsync -rtz --partial liqfade-vps:/srv/liqfade/data/parquet/ "<data_dir>/parquet/"
+
 ## Phase 0 verification
 
     make setup
