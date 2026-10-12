@@ -441,3 +441,15 @@ def test_the_two_address_tiers_may_not_exceed_the_poll_ceiling(tmp_path: Path) -
     )
     with pytest.raises(ConfigError, match="max_addresses"):
         load_settings("paper", extra_files=[extra], environ={})
+
+
+def test_the_liqmap_ladder_is_the_exchange_leverage_menu_in_multiples() -> None:
+    """Q10's ladder is percentages derived from leverage, never dollars: the public
+    indicator it decodes is hardcoded for Bitcoin at $40,000 and works nowhere else.
+    `max_dist_bps` is its own key, because features.levels.max_dist_bps of 200 is far too
+    tight for a rung that sits 9.5% out, and moving that one would shift Q7's result."""
+    liqmap = load_settings("paper", environ={}).features.liqmap
+    assert liqmap.ladder == (3.0, 5.0, 10.0, 15.0, 20.0, 25.0, 40.0, 50.0)
+    assert liqmap.mm_frac == 0.005
+    assert liqmap.max_dist_bps == 1200.0
+    assert sum(liqmap.histogram.values()) == pytest.approx(0.949)

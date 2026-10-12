@@ -160,6 +160,41 @@ features:
     range_d: 5  # days behind the rolling highest high and lowest low
     max_dist_bps: 200.0  # bps: a level further than this is reported absent, not far away
     zone_width_bps: 15.0  # bps: how close the cascade extreme must be to count as in the zone
+  liqmap:
+    # The projected liquidation map for Q10. A trader who opened at a swing extreme with
+    # leverage L is liquidated 1/L - mm_frac away, so each untouched anchor projects a ladder
+    # of prices where trapped positions are force-closed. Percentages, never dollars: the
+    # public indicator this is decoded from hardcodes the same ladder in dollars for Bitcoin
+    # at $40,000 and works on nothing else. docs/research/projected_liqmap.md.
+    ladder: [3, 5, 10, 15, 20, 25, 40, 50]  # leverage multiples: the exchange's own menu
+    mm_frac: 0.005  # fraction of notional: maintenance margin. Flat, see the ponytail note in liqmap.py
+    # Its own key, deliberately not features.levels.max_dist_bps, which is 200 and would drop
+    # every rung below 50x. 1200 bps is 12%, which is exactly the furthest line the source
+    # indicator draws, and it admits 10x (950 bps) and everything above it. 3x and 5x sit
+    # 3283 and 1950 bps out and are therefore always dropped; they stay in the ladder so the
+    # menu is written down in full rather than pre-filtered by one cap's value.
+    max_dist_bps: 1200.0  # bps: a band further from its own anchor than this is dropped
+    band_width_bps: 15.0  # bps: how close to a band counts as in it, matching zone_width_bps
+    # Q8 measured maximum adverse excursion at 74 bps at p75 and 177 at p90, so 200 covers
+    # most of where a cascade actually travels inside the 15 minute horizon.
+    fuel_window_bps: 200.0  # bps each way: how far ahead forced flow is summed
+    # One day. A fresh swing keeps nearly all its weight; a range edge at the far end of
+    # features.levels.range_d (5 days) keeps 3%, which is the shape we want.
+    half_life_min: 1440.0  # minutes: age at which a band carries half its weight
+    # Measured, not invented: 194 addresses and $1,561M of tracked notional on the VPS on
+    # 2026-09-09, the only free source of a leverage distribution anywhere (Binance, Bybit
+    # and OKX publish open interest and funding, never leverage). Each rung takes the share
+    # of the measured bucket containing it, and [10,20) is split across its two rungs. The
+    # missing 5.1% is the under-3x bucket, which projects no rung at all.
+    histogram:
+      3: 0.072    # measured 3 to 5x
+      5: 0.223    # measured 5 to 10x
+      10: 0.16050  # half of the measured 10 to 20x
+      15: 0.16050  # the other half
+      20: 0.175   # measured 20 to 25x
+      25: 0.158   # measured 25 to 40x
+      40: 0.0     # measured 40x and up: nothing
+      50: 0.0
   proxy:
     # HL-native forced flow proxy, since the free feed does not flag liquidations.
     vol_median_lookback_s: 3600  # seconds of trailing aggressive volume used as the denominator

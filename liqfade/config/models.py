@@ -186,6 +186,22 @@ class Levels(Base):
     zone_width_bps: Pos = Field(..., description="bps within which a price is inside the zone")
 
 
+class Liqmap(Base):
+    """The projected liquidation map, Q10's inputs. Percentages, never dollars."""
+
+    ladder: tuple[float, ...] = Field(
+        ..., min_length=1, description="leverage multiples: the exchange's own menu"
+    )
+    mm_frac: Frac = Field(..., description="fraction of notional: maintenance margin, flat")
+    max_dist_bps: Pos = Field(..., description="bps: a band further from its anchor is dropped")
+    band_width_bps: Pos = Field(..., description="bps within which a price is inside a band")
+    fuel_window_bps: Pos = Field(..., description="bps each way that forced flow is summed over")
+    half_life_min: Pos = Field(..., description="minutes: age at which a band carries half weight")
+    histogram: dict[float, float] = Field(
+        ..., description="leverage multiple -> share of notional opened at it"
+    )
+
+
 class Features(Base):
     decision_cadence_ms: int = Field(..., gt=0, description="milliseconds between feature ticks")
     windows_s: tuple[int, ...] = Field(..., min_length=1, description="seconds: trailing windows")
@@ -202,6 +218,7 @@ class Features(Base):
     proxy: ForcedProxy
     episodes: Episodes
     levels: Levels
+    liqmap: Liqmap
 
 
 CascadeTrigger = Literal["exact", "proxy", "crossvenue"]

@@ -12,7 +12,8 @@ because four hours cannot clear a bar that asks for eight calendar months.
 
 Shape: three coins across two tiers, HL-exact liquidations plus a Bybit mirror of most of
 them (and a handful of Bybit-only cascades, so Q4 has something to find), a trade every
-two seconds, `asset_ctx` once a minute with impact prices, and 1m candles.
+two seconds, `asset_ctx` once a minute with impact prices, 1m candles, and eight public
+positions a minute in `hl_positions` so Q10d has liquidation prices to compare against.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from liqfade.data.schemas import SOURCE_HL_S3, SOURCE_TARDIS
+from liqfade.data.schemas import SOURCE_HL_S3, SOURCE_RECORDER, SOURCE_TARDIS
 from liqfade.recorder.writer import write_rows
 
 DATE = "2026-03-01"
@@ -195,6 +196,43 @@ def _asset_ctx(cascades: list[Cascade], rng: random.Random) -> list[dict[str, An
     return rows
 
 
+def _positions(cascades: list[Cascade], rng: random.Random) -> list[dict[str, Any]]:
+    """A handful of public positions per poll, with liquidation prices near where price goes.
+
+    Q10d asks whether the projected ladder lines up with the liquidation prices the
+    recorder actually saw, so the fixture needs some. Deliberately thin: eight addresses at
+    a one minute cadence, enough to exercise the join and the isolated/cross split and far
+    too little to be mistaken for a measurement.
+    """
+    addresses = [f"0x{index:040x}" for index in range(1, 9)]
+    rows = []
+    for ts_ms in range(START_MS, START_MS + SPAN_MS, CTX_STEP_MS):
+        for index, address in enumerate(addresses):
+            coin = list(COINS)[index % len(COINS)]
+            mid = _price(coin, ts_ms, cascades, rng)
+            leverage = rng.choice((10.0, 15.0, 20.0, 25.0))
+            long_side = index % 2 == 0
+            away = 1.0 / leverage - 0.005
+            size = rng.uniform(1.0, 40.0) * COINS[coin][2]
+            rows.append(
+                {
+                    "coin": coin,
+                    "ts_ms": ts_ms,
+                    "rx_ms": ts_ms + rng.randint(50, 400),
+                    "address": address,
+                    "szi": size if long_side else -size,
+                    "entry_px": mid,
+                    "liquidation_px": mid * (1 - away) if long_side else mid * (1 + away),
+                    "position_value_usd": size * mid,
+                    "margin_used_usd": size * mid / leverage,
+                    "leverage": leverage,
+                    "leverage_type": "cross" if index % 3 else "isolated",
+                    "max_leverage": 40,
+                }
+            )
+    return rows
+
+
 def _candles(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """1m OHLCV from the same trades, the way `liqfade derive candles` builds them."""
     buckets: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -266,6 +304,7 @@ def build(root: Path) -> Path:
         ("liquidations", "bybit"): (bybit_liqs, SOURCE_TARDIS),
         ("asset_ctx", "hyperliquid"): (_asset_ctx(cascades, rng), SOURCE_HL_S3),
         ("candles_1m", "hyperliquid"): (_candles(trades), SOURCE_HL_S3),
+        ("hl_positions", "hyperliquid"): (_positions(cascades, rng), SOURCE_RECORDER),
     }
     for day, rows in _history(rng).items():
         write_rows(parquet, ("asset_ctx", "hyperliquid", day, 0), rows, source=SOURCE_HL_S3)
