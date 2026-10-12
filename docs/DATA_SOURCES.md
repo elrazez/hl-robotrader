@@ -2,6 +2,8 @@
 
 Researched 2026-08-30. Budget constraint: under $50/month total. Everything below is free or requester-pays unless marked.
 
+What the VPS recorder actually captured, 2026-09-05 to its retirement in October 2026, how complete it is and how to read it: `docs/RECORDED_DATA.md`.
+
 ## Summary table
 
 | Need | Source | Cost | Real-time | History | Quality notes |
@@ -157,7 +159,7 @@ Captured live on 2026-08-30 with `scripts/probe/ws_payloads.py`. Where this diff
 
 - **OKX swap sizes are in contracts, not coin units, so OKX `notional_usd` is null.** `sz` on `liquidation-orders` counts contracts of `ctVal` each, so `bkPx * sz` is out by up to 100x and is not USD. `notional_usd` means USD or it means null, so both OKX paths (`recorder/streams/okx.py` and `data/ingest/tardis_free.py`) write null. `px`, `sz` and `venue_symbol` are preserved intact, so joining `ctVal` from the instruments endpoint later is a backfill over the lake rather than a re-pull. Until that join exists, OKX contributes event counts but no notional, and cross-venue notional leans on `venues.okx.liq_weight` and the other three venues. OKX inverse (coin margined) swaps such as `BTC-USD-SWAP` are recorded with `coin = null` for the same reason: their size is in USD contracts and folding them into the coin would corrupt every cross-venue total.
 - **Bybit `allLiquidation` `S` is confirmed**: `Sell` means a long was liquidated, `Buy` means a short was. Verified against live BTCUSDT and SOLUSDT events.
-- **Binance `!forceOrder@arr` delivered nothing from a geo-blocked network.** The connection is accepted and stays open, but no message ever arrives, and neither does `btcusdt@aggTrade`, so this is a silent block rather than a quiet market or a parser bug. The parser is tested against the documented payload. **Confirm Binance liquidations actually flow once the recorder runs in Tokyo**; `liqfade status` showing `binance.liquidations` with `msgs/min = 0` for a busy hour means the block follows the VPS too, and then Binance is worth dropping from `venues` rather than pretending it is a feed.
+- **Binance `!forceOrder@arr` delivered nothing from a geo-blocked network.** The connection is accepted and stays open, but no message ever arrives, and neither does `btcusdt@aggTrade`, so this is a silent block rather than a quiet market or a parser bug. The parser is tested against the documented payload. **Confirmed on the VPS on 2026-09-05: the block follows it to Tokyo.** Connected for four hours, not one message. The box ran with `LIQFADE_VENUES__BINANCE__ENABLED=false` from that day, so the recorded lake has no Binance rows at all; `config/default.yaml` still enables it. See `docs/RECORDED_DATA.md`.
 
 Symbol mapping lives in `data/symbols.py` (`BTC` <-> `BTCUSDT` on Binance/Bybit, `BTC-USDT-SWAP` on OKX, Coinalyze suffix codes). Unknown symbols are recorded under their venue symbol with `coin = null` rather than dropped.
 
@@ -393,6 +395,11 @@ Hyperliquid (it still pulls the Hyperliquid side tables, `book_snapshot_5` and
 any Tardis Hyperliquid rows it finds in a partition it rewrites. Tardis was the smaller
 set anyway: 541,237 BTC trades against `hl_s3`'s 541,557 on 2026-03-01, and every Tardis
 `tid` is present in `hl_s3`.
+
+**That includes the recorder's own Hyperliquid trades.** `liqfade backfill s3-fills` over
+a recorded day keeps no Hyperliquid row that did not come from S3 (`hl_s3._assemble`), so it
+replaces the recorded trades and their `rx_ms`, the only live receive times they ever had.
+Copy a recorded day somewhere no job writes before pulling S3 over it.
 
 Consumers still deduplicate on `(coin, tid)`, as `liqfade/data/derive/candles.py` does.
 That costs nothing, and it is what will keep a recorded day and a backfilled day of the

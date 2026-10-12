@@ -16,6 +16,10 @@ Build: `recorder/` with one async task per venue stream, reconnect with jittered
 
 Also: **Panel v1** (recorder page): per-stream lag, gaps, message rates, disk usage, universe list, WS ping RTT and REST RTT to Hyperliquid as time series, last 24h of liquidations per venue as a chart. Recorder registers with the control plane so `/status` and the panel share one source.
 
+**Retired October 2026.** The recorder ran on the VPS from 2026-09-05 12:38 UTC until the
+box was deleted: 38 days, 9.4 GB, no day missing. The data was not kept; what it held and
+how complete it was are recorded in `docs/RECORDED_DATA.md`.
+
 DoD: 48 hours on the VPS with no gap over 5s on HL trades and BBO for the core coins, Bybit liquidations flowing, Binance and OKX liquidations flowing, Parquet files readable with `duckdb` and matching the schema doc, `tests/fixtures/` populated with a 5-minute real sample used by unit tests, `make sync` pulls the lake to the local machine and a local `duckdb` query over it works, Panel v1 shows all of the above over Tailscale.
 
 ## Phase 2: Historical ingestion (2 days plus pull time)
@@ -54,6 +58,10 @@ sampling, Q4 with a real cross-venue sample instead of twelve Tardis first-of-mo
 Q4 then shows Bybit-only cascades revert on Hyperliquid, Phase 4 proceeds on a cross-venue
 trigger with the parameters already written into `config/default.yaml`. If it does not, this
 thesis has an edge nobody can reach and the momentum variant needs its own Phase 3.
+
+**Superseded in October 2026: the VPS was retired with 37 full recorder days and its data
+was not kept, so 2026-11-04 never arrives.** Q4's 60 recorder days and the Q3 re-cut's live
+`asset_ctx` both start from zero on any future recorder. See `docs/RECORDED_DATA.md`.
 
 Config writeback applied the same day: `intent.k_target` 0.8, `intent.k_stop` 1.0,
 `filters.max_spread_bps` 30 flat, `skip_when_btc_cascading` off, the funding gate off. Every
@@ -95,6 +103,10 @@ Owner acceptance runs, once the lake is synced locally:
 
 Build: `live/` loop in paper mode (real feeds, simulated fills using the backtest fill model), `alerts/` Telegram bot with all commands, `execution/` against testnet, order manager state machine with SQLite persistence, reconciliation, watchdog unit, kill switch path with its own tests, the six testnet probes listed in `docs/HYPERLIQUID.md`. **Panel v3**: live positions and orders, fills history, PnL and equity, submit-to-ack latency percentiles, pause/resume/flat buttons (kill stays Telegram and file only, on purpose), and the settings page: sizing fractions, risk limits, trigger thresholds, universe overrides, with diff preview, typed confirmation for risk fields, audit log, and Telegram notification on every change.
 
+**Not met.** The paper acceptance run started 2026-09-07 17:51 UTC, placed nothing, and was
+stopped by the watchdog on 2026-09-12 06:24 UTC; the `KILL` flag then stayed up unnoticed
+until the box was retired. See `docs/RECORDED_DATA.md`, "What the month showed".
+
 DoD: 7 days of paper trading with every intent and simulated fill posted to Telegram and logged; paper results within a plausible band of backtest expectations for the same days (document the comparison) (`liqfade drift`, see reports/live/); testnet orders round-trip correctly including TP/SL grouping, reconnects and reconciliation; `/kill` verified to flatten within 5s from a state with resting orders and an open testnet position; watchdog verified by killing the loop process.
 
 ## Phase 6: Mainnet, small (ongoing)
@@ -107,4 +119,6 @@ Scaling rule of thumb: increase `risk_frac` or deposit only after a full week wh
 
 ## Phase 7: Iterate
 
-Candidates, each as its own research question first: cross-venue liquidation weights, funding and OI regime filters, book-imbalance timing, coin-tier specific parameters, trailing exits, HL paid liquidation feed if budget grows, partial-liquidation rhythm exploitation, momentum variant for market-wide sweeps, liquidation map from public positions (recorder since 2026-09-08; the address selection changed 2026-09-09, so Q9's 21 days count from 2026-09-10 and the gate opens 2026-10-01 at the earliest).
+Candidates, each as its own research question first: cross-venue liquidation weights, funding and OI regime filters, book-imbalance timing, coin-tier specific parameters, trailing exits, HL paid liquidation feed if budget grows, partial-liquidation rhythm exploitation, momentum variant for market-wide sweeps, liquidation map from public positions (recorder since 2026-09-08; the address selection changed 2026-09-09, so Q9's 21 days count from 2026-09-10 and the gate opens 2026-10-01 at the earliest). The gate
+was met (32 complete days, 2026-09-10 to 2026-10-11), but Q9 was never run and the data went
+with the box, so Q9's 21 days start again on any future recorder.
