@@ -1,0 +1,220 @@
+{
+  "bootstrap": {
+    "draws": 1000,
+    "hi": 23.463742600707626,
+    "lo": -83.88946330301349,
+    "mean_bps": -34.236530118198935
+  },
+  "coins": [
+    "BTC",
+    "ETH",
+    "HYPE",
+    "SOL"
+  ],
+  "config_hash": "c724f478a779c10b83f8c47326b14454ef2157beecca57c3e08a847410fbab88",
+  "coverage": {
+    "replayed_frac": 0.07167824074074074,
+    "replayed_ms": 18579000,
+    "skipped_ms": 240621000,
+    "windows": 8
+  },
+  "deflated_sharpe": 0.17381121630952023,
+  "end_ms": 1760227200000,
+  "env": "paper",
+  "exhaustion_mode": "rule",
+  "funding": {
+    "applied_hours": 0,
+    "missing_hours": 0
+  },
+  "funnel": {
+    "abandoned_entries": 0,
+    "confluence_blocks": 2,
+    "entries_placed": 4,
+    "filter_blocks": {
+      "edge_too_small": 6,
+      "spread_too_wide": 1
+    },
+    "intents": 6,
+    "risk_blocks": {
+      "cluster_exposure": 2
+    },
+    "rule_blocks": {},
+    "sizing_blocks": {},
+    "trades": 4
+  },
+  "holdout": {
+    "avg_entry_slippage_bps": 2.0992878653385008,
+    "avg_hold_s": 1.559,
+    "avg_loss_bps": -54.221261621727834,
+    "avg_net_bps": -54.221261621727834,
+    "avg_stop_slippage_bps": 0.0,
+    "avg_win_bps": 0.0,
+    "by_cascade_size": {
+      "5m-20m": -7.558385039999999
+    },
+    "by_coin": {
+      "BTC": -7.558385039999999
+    },
+    "by_exit_reason": {
+      "target": 1
+    },
+    "by_hour": {
+      "22": -7.558385039999999
+    },
+    "by_urgency": {
+      "high": -7.558385039999999
+    },
+    "exposure_frac": 6.014660493827161e-6,
+    "fees_usd": 0.8353850399999998,
+    "funding_usd": 0.0,
+    "gross_pnl": -6.723,
+    "hit_rate": 0.0,
+    "max_drawdown": 0.0,
+    "max_drawdown_frac": 0.0,
+    "max_hold_s": 1.559,
+    "net_pnl": -7.558385039999999,
+    "no_book_share": 0.0,
+    "profit_factor": 0.0,
+    "sharpe_daily": 0.0,
+    "sharpe_per_trade": 0.0,
+    "sortino_per_trade": -1.0,
+    "stop_rate": 0.0,
+    "top5_pnl_share": 0.0,
+    "trades": 1,
+    "turnover_usd": 1393.9891499999999
+  },
+  "lagged_ms": null,
+  "latency_fragile": null,
+  "latency_ms": 1000,
+  "metrics": {
+    "avg_entry_slippage_bps": 10.450793681615215,
+    "avg_hold_s": 2.004,
+    "avg_loss_bps": -62.101621493660616,
+    "avg_net_bps": -34.236530118198935,
+    "avg_stop_slippage_bps": 0.0,
+    "avg_win_bps": 49.358744008186115,
+    "by_cascade_size": {
+      "5m-20m": -15.144299141809917,
+      ">20m": -22.87084481595589
+    },
+    "by_coin": {
+      "BTC": -31.83998511279988,
+      "ETH": -7.585914101809917,
+      "SOL": 1.410755256843987
+    },
+    "by_exit_reason": {
+      "target": 4
+    },
+    "by_hour": {
+      "20": -24.28160007279988,
+      "21": 1.410755256843987,
+      "22": -7.558385039999999,
+      "8": -7.585914101809917
+    },
+    "by_urgency": {
+      "high": -38.01514395776581
+    },
+    "exposure_frac": 0.000030925925925925924,
+    "fees_usd": 3.9346519977659997,
+    "funding_usd": 0.0,
+    "gross_pnl": -34.080491959999804,
+    "hit_rate": 0.25,
+    "max_drawdown": 38.01514395776758,
+    "max_drawdown_frac": 0.003801514395776758,
+    "max_hold_s": 3.468,
+    "net_pnl": -38.01514395776581,
+    "no_book_share": 0.0,
+    "profit_factor": 0.03578244973347907,
+    "sharpe_daily": -22.481688753194522,
+    "sharpe_per_trade": -0.5422537122431349,
+    "sortino_per_trade": -0.4974317690894908,
+    "stop_rate": 0.0,
+    "top5_pnl_share": 0.0,
+    "trades": 4,
+    "turnover_usd": 6566.2734526
+  },
+  "min_confluence": 2,
+  "n_trials": 1,
+  "rules": {
+    "level_reclaim": {
+      "evaluated": 15,
+      "killed": 0,
+      "passed": 10,
+      "required": false
+    },
+    "min_cascade_notional": {
+      "evaluated": 15,
+      "killed": 0,
+      "passed": 15,
+      "required": true
+    },
+    "oi_flush": {
+      "evaluated": 15,
+      "killed": 0,
+      "passed": 7,
+      "required": false
+    },
+    "vwap_stretch": {
+      "evaluated": 15,
+      "killed": 0,
+      "passed": 15,
+      "required": false
+    },
+    "zone_proximity": {
+      "evaluated": 15,
+      "killed": 0,
+      "passed": 5,
+      "required": false
+    }
+  },
+  "run_id": "20260906T132207Z_c724f478",
+  "start_ms": 1759968000000,
+  "starting_equity": 10000.0,
+  "train": {
+    "avg_entry_slippage_bps": 13.234628953707452,
+    "avg_hold_s": 2.1523333333333334,
+    "avg_loss_bps": -66.04180142962701,
+    "avg_net_bps": -27.574952950355968,
+    "avg_stop_slippage_bps": 0.0,
+    "avg_win_bps": 49.358744008186115,
+    "by_cascade_size": {
+      "5m-20m": -7.585914101809917,
+      ">20m": -22.87084481595589
+    },
+    "by_coin": {
+      "BTC": -24.28160007279988,
+      "ETH": -7.585914101809917,
+      "SOL": 1.410755256843987
+    },
+    "by_exit_reason": {
+      "target": 3
+    },
+    "by_hour": {
+      "20": -24.28160007279988,
+      "21": 1.410755256843987,
+      "8": -7.585914101809917
+    },
+    "by_urgency": {
+      "high": -30.456758917765807
+    },
+    "exposure_frac": 0.000024911265432098765,
+    "fees_usd": 3.099266957766,
+    "funding_usd": 0.0,
+    "gross_pnl": -27.35749195999981,
+    "hit_rate": 0.3333333333333333,
+    "max_drawdown": 0.0,
+    "max_drawdown_frac": 0.0,
+    "max_hold_s": 3.468,
+    "net_pnl": -30.45675891776581,
+    "no_book_share": 0.0,
+    "profit_factor": 0.044269385089596845,
+    "sharpe_daily": -26.91854895960443,
+    "sharpe_per_trade": -0.36481535674186966,
+    "sortino_per_trade": -0.36731763895179576,
+    "stop_rate": 0.0,
+    "top5_pnl_share": 0.0,
+    "trades": 3,
+    "turnover_usd": 5172.2843026
+  },
+  "trigger": "exact"
+}

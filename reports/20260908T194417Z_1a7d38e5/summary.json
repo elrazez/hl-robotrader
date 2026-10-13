@@ -1,0 +1,275 @@
+{
+  "bootstrap": {
+    "draws": 1000,
+    "hi": 3853.4084532724687,
+    "lo": -813.983598182315,
+    "mean_bps": 1222.6654148076616
+  },
+  "coins": [
+    "ASTER",
+    "AVAX",
+    "BNB",
+    "BTC",
+    "DOGE",
+    "ENA",
+    "ETH",
+    "FARTCOIN",
+    "HYPE",
+    "LINK",
+    "NEAR",
+    "PUMP",
+    "SOL",
+    "SUI",
+    "TAO",
+    "TON",
+    "TRUMP",
+    "UNI",
+    "WLD",
+    "XPL",
+    "XRP",
+    "ZEC"
+  ],
+  "config_hash": "1a7d38e5c41e576bf344937d3f9ffd43d8afb963d4e4f3fdb19ac1b7359d6ec2",
+  "coverage": {
+    "replayed_frac": 0.522079475308642,
+    "replayed_ms": 135323000,
+    "skipped_ms": 123877000,
+    "windows": 31
+  },
+  "deflated_sharpe": 0.00003264099358912809,
+  "end_ms": 1760227200000,
+  "env": "paper",
+  "exhaustion_mode": "rule",
+  "funding": {
+    "applied_hours": 0,
+    "missing_hours": 0
+  },
+  "funnel": {
+    "abandoned_entries": 0,
+    "confluence_blocks": 0,
+    "entries_placed": 18,
+    "filter_blocks": {
+      "edge_too_small": 65,
+      "spread_too_wide": 1,
+      "target_behind": 145
+    },
+    "intents": 56,
+    "risk_blocks": {
+      "cluster_exposure": 25,
+      "coin_cooldown": 3,
+      "max_positions": 8,
+      "max_positions_per_direction": 1,
+      "stale_coin_data": 1
+    },
+    "rule_blocks": {},
+    "sizing_blocks": {},
+    "trades": 18
+  },
+  "holdout": {
+    "avg_entry_slippage_bps": 183.47777965597814,
+    "avg_hold_s": 535.3315,
+    "avg_loss_bps": 0.0,
+    "avg_net_bps": 7989.707819185411,
+    "avg_stop_slippage_bps": 0.0,
+    "avg_win_bps": 7989.707819185411,
+    "by_cascade_size": {
+      "1m-5m": 195.3045420048382,
+      ">20m": 53.59124700421992
+    },
+    "by_coin": {
+      "HYPE": 4.220575745354632,
+      "NEAR": 33.68449575621357,
+      "TRUMP": 157.39947050326998,
+      "XPL": 53.59124700421992
+    },
+    "by_exit_reason": {
+      "target": 2,
+      "time_stop": 2
+    },
+    "by_hour": {
+      "19": 4.220575745354632,
+      "21": 244.67521326370348
+    },
+    "by_urgency": {
+      "normal": 248.89578900905812
+    },
+    "exposure_frac": 0.003743726851851852,
+    "fees_usd": 1.7853584792001242,
+    "funding_usd": 0.0,
+    "gross_pnl": 250.68114748825823,
+    "hit_rate": 1.0,
+    "max_drawdown": 0.0,
+    "max_drawdown_frac": 0.0,
+    "max_hold_s": 900.0,
+    "net_pnl": 248.89578900905812,
+    "no_book_share": 0.0,
+    "profit_factor": null,
+    "sharpe_daily": 13.9834980401252,
+    "sharpe_per_trade": 0.8778030203936494,
+    "sortino_per_trade": 0.0,
+    "stop_rate": 0.0,
+    "top5_pnl_share": 1.0,
+    "trades": 4,
+    "turnover_usd": 2729.975516389108
+  },
+  "lagged_ms": null,
+  "latency_fragile": null,
+  "latency_ms": 1000,
+  "metrics": {
+    "avg_entry_slippage_bps": 46.389668259236146,
+    "avg_hold_s": 366.7316111111111,
+    "avg_loss_bps": -1136.920816727739,
+    "avg_net_bps": 1222.6654148076616,
+    "avg_stop_slippage_bps": 31.692970564301536,
+    "avg_win_bps": 3582.251646343062,
+    "by_cascade_size": {
+      "1m-5m": 143.06445234410535,
+      "5m-20m": -136.82927357810962,
+      ">20m": -27.071274213407037
+    },
+    "by_coin": {
+      "AVAX": -50.692829191496635,
+      "BNB": -62.24691672657047,
+      "ETH": -60.0214040641998,
+      "HYPE": -3.8112637889553165,
+      "LINK": -50.101433295975134,
+      "NEAR": 33.68449575621357,
+      "PUMP": 0.9192440244862117,
+      "SOL": -51.72554125012656,
+      "TRUMP": 157.39947050326998,
+      "XPL": 59.508709953657714,
+      "XRP": 6.251372632285125
+    },
+    "by_exit_reason": {
+      "stop": 6,
+      "target": 7,
+      "time_stop": 5
+    },
+    "by_hour": {
+      "14": -8.031839534309949,
+      "15": -21.077597030861764,
+      "19": 4.220575745354632,
+      "2": -2.6510698859239366,
+      "20": -21.82685748372901,
+      "21": 37.079109456306014,
+      "8": -8.548416714247292
+    },
+    "by_urgency": {
+      "normal": -20.836095447411285
+    },
+    "exposure_frac": 0.018002739197530863,
+    "fees_usd": 14.162870500794444,
+    "funding_usd": 0.0,
+    "gross_pnl": -6.673224946616865,
+    "hit_rate": 0.5,
+    "max_drawdown": 276.709291152858,
+    "max_drawdown_frac": 0.02765163544465405,
+    "max_hold_s": 900.0,
+    "net_pnl": -20.836095447411306,
+    "no_book_share": 0.5277777777777778,
+    "profit_factor": 0.9302046424750893,
+    "sharpe_daily": -13.709795543138874,
+    "sharpe_per_trade": 0.2241839740273434,
+    "sortino_per_trade": 0.6850517189116468,
+    "stop_rate": 0.3333333333333333,
+    "top5_pnl_share": 0.0,
+    "trades": 18,
+    "turnover_usd": 18484.69819466727
+  },
+  "min_confluence": 0,
+  "n_trials": 5,
+  "rules": {
+    "level_reclaim": {
+      "evaluated": 267,
+      "killed": 0,
+      "passed": 121,
+      "required": false
+    },
+    "min_cascade_notional": {
+      "evaluated": 267,
+      "killed": 0,
+      "passed": 267,
+      "required": true
+    },
+    "oi_flush": {
+      "evaluated": 267,
+      "killed": 0,
+      "passed": 61,
+      "required": false
+    },
+    "vwap_stretch": {
+      "evaluated": 267,
+      "killed": 0,
+      "passed": 248,
+      "required": false
+    },
+    "zone_proximity": {
+      "evaluated": 0,
+      "killed": 0,
+      "passed": 0,
+      "required": true
+    }
+  },
+  "run_id": "20260908T194417Z_1a7d38e5",
+  "start_ms": 1759968000000,
+  "starting_equity": 10000.0,
+  "train": {
+    "avg_entry_slippage_bps": 7.22163643159558,
+    "avg_hold_s": 318.56021428571427,
+    "avg_loss_bps": -1136.920816727739,
+    "avg_net_bps": -710.7752721574096,
+    "avg_stop_slippage_bps": 31.692970564301536,
+    "avg_win_bps": 56.28670806918325,
+    "by_cascade_size": {
+      "1m-5m": -52.24008966073284,
+      "5m-20m": -136.82927357810962,
+      ">20m": -80.66252121762696
+    },
+    "by_coin": {
+      "AVAX": -50.692829191496635,
+      "BNB": -62.24691672657047,
+      "ETH": -60.0214040641998,
+      "HYPE": -8.031839534309949,
+      "LINK": -50.101433295975134,
+      "PUMP": 0.9192440244862117,
+      "SOL": -51.72554125012656,
+      "XPL": 5.917462949437793,
+      "XRP": 6.251372632285125
+    },
+    "by_exit_reason": {
+      "stop": 6,
+      "target": 5,
+      "time_stop": 3
+    },
+    "by_hour": {
+      "14": -8.031839534309949,
+      "15": -21.077597030861764,
+      "2": -2.6510698859239366,
+      "20": -21.82685748372901,
+      "21": -207.59610380739747,
+      "8": -8.548416714247292
+    },
+    "by_urgency": {
+      "normal": -269.7318844564694
+    },
+    "exposure_frac": 0.014259012345679013,
+    "fees_usd": 12.37751202159432,
+    "funding_usd": 0.0,
+    "gross_pnl": -257.3543724348751,
+    "hit_rate": 0.35714285714285715,
+    "max_drawdown": 0.0,
+    "max_drawdown_frac": 0.0,
+    "max_hold_s": 900.0,
+    "net_pnl": -269.7318844564694,
+    "no_book_share": 0.0,
+    "profit_factor": 0.09647019236292914,
+    "sharpe_daily": -14.8433128129929,
+    "sharpe_per_trade": -0.5512352862271923,
+    "sortino_per_trade": -0.398242901168448,
+    "stop_rate": 0.42857142857142855,
+    "top5_pnl_share": 0.0,
+    "trades": 14,
+    "turnover_usd": 15754.722678278165
+  },
+  "trigger": "exact"
+}
